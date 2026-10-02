@@ -660,3 +660,71 @@ with the classification and must be quoted with it. The shape counts underlying 
 split 42 behind / 10 ahead -- reproduce EXACTLY across the two criteria, and the permutation nulls
 differ (35/39/44 against 34/38/42) in the direction the label imbalance predicts (86.1% against
 85.0% behind), which is the agreement worth having.
+
+---
+
+## Amendment 12 (2026-10-02): a quantifier corrected, the percentile's convention stated, and the ceiling's axis identified
+
+### 1. A quantifier error in my own restatement, corrected with the measured value
+
+I wrote that redwood's float64 screen found "**0 cells behind MKL in any reading**". The tool
+computed something weaker and correct: `an_f64_vs_mkl.py` classifies BEHIND as `all(r > 1.0 for
+r in rs)` and prints it as "behind in **every** reading". Those are different claims, and the
+stronger one is false by my own numbers in the same sentence -- 81 mixed cells each hold at least
+one reading that is not ahead.
+
+Measured rather than bounded: **192 of 46 704 readings (0.4111%) have ours slower than MKL**,
+spread over exactly the 81 mixed cells, distributed 39 cells with one such reading, 18 with two,
+5 with three, 8 with four, 4 with five, 3 with six, 1 with seven, 2 with eight and 1 with nine.
+
+So the correct statements are: **no cell is consistently behind** (0 of 2919), and **0.41% of
+individual readings are behind**, confined to 2.77% of cells. The code had every part of this
+right -- it counts the three outcomes separately, and its own comment at `:194-200` explains why
+the sum-to-total equality is an identity that must not be asserted as coverage. The failure was
+one word of English, in the direction that strengthened the claim.
+
+### 2. The percentile's convention, which was unstated and not re-derivable
+
+Amendment 11's `pctile 43.04` is **164/381**: the denominator is the CLASSIFIED keys at that
+width (328 behind + 53 ahead), excluding the 11 mixed, because the permutation null shuffles
+labels only among those. A peer reading the same quantity over all 392 keys gets 44.39%
+(174/392). Both are defensible and the verdict is identical -- both sit far below the null p05 of
+95.01, p = 0.0000 either way -- but the amendment quoted the number without its denominator.
+
+**And the ceiling must not be quoted as a rounded decimal.** Its exact value is **3835/64 =
+59.921875**, attained by exactly one key (`rows=64 nnz=3835`). Recomputing any percentile or
+precision figure from the printed `59.92` *excludes the very key that attains it*, which shifts
+the count by one in every table: 163/381 instead of 164/381, 173/392 instead of 174/392. Quote
+it as `3835/64`, or as its (rows, nnz), not as two decimal places.
+
+**Both ceilings are single-key statistics** -- mine attained by one key at 3835/64, a peer's
+weaker classification by one key at 88.25 -- so each is one reclassified key from moving. That is
+the sharper form of amendment 11's caveat that the VALUE is criterion-dependent while the
+existence and the p are not, and it is the reason the percentile-with-its-null is the quotable
+form while the raw ceiling and any precision-at-that-threshold figure are not.
+
+### 3. WHICH AXIS the ceiling is on, which amendment 11 assumed rather than tested
+
+The attaining key has only 64 rows, so "degree" could have been standing in for nnz or for rows.
+Same one-sided statistic and the same null on each candidate, so they are comparable:
+
+| axis                 | ahead max   | keys above | of those, behind | percentile | null median | p      |
+|----------------------|-------------|------------|------------------|------------|-------------|--------|
+| **mean degree**      |    59.92    |    **217** |      **217/217** | **43.04%** |      98.95% | 0.0000 |
+| nnz                  |  852 171    |         25 |            25/25 |     93.44% |      98.95% | 0.0230 |
+| rows                 |   33 288    |          0 |                - |    100.00% |     100.00% | 1.0000 |
+| nnz x mean degree    |  2.1816e7   |        104 |          104/104 |     72.70% |      98.95% | 0.0000 |
+
+**Mean degree is the carrier.** It leaves 217 keys above its ceiling with zero exceptions at the
+43rd percentile of a distribution where chance puts the ceiling at the 99th. `nnz` reaches only
+the 93rd percentile and p = 0.0230, which is marginal and leaves 25 keys above. `rows` is
+**exactly null**: the ahead set contains the corpus's widest matrix, so there is no row-count
+ceiling at all. The product is real but strictly weaker than degree alone, which means degree is
+not a proxy for total work.
+
+**This tightens amendment 11's constraint from a size effect to a per-row one.** Mean degree is
+the inner-loop trip count per row. So the mechanism must be a cost **per nonzero within a row**
+that is decisive above ~60 nonzeros per row at k=2 and not decisive at k=8, where the ahead set
+reaches degree 1382. It is not a function of problem size: `rows` carries nothing and `nnz` is
+marginal, so an explanation keyed on working-set size or total traffic has to account for why
+degree beats both on the same test.
