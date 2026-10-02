@@ -2340,3 +2340,51 @@ at 1.1051 and none against `shpb`, whose maximum is 1.0979. So the demonstration
 criterion fires on object-level displacement alone holds specifically on the base that matches
 the original — the same base carrying the larger sub-threshold tail. Two independent facts, one
 direction.
+
+## Amendment 28 — amendment 26's predictor, computed on DLMC before any outcome is joined
+
+Run on this Mac against the local `~/dlmc` tree, so **neither measurement host was touched**:
+392 keys x 7 widths = 2744 rows, 0 skipped for zero nonzeros, `pack` inside (0, 1] on all of
+them (so no row repeats a column index), widest row 2494 nonzeros against a 2,000,000 block
+budget, 3m44s single-threaded. The key list was fetched from MKT rather than regenerated —
+`dlmc_corpus.py` wants an npz cache and refused cleanly on the raw `.smtx` tree — and digests to
+`24e386cee4371ce9`, matching the digest `pfs_screen_dlmc.sbatch` pinned at startup, with all 392
+keys resolving locally.
+
+**This is the predictor's input distribution only. No timing is joined to it.** Amendment 26
+registers a behind/ahead contrast within degree strata against a permutation null, on the
+completed run; that has not been computed, and reading the outcome first would void the
+registration.
+
+| k | S | shares a line | pack p05 | pack median | pack p95 | B bytes/nnz | vs A's 8 bytes |
+|---|---|---|---|---|---|---|---|
+| 2 | 8 | yes | 0.1344 | **0.2400** | 0.5098 | 33.3 | 4.2x |
+| 8 | 32 | yes | 0.5053 | 0.5561 | 0.6772 | 57.5 | 7.2x |
+| 12 | 48 | yes | 0.5051 | 0.5556 | 0.6796 | 86.4 | 10.8x |
+| 16 | 64 | **no** | 1.0000 | 1.0000 | 1.0000 | 64.0 | 8.0x |
+| 20 | 80 | yes | 0.6299 | 0.6758 | 0.7776 | 118.4 | 14.8x |
+| 24 | 96 | yes | 0.7540 | 0.7898 | 0.8629 | 121.5 | 15.2x |
+| 32 | 128 | **no** | 1.0000 | 1.0000 | 1.0000 | 128.0 | 16.0x |
+
+**What the table says without any outcome.** `pack` is the fraction of each fetched 64-byte B line
+that the row consumes, so a median of 0.2400 at k=2 means **76% of every fetched B line is
+discarded** — eight B rows share a line at S=8 and a typical row uses two of them. Median B
+traffic is 33.3 bytes per nonzero against 8 bytes of A (a float value plus a 4-byte index), so
+**B dominates the memory stream by 4.2x at k=2** and by 7x to 16x at the wider widths.
+
+**The two registered negative controls are live in the data rather than assumed.** At k=16 and
+k=32, `S % 64 == 0`, and `pack` reads exactly 1.0000 at p05, median and p95 — spread **0.0000**,
+confirming that no column pattern can change B traffic there. The signal widths carry real
+spread: 0.3755 at k=2, then 0.1745, 0.1719, 0.1477, 0.1090 at k=12, 8, 20, 24. So the contrast
+amendment 26 registers has variation to work with at every width where the mechanism can act,
+and provably none where it cannot.
+
+**A co-occurrence I am recording as a co-occurrence and not as evidence.** The width with the
+worst line utilization (k=2, median 0.24) is the width where DLMC float32 is furthest *behind*
+MKL (1.4489, 14.0% of matrices ahead), and the two widths where utilization is pinned perfect
+(k=16, k=32) are where we are furthest *ahead* (0.8759 and 0.6584). That is one ordering agreeing
+with another across seven points. It is not the registered test, it conditions on nothing, and
+mean degree is a known confounder that moves the same way — amendment 26 exists precisely because
+a predictor that only reproduces the degree split has added nothing. Stated here so that when the
+registered contrast runs, it is clear the expectation existed beforehand and was not fitted to
+the answer.
