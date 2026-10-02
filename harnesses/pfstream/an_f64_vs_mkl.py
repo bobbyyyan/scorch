@@ -144,6 +144,9 @@ def main(argv):
             row += "%7s" % (n if d_ else "-")
             tt += n
         print(row + "%8d" % tt if any_cell else row + "%8s" % "-")
+    print("  (every width in the grid is a column above, so the row totals close on %d with no"
+          % counts[BEHIND])
+    print("   width omitted -- read the per-width totals rather than subtracting.)")
     print("  %-9s" % "TOTAL" + "".join(
         "%7d" % sum(1 for (key, k), v in verdict.items() if k == w and v == BEHIND)
         for w in widths) + "%8d" % counts[BEHIND])
@@ -167,11 +170,56 @@ def main(argv):
     # something the matrices share. Printed as a comparison, never as the behind set alone:
     # a property is only a candidate if it SEPARATES behind from ahead.
     print()
+    # THE COLUMN'S IDENTITY IS CHECKED BEFORE ANY NUMBER RESTS ON IT. Three quantities are in
+    # the CSV -- nnz, rows, deg -- and one identity relates them. Every structural figure below
+    # is a quantile of `deg`, so if that column were nnz/cols, or a mean over non-empty rows
+    # only, or a count rather than a mean, the separation would print identically and read just
+    # as convincing. An earlier version of this function built the two components into a dict
+    # and never read it, which is the shape of having the check available and not making it.
+    worst, worst_key = 0.0, None
+    checked, unchecked = 0, 0
+    for key in sorted(nnz):
+        r = rows_of.get(key)
+        if not r or key not in degree_of:
+            unchecked += 1
+            continue
+        want = nnz[key] / float(r)
+        got = degree_of[key]
+        checked += 1
+        # ABSOLUTE, not relative. The field is printed to two decimals, so its error is bounded
+        # by half the last place (0.005) regardless of magnitude, while the RELATIVE error is
+        # unbounded as the true value approaches zero. A relative criterion here refused on
+        # Hamrle3_b, whose deg reads 0.00 against a true 0.000304 -- a correct column failing a
+        # criterion that did not match its precision. The corpus really does contain such
+        # matrices: LF10000_B has one nonzero in 19998 rows.
+        d = abs(got - want)
+        if d > worst:
+            worst, worst_key = d, key
+    print("DEGREE COLUMN IDENTITY: deg == nnz/rows over %d keys (%d unchecked)"
+          % (checked, unchecked))
+    if worst_key is None:
+        sys.exit("REFUSE: the identity could not be evaluated on a single key, so every degree "
+                 "quantile below would rest on an unchecked column")
+    print("  worst ABSOLUTE discrepancy %.3e on %s (deg %.6f, nnz/rows %.6f)"
+          % (worst, worst_key, degree_of[worst_key], nnz[worst_key] / float(rows_of[worst_key])))
+    TOL = 0.005 + 1e-9        # half the last decimal place of a two-decimal field
+    if worst > TOL:
+        sys.exit("REFUSE: the deg column is not nnz/rows to within %.4f (worst %.3e on %s), so it "
+                 "does not mean what the structure table below would claim it means"
+                 % (TOL, worst, worst_key))
+    print("  within %.4f, which is half the last place of a two-decimal field, so the column IS"
+          % TOL)
+    print("  nnz/rows. The table below nonetheless uses nnz/rows computed from its components,")
+    print("  because rounding to two decimals makes the small-degree tail unusable: a true")
+    print("  0.000304 prints as 0.00, and that tail is where the ahead set lives at k=2.")
+    degree_of = {k: nnz[k] / float(rows_of[k]) for k in nnz if rows_of.get(k)}
+    # The smallest degree in the corpus, printed because an extreme value in the column the
+    # separation rests on is the strongest argument for showing its components.
+    lo = min(degree_of, key=lambda k: degree_of[k])
+    print("  smallest degree in the corpus: %s deg %.4f = %d nnz / %d rows"
+          % (lo, degree_of[lo], nnz[lo], rows_of[lo]))
+    print()
     print("STRUCTURE: the behind set against the ahead set, same widths")
-    deg = {}
-    for ck in cell:
-        key = ck[0]
-        deg[key] = rows_of.get(key), nnz[key]
     print("  %-6s %-7s %7s %9s %9s %9s %9s" % ("k", "set", "cells", "med deg", "p10 deg", "p90 deg", "med nnz"))
     for w in widths:
         for lab, want in (("behind", BEHIND), ("ahead", AHEAD), ("mixed", MIXED)):

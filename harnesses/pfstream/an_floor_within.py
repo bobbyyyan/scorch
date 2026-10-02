@@ -163,6 +163,7 @@ def main(argv):
     print("(c4-corrected sd / mean, per (key, width, class); n = members in the class)")
     rows_by_band = collections.defaultdict(list)
     per_class = collections.defaultdict(list)
+    within_med = {}
     n_cells = 0
     short = collections.Counter()
     for key in sorted(nnz):
@@ -188,6 +189,7 @@ def main(argv):
             continue
         print("  %-9s %6d %8.3f%% %8.3f%% %8.3f%%"
               % (lab, len(v), 100 * pct(v, 0.5), 100 * pct(v, 0.95), 100 * v[-1]))
+        within_med[lab] = pct(v, 0.5)
     allv = sorted(x for v in rows_by_band.values() for x in v)
     print("  %-9s %6d %8.3f%% %8.3f%% %8.3f%%   <- pooled, which bounds NEITHER end"
           % ("POOLED", len(allv), 100 * pct(allv, 0.5), 100 * pct(allv, 0.95), 100 * allv[-1]))
@@ -197,6 +199,43 @@ def main(argv):
     for c in sorted(per_class):
         v = sorted(per_class[c])
         print("    class %-3d cells %5d  median %6.3f%%  p95 %6.3f%%" % (c, len(v), 100 * pct(v, 0.5), 100 * pct(v, 0.95)))
+
+    # ---- THE MATCHED FUNCTIONAL. The floor's magnitude depends mostly on WHICH cell statistic
+    # is formed, not on the data: on this branch the same full-collection comparison gave pooled
+    # p95 of 0.0569, 0.0851, 0.1970 and 0.4023 for four different cell statistics -- a 7.1x
+    # spread. So a floor has to be the same functional as the contrast it bounds, structurally
+    # rather than by argument. The coefficient of variation above is a dispersion over FOUR
+    # objects; an arm contrast is a ratio between TWO objects. Those are different functionals,
+    # so the CV is NOT the matched floor for an arm comparison -- this is.
+    print()
+    print("MATCHED FUNCTIONAL: the ratio between TWO same-class objects, which is the form an")
+    print("arm contrast takes. Every unordered same-class pair contributes one |ratio - 1|.")
+    pair_by_band = collections.defaultdict(list)
+    npairs = 0
+    for key in sorted(nnz):
+        for w in widths:
+            for c, mem in cls.items():
+                have = [m for m in mem if (key, w, m, arm) in ms]
+                for i in range(len(have)):
+                    for j in range(i + 1, len(have)):
+                        a_, b_ = ms[(key, w, have[i], arm)], ms[(key, w, have[j], arm)]
+                        if a_ > 0 and b_ > 0:
+                            pair_by_band[band(nnz[key])].append(abs(a_ / b_ - 1.0))
+                            npairs += 1
+    print("  pairs contributing %d (%d same-class pairs per (key,width,class) at n=4)" % (npairs, 6))
+    print("  %-9s %6s %9s %9s %9s" % ("band", "pairs", "median", "p95", "max"))
+    for lab in BAND_ORDER:
+        v = sorted(pair_by_band.get(lab, []))
+        if not v:
+            continue
+        print("  %-9s %6d %8.3f%% %8.3f%% %8.3f%%"
+              % (lab, len(v), 100 * pct(v, 0.5), 100 * pct(v, 0.95), 100 * v[-1]))
+    allp = sorted(x for v in pair_by_band.values() for x in v)
+    print("  %-9s %6d %8.3f%% %8.3f%% %8.3f%%   <- pooled" % ("POOLED", len(allp),
+          100 * pct(allp, 0.5), 100 * pct(allp, 0.95), 100 * allp[-1]))
+    print("  This is the number to compare an arm's two-object contrast against. The CV table")
+    print("  above answers a different question -- how far four objects of one class spread --")
+    print("  and the two are not interchangeable.")
 
     # ---- the between-class term, labelled as the bound it is.
     print()
@@ -227,6 +266,7 @@ def main(argv):
         print("process-level A/A and does NOT bound inter-object variation, so it is the wrong")
         print("floor for an arm whose macro changes emitted code. Reported to show the gap.")
         rep = collections.defaultdict(list)
+        rep_med = {}
         for (key, w, m, a), t in ms.items():
             if a != "ours":
                 continue
@@ -239,6 +279,31 @@ def main(argv):
             if not v:
                 continue
             print("  %-9s %6d %8.3f%% %8.3f%%" % (lab, len(v), 100 * pct(v, 0.5), 100 * pct(v, 0.95)))
+            rep_med[lab] = pct(v, 0.5)
+    else:
+        rep_med = {}
+    print()
+    print("THE GAP, PER BAND, because the ratio between the two IS the finding and two separate")
+    print("ranges cannot produce it (a published '3-10x' was not derivable from them):")
+    print("  %-9s %12s %12s %9s" % ("band", "within-class", "same-process", "ratio"))
+    ratios = []
+    for lab in BAND_ORDER:
+        w_ = within_med.get(lab)
+        r_ = rep_med.get(lab)
+        if w_ is None or r_ is None or r_ <= 0:
+            continue
+        ratios.append(w_ / r_)
+        print("  %-9s %11.3f%% %11.3f%% %8.2fx" % (lab, 100 * w_, 100 * r_, w_ / r_))
+    # A band count beside the range, because a single-band table printed "3.51x to 3.51x" and
+    # read as a result: the assignment that fills this dict had been placed one indent level
+    # outside its loop, so it ran once with the loop variable left at its last value.
+    print("  bands contributing %d of %d" % (len(ratios), len(BAND_ORDER)))
+    if len(ratios) < 2:
+        print("  REFUSING to state a range over %d band(s); the per-band pairing is the finding"
+              % len(ratios))
+    elif ratios:
+        print("  so the inter-object floor is %.2fx to %.2fx the same-process floor by band"
+              % (min(ratios), max(ratios)))
     return 0
 
 
