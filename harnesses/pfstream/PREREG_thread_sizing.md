@@ -312,3 +312,51 @@ as the result, exactly as the M5's 1.0032 was.
 `n* ~ sqrt(T1/c)`, which no linear grain reproduces, and a host-measured `c` is a defensible
 constant rather than a tuned one -- but a defensible form fitted to a noise-selected optimum is
 still fitted to noise, which is what the winner's-curse null exists to prevent.
+
+---
+
+## Amendment 6 (2026-10-02, minutes after amendment 5, before any x86 sweep): amendment 5's mechanism is refuted by data already in hand
+
+**Amendment 5's table was selection on the outcome and the full population reverses it.** I
+probed five shapes chosen from the worst-cells table, found the worst ones resolving to one
+worker, and proposed that the work grain is too conservative where teams are cheap. The check
+that account needed -- the resolved count over ALL cells, with the ahead set as the contrast --
+was available without any new measurement and says the opposite.
+
+At k=2, pool 32, over all 392 MKT DLMC float32 keys classified by the 12-reading sign rule:
+
+| class  |   n | resolved to 1 worker | share <= 2 workers | median count | median nnz | median deg |
+|--------|-----|----------------------|--------------------|--------------|------------|------------|
+| behind | 328 |                   75 |              32.9% |          6.0 |     58 982 |     115.00 |
+| ahead  |  53 |               **49** |          **92.5%** |          1.0 |  **1 311** |       7.12 |
+| mixed  |  11 |                    9 |              81.8% |          1.0 |          - |          - |
+
+**The ahead cells are the single-worker cells.** 92.5% of them run on at most two workers against
+32.9% of the behind cells, so a single worker does not distinguish behind from ahead -- it
+anti-correlates with the deficit. Matched within an nnz decade the count does not separate them
+either: at 1e3 both sets read a median count of 1.0 (35 behind, 31 ahead), and at 1e5 the ahead
+cells resolve HIGHER (18 against 14). The two decades holding most of the behind set, 1e4 and
+1e6, contain **no ahead cells at all**, which is why a decade-matched comparison is possible at
+only two of four decades and is reported with those gaps named.
+
+**Amendment 5's predictions are NOT withdrawn, because they are about a different quantity** --
+the excess over the winner's-curse null on an x86 sweep -- and they remain scoreable. But
+prediction 2, "the headroom concentrates where the resolved count is small", now has this
+evidence against its direction before the sweep runs, and that is recorded here rather than
+discovered afterwards. Prediction 1 and the k=32 control stand unaffected.
+
+**What the same table says instead, and it is a harder fact than the one it replaces.** The
+behind set's median is 58 982 nonzeros and the ahead set's is **1 311**. So at k=2 the matrices
+we beat MKL on are essentially trivial -- a kernel with 1311 nonzeros on one worker, where MKL's
+own call overhead is most of its time -- and we lose on nearly every DLMC matrix of consequential
+size. The earlier framing, "we lose on long rows and win on short ones", understated it by
+describing degree when the sets also differ 45x in nonzero count and 4x in row count. The honest
+statement of the remaining deficit is: **at k=2 we are behind on 328 of 392 DLMC matrices, ahead
+on 53 whose median size is 1311 nonzeros, and no thread-count property separates the two.**
+
+**Method note, recorded because it is the second time today.** Both of today's dissolved findings
+-- the 169x cell and amendment 5's single-worker account -- came from reading a table sorted by
+the outcome and then characterising its top rows. A property found that way is conditioned on the
+outcome and cannot be evidence about it. The fix that worked both times was the same: state the
+property, then recompute it on the whole population WITH the opposite class as a contrast, before
+writing anything down.
