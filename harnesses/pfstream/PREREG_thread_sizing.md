@@ -728,3 +728,86 @@ that is decisive above ~60 nonzeros per row at k=2 and not decisive at k=8, wher
 reaches degree 1382. It is not a function of problem size: `rows` carries nothing and `nnz` is
 marginal, so an explanation keyed on working-set size or total traffic has to account for why
 degree beats both on the same test.
+
+---
+
+## Amendment 13 (2026-10-02): redwood's sweep scored, two predictions FAIL, and the curve/headroom distinction earns its keep
+
+Object `8192715070225fd3`, pool 24, overrides 0..24 x 8 widths x 2 reps, 28 800 rows, one
+`so_sha` throughout. Scored as registered, before MKT's sweep exists.
+
+### The result that matters most: a huge curve and no rule headroom, on the same data
+
+redwood's k=2 time against resolved worker count, geometric mean relative to each cell's own
+smallest count:
+
+```
+count   1      2      3      4      5      6      7      8      9     ...   24
+geo  1.0000 0.6476 0.4993 0.4335 0.3813 0.3497 0.3335 0.3278 0.3147  ...  0.3883
+```
+
+**Nine workers run 3.18x faster than one, and twenty-four give back 23% of that.** The endpoint
+ratio is 0.5097 against a permutation null of 0.9863 -- a 48% excess, enormous and in the
+falling direction. By any reading, worker count matters hugely here. The M5's curve over the same
+corpus barely moved (0.8089 at its best).
+
+**And the thread RULE still has nothing to recover.** The headroom statistic -- production's
+count against the best reachable count, over its own winner's-curse null -- reads **1.1670
+against a null of 1.2176, excess 0.9584**. Production *beats* an arbitrary count by 4.2% of the
+null at k=2, and by 4.5 / 2.2 / 0.7% at k=4 / 8 / 12.
+
+So a curve with 3.2x of real structure and a rule with negative headroom coexist on one host.
+That is exactly the confusion this script was split off from `an_ntoracle.py` to prevent, and it
+is the first time the distinction has been load-bearing rather than hypothetical: *the shape of
+the curve says whether the parameter matters; only the headroom says whether the RULE is leaving
+anything on the table.* A reader given only the 0.5097 would conclude there was a large win
+available, and there is not.
+
+### Scoring, as registered in amendment 5
+
+| # | prediction | verdict | evidence |
+|---|------------|---------|----------|
+| 1 | MKT's k=2 excess exceeds 1.05 | **NOT SCOREABLE** | MKT's screen still running; no sweep exists |
+| 2 | headroom concentrates where the resolved count is small | **FAILS** | k=2: `<=2` workers 0.9584 (n=9) vs `>=8` workers **1.0319** (n=33). k=32: 1.0523 vs 1.0550. Direction REVERSED at both widths |
+| 3 | redwood sits between MKT and the M5 | **FAILS** | redwood 0.9584 is BELOW the M5's 1.0032, not between it and a predicted >1.05 |
+| 4 | k=32 excess below k=2's (negative control, MKT) | not its host, but **contrary** | redwood k=32 reads 1.0330 against k=2's 0.9584 -- the control shows MORE excess, not less |
+
+Prediction 3 was registered as "the prediction most likely to fail", for the stated reason that
+`c` enters the criterion under a square root so a 4.3x difference in `c` is only 2.1x in `n*`,
+which the pool clamp may absorb. It failed, and it failed harder than that reasoning allowed --
+not absorbed toward the middle but past the M5 in the other direction.
+
+Prediction 2's failure is its third contradiction: amendment 6 (population check at override 0),
+amendment 7 (the same at override=POOL), and now a direct measurement of the registered
+statistic. It should be considered settled.
+
+### Corrections carried in from a peer's audit, and one of mine applied to my own table
+
+- **The behind-set floor is `2621/512 = 5.119140625`, not 5.12.** Confirmed on my own split: the
+  attaining key is `rows=1024 nnz=5242` and it is the same key under both classifications.
+  Amendment 11 quoted the rounded decimal and inherits the exact defect amendment 12 filed.
+- **The `nnz x degree` ceiling must not be `2.1816e7`.** Its attaining key is `rows=33288
+  nnz=852171` and the exact value is `242065137747/11096`. Five significant figures of a
+  composite carries a tolerance of several hundred; it happened to shift nothing (104 above it
+  either way) but the remedy applies to it as much as to the degree ceiling.
+- **The ledger's `deg` column is `nnz/rows` rounded to two decimals** -- 0 of 392 keys deviate
+  from `round(nnz/rows, 2)` and only 32 are exact by coincidence. So the exact degree is
+  unrecoverable from that column, and `rows` and `nnz` are the only carriers. Every degree figure
+  either of us has quoted today came from it.
+- **The argument in amendment 12 should lean on the `nnz` row, not the product row.** The claim
+  being retired is "degree is a proxy for total work", total work in SpMM is proportional to
+  `nnz` times the width, so `nnz` IS the total-work candidate and its marginal p = 0.0230 is what
+  rules it out. `nnz x degree` is `nnz^2/rows`, not a natural work measure, so its being weaker
+  than degree alone is hard to interpret and is demoted to a footnote.
+- **Four candidates were searched, so the carrier test wants a multiplicity correction, and it
+  helps.** At Bonferroni `0.05/4 = 0.0125`, `nnz`'s p = 0.0230 does **not** survive while mean
+  degree's p = 0.0000 survives trivially. Accounting for the search strengthens the conclusion
+  rather than weakening it, which is rare enough to state.
+
+### What is still unscored
+
+Prediction 1 and prediction 4 are both MKT predictions and MKT has three screen passes left. The
+conditional registered with them stands: **if prediction 1 PASSES on MKT while amendment 8's
+table holds, the excess statistic is wrong rather than the thread rule right.** With prediction 2
+now failed on direct measurement and prediction 3 failed, a passing prediction 1 would be the
+only surviving leg of amendment 5's account, and the conditional says to distrust it.
