@@ -256,13 +256,18 @@ def main(argv):
         lo, hi = pct(fl, 0.05), pct(fl, 0.95)
         if vn:
             mn = pct(vn, 0.5)
+            # THE EDGE REPORTED MUST BE THE ONE THE EFFECT IS HEADING TOWARD. The first version
+            # printed `hi` whenever the verdict was "inside", so a NEGATIVE arm median was shown
+            # against the POSITIVE edge -- "-1.507 vs +3.033" when the binding comparison is
+            # -1.507 against -3.299. A reader would take the wrong number as the bar.
             if mn < lo:
-                vd = "FASTER, outside"
+                vd, edge = "FASTER, outside", lo
             elif mn > hi:
-                vd = "SLOWER, outside"
+                vd, edge = "SLOWER, outside", hi
             else:
-                vd = "inside, no verdict"
-            vd += " (%+.3f vs %+.3f)" % (100 * mn, 100 * (lo if mn < lo else hi))
+                vd, edge = "inside, no verdict", (lo if mn < 0 else hi)
+            vd += " (%+.3f vs %+.3f, margin %.3f pp)" % (100 * mn, 100 * edge,
+                                                         abs(100 * (mn - edge)))
         else:
             vd = "-"
         print("  k=%-4d %7.3f%% %7.3f%% %7.3f%% %7.3f%% %7.3f%% | %10s %10s %10s | %s"

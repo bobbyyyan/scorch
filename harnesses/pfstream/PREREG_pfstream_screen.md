@@ -3419,3 +3419,75 @@ equivalent of a plant here was two minutes asking what happens to the second key
 Stated as the rule: *a branch-closing finding deserves the plant treatment, not the read
 treatment.* And the specific trap under it — I have been writing "ask what each quantity is the
 spread **of**" all afternoon, and did not ask what this denominator was a count **of**.
+
+---
+
+## Amendment 41 — amendment 38 reported the floor's LOCATION and the verdict reads its DISPERSION, which is wider on redwood, not narrower
+
+Amendment 38 called redwood's floor "clean" and concluded the prefetch deletion is real but not
+actionable. Both hold. But "clean" was established on **location** — median near zero, cells-better
+near half — while the actionability verdict reads `pct(fl, 0.05)`, a **dispersion**, which
+amendment 38 did not print. The tool printed it; the amendment dropped it.
+
+### The column the verdict consumes, now on the page
+
+| k | redwood f64 floor p05 / p95 | band width | | k | MKT f32 DLMC floor p05 / p95 | band width |
+|---|---|---|---|---|---|---|
+| 2 | −3.299 / +3.033 | 6.33 pp | | 2 | −1.107 / +2.999 | 4.11 pp |
+| 4 | **−3.536** / +3.660 | 7.20 pp | | 8 | −1.053 / +2.245 | 3.30 pp |
+| 6 | −2.736 / +3.370 | 6.11 pp | | 12 | −1.888 / +2.487 | 4.38 pp |
+| 8 | −2.969 / +3.255 | 6.22 pp | | 16 | −0.780 / +3.793 | 4.57 pp |
+| 10 | −3.393 / +3.474 | 6.87 pp | | 20 | −1.349 / +2.570 | 3.92 pp |
+| 12 | −4.219 / +4.245 | 8.46 pp | | 24 | −0.549 / +4.340 | 4.89 pp |
+| 16 | −4.757 / +4.274 | 9.03 pp | | 32 | −0.982 / +3.301 | 4.28 pp |
+
+**The ranges do not overlap.** Redwood's band widths run 6.11–9.03 pp, MKT's 3.30–4.89 pp.
+Redwood's *narrowest* p05 (−2.736 at k=6) is **1.45× beyond MKT's widest** (−1.888 at k=12).
+
+So the inversion is real and complete: **the host whose floor has the better-behaved location has
+the wider per-cell dispersion, and therefore the HIGHER actionability bar.** Two true statements
+about different functionals — location null, spread large. A reader taking "clean" to mean "small"
+would conclude the bar had dropped when it rose.
+
+Amendment 38's verdict does not change; it stands **more firmly** than stated, since the bar it
+fails to clear is larger than the amendment let on. And the reading runs the other way for MKT:
+its narrower bands make arm effects clear more easily, which on top of its asymmetric location is
+a second reason the marginal MKT verdicts — k=12 at 0.465 pp outside, k=32 on the boundary — should
+not be strengthened.
+
+This is the same defect as the arm/band units mismatch of amendment 31, arriving on the other host
+and in the prose rather than the code: **a location and a spread cannot stand in for each other.**
+
+### And the tool was reporting the wrong edge, which compounded it
+
+`vd += " (%+.3f vs %+.3f)" % (mn, lo if mn < lo else hi)`. When the verdict is "inside",
+`mn >= lo`, so it printed **`hi`** — the positive edge — against a negative arm median. The output
+read `inside, no verdict (-1.507 vs +3.033)` when the binding comparison is −1.507 against
+**−3.299**. A reader would take the wrong number as the bar, and the number shown was on the far
+side.
+
+Fixed to report the edge the effect is heading toward, with the margin to it:
+`inside, no verdict (-1.507 vs -3.299, margin 1.792 pp)`. Margins to the binding edge across
+redwood f64: **1.792 / 1.016 / 0.971 / 1.141 / 2.073 / 2.907 / 3.545 pp** — so the closest any
+width comes to clearing is k=6 at 0.971 pp, and nothing is marginal.
+
+### A provenance digest reproduced from invented data, which settles its scope
+
+The reviewing session staged this harness and fed `boot_median_ci` the list
+`[0.001*i for i in range(417)]` — an arithmetic sequence with nothing in common with timing ratios
+— and got back **`9bbfbcaecab8`**, the exact `i:` string from every row of the redwood table. At
+n=392 it returns `93acf2dd10a6`, matching every earlier table at that size.
+
+Both consequences are worth keeping and they pull opposite ways. The `i:` digest **is** a genuine
+provenance check of a narrow kind: a run at a different resample count, seed or cell count prints
+something else, and a reader can verify that **from their own machine with no access to the data**.
+And it carries **no** information about the data, now proved by construction rather than argued.
+`i:` says the resample was the registered one; `v:` says the data was. Neither substitutes for the
+other, which is why both print.
+
+### The three-factor confound, and the one measurement that cuts it
+
+Host, dtype and corpus all change between the two columns above, so amendment 38's disjunction — "a
+property of that host, dtype or corpus" — was the only supportable form. **MKT float64 on
+SuiteSparse holds dtype and corpus fixed and isolates host**, and the same run settles the 192's
+provenance through the `Pothen/barth4` nnz row. Two blocking questions, one measurement.
