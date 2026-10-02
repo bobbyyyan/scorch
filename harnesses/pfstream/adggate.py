@@ -47,7 +47,14 @@ TDT = torch.float32 if A.dtype == "float32" else torch.float64
 SYM = so.spmm_csr_float_v2 if A.dtype == "float32" else so.spmm_csr_double_v2
 KS = [int(x) for x in A.ks.split(",")]
 POOL = torch.get_num_threads()
-ARMS = ["ours", "oursb", "mkl"]
+# The reference arm is named for WHAT IT IS, not for what we wish it were. torch.sparse.mm
+# dispatches to MKL sparse only where torch was built with it; on this project's Mac it falls
+# back to PyTorch's native CSR path and reads 11.7x slower than our kernel, which would make an
+# "ours/mkl" column in a CSV look like an enormous win and mean nothing. The backend is recorded
+# in every row so a reader cannot have to infer it from the host, which is exactly how the
+# chain212 filenames went wrong.
+REF_BACKEND = "mkl" if torch.backends.mkl.is_available() else "torch-native"
+ARMS = ["ours", "oursb", "ref"]
 
 
 def read_smtx(path):
@@ -127,10 +134,14 @@ def timeit(fn, batch):
 
 out = open(A.csv, "w", newline="")
 w = csv.DictWriter(out, fieldnames=["build", "key", "k", "rows", "cols", "nnz", "deg", "arm",
-                                    "ms", "batch", "nthreads"])
+                                    "ms", "batch", "nthreads", "refbackend"])
 w.writeheader()
-print("build %s dtype %s pool %d  %d matrices  %d widths"
-      % (A.build, A.dtype, POOL, len(keys), len(KS)), flush=True)
+print("build %s dtype %s pool %d  %d matrices  %d widths  reference backend %s"
+      % (A.build, A.dtype, POOL, len(keys), len(KS), REF_BACKEND), flush=True)
+if REF_BACKEND != "mkl":
+    print("NOTE: torch has no MKL here, so the reference arm is PyTorch's native CSR path and is "
+          "NOT an MKL comparison. Every row records this; the analysis refuses to label it MKL.",
+          flush=True)
 nrow = 0
 for key in keys:
     indptr, indices, M, J = loaded[key]
@@ -150,13 +161,13 @@ for key in keys:
         def ours():
             return SYM(nthreads_override=POOL, atparallel=False, **native)
 
-        fns = {"ours": ours, "oursb": ours, "mkl": lambda: torch.sparse.mm(Acsr, B)}
+        fns = {"ours": ours, "oursb": ours, "ref": lambda: torch.sparse.mm(Acsr, B)}
         # The thread count the OBJECT resolves to, asked of the object rather than restated here.
         # A harness that recomputes a production policy is wrong silently and flatteringly.
         nt = so.scorch_spmm_nthreads(nnz * max(k, 16), M, POOL, nnz * k, nnz)
         try:
             batch_ours = calibrate(ours)
-            batch_mkl = calibrate(fns["mkl"])
+            batch_ref = calibrate(fns["ref"])
         except Exception as exc:
             print("  SKIP %s k=%d calibration: %s" % (key, k, type(exc).__name__), flush=True)
             continue
@@ -165,13 +176,13 @@ for key in keys:
                                          .encode())).shuffle(order)
         for arm in order:
             try:
-                ms, batch = timeit(fns[arm], batch_mkl if arm == "mkl" else batch_ours)
+                ms, batch = timeit(fns[arm], batch_ref if arm == "ref" else batch_ours)
             except Exception as exc:
                 print("  SKIP %s k=%d %s: %s" % (key, k, arm, type(exc).__name__), flush=True)
                 continue
             w.writerow(dict(build=A.build, key=key, k=k, rows=M, cols=J, nnz=nnz,
                             deg=round(nnz / max(M, 1), 2), arm=arm, ms="%.6f" % ms,
-                            batch=batch, nthreads=nt))
+                            batch=batch, nthreads=nt, refbackend=REF_BACKEND))
             nrow += 1
         out.flush()
 print("wrote %d rows to %s" % (nrow, A.csv), flush=True)
