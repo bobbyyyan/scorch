@@ -3267,3 +3267,74 @@ fix is doing visible work on its first real grid.
 Redwood f64 has **no deficit** — 0 cells behind MKL at any width. So the prefetch deletion here
 would be a further improvement on a corpus already won, not a fix for anything, and it is below
 the actionability bar in any case. The 328 k=2 float32 DLMC cells remain without a mechanism.
+
+---
+
+## Amendment 39 — the 192's denominator is host-diagnostic: 2926 is MKT's RESOLVED count, so float64 is a two-host difference
+
+Amendment 36 read 2926 as a count over a key *list* against 2919 as a count over what *resolved*,
+and called that corroboration. It understates the evidence, and the stronger reading is checkable
+on redwood's own files.
+
+### The 418 → 417 reduction is exactly one cache collision, and it is the only one
+
+| list | lines | `barth4` entries |
+|---|---|---|
+| `f64_keys_redwood.txt` | 418 | `Nasa/barth4/barth4`, `Pothen/barth4/barth4` |
+| `ss_sample_418.txt` | 418 | both |
+| `f64_keys_screen.txt` | **417** | `Nasa/barth4/barth4` only |
+
+`comm -23` between the 418 and 417 lists returns **exactly one line**: `Pothen/barth4/barth4`.
+And `sed 's|.*/||' | sort | uniq -d` over the 418 list returns **exactly one basename**: `barth4`.
+
+Redwood's cache is flat — `ss/<name>/<name>.npz`, no group level — so it can hold only one
+`barth4`, and the two requested keys collapse to one. MKT's cache is group-qualified and
+distinguishes them, so all 418 resolve: **418 × 7 = 2926 exactly**, and 2926 − 2919 = 7 = one key
+× seven widths.
+
+**So the denominator is host-diagnostic.** 2926 is not a key-list artefact; it is what resolves on
+MKT and cannot be what resolves on redwood. That upgrades MKT from leading-by-elimination to
+**positively supported**, and amendment 36's second branch — that 192 came from a superseded
+redwood run, with amendment 26's premise withdrawn — is closed.
+
+**Float64 is therefore a two-host difference: MKT 192 of 2926 behind MKL, redwood 0 of 2919.**
+That is the two-host float64 comparison this project needed, and it means amendment 26's predictor
+is registered against a real MKT population and becomes scoreable the moment `/scr` is readable.
+
+### The direction of the layout mismatch decides the sign of the key-count error
+
+This must not be conflated with the opposite-direction failure already on record, where MKT read
+**248 of 298** keys because a *flat* corpus list met a *group-qualified* cache and 50 dropped
+silently. Here the list is group-qualified and so is MKT's cache, so it resolves fully, and it is
+redwood's *flat* cache that collapses two entries. **This project has now hit both directions of
+the same mismatch, with opposite signs on the key count.**
+
+### An axis removed rather than added: the classification is byte-stable across tool revisions
+
+`an_f64_vs_mkl.py` is a different object at the two endpoints — `d5a75459df1c613a` where the 192
+was registered, `82e10428eec95cdf` now, 37 insertions and 6 deletions. But the whole diff is the
+MARGIN block from `:264`, the per-cell summary moving from max-over-readings to
+median-over-readings after one DLMC cell read 169.181× off a single timing against a 1.481× median.
+Lines 150–230, holding `all(r < 1.0)` and `all(r > 1.0)`, **digest identically at
+`37d34a93c0165287` in both revisions.** So 192-vs-0 is not a counting-tool artefact.
+
+### The concrete artefact to grep for when `/scr` frees
+
+Both drivers default `KEYS` to the 417-key file — `f64_screen.sh:24` and `arm_screen.sh:51`, both
+`${F64_KEYS:-$ROOT/f64_keys_screen.txt}` — so a 418-key run required an explicit `F64_KEYS`
+override, and both echo `KEYS=$KEYS` in their spec loop. **The 192 run's log should contain a
+`KEYS=` line naming a 418-key file.** That is a string to grep, not a run to find.
+
+### And a zsh trap that returns a plausible count instead of an error
+
+`git show "$sha:harnesses/..."` does not do what it looks like. `$sha:h` applies zsh's **history
+modifier** (`:h` = dirname), so the expansion silently becomes `arnesses/...` and git reports an
+ambiguous argument. It bites `:h :t :r :e :s :a :A :l :u :q :Q :g :P`, so `harnesses/`, `tests/`,
+`src/`, `examples/`, `lib/` and `utils/` are all exposed. Use `"${sha}:harnesses/..."`.
+
+Why it belongs here rather than being merely annoying: piped into `grep -c`, it prints `fatal:` on
+stderr **and a clean `0` on stdout** — and `0` is exactly what "this file has no classification
+predicate" looks like. `grep -c` never fails, so the exit status is 0 either way. The real answer
+came from re-asking with a **digest over a line range** instead of a count: **a digest cannot
+return a plausible-looking wrong value the way a count can — there is no hash that reads as
+"absent."**
