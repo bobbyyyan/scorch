@@ -98,14 +98,20 @@ done
 [ "$fail" -eq 0 ] || { echo "REFUSE: a build failed"; exit 1; }
 
 echo
-echo "EMISSION CHECK (the floor pair adg0/adgb must agree, adgG must differ)"
+echo "BYTE DIGESTS (one-sided: a difference here proves nothing about decisions, and"
+echo "              agreement is impossible by construction -- each object embeds its own"
+echo "              staging path, which is why the path-LENGTH clause above exists. The"
+echo "              floor pair's 'agree' clause is therefore asserted on DECISIONS below.)"
 a=$(shasum -a 256 "$ROOT"/adg0/src/scorch_ops*.so | cut -d' ' -f1)
 b=$(shasum -a 256 "$ROOT"/adgb/src/scorch_ops*.so | cut -d' ' -f1)
 g=$(shasum -a 256 "$ROOT"/adgG/src/scorch_ops*.so | cut -d' ' -f1)
 echo "  adg0 ${a:0:16}   adgb ${b:0:16}   adgG ${g:0:16}"
 [ "$a" != "$g" ] || { echo "REFUSE: adgG is byte-identical to adg0, so the define never reached the"
                       echo "        compiler and every reading would be a floor."; exit 1; }
-echo "  ASSERTED: adgG differs from adg0."
+[ "$a" != "$b" ] || { echo "REFUSE: adg0 and adgb are byte-identical. Each object embeds its own staging"
+                      echo "        path, so identical bytes mean one build was SKIPPED and both tags are"
+                      echo "        reading one object -- the copied-.so-newer-than-source hazard."; exit 1; }
+echo "  ASSERTED: all three digests are distinct."
 
 echo
 echo "HOOKS CHECK (a hooks object charges ~19us of getenv a call and inverts a short cell vs MKL)"
@@ -118,14 +124,41 @@ sys.exit(1 if h else 0)" || { echo "REFUSE: $tag is a hooks build"; exit 1; }
 done
 
 echo
-echo "DECISION CHECK -- what each object resolves to, asked of the object itself"
+echo "DECISION CHECK -- the grid each object resolves, asked of the object itself."
+echo "The pool comes from the object's own process (torch.get_num_threads), not a"
+echo "constant, so this table is host-shaped. The row counts are DLMC's eight real"
+echo "ones; the degrees are a synthetic span of the collection's range, so a grid"
+echo "point need not be a matrix in the corpus."
 for tag in $TAGS; do
   PYTHONPATH="$ROOT/$tag/src" python -c "
-import scorch_ops as so
-POOL=6
-out=[]
-for nnz in (32530, 151805):
-    for k in (2,8,16,32):
-        out.append('%d/k%d=%d' % (nnz, k, so.scorch_spmm_nthreads(nnz*max(k,16), 512, POOL, nnz*k, nnz)))
-print('  $tag  override=%d rows=512: %s' % (POOL, ' '.join(out)))"
+import torch, scorch_ops as so
+pool = torch.get_num_threads()
+print('pool %d' % pool)
+for rows in (64, 128, 256, 512, 1000, 1024, 2048, 33288):
+    for deg in (4, 16, 64):
+        nnz = rows * deg
+        for k in (2, 8, 16, 32):
+            print('rows=%-5d deg=%-2d nnz=%-8d k=%-2d -> %d'
+                  % (rows, deg, nnz, k,
+                     so.scorch_spmm_nthreads(nnz*max(k,16), rows, pool, nnz*k, nnz)))
+" > "$ROOT/decisions.$tag.txt" || { echo "REFUSE: $tag could not answer the decision grid."; exit 1; }
+  echo "  $tag  $(head -1 "$ROOT/decisions.$tag.txt")  $(( $(wc -l < "$ROOT/decisions.$tag.txt") - 1 )) grid points"
 done
+
+# THE FLOOR PAIR'S AGREEMENT CLAUSE, ASSERTED. Stating "adg0/adgb must agree, adgG must
+# differ" and then only testing the difference lets a floor pair whose configuration had
+# silently diverged print the divergence and pass -- the unasserted conjunct is always the
+# one about two things AGREEING, because its violation looks like ordinary output.
+if ! diff -q "$ROOT/decisions.adg0.txt" "$ROOT/decisions.adgb.txt" >/dev/null; then
+  echo "REFUSE: the floor pair adg0/adgb resolves DIFFERENT counts, so it is not a floor."
+  diff "$ROOT/decisions.adg0.txt" "$ROOT/decisions.adgb.txt" | head -20
+  exit 1
+fi
+echo "  ASSERTED: adg0 and adgb agree on every grid point (the floor pair is a floor)."
+
+ndiff=$(diff "$ROOT/decisions.adg0.txt" "$ROOT/decisions.adgG.txt" | grep -c '^<' || true)
+[ "${ndiff:-0}" -ge 1 ] || { echo "REFUSE: adgG resolves the same count as adg0 at every one of the grid points,"
+                             echo "        so the define is inert here and the arm cannot be measured."; exit 1; }
+total=$(( $(wc -l < "$ROOT/decisions.adg0.txt") - 1 ))
+echo "  ASSERTED: adgG differs from adg0 on $ndiff of $total grid points (the arm reaches the decision)."
+echo "  Grids kept at $ROOT/decisions.*.txt"

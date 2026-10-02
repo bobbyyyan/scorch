@@ -22,8 +22,18 @@ Every constant any rule needs is estimated on FIT; every reported number is from
 ONE RESTATEMENT OF PRODUCTION, FLAGGED. `policy` and `cap_rows` come from the object, recorded by
 the sweep. The adoption candidate for an arbitrary grain G cannot -- G is compiled in -- so
 rule_adopt restates `min(pool, cap_rows, max(1, nnz*k//G))` and is validated at G=150000 against
-the adgG object by a separate call. An earlier draft reimplemented the POLICY count too and
-disagreed with the object on 16% of cells, always in one direction.
+the adgG object by a separate call. An earlier draft reimplemented the POLICY count too, which
+is the defect this comment exists to record: a harness that recomputes a production policy is
+wrong silently and flatteringly.
+
+A FIGURE WITHDRAWN. That draft was reported as disagreeing with the object on 92 of 576 cells
+(16.0%), one-signed. It does not. Re-measured against the DEFAULT object, the restated policy
+count disagrees on 0 of 576 cells and the signed-difference histogram is empty. The 16% was a
+measurement of an experimental SCORCH_SPMM_BASE_WORK_TRUE=1 build that an in-place two-arm
+script had left in the worktree -- which the conda env's editable .pth makes the import default
+for the whole environment -- so it described that object, not any restatement error. Do not
+quote it. The structural objection stands on its own: a restatement can drift from production
+without any run noticing, so it is validated against the object here rather than trusted.
 """
 import argparse, csv, collections, math, statistics as st
 
@@ -258,6 +268,23 @@ for k in ks:
     d = [abs(r_sqrt_meas(c) - best(c)[0]) for c in cells if r_sqrt_meas(c) is not None]
     byw[k] = d
     pooled_d.extend(d)
+
+# THE REGISTERED DENOMINATOR IS AMBIGUOUS, SO EVERY DEFENSIBLE ONE IS REPORTED.
+# Prediction 3 says "at least 80% of (matrix, width) cells" over "the 72-key corpus", which
+# admits four readings: all 576 cells, the 345 live ones, the 288 test ones, the 160 live-test
+# ones. The registration predates knowing that 231 of 576 cells can reach only one thread
+# count, so "cells" could not then have meant what it now has to mean -- a cell with no
+# measurable argmin cannot be within 1 of it.
+#   This particular rule is sqrt(T1_measured/c): T1 is measured per cell and c is the host's
+# per-worker team cost from a separate probe. NO constant is fitted on these cells, so the
+# fit/test split is not protecting anything here and the all-live denominator is not the
+# optimistic reading -- it is just the larger one.
+pooled_live, byw_live = [], {}
+for k in ks:
+    cells = [(key, k) for key in sorted(FIT | TEST) if (key, k) in live]
+    d = [abs(r_sqrt_meas(c) - best(c)[0]) for c in cells if r_sqrt_meas(c) is not None]
+    byw_live[k] = d
+    pooled_live.extend(d)
 print()
 print("PREDICTION 2 -- registered scope: k in %s, 'within +/-1 at every one of those widths'." % P2_WIDTHS)
 print("The registration names no share, so the verdict prints at the same three thresholds")
@@ -282,8 +309,20 @@ print("   clause B  'and no cell off by more than 2'         %d cell(s) off by >
 if gt2:
     print("       by width: %s" % {k: sum(1 for x in v if x > 2) for k, v in byw.items()
                                     if any(x > 2 for x in v)})
-print("   NOTE: clause A is POOLED as registered and holds; per width, %s sit below 80%%."
+print("   NOTE: clause A is POOLED as registered; per width, %s sit below 80%%."
       % [k for k, v in byw.items() if v and 100.0 * sum(1 for x in v if x <= 1) / len(v) < 80])
+wL = 100.0 * sum(1 for x in pooled_live if x <= 1) / max(len(pooled_live), 1)
+gt2L = sum(1 for x in pooled_live if x > 2)
+print("   SAME CLAUSES ON THE OTHER DEFENSIBLE DENOMINATOR -- all live cells, both halves:")
+print("     clause A  %5.1f%% of n=%-4d -> %s      clause B  %d off by >2 -> %s"
+      % (wL, len(pooled_live), "HOLDS" if wL >= 80 else "FAILS",
+         gt2L, "HOLDS" if gt2L == 0 else "FAILS"))
+print("     headroom above the registered 80%%: %+.1f points on n=%d, %+.1f on n=%d."
+      % (w1 - 80.0, len(pooled_d), wL - 80.0, len(pooled_live)))
+if (w1 >= 80) != (wL >= 80):
+    print("     THE VERDICT TURNS ON THE DENOMINATOR. Clause A is not decided by this run.")
+else:
+    print("     Clause A reads the same way under both, so the ambiguity does not decide it.")
 print()
 print("PER-WIDTH DETAIL, which is not any registered statistic:")
 print("The four columns are exhaustive and are asserted to sum to 100%.")

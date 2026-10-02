@@ -43,6 +43,7 @@ ap.add_argument("--reps", type=int, default=5)
 ap.add_argument("--target-ms", type=float, default=10.0)
 ap.add_argument("--threads", default="", help="comma list; default 1..pool")
 A = ap.parse_args()
+import hashlib
 import numpy as np, torch, scorch_ops as so
 if so.scorch_tune_hooks():
     sys.exit("REFUSE: hooks object; the per-call getenv tax lands on exactly the short kernels "
@@ -62,6 +63,23 @@ TS = [int(x) for x in A.threads.split(",")] if A.threads else [0] + list(range(1
 REPEAT = 2
 # The override used for the res_ovr_max column. Recorded per row rather than implied.
 PROBE_OVR = 1 << 20
+
+# THE OBJECT THAT ANSWERED, DIGESTED AND RECORDED IN EVERY ROW.
+#
+# The `scorch` conda env carries an editable install whose __editable__ .pth puts
+# /Users/bobby/scorch-beat-mkl/src on sys.path for the WHOLE environment. So every
+# `import scorch_ops` in that env loads whatever in-place .so sits in that worktree -- from any
+# directory, with no PYTHONPATH, including a plain `import scorch as torch`. For about seventy
+# minutes an experimental object with SCORCH_SPMM_BASE_WORK_TRUE=1 sat there, left by a two-build
+# script that built its second arm in place, and two sessions spent an hour reconciling readings
+# of one policy function that differed only because of it. A PYTHONPATH naming a staged tree wins
+# over that path, which is why the staged runs were clean -- but nothing in the OUTPUT said so.
+#
+# Recording the digest is the only part of the three-part rule that cannot be recovered
+# afterwards: a figure's pool and probe argument can be re-derived from the script, and the
+# object cannot be re-derived from anything once it is overwritten.
+SO_SHA = hashlib.sha256(open(so.__file__, "rb").read()).hexdigest()[:16]
+print("object: %s  sha %s" % (so.__file__, SO_SHA), flush=True)
 
 
 def read_smtx(path):
@@ -127,7 +145,7 @@ out = open(A.csv, "w", newline="")
 # had SCORCH_SPMM_BASE_WORK_TRUE=1 compiled in.
 w = csv.DictWriter(out, fieldnames=["key", "k", "rows", "cols", "nnz", "deg", "nthreads",
                                     "resolved", "res_ovr0", "res_ovr_max", "probe_ovr",
-                                    "cap_rows", "pool", "ms", "batch"])
+                                    "cap_rows", "pool", "ms", "batch", "so_sha"])
 w.writeheader()
 nrow = 0
 CELLN = collections.Counter()
@@ -191,7 +209,7 @@ for key in keys:
                             deg=round(nnz / max(M, 1), 2), nthreads=nt, resolved=res,
                             res_ovr0=pol, res_ovr_max=sat, probe_ovr=PROBE_OVR,
                             cap_rows=max(1, M // 16), pool=POOL,
-                            ms="%.6f" % (best * 1e3), batch=batch))
+                            ms="%.6f" % (best * 1e3), batch=batch, so_sha=SO_SHA))
             nrow += 1
         out.flush()
 print("wrote %d rows to %s" % (nrow, A.csv), flush=True)

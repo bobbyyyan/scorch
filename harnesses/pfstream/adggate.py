@@ -38,6 +38,7 @@ ap.add_argument("--target-ms", type=float, default=15.0)
 ap.add_argument("--pass-tag", default="p1")
 ap.add_argument("--build", required=True)
 A = ap.parse_args()
+import hashlib
 import numpy as np, torch, scorch_ops as so
 if so.scorch_tune_hooks():
     sys.exit("REFUSE: this is a hooks object. Against MKL that charges ~19 microseconds of getenv "
@@ -55,6 +56,23 @@ POOL = torch.get_num_threads()
 # chain212 filenames went wrong.
 REF_BACKEND = "mkl" if torch.backends.mkl.is_available() else "torch-native"
 ARMS = ["ours", "oursb", "ref"]
+
+# THE OBJECT THAT ANSWERED, DIGESTED AND RECORDED IN EVERY ROW.
+#
+# The `scorch` conda env carries an editable install whose __editable__ .pth puts
+# /Users/bobby/scorch-beat-mkl/src on sys.path for the WHOLE environment. So every
+# `import scorch_ops` in that env loads whatever in-place .so sits in that worktree -- from any
+# directory, with no PYTHONPATH, including a plain `import scorch as torch`. For about seventy
+# minutes an experimental object with SCORCH_SPMM_BASE_WORK_TRUE=1 sat there, left by a two-build
+# script that built its second arm in place, and two sessions spent an hour reconciling readings
+# of one policy function that differed only because of it. A PYTHONPATH naming a staged tree wins
+# over that path, which is why the staged runs were clean -- but nothing in the OUTPUT said so.
+#
+# Recording the digest is the only part of the three-part rule that cannot be recovered
+# afterwards: a figure's pool and probe argument can be re-derived from the script, and the
+# object cannot be re-derived from anything once it is overwritten.
+SO_SHA = hashlib.sha256(open(so.__file__, "rb").read()).hexdigest()[:16]
+print("object: %s  sha %s" % (so.__file__, SO_SHA), flush=True)
 
 
 def read_smtx(path):
@@ -134,7 +152,7 @@ def timeit(fn, batch):
 
 out = open(A.csv, "w", newline="")
 w = csv.DictWriter(out, fieldnames=["build", "key", "k", "rows", "cols", "nnz", "deg", "arm",
-                                    "ms", "batch", "nthreads", "refbackend"])
+                                    "ms", "batch", "nthreads", "refbackend", "so_sha"])
 w.writeheader()
 print("build %s dtype %s pool %d  %d matrices  %d widths  reference backend %s"
       % (A.build, A.dtype, POOL, len(keys), len(KS), REF_BACKEND), flush=True)
@@ -182,7 +200,8 @@ for key in keys:
                 continue
             w.writerow(dict(build=A.build, key=key, k=k, rows=M, cols=J, nnz=nnz,
                             deg=round(nnz / max(M, 1), 2), arm=arm, ms="%.6f" % ms,
-                            batch=batch, nthreads=nt, refbackend=REF_BACKEND))
+                            batch=batch, nthreads=nt, refbackend=REF_BACKEND,
+                            so_sha=SO_SHA))
             nrow += 1
         out.flush()
 print("wrote %d rows to %s" % (nrow, A.csv), flush=True)
