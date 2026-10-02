@@ -2349,8 +2349,11 @@ Run on this Mac against the local `~/dlmc` tree, so **neither measurement host w
 them (so no row repeats a column index), widest row 2494 nonzeros against a 2,000,000 block
 budget, 3m44s single-threaded. The key list was fetched from MKT rather than regenerated —
 `dlmc_corpus.py` wants an npz cache and refused cleanly on the raw `.smtx` tree — and digests to
-`24e386cee4371ce9`, matching the digest `pfs_screen_dlmc.sbatch` pinned at startup, with all 392
-keys resolving locally.
+`24e386cee4371ce9`, with all 392 keys resolving locally. That digest matched the value
+`pfs_screen_dlmc.sbatch` **printed into the MKT job log** — at the time that script stored no
+expected digest and only printed one, so the comparison was against a log line only this session
+can read, not against anything stored. The value is now in that script's `WANT` array, where a
+comparison can reach it.
 
 **This is the predictor's input distribution only. No timing is joined to it.** Amendment 26
 registers a behind/ahead contrast within degree strata against a permutation null, on the
@@ -2380,15 +2383,36 @@ spread: 0.3755 at k=2, then 0.1745, 0.1719, 0.1477, 0.1090 at k=12, 8, 20, 24. S
 amendment 26 registers has variation to work with at every width where the mechanism can act,
 and provably none where it cannot.
 
-**A co-occurrence I am recording as a co-occurrence and not as evidence.** The width with the
-worst line utilization (k=2, median 0.24) is the width where DLMC float32 is furthest *behind*
-MKL (1.4489, 14.0% of matrices ahead), and the two widths where utilization is pinned perfect
-(k=16, k=32) are where we are furthest *ahead* (0.8759 and 0.6584). That is one ordering agreeing
-with another across seven points. It is not the registered test, it conditions on nothing, and
-mean degree is a known confounder that moves the same way — amendment 26 exists precisely because
-a predictor that only reproduces the degree split has added nothing. Stated here so that when the
-registered contrast runs, it is clear the expectation existed beforehand and was not fitted to
-the answer.
+**A co-occurrence, recorded as a co-occurrence and stated no more strongly than it measures.**
+The width with the worst line utilization — k=2, median `pack` 0.2400 — is also the width where
+DLMC float32 is furthest behind MKL (1.4489, 14.0% of matrices ahead). Beyond that single point
+the agreement is partial, and the exact form matters because this paragraph's only job is to be
+the record of a prior:
+
+The two orderings are not the same. Worst-utilization-first is [2, 12, 8, 20, 24, 16, 32];
+furthest-behind-first is [2, 8, 12, 16, 20, 24, 32]. Over the 21 width pairs: 17 concordant, 3
+discordant, 1 exactly tied (k=16 and k=32 both at `pack` 1.0000). One of the three discordances,
+the pair (8, 12), rests on `pack` medians 0.5561 and 0.5556 — **0.0005 apart, 0.09% of the
+value** — which is a tie at any resolution a median over 392 keys supports. Treating it as a tie
+leaves **17 of 19 pairs with a resolvable utilization difference concordant**, and **k=16 carries
+both real disagreements**.
+
+**And k=16 is a genuine counter-point, not a rounding artefact.** It has *perfect* line
+utilization, `pack` exactly 1.0000 by construction, and it is only 4th of 7 against MKL — beaten
+by k=20 and k=24, which waste **32%** and **21%** of every fetched B line. So the width where no
+B byte is wasted is outperformed by two widths that waste a fifth to a third of their B traffic.
+Whatever sets the MKL margin, B-line utilization is not all of it, and nothing in this amendment
+offers an account of where k=16 sits.
+
+An earlier version of this paragraph said "the two widths where utilization is pinned perfect are
+where we are furthest ahead" and "one ordering agreeing with another across seven points". Both
+were wrong: k=16 is 4th by `ours/mkl` and 4th by percent-ahead, and the orderings differ on three
+pairs. **A prior recorded more strongly than its data makes the later contrast look more
+confirmed than it is**, which would defeat the point of writing it down in advance.
+
+None of this is the registered test. It conditions on nothing, and mean degree is a known
+confounder moving the same way — amendment 26 exists precisely because a predictor that only
+reproduces the degree split has added nothing.
 
 ### Amendment 27, correction 9 — the enrichment figure, and a digest "pin" that only printed
 
