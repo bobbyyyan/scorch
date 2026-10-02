@@ -1692,3 +1692,51 @@ within-cache ambiguity count of 0 of 4584 looked vacuous by construction — a c
 `ss/<X>/<X>` cannot hold two directories of one name. The mixed layout refutes that: the count was
 capable of returning nonzero, so it was a measured zero over the wrong population rather than a
 vacuous one.
+
+### Corrections to amendment 25
+
+Four, all verified here before adoption.
+
+**The manifest holds 9 entries, not 8.** `grep -c . SHA256SUMS` = 9, all at digest width 64, and
+`shasum -a 256 -c SHA256SUMS` prints nine OK lines with rc=0 read directly rather than through a
+pipe. The directory lists 11 entries, of which `SHA256SUMS` and `SHA256SUMS.sha256` are not
+manifest lines, so 11 − 2 = 9 and no natural subset of 8 exists. My 8 came from counting the lines
+a `tail -8` had displayed to me — the same error as reading a rule off the head of a sorted list,
+one level down: a count taken from a truncated view of the thing being counted. The direction
+understates, so a reader reproducing it gets a larger number and has to work out which file the
+record skipped. The seal-of-seal also holds: `-c SHA256SUMS.sha256` prints `SHA256SUMS: OK`, rc=0.
+
+**The second file is 3823 lines, not 3822**, decomposing exactly as 2 comment lines + 1 header +
+3820 data rows. My 3822 came from `len(rows) - 1` over a `csv.reader`, which charges one line to a
+header when the file has two comment lines above its header.
+
+**The two files are not equally attested, and that asymmetry is what tells a reader which digest
+to prefer.** `chain209-dlmc-dims` carries `SHA256SUMS` (9 entries), a verified `SHA256SUMS.sha256`
+sealing it, and a 31-line `PROVENANCE.md`. `verifier-dlmc-dims` has **no `SHA256SUMS` and no
+`PROVENANCE.md`** — only a one-line file *named* `SHA256SUMS.sha256` which is itself the manifest,
+inverting the role that exact name plays in chain209. Two consequences: a checker pinning the
+conventional name gets a failed open and reads the directory as unsealed, where the command that
+works is `-c SHA256SUMS.sha256`; and with no PROVENANCE.md that directory records no producing
+host and no producing session, its directory name being the only identification. The cited digest
+is correct — recomputed as `3f0887e553b61e71627246d676035b3577382f314103df11fb36527dd011b028`,
+matching both the file and its one-line manifest — so nothing numeric moves. It is also a
+**sibling of `spmm-beat-mkl` at the cache root**, not under it; amendment 25's body gives the full
+path correctly but the commit body reads as though it were nested.
+
+**`dlmc_dims.csv` is NOT npz-derived, and amendment 25 implied it was** by calling it "the same"
+after describing `ss_dims.csv` as coming from redwood's npz cache. Per `PROVENANCE.md:10-17` it is
+built from the **first header line of each `.smtx`**, generated independently on redwood
+(`/scratch/bobbyy/dlmc`) and on the Mac (`~/dlmc`) and byte-identical between them — which is what
+binds the Mac corpus to the corpus chain207 timed. `ss_dims.csv` is the npz-derived one, via
+`csrresolve.py` resolving all 4584 keys `exact`, with shapes read from the stored `shape` array.
+
+The distinction has a consequence worth stating: the 3820 keys shared between the sealed and
+unsealed DLMC tables agree on rows and nnz with zero disagreements, and that is **not** independent
+corroboration — both are reads of the same `.smtx` headers. It confirms the join and the
+subsetting, nothing about the numbers' independence. The genuine independence in the sealed file is
+**cross-host** (two machines, same source, byte-identical), not cross-source.
+
+Also recorded, since amendment 25 quoted the density caveat without its cause: the 67 of 150
+matrices at ≥20% density have **`cols == 1`** — they are right-hand-side vectors, where "density"
+is the filled fraction of a single column. The ≥20% band reads 0.3347 with them and 0.2416
+without, a 38% difference.
