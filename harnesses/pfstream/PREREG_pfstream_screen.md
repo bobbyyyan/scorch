@@ -2173,3 +2173,79 @@ builds and seven widths the figure is 0 of 10976, and it cannot be otherwise, be
 column is live sits in the same place: `ours` versus `mkl`, separately calibrated, differs on
 **10940 of 10976 = 99.7%**. With that printed beside it the zero is a pipeline check; without it,
 it reads as evidence for a conclusion it cannot support.
+
+### Amendment 27, correction 6 — the k=32 argument used the wrong instrument, and the right one reads a live zero
+
+**My reasoning at k=32 was wrong even though the conclusion holds.** I argued "the recorded harm
+would have had to appear as a positive contrast and does not", from a pooled paired median. That
+does not follow, because the recorded harm was never a median effect. The criterion on record
+(`spmm_regblock_prefetch_costs_15pct.md:81`) is **"at width 32, 115 of 4584 matrices are more
+than 10% slower with an A/A under 5%"** — a per-cell tail test on 2.51% of cells at a 10%
+threshold, with those 115 named as a frozen population at `:151`. A geometric median over 392
+keys cannot see an effect defined on 2.5% of cells, and a 1.13 pp bound is the wrong scale for a
+10% threshold by a factor of nine. The pooled contrast is **silent** about the blocker in both
+directions — not weak evidence, the wrong instrument.
+
+**The scope-matched criterion, reproduced cell by cell from the sealed files.** `nopf` more than
+10% slower, gated on that cell's own repeat deviation `dev(oursb/ours) < 5%`, which is the A/A
+gate the original used:
+
+| k | n | gated | >10% slower vs ship | vs shpb | >10% faster vs shpb |
+|---|---|---|---|---|---|
+| 2 | 392 | 384 | 0 | 0 | 0 |
+| 8 | 392 | 392 | 0 | 0 | **108** |
+| 12 | 392 | 376 | 0 | 0 | 11 |
+| 16 | 392 | 390 | 0 | 0 | 29 |
+| 20 | 392 | 390 | **1** | 0 | 7 |
+| 24 | 392 | 391 | 0 | 0 | 3 |
+| 32 | 392 | 384 | **0** | **0** | 5 |
+
+**At k=32 the registered criterion reads 0 of 384 gated cells against both bases**, and the
+criterion is demonstrably live on the same data: it fires 108 times at k=8 in the mirror
+direction and once at k=20 in the slower direction. So the zero is not vacuous.
+
+**It is still not a closure, and this is the limit that matters.** The 115 are a *frozen
+SuiteSparse population* and **not one of them is in this corpus**. A DLMC null at the same
+threshold is new evidence about a different population, not the registered test. The blocker was
+registered on those matrices at width 32; retiring it requires those matrices. The status I will
+defend, and the wording that replaces both earlier versions:
+
+> No harm detected by the registered criterion in a 392-matrix DLMC population at k=32 — 0 of
+> 384 gated cells against both bases, with the criterion demonstrated live in both directions on
+> the same data. The blocker's own frozen population of 115 SuiteSparse matrices at width 32 is
+> untested, and none of them appears in this corpus.
+
+That is stronger than "indistinguishable" and weaker than "closes the float32 `PFD=0` question".
+Amendment 27's claim to have closed it is withdrawn.
+
+**Two reconciliations with the verifying session's figures, both resolved as unnamed parameters
+rather than errors, and both changing a count materially.**
+
+*Base.* Their k=32 caveat distribution — median 0.9952, p05 0.9547, p95 1.0236, slower on 38.8%,
+>5% slower on 4 of 384 — is `nopf/shpb`, the arm against the *floor object*. Against `ship` the
+same cells read median 1.0151, p05 0.9641, p95 1.0548, slower on 65.1%, >5% slower on **39**.
+Both bases are legitimate and they differ by a factor of ten on the tail count. The base has to
+be named.
+
+*Threshold.* "More than 10% faster" as the exact ratio mirror of ">10% slower" is `< 1/1.10 =
+0.9091` and gives 108 at k=8 and 5 at k=32; as `< 0.90` it gives 80 and 1. A 35% difference at
+k=8 and 5x at k=32 from the threshold convention alone. This is the third instance today of a
+two-object statistic published without its base or threshold, and the first two were mine.
+
+**The per-width residual profile I said I would rather have is structurally unobtainable.**
+`k=2` is the only inert width in this grid. At every other width the arm's code can execute, so
+arm effect and instrument displacement are confounded and no residual is separable. The only
+other inert widths are k=1 and k=3, since `narrow_exact` owns {1,2,3}, and all three run the same
+kernel — so even a three-point profile would sit entirely inside `narrow_exact` and would never
+reach a register-block width. The 1.13 pp scalar is therefore not a provisional stand-in for a
+profile; it is the most that construction permits, and my second registered limit stands
+unresolvable without a different grid.
+
+**Correction to the re-sealed `PROVENANCE.md`.** It says the repeat's p95 is "comparable to the
+inter-object offset itself at k=12 and k=32". Measured against the **same-width** offset rather
+than the range endpoints, the p95 *exceeds* it at **six of seven widths** — ratios 1.52, 0.50,
+6.62, 1.10, 1.48, 1.01, 1.39 for k = 2, 8, 12, 16, 20, 24, 32. Only k=8 is below. So the per-cell
+floor sits above the median inter-object offset nearly everywhere, which strengthens the caveat
+rather than qualifying it. The single width where it does not is k=8 — the one contrast that is
+readable in correction 5's table and the one where the mirror criterion fires 108 times. Those
+agree, and the agreement is the reason k=8 is the only arm result this run supports.
