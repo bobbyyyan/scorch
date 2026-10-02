@@ -2998,3 +2998,59 @@ pipe there does not degrade a number; it **discards the entire verdict** and sub
 of a formatter that always succeeds. `tail`, `head`, `cat` and `grep -c` all return 0 on healthy
 input, so the substitution is always toward a false PASS. Every other instance of this trap
 degrades a measurement; this one inverts a verdict.
+
+---
+
+## Amendment 35 — "covers nothing" understated, and that error is the one that invites deletion
+
+Amendment 34's label said the antisymmetry check *"holds unconditionally, covers nothing"*. The
+first half is right; the second is wrong, and wrong in the direction that does damage.
+
+Changing `(f - b) / b` to `(f - b) / f` in `paired_d` — **one character** — breaks antisymmetry
+while barely moving the value, and this check catches it:
+
+| | value |
+|---|---|
+| correct, `(a−f)/b` | −0.040000 |
+| mutated, `(a−b)/b − (f−b)/f` | −0.039901 — the signed check fails by 9.9e-5 |
+| mutated + tag swap | +0.040928 |
+| sum | **+1.027e-3**, so the identity check fails |
+
+Verified: `SELFTEST FAILED 2 of 14`, exit 1, with `cmp -s` against a pristine copy confirming the
+mutation was applied.
+
+So the check holds for every dataset **and every tag assignment** — which is exactly what made it
+useless as call-site coverage — but **not** over mutations of `paired_d`'s arithmetic, which is
+what it does cover. Relabelled *"covers its ARITHMETIC, not the call site"*.
+
+**The harm runs opposite to amendment 34's and is worse.** That label contradicted an observed
+FAIL and would have misled a reader for one run. *"Covers nothing"* invites **deletion**: anyone
+trimming dead weight reads it, removes a check that catches a real arithmetic mutation, and every
+remaining check still passes, so nothing objects. A label that understates coverage is load-bearing
+in the destructive direction.
+
+### The three-step sequence is the lesson, recorded as one unit
+
+1. The assertion was tied to an **identity**, so it could not fail. No coverage; the label implied
+   coverage.
+2. Its form was fixed but its operands **mixed**, so it failed where an identity cannot. Coverage
+   it did not claim; the label contradicted the behaviour.
+3. The form is right and the label **understates** what remains.
+
+Every step was a true statement about the code paired with a false statement about the assertion,
+and **in all three rounds only a plant distinguished them.** Reading the assertion never did, in
+either session.
+
+### And a vacuous plant nearly inverted the answer, which is this thread's own pattern arriving on the probe
+
+A first attempt at plant 2 printed `SELFTEST PASSED: 14 checks`, exit 0 — one step from being
+reported as "the check is vacuous". It had changed nothing: `grep -n 'out.append'` matches **twice**
+in `an_f64_arms.py`, at `paired_d` and at `rel`, so the captured line number was the two-line
+string `"84\n170"`, `sed` rejected it as a malformed address, and the file was untouched.
+
+**A null result from an unapplied mutation is indistinguishable from a null result from a mutation
+the suite survives: both print PASSED at exit 0.** `sed`'s stderr and echoing the mutated line are
+not sufficient, and the stderr would have been lost entirely had it been piped. The sufficient
+check is `cmp -s` against a pristine copy, reported beside the result — the number showing the
+plant was not vacuous. Used here, along with asserting the anchor string occurs **exactly once**
+before substituting, which catches the two-match case at its source.

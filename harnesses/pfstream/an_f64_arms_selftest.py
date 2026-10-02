@@ -134,9 +134,16 @@ def main():
     # claim and has to match the assertion's FORM.
     fwd = paired_d(synth, pop, "nopf", "shpb", "ship")
     sw = paired_d(synth, pop, "shpb", "nopf", "ship")
-    check("paired_d is antisymmetric in its two tags (an IDENTITY, not coverage)",
+    # "COVERS NOTHING" WAS WRONG IN THE OPPOSITE DIRECTION, and that error is the dangerous one:
+    # it invites deletion. Changing `(f - b) / b` to `(f - b) / f` in paired_d -- one character --
+    # breaks antisymmetry (sum +1.027e-3 > 1e-12) while moving the value by only 9.9e-5, and this
+    # check FAILS on it. So it holds for every dataset and every tag ASSIGNMENT, which is what
+    # made it useless as call-site coverage, but not over mutations of the ARITHMETIC, which is
+    # exactly what it does cover. A label that understates coverage is load-bearing in the
+    # destructive direction: anyone trimming dead weight removes a real check and nothing objects.
+    check("paired_d antisymmetry: covers its ARITHMETIC, not the call site",
           abs(pct(sw, 0.5) + pct(fwd, 0.5)) < 1e-12,
-          "%+.4f vs %+.4f -- holds unconditionally, covers nothing"
+          "%+.4f vs %+.4f -- holds for every dataset and tag assignment"
           % (pct(fwd, 0.5), pct(sw, 0.5)))
     miss = dict(synth)
     del miss[(pop[0][0], 2, "shpb")]
