@@ -261,7 +261,9 @@ calibrates its own, so `deep/base` compares two readings taken at different batc
 | 32 | 313 | 0.9025 | 0.506 |
 | A/A pair, same quantity | | | 0.439 |
 
-At k=8, `1/0.8255 = 1.2114` against a measured `ms` ratio of 1.1963 -- **1.3% apart**, so the batch
+At k=8, `1/0.8255 = 1.2114` against a measured `ms` ratio of 1.1963 -- **1.25% apart**
+(symmetric `2(a-b)/(a+b)`; the asymmetric readings are 1.2465% on 1.2114 and 1.2622% on 1.1963,
+a spread of 0.016 points, so the figure does not depend on the choice), so the batch
 tracks `target/ms` and the pinning mechanism is confirmed directly from data. (An earlier version
 said "to within 1%", which the two numbers do not support.) The A/A pair's divergence (43.9%) is
 comparable to the arms', so **the `bsb_/base` floor contains this term**, which is exactly why it
@@ -1756,14 +1758,39 @@ holding 3 vectors (3.85%), which cannot move the statistic those two numbers rep
 statistic is now named rather than assumed. `0.3347` and `0.2416` are `S all` and
 `S non-vector` from `an_verify5.py` POINT 5: the **geometric median** (`red` = `exp` of the
 median of logs) of `ours/mkl` at **k=4**, where S below 1 means Scorch is faster. Being a
-median, it is insensitive to 3 contaminated members in 78, so the below-60% exemption holds for
-*this* statistic and is not established for a maximum or a p95 of the same ratio. Two further
-things follow from the producer. The direction favours us: removing the vectors moves S from
-0.3347 to 0.2416, so the right-hand-side vectors are where our margin is *smallest* and the
-split the sealed file asks for strengthens the result rather than weakening it. And the two
-halves of that sentence have different denominators — `64 of 72` counts rows of `ss_dims.csv`,
-while S is computed over chain196's k=4 cells that survive six passes in both builds, so `72`
-is not the population S was measured on and the membership fraction should not be read as S's n.
+median, it cannot be moved by the 3 contaminated members among the 78 matrices below 60%, so the
+exemption holds for *this* statistic and is not established for a maximum or a p95 of the same
+ratio. The direction also favours us: removing the vectors moves S from 0.3347 to 0.2416, so the
+right-hand-side vectors are where our margin is *smallest*, and the split the sealed file asks
+for strengthens the result rather than weakening it.
+
+**The exemption is now measured rather than inferred, in both sub-bands, and the producer only
+covers one of them.** `an_verify5.py:52` loops over `((.35,.60),(.60,1.01))`, so the artefact
+carries no row for 20-35% and "below 60%" spans a band the producer never reports. Recomputed
+from chain196's twelve local float32 pass files using the producer's own definitions — by the
+verifying session first, and reproduced here independently:
+
+| band | n | vectors | S all | S non-vector |
+|---|---|---|---|---|
+| 20-35% | 54 | 1 | 0.2435 | 0.2433 |
+| 35-60% | 24 | 2 | 0.2371 | 0.2362 |
+| 60-101% | 72 | 64 | 0.3347 | 0.2416 |
+
+The bottom two rows reproduce `PROVENANCE.md:32-33` in all four numbers; the top row is new and
+is the verifying session's measurement. Both sub-bands below 60% are clean on this statistic, so
+the exemption stands on measurement in each, not on the membership fraction alone. The artefact
+is sealed and is not being amended to add the row; this table is where it lives.
+
+**A claim withdrawn, from the paragraph this replaces.** I wrote that "`64 of 72`" and S's n have
+different denominators — the first counting `ss_dims.csv` rows, the second counting chain196 cells
+that survive six passes in both builds. Measured: `len(cells)` and `len(ok)` are **both 22920**, so
+no cell in that run fails the pass test, and the k=4 slice is one cell per matrix. 72 *is* S's n
+and the two halves share a denominator. The general worry is sound and would bite in a run where
+cells do fail; the one-line check that settles it either way is `len(cells) == len(ok)`, and it
+should be printed beside any such statistic rather than reasoned about. What pointed at the error
+was an internal contradiction in my own paragraph, not the measurement: the robustness argument
+treats 78 as the sample size while the next sentence denies that the membership count is the
+sample size. Two claims that cannot both hold is a cheaper signal than either one checked alone.
 
 `PROVENANCE.md:33-35` also records that the 5-matrix control in the results doc has zero
 vectors because its `nnz >= 2e4` bound makes `cols == 1`
@@ -1787,7 +1814,18 @@ published the 24.4% without naming its base. That is the same order-dependent tw
 relative difference I replaced with a symmetric form in `an_floor_within.py:220` about an hour
 earlier, reappearing in prose — a fix to an estimator reaches one analyser, and prose inherits
 nothing from it, so after correcting a statistic's form in code the amendments and commit bodies
-have to be swept for the same form by hand. Swept: this was the only instance.
+have to be swept for the same form by hand.
+
+**The sweep's scope was wrong before it was right.** I first swept the amendments only and
+reported one instance. Swept over the whole file, the five spellings (`% apart`,
+`% difference`, `differ by N`, `understat`, `overstat`) return 16 lines, of which 15 are
+directional claims about an estimator or a proxy — "the proxy always overstates", "the floor
+is understated" — where there is no second object and no base to name. One is a genuine
+two-object ratio: `:264`, "1.3% apart" on 1.2114 against 1.1963, now carrying the symmetric
+figure and both asymmetric readings. Its spread is 0.016 percentage points, so nothing it
+supports moves. The scoping error matters more than the hit: a hand sweep fails at the
+spelling list *and* at per-hit classification, and `% apart` was on my list and present at
+:264, so this was the classification half, not a missed spelling.
 
 **2. The 0.3347 / 0.2416 pair is the 60-101% band, not the ≥20% band.** Fixed in place above with
 the measured three-band partition. The direction matters: attributing it to ≥20% moves the
