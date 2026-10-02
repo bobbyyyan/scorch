@@ -1838,59 +1838,97 @@ rather than once.
 
 ## Amendment 26 — a structural predictor for the 192-cell float64 deficit, registered before it runs
 
+*(Rewritten after review. The first version of this amendment and of the script behind it used
+the wrong predicate for cache-line sharing, which narrowed the registered reach from 183 cells to
+164 and mislocated the negative control. Both are corrected below; the error is recorded at the
+end rather than quietly replaced.)*
+
 The float64 screen leaves **192 of 2926 cells behind MKL**, and neither prefetch arm touches
 them: `PFD=0` wins 1.3-2.9% at k=4..16 but reads **+0.139%** on that selected set at k=2, inside
 the floor's own 61% better-count there. So the deficit is not the register-block prefetch, and a
-third arm on the same axis would be a guess. This amendment registers a *mechanism* and the
-measurement that can refute it, before the measurement is run, because the corpus verdicts are
-already known to me and any threshold chosen after looking at them would be fitted.
+third arm on the same axis would be a guess. This registers a *mechanism* and the measurement
+that can refute it, before the measurement runs, because the corpus verdicts are already known to
+me and any threshold chosen after seeing them would be fitted.
 
-**The mechanism.** Every nonzero gathers one row of B. At k=2 float64 that row is 16 bytes, inside
-a 64-byte cache line, so **four B rows share a line** and whether they are used together is a
-property of A's column index pattern, not of the kernel. `harnesses/pfstream/bstream_locality.py`
-measures exactly that and nothing else: per row, the number of distinct 64-byte B lines its
-columns touch; amortized per nonzero; reported as `lines_per_nnz` and as
-`pack = 1 / (lines_per_nnz * brows_per_line)`, the mean fraction of each fetched line the row
-consumes. It reads only `indptr` and `indices`, so no arm and no timing can influence it.
+**The mechanism.** Every nonzero gathers one row of B, occupying bytes `[j*S, j*S + S)` for
+`S = k * itemsize`. Whether two gathered rows land in the same 64-byte line is a property of A's
+column index pattern, not of the kernel. `harnesses/pfstream/bstream_locality.py` measures that
+and nothing else, from `indptr` and `indices` only, so no arm and no timing can influence it.
 
-**The reach is arithmetic, and it is narrower than I first reasoned.** `brows_per_line` is
-`max(1, 64 // (k * itemsize))`. I wrote down the boundary as "`k * 8 < 64`, so k = 2, 4, 6" and the
-computation returned k = 2, 4 only: at k=6 a B row is 48 bytes and `64 // 48 == 1`, because two
-48-byte rows do not fit in a line. Integer division, not a judgment call, and the self-test pins
-it. So for float64:
+**The reach is arithmetic: a B row owns its lines outright exactly when `S % 64 == 0`.**
 
-| k | B row bytes | brows_per_line | structural signal | cells behind MKL |
+| k | S | S % 64 | column pattern can matter | cells behind MKL |
 |---|---|---|---|---|
-| 2 | 16 | 4 | yes | 129 |
-| 4 | 32 | 2 | yes | 35 |
-| 6 | 48 | 1 | **none, constant** | 18 |
-| 8 | 64 | 1 | none, constant | 9 |
-| 10 | 80 | 1 | none, constant | 1 |
-| 12, 16 | 96, 128 | 1 | none, constant | 0 |
+| 2 | 16 | 16 | yes | 129 |
+| 4 | 32 | 32 | yes | 35 |
+| 6 | 48 | 48 | yes | 18 |
+| 8 | 64 | **0** | **no — B row exclusive** | 9 |
+| 10 | 80 | 16 | yes | 1 |
+| 12 | 96 | 32 | yes | 0 |
+| 16 | 128 | **0** | **no — B row exclusive** | 0 |
 
-The predictor can speak for **164 of 192 cells (85.42%)** and is provably silent on the other 28.
-That limit is stated here rather than discovered afterwards. For float32 the same arithmetic gives
-a signal at k = 2 and k = 8 and silence from k = 12 up, which is a second, independently reachable
-test on the DLMC screen's own width set.
+The predictor speaks for **183 of 192 cells (95.31%)** and is silent on **9 (4.69%)**, all at
+k=8. For float32 the same arithmetic gives a signal wherever `k % 16 != 0`, so on the DLMC
+screen's own widths it reaches k = 2, 8, 12, 20, 24 and is silent at 16 and 32 — an independently
+reachable second test on a different dtype and corpus.
 
-**What would establish it, and what would refute it.** Within k=2 and k=4, the behind-MKL cells
-should show **lower `pack`** than the ahead cells — worse line utilization, so more bytes fetched
-per useful B row. Two conditions on that, both registered now:
+**The traffic column is exact, not a per-width constant.** Lines touched per gathered row are
+computed from the byte extents, so straddling is counted: at k=6 float64 four consecutive columns
+occupy three lines (0.75 lines per nonzero) and two straddling columns occupy three (1.50), while
+at k=10 and k=12 a scattered row costs 2.0 lines rather than 1.0. `pack` is useful B bytes over
+fetched B bytes, in (0, 1], and 1.0 means no byte is wasted.
+
+**What would establish it, and what would refute it.** Within the widths that carry a signal, the
+behind-MKL cells should show **lower `pack`** than the ahead cells. Three conditions, all
+registered now:
 
 1. **It must survive conditioning on degree.** Mean degree already separates these sets (behind
    6.86 vs ahead 3.98 at k=2). A predictor that only reproduces the degree split has added
-   nothing, so the contrast is to be read *within* degree strata, and the registered criterion is
-   that the separation persists inside strata, not merely in the pooled comparison.
-2. **It must be silent where it is constant.** At k=6 and above, `pack` is pinned at 1.0 for every
-   matrix by the table above. An analysis that reports a `pack` contrast at those widths has a bug,
-   not a finding. This is a negative control the construction supplies for free.
+   nothing, so the contrast is read *within* degree strata.
+2. **The null is a permutation distribution, computed and printed, not a constant.** The
+   criterion is the observed within-stratum `pack` separation against the distribution of that
+   same separation under 10,000 random reassignments of the behind/ahead labels inside each
+   stratum, reported as the permutation p-value and the null's own median and p95. The
+   mechanism is established only if the observed separation exceeds the null's p95; refuted if
+   it sits inside the null's central mass. (The first version of this amendment registered
+   "overlap at k=2 and k=4 as much as at k=6" as the bar. At k=6 the old script reported `pack`
+   identically 1.0 for every matrix, so both label groups there were the single point 1.0 and
+   the overlap was 100% *by construction* — the bar was "identical distributions", which
+   continuous data cannot reach. A criterion whose comparison level is a constant cannot report
+   its own null.)
+3. **k=8 and k=16 are genuine negative controls, and they are controls on the HARDWARE claim,
+   not on the instrument.** At those widths `S % 64 == 0`, so no column pattern can change the
+   traffic and `pack` is pinned at 1.0 for every matrix — a physical statement about B rows
+   owning their lines, which the self-test pins by checking that a scattered row reads
+   identically to a consecutive one. If the deficit were B-line sharing, k=8 should hold few
+   behind cells; it holds 9 of 192, and k=16 holds none.
 
-Refutation: if the behind and ahead `pack` distributions overlap at k=2 and k=4 as much as they do
-at k=6, the mechanism is wrong and this amendment closes with a null.
+**What it does not license.** No threshold, no cache-size constant, no per-matrix rule. The
+script's output is continuous and classifies nothing. If the mechanism survives, the change it
+motivates is a B-side access-order change, and under the project's performance convention that
+ships only gated on a condition that *provably cannot fire* where it would hurt — which, given
+the table above, means a gate inert for `k * itemsize % 64 == 0` by construction.
 
-**What it does not license.** No threshold, no cache-size constant, and no per-matrix rule. The
-script's output is a continuous structural column and it classifies nothing. If the mechanism
-survives, the kernel change it would motivate is a B-side access-order change, and under the
-project's performance convention that change ships only gated on a condition that *provably cannot
-fire* where it would hurt — which, given the table above, means a gate that is inert for
-`k * itemsize >= 32` by construction rather than by measurement.
+### The error this amendment was rewritten to fix
+
+The first version asked "how many whole B rows fit in a cache line", `max(1, 64 // S)`, and
+treated a value of 1 as "no sharing". That is the right answer to the wrong question. At k=6
+float64 a B row is 48 bytes and `64 // 48 == 1`, yet four consecutive such rows occupy 192 bytes
+= exactly three lines and plainly share them. The sharing condition is `S % 64 != 0`. Three
+consequences, all of which were live in the committed file:
+
+- The registered reach was k ∈ {2, 4} covering 164 of 192 cells. It is k ∈ {2, 4, 6, 10, 12}
+  covering **183**. The 19 cells at k=6 and k=10 were outside the *implementation*, and I had
+  recorded them as outside the *mechanism*.
+- The traffic column charged 1.0 lines per nonzero at every k ≥ 6. Measured against exact
+  extents it was right at k ∈ {2, 4, 8}, wrong in both directions at k=6, and understated by
+  exactly **2x** at k = 10, 12 and 16 — where the docstring invited comparison against a 12-byte
+  A-side cost, so the comparison read 64 against 12 where its own assumption gives 128.
+- The "free negative control" at k ≥ 6 tested that the analysis code had no bug, not that the
+  mechanism was absent. It could not distinguish "sharing is irrelevant here" from "this
+  instrument has no resolution here", and the second was the case.
+
+This is the third instance today of one expression being load-bearing in two directions with only
+one direction examined, and the same shape as the other two: `max(1, 64 // S)` answers both "rows
+per line" and "lines per row", and `64 // 48 == 1` was checked as arithmetic and never as a
+premise. Correcting the arithmetic was not the same as correcting the question.
