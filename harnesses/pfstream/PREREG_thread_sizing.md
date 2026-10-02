@@ -811,3 +811,94 @@ conditional registered with them stands: **if prediction 1 PASSES on MKT while a
 table holds, the excess statistic is wrong rather than the thread rule right.** With prediction 2
 now failed on direct measurement and prediction 3 failed, a passing prediction 1 would be the
 only surviving leg of amendment 5's account, and the conditional says to distrust it.
+
+---
+
+## Amendment 14 (2026-10-02): the census amendment 13 omitted, and two numbers relabelled
+
+### 1. THE SHAPE CENSUS, which my own instrument says must precede the verdict
+
+`nt_k2curve.py:191-195` states that the rising/falling/interior-min census "decides whether the
+registered question is even well posed on this host, so it is printed before any verdict is
+read". Amendment 13 reported redwood's verdicts and omitted the census entirely. Here it is, and
+redwood is the case the instruction was written for:
+
+| k  | live | rising | falling | **interior min** | flatish |
+|----|------|--------|---------|------------------|---------|
+| 2  |   53 |      1 |       9 |           **43** |       0 |
+| 4  |   53 |      1 |       8 |               44 |       0 |
+| 8  |   53 |      0 |      13 |               40 |       0 |
+| 12 |   53 |      0 |      16 |               37 |       0 |
+| 16 |   53 |      0 |      13 |               40 |       0 |
+| 20 |   54 |      0 |      17 |               37 |       0 |
+| 24 |   57 |      2 |      16 |               39 |       0 |
+| 32 |   59 |      2 |      15 |               42 |       0 |
+
+**81% of redwood's k=2 live cells (43 of 53) have an interior minimum**, against 47% on the M5
+(23 of 49). The registration's dichotomy -- "flat in worker count rather than rising" -- has no
+true answer on four fifths of them. **That is the primary result for the curve question on this
+host**, and it is not a hedge: the pooled curve's own shape shows it, falling to 0.3147 at nine
+workers and rising to 0.3883 at twenty-four.
+
+The headroom verdicts in amendment 13 are unaffected -- they do not depend on the curve's shape,
+which is the whole reason the headroom statistic exists -- so predictions 2 and 3 remain FAILED.
+
+### 2. Two numbers that cannot sit adjacent unlabelled, and the fix is in the tool
+
+Amendment 13 printed a curve ending at **0.3883** at count 24 with a base of 1.0000, and three
+paragraphs later an "endpoint ratio" of **0.5097**. A reader reconstructing the second from the
+first fails, and concludes one is wrong. They are different statistics with three differences:
+
+| | the curve's last row | "endpoint hi/lo" |
+|---|---|---|
+| statistic | geometric mean | **median** |
+| upper count | fixed at 24 | **each cell's own maximum** |
+| population | only cells reaching 24 | **all live cells** |
+
+`stat_endpoint` takes `min(counts)` and `max(counts)` per cell, and `cand = min(override,
+rows/16)` caps small-row matrices low, where the curve is much higher -- which is what lifts the
+pooled median from 0.39 to 0.51. Both are sound against their own nulls; neither is derivable
+from the other. `nt_k2curve.py` now prints both side by side with the three differences named, so
+the next reader cannot make this mistake from the output alone.
+
+**And my host contrast was cross-paired.** I wrote redwood's endpoint (0.5097) against the M5's
+minimum (0.8089). Matched:
+
+- minimum against minimum: redwood **0.3147** vs M5 **0.8089**
+- endpoint against endpoint: redwood **0.5097** vs M5 **0.9615**
+
+Both favour the point and neither invites the objection, so there was never a reason to cross
+them.
+
+### 3. The product ceiling, in exact rationals, with both denominators named
+
+`2.1816e7` overstates the exact `242065137747/11096 = 21815531.5200973...` by **468.5**, and one
+key sits in that gap. Recomputed with exact rational arithmetic (`Fraction(nnz*nnz, rows)`, no
+floats):
+
+| population | n | above the exact ceiling | of those, behind |
+|---|---|---|---|
+| all keys | 392 | **105** | 104 |
+| classified (behind + ahead) | 381 | **104** | 104 |
+
+The difference is **exactly the one mixed key** above the ceiling, not a coincidence of two
+offsets. My published 104 was over the classified population and is correct for it; the all-key
+figure is 105. Same structure on the degree row, now stated with both denominators: above
+`3835/64`, **218 of 392 all keys** and **217 of 381 classified**, differing by the single mixed
+key, and all 217 classified ones behind.
+
+### 4. The pattern, which is now three instances in one day
+
+Each time, the tool printed a qualifier and my restatement dropped it, and each time the headline
+number was correct while the clause saying what it was a number ABOUT went missing:
+
+1. `all` became `any` on the float64 verdict (amendment 12) -- the code classifies
+   `all(r > 1.0)` and prints "behind in every reading".
+2. The per-count `cells` column, printed precisely so a changing denominator is visible, dropped
+   from the curve I quoted.
+3. The shape census, which the code says to print before any verdict, omitted from amendment 13.
+
+The operational form, and it is not "read your own output more carefully": **diff the sentence
+against the tool's own print string, not against its logic.** The logic was right all three
+times. What differed was the English, and the print string is the only artefact that holds the
+qualifier in the same words the tool uses.

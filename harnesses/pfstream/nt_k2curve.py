@@ -299,6 +299,30 @@ for c in sorted(bycount):
         mono = False
     prev = g
 print("  monotone non-decreasing in worker count: %s" % mono)
+
+# THE LAST POINT OF THIS CURVE IS NOT THE "endpoint hi/lo" STATISTIC ABOVE, AND THE TWO SIT
+# CLOSE ENOUGH TOGETHER TO BE READ AS ONE. A reader who divides this table's last row by its
+# first gets a different number, concludes one of them is wrong, and is right to. Three
+# differences, printed rather than left to be discovered:
+#   this table's last row : GEOMETRIC MEAN, over only the cells that REACH that count,
+#                           of t(count) / t(that cell's own smallest count)
+#   "endpoint hi/lo"      : MEDIAN, over ALL live cells, of t(cell's own LARGEST count)
+#                           / t(cell's own smallest) -- a different count per cell, since
+#                           `cand = min(override, rows/16)` caps small-row matrices low
+# Mean versus median, a fixed count versus a per-cell maximum, and a subset versus all live
+# cells. Both are sound against their own nulls; neither is reconstructible from the other.
+if bycount:
+    last = max(bycount)
+    g_last = math.exp(sum(math.log(x) for x in bycount[last]) / len(bycount[last]))
+    ep = verdicts.get(k0, {}).get("endpoint hi/lo")
+    print("  NOT THE SAME NUMBER AS 'endpoint hi/lo' ABOVE, and the difference is not an error:")
+    print("    this table at count %d : %.4f  (geometric mean over the %d cells reaching %d)"
+          % (last, g_last, len(bycount[last]), last))
+    print("    'endpoint hi/lo'       : the MEDIAN over all live cells of each cell's OWN")
+    print("      largest-count time over its own smallest, so the upper count differs per cell.")
+    print("    Mean vs median, fixed count vs per-cell maximum, subset vs all live cells.")
+    print("    Quote them matched -- minimum against minimum, endpoint against endpoint --")
+    print("    never one host's endpoint against another host's minimum.")
 print("  (a rising-and-monotone curve is the team-width account; a flat or U-shaped one is not,")
 print("   and the counts are NOT a common support -- each cell contributes only its own")
 print("   reachable counts, so a count with few cells is a different population, not a trend.)")
