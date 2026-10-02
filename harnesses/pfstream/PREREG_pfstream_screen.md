@@ -1712,7 +1712,7 @@ header when the file has two comment lines above its header.
 
 **The two files are not equally attested, and that asymmetry is what tells a reader which digest
 to prefer.** `chain209-dlmc-dims` carries `SHA256SUMS` (9 entries), a verified `SHA256SUMS.sha256`
-sealing it, and a 31-line `PROVENANCE.md`. `verifier-dlmc-dims` has **no `SHA256SUMS` and no
+sealing it, and a 41-line `PROVENANCE.md`. `verifier-dlmc-dims` has **no `SHA256SUMS` and no
 `PROVENANCE.md`** — only a one-line file *named* `SHA256SUMS.sha256` which is itself the manifest,
 inverting the role that exact name plays in chain209. Two consequences: a checker pinning the
 conventional name gets a failed open and reads the directory as unsealed, where the command that
@@ -1738,5 +1738,42 @@ subsetting, nothing about the numbers' independence. The genuine independence in
 
 Also recorded, since amendment 25 quoted the density caveat without its cause: the 67 of 150
 matrices at ≥20% density have **`cols == 1`** — they are right-hand-side vectors, where "density"
-is the filled fraction of a single column. The ≥20% band reads 0.3347 with them and 0.2416
-without, a 38% difference.
+is the filled fraction of a single column. **The 0.3347-vs-0.2416 pair is the 60-101% band, not the
+≥20% band as a whole.** Measured from `ss_dims.csv`, the three bands partition the 150 exactly
+and so does their vector count:
+
+| band | n | `cols == 1` | vectors |
+|---|---|---|---|
+| 20-35% | 54 | 1 | 1.9% |
+| 35-60% | 24 | 2 | 8.3% |
+| 60-101% | 72 | 64 | 88.9% |
+| (all ≥20%) | 150 | 67 | 44.7% |
+
+So the contrast those two numbers describe sits in a population that is 88.9% right-hand-side
+vectors, not one that is 44.7%. The vectors concentrate almost entirely in the top band, which is
+the actionable half of the caveat: the 35-60% band is 2 of 24 and is clean, so a dense-population
+claim restricted below 60% needs no split. `PROVENANCE.md:33-35` also records that the 5-matrix
+control in the results doc has zero vectors because its `nnz >= 2e4` bound makes `cols == 1`
+unreachable at `rows <= 4096` — that was luck in the predicate, not foresight, and it does not
+transfer to a control chosen on any other bound.
+
+
+### Corrections to the corrections above (two defects in my own new material)
+
+Both were found by the verifying session, within the hour, in the paragraphs immediately above.
+
+**1. "a 31-line `PROVENANCE.md`" is 41 lines.** `wc -l` reads 41; `grep -c .` reads 31; the file
+has 10 blank lines. My census script printed `$(grep -c . "$f") line(s)`, so the number was a
+non-blank-line count wearing the label `lines`. This is not the truncated-view error from the
+other corrections in this section — the view was complete and the predicate was wrong, which is
+why auditing the number against the file it describes could not find it and only recomputing with
+the named predicate could. A count in a durable record must name the predicate that produced it;
+`line` and `non-blank line` differ by 24% on this file.
+
+**2. The 0.3347 / 0.2416 pair is the 60-101% band, not the ≥20% band.** Fixed in place above with
+the measured three-band partition. The direction matters: attributing it to ≥20% moves the
+population from 88.9% right-hand-side vectors to 44.7%, which understates the concentration and so
+runs *against* the caveat's own point. The sealed `PROVENANCE.md` had the band right; the error
+entered when I transcribed it, which makes the derived record less reliable than the artefact it
+cites — the failure mode that makes transcription worth checking against the source each time
+rather than once.
