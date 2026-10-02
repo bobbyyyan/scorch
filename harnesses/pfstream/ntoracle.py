@@ -127,9 +127,15 @@ for key in keys:
         f = at(POOL)
         try:
             f(); f(); f()
-            c = sorted(time.perf_counter() - t for t in
-                       [(lambda: (time.perf_counter(), f())[0])() for _ in range(5)])
-            batch = max(1, int((A.target_ms * 1e-3) / max(c[2], 1e-9)))
+            # Estimate the per-call cost from a WARM BATCH, not from single calls. A single call
+            # carries cold overhead the batched loop does not pay, which inflates the estimate
+            # and shrinks the batch by the same factor.
+            probe = 32
+            t0 = time.perf_counter()
+            for _ in range(probe):
+                f()
+            per = (time.perf_counter() - t0) / probe
+            batch = max(1, int((A.target_ms * 1e-3) / max(per, 1e-9)))
         except Exception as exc:
             print("  SKIP %s k=%d calibration: %s" % (key, k, type(exc).__name__), flush=True)
             continue
@@ -157,6 +163,7 @@ for key in keys:
                 continue
             w.writerow(dict(key=key, k=k, rows=M, cols=J, nnz=nnz,
                             deg=round(nnz / max(M, 1), 2), nthreads=nt, resolved=res,
+                            policy=pol, cap_rows=max(1, M // 16), pool=POOL,
                             ms="%.6f" % (best * 1e3), batch=batch))
             nrow += 1
         out.flush()

@@ -37,7 +37,33 @@ if not set(builds) >= {"adg0", "adgb", "adgG"}:
     raise SystemExit("REFUSE: need adg0, adgb and adgG; got %s. Without the floor PAIR the arm "
                      "has nothing to clear." % builds)
 
-gm = lambda v: math.exp(st.median([math.log(x) for x in v])) if v else float("nan")
+# TWO POOLED ESTIMATORS, NAMED, because they answer different questions and one of them cannot
+# see this lever at all. `gmed` is exp(median(log x)) -- a geometric MEDIAN. Its breakdown point
+# is 50%, and this rule changes the worker count on about 26% of cells, so the median sits inside
+# the UNCHANGED group and reads the floor no matter how large the effect on the changed cells. A
+# pooled median was therefore reporting the estimator's breakdown point as a measurement of
+# neutrality. `gmean` is exp(mean(log x)) and does register a minority effect, diluted by the
+# share that is unchanged. Both are printed; neither is the primary reading, which is the
+# conditional table.
+def gmed(v):
+    return math.exp(st.median([math.log(x) for x in v])) if v else float("nan")
+
+
+def gmean(v):
+    return math.exp(sum(math.log(x) for x in v) / len(v)) if v else float("nan")
+
+
+def gmean_ci(v):
+    """Geometric mean with a 95% interval from the standard error of mean(log)."""
+    if len(v) < 2:
+        return float("nan"), float("nan"), float("nan")
+    l = [math.log(x) for x in v]
+    m = sum(l) / len(l)
+    se = (sum((x - m) ** 2 for x in l) / (len(l) - 1) / len(l)) ** 0.5
+    return math.exp(m), math.exp(m - 1.96 * se), math.exp(m + 1.96 * se)
+
+
+gm = gmed
 
 
 def ratio(b1, b2, k, arm="ours"):
@@ -70,18 +96,35 @@ for k in ks:
           dev[min(len(dev) - 1, int(0.95 * len(dev)))] * 100))
 
 print()
-print("THE ARM: adgG/adg0 on our own kernel. Below 1.0 = the narrower adopted team is FASTER.")
-print("%4s %7s %10s %12s %10s   %s" % ("k", "n", "adgG/adg0", "vs floor p95", "n_changed",
-                                        "verdict"))
+print("THE ARM, POOLED, WITH BOTH ESTIMATORS AND A MATCHED COMPARATOR.")
+print("A pooled CENTRAL effect is compared to the FLOOR's pooled central effect and its 95%")
+print("interval -- not to the floor's p95, which answers a per-cell tail question and is the")
+print("wrong comparator in either direction.")
+print("%4s %5s %8s %9s %-22s %-22s %s" % ("k", "n", "chg", "chg%", "arm gmean [95% CI]",
+                                           "floor gmean [95% CI]", "verdict"))
 for k in ks:
     v = ratio("adgG", "adg0", k)
-    r = gm(v)
+    f = ratio("adgb", "adg0", k)
+    am, alo, ahi = gmean_ci(v)
+    fm, flo, fhi = gmean_ci(f)
     changed = sum(1 for key in keys
                   if nt.get(("adgG", key, k)) != nt.get(("adg0", key, k)))
-    eff = (max(r, 1 / r) - 1) * 100
-    verdict = "readable" if eff > floor_p95[k] else "INSIDE THE FLOOR"
-    print("%4d %7d %10.4f %12.2f%% %10d   %s (effect %.2f%% vs floor %.2f%%)"
-          % (k, len(v), r, floor_p95[k], changed, verdict, eff, floor_p95[k]))
+    # Readable only if the two intervals do not overlap. Overlap is not proof of neutrality --
+    # it is a statement that this n cannot separate them.
+    sep = ahi < flo or alo > fhi
+    print("%4d %5d %8d %8.1f%% %7.4f [%.4f,%.4f] %7.4f [%.4f,%.4f] %s"
+          % (k, len(v), changed, 100.0 * changed / max(len(v), 1), am, alo, ahi, fm, flo, fhi,
+             "SEPARATED" if sep else "intervals overlap"))
+print()
+print("The same arm under the geometric MEDIAN, to show what that estimator can and cannot see:")
+for k in ks:
+    v = ratio("adgG", "adg0", k)
+    changed = sum(1 for key in keys
+                  if nt.get(("adgG", key, k)) != nt.get(("adg0", key, k)))
+    print("     k=%-3d median %.4f  mean %.4f   changed share %.1f%%  %s"
+          % (k, gmed(v), gmean(v), 100.0 * changed / max(len(v), 1),
+             "median is BLIND here (changed share below 50%)"
+             if changed < 0.5 * len(v) else "median can move"))
 
 print()
 print("CONDITIONED ON WHETHER THE OBJECTS ACTUALLY RESOLVED DIFFERENT COUNTS.")
@@ -161,3 +204,40 @@ for k in ks:
             helped += 1
     print("%4d %8d %8d %8.2f%% %9d" % (k, gated, harmed,
           100.0 * harmed / max(gated, 1), helped))
+
+print()
+print("THE HARMED CELLS, NAMED. A share is not a finding -- a regression is a shape, and the")
+print("question is whether the harmed cells share one. Each row is a cell where adgG is more than")
+print("%.0f%% slower than adg0 with the floor pair agreeing within %.0f%% on that same cell."
+      % (A.harm * 100, A.harm * 50))
+print("%4s %7s %9s %8s %7s %7s %7s   %s" % ("k", "rows", "nnz", "deg", "nt_0", "nt_G", "ratio",
+                                              "key"))
+allharm = []
+for k in ks:
+    for key in keys:
+        cG, c0, cb = (cells.get((b, key, k), {}) for b in ("adgG", "adg0", "adgb"))
+        if not all("ours" in c for c in (cG, c0, cb)):
+            continue
+        if abs(cb["ours"] / c0["ours"] - 1.0) > A.harm / 2:
+            continue
+        rr = cG["ours"] / c0["ours"]
+        if rr > 1 + A.harm:
+            M, nnz, deg = meta[key]
+            allharm.append((k, M, nnz, deg, nt.get(("adg0", key, k)), nt.get(("adgG", key, k)),
+                            rr, key))
+for row in sorted(allharm, key=lambda r: -r[6])[:14]:
+    print("%4d %7d %9d %8.1f %7s %7s %7.3f   %s"
+          % (row[0], row[1], row[2], row[3], row[4], row[5], row[6], row[7][-52:]))
+if allharm:
+    nch = sum(1 for r in allharm if r[4] != r[5])
+    print("  of %d harmed cells, %d actually changed the worker count and %d did NOT."
+          % (len(allharm), nch, len(allharm) - nch))
+    print("  A harmed cell whose count did not change cannot have been harmed by the rule; it is")
+    print("  the floor's own tail showing through the gate, and it bounds how much of the harm")
+    print("  column is attributable at all.")
+    import collections as _c
+    print("  harmed cells by row count: %s" % dict(sorted(_c.Counter(r[1] for r in allharm).items())))
+    print("  harmed cells by nnz decade: %s"
+          % dict(sorted(_c.Counter(int(math.log10(max(r[2], 1))) for r in allharm).items())))
+else:
+    print("  (none)")
