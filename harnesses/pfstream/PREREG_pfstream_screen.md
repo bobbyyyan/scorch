@@ -3272,6 +3272,11 @@ the actionability bar in any case. The 328 k=2 float32 DLMC cells remain without
 
 ## Amendment 39 — the 192's denominator is host-diagnostic: 2926 is MKT's RESOLVED count, so float64 is a two-host difference
 
+> **WITHDRAWN by amendment 40.** The conclusion does not follow: `mrgate.py` does not
+> deduplicate keys, so a 418-key list yields 2926 cells on *either* host. The denominator is
+> diagnostic of the KEY LIST, not the host. The key-list facts below all hold; the inference
+> from them does not. Do not cite this section without amendment 40.
+
 Amendment 36 read 2926 as a count over a key *list* against 2919 as a count over what *resolved*,
 and called that corroboration. It understates the evidence, and the stronger reading is checkable
 on redwood's own files.
@@ -3338,3 +3343,79 @@ predicate" looks like. `grep -c` never fails, so the exit status is 0 either way
 came from re-asking with a **digest over a line range** instead of a count: **a digest cannot
 return a plausible-looking wrong value the way a count can — there is no hash that reads as
 "absent."**
+
+---
+
+## Amendment 40 — amendment 39 is WITHDRAWN: the denominator is diagnostic of the key LIST, not the host
+
+Amendment 39 concluded that 2926 is MKT's resolved count and cannot be redwood's, closing one of
+amendment 36's two branches and declaring float64 a two-host difference. **The conclusion does not
+follow.** The premise was right; the inference needed one more step, which neither session took
+before it was committed.
+
+### The step that was missing: the harness does not deduplicate
+
+Verified at the source rather than taken on report:
+
+- `mrgate.py:85` — `keys = [l.strip() for l in open(A.keys) if l.strip()]`. A plain list.
+- `:94` — `resolve_all(A.cache, keys)` resolves **every** key; resolution is exact-path then
+  unique basename, and `barth4` is unique *within* the cache (0 collisions of 4584), so the
+  basename step **succeeds for both** requested keys. Neither fails, and the `REFUSE` on `_bad` is
+  never reached.
+- `:108` — `for key in keys:` loads `_paths[key]` per key, with no dedup anywhere.
+- `:106` — prints `len(keys)` as `"%d matrices"`, so even the corpus line reports the **key** count
+  rather than the distinct-matrix count.
+
+So a 418-key list on redwood emits 418 × 7 = **2926 cells**, with `Nasa/barth4`'s data appearing
+twice. **2926 is fully reachable on redwood.** The 417 comes from `f64_keys_screen.txt`, a curated
+file equal to the 418 minus `Pothen/barth4/barth4` — **an editorial act, not a cache property.**
+
+The correct statement: **2926 tells you which key list was used.** Both hosts produce 2926 from the
+418 list, differing only in whether those cells cover 418 distinct matrices (MKT) or 417 with one
+duplicated (redwood).
+
+### What survives, and what it does and does not establish
+
+Every check in amendment 39 holds: `barth4` is the only basename collision in the 418 list,
+`comm -23` returns exactly `Pothen/barth4/barth4`, and 2926 − 2919 = 7 = one key × seven widths.
+**Those establish that the 418 → 417 reduction IS the barth4 difference. They do not establish
+that redwood cannot run the 418 list.** A cache-layout fact constrains *resolution*; it constrains
+a *cell count* only through the code that consumes it.
+
+### The replacement test, which tests the host directly, and what it returns today
+
+On MKT the two `barth4` keys resolve to different matrices; on redwood both resolve to Nasa's
+23492 nonzeros. So in the 192 run's CSV, **the `Pothen/barth4` row's `nnz` is a direct host
+discriminator: 23492 means redwood collapsed it, anything else means MKT distinguished it.**
+
+Run against every f64 CSV on redwood: **0 rows mention `Pothen/barth4`**; the only `barth4` rows
+are `Nasa/barth4/barth4,…,6019,23492` across all seven widths; and no redwood log reports 418
+matrices — `screen_f64_redwood.log` reads `corpus 417 matrices`. That is **absence of evidence for
+a 418-key redwood run, not evidence of absence**: the data could have been deleted. And pointing
+the other way, the 418-key file is named `f64_keys_redwood.txt` — named for redwood — which is weak
+evidence *for* the superseded-redwood-run branch.
+
+### Status restored
+
+The live branches are exactly what they were after the reading-count exclusion: **MKT host
+difference, or superseded redwood run.** "Float64 is a two-host difference" is unsupported again.
+Amendment 26's premise is neither withdrawn nor rescued, and the predictor is not yet scoreable —
+so the vanished-negative-control problem is **live again rather than moot**, and amendment 37's
+closing paragraph stands. Amendment 37 itself is untouched: reading count really is excluded, and
+that was measurement, not inference.
+
+One figure to carry forward: if the 192 run turns out to be redwood on the 418 list, up to 7 of its
+192 cells are duplicates of another 7, so the distinct-matrix deficit would be at most **185**.
+
+### The process lesson, which is mine as much as it is the reviewing session's
+
+A finding that **closes a branch** needs every intermediate step verified. One that **removes an
+axis** needs only a negative — and the pairing is not a coincidence: the same session's check that
+removed an axis (the classification bytes being identical across tool revisions) was correct, and
+its check that closed a branch was wrong. I verified the key-list facts, found them all true, and
+adopted the conclusion without reading the twenty lines of `mrgate.py` that decide it. **The
+equivalent of a plant here was two minutes asking what happens to the second key.**
+
+Stated as the rule: *a branch-closing finding deserves the plant treatment, not the read
+treatment.* And the specific trap under it — I have been writing "ask what each quantity is the
+spread **of**" all afternoon, and did not ask what this denominator was a count **of**.
