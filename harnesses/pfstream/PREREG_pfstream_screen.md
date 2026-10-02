@@ -3054,3 +3054,73 @@ not sufficient, and the stderr would have been lost entirely had it been piped. 
 check is `cmp -s` against a pristine copy, reported beside the result — the number showing the
 plant was not vacuous. Used here, along with asserting the anchor string occurs **exactly once**
 before substituting, which catches the two-match case at its source.
+
+---
+
+## Amendment 36 — redwood's float64 SuiteSparse screen has NO deficit at any width, and amendment 26's 192-cell figure cannot be produced from this data
+
+Returning to the kernel question. The open item was "19 unaccounted behind-cells at k=6 and
+k=10", recorded as an analysis question because both widths are genuinely measured. It is
+answered, and the answer is larger than the question.
+
+### Redwood's complete float64 screen, both datasets, read with the tool digest pinned
+
+`an_f64_vs_mkl.py` at `82e10428eec95cdf` on redwood, **byte-identical to the worktree copy** —
+checked first, because a two-revision tool divergence cost a wasted read earlier today.
+
+| dataset | passes | readings/cell | cells | ahead in all | **behind in all** | mixed |
+|---|---|---|---|---|---|---|
+| `csv64` (complete) | 4 | 16 | 2919 | 2838 (97.23%) | **0** | 81 (2.77%) |
+| `csv64_p123` (interim) | 3 | 12 | 2919 | 2845 (97.46%) | **0** | 74 (2.54%) |
+
+Expected readings 417 × 7 × 16 = 46704, observed 46704; and 417 × 7 × 12 = 35028, observed 35028.
+Per-width behind counts are `{2: 0, 4: 0, 6: 0, 8: 0, 10: 0, 12: 0, 16: 0}` — **zero at k=6 and
+k=10 specifically**, the two widths the open item named.
+
+So the 19 cells are not in redwood's screen data. The question dissolves rather than resolving:
+there is nothing at those widths to account for.
+
+### And amendment 26's 192 is not reachable from this data under any criterion
+
+Amendment 26 registered a structural predictor against "**192 of 2926 cells behind MKL**", with a
+per-width table summing to exactly 192 (`129 + 35 + 18 + 9 + 1`), whose k=6 and k=10 entries are
+the 18 + 1 = **19** of the open item.
+
+That figure cannot come from either dataset above, and the argument is a bound rather than a
+guess: **2838 cells are ahead in every one of 16 readings**, so no criterion computed from those
+readings can label any of them behind. At most the 81 mixed cells could ever be called behind.
+**81 < 192.** Weakening the criterion cannot get there; neither can strengthening it.
+
+The cell totals agree with that: 2926 = 418 × 7 against this screen's 2919 = 417 × 7. Redwood's
+key *list* `f64_keys_redwood.txt` holds 418 and `ss_sample_418.txt` holds 418, while
+`f64_keys_screen.txt` holds **417** and the screen log's own first lines read `corpus 417
+matrices`. So 2926 is a count over a key list and 2919 is a count over what resolved.
+
+**What I have NOT established is where 192 came from**, and I am not going to guess. The two
+surviving redwood f64 logs (`rw_f64.log`, `rw_f64_grid.log`) are dated 2026-08-21 and are 11 lines
+and 0 lines, so neither is the source. MKT's `/scr` is unreadable while job 17696556 holds all 32
+CPUs. The candidate I can neither confirm nor exclude today is an MKT float64 screen — job
+17681665 is recorded at `:1472` over "418 keys × 7 widths", which matches 2926 exactly, and it is
+a Slurm job ID, so MKT.
+
+### Consequence, stated as a constraint on what may be claimed rather than as a result
+
+**Amendments 26 and 28's structural predictor is registered against a deficit set that does not
+exist on redwood.** Until its source is named, the predictor cannot be scored: a predictor whose
+target population is unlocated is not refutable, which is the property it was registered to have.
+The next action on it is provenance, not analysis — identify the run behind 192-of-2926 and attach
+it, or withdraw the amendments' premise.
+
+If the source is MKT, then nothing is wrong with either number and the finding is a **host
+difference in float64**: MKT 192 behind of 2926, redwood 0 of 2919. That is the two-host f64
+comparison this project needs and it would be a real result. If the source is a superseded
+redwood run, amendment 26's premise is withdrawn. Those are different outcomes and the data to
+separate them is on MKT.
+
+### The part that answers the loop's actual question
+
+On redwood, **float64 SpMM over SuiteSparse is ahead of MKL on 2838 of 2919 cells in all sixteen
+readings, behind on none, with 81 cells inside the object/pass spread.** Pooled 2.500×; by band
+4.127 / 2.652 / 2.347 / 2.386 / 1.857 / 1.344. That is the goal met for float64 on this host and
+this corpus, and it is one host — MKT float64 remains unmeasured by me, which is exactly the gap
+the paragraph above turns on.
