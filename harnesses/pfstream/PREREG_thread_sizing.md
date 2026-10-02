@@ -94,3 +94,35 @@ The model is refuted, and reported as refuted, if any of:
 Reporting a refutation is the result. Nothing here is a reason to tune a constant per width:
 a per-width table of worker counts with no host property behind it is the overfitting this
 project is explicitly measuring against.
+
+## Amendment 1: prediction 4 with numbers, and a competing mechanism named in advance
+
+Registered before any x86 cell was measured. MKT's screen logs record `pool 32`; redwood's
+`nproc` is 32 with a torch pool of 24.
+
+**Prediction 4, concretely.** On MKT `c = 0.06us`. For the DLMC deficit class (nnz = 32530,
+rows = 512, k = 2) the row ceiling is `min(32, 512/16) = 32`, so the clamp allows the whole pool.
+`n* = sqrt(T1/c)` reaches 32 as soon as `T1 >= 61us`, which is 1.9ns a nonzero or about five
+cycles each -- comfortably inside what a six-instruction kernel takes single-threaded. So the
+rule should name the pool on essentially every cell with nnz >= 1e4 on MKT, i.e. **be inert
+there**, and the same arithmetic on redwood (`c = 0.26us`, pool 24) needs `T1 >= 150us` to reach
+24, so redwood should be partly bound and the M5 (`c = 4.75us`, pool 6) heavily bound. The
+ordering of how much the rule bites is registered as M5 > redwood > MKT.
+
+**A COMPETING MECHANISM, named now because it predicts the same sign on the M5 and a different
+one on MKT.** MKT's measured k=2 time is 22.7us at 32 workers on 32530 nonzeros. If `T1` were
+61us the ideal split plus team cost is under 4us, so 22.7us is roughly six times what the model
+allows. Either `T1` is much larger on MKT than a cycle count suggests, or the parallel scaling at
+k=2 is limited by something the model has no term for -- and the obvious candidate is aggregate
+bandwidth: at k=2 each nonzero fetches a 64-byte line to use 8 bytes, so 32 workers demand
+32 times that line traffic at once where 6 workers do not. A rule expressed in worker count
+cannot fix a saturated memory system.
+
+**The two hypotheses are distinguished by the SHAPE of time against worker count, which the
+oracle sweep measures directly on every host:** rising with workers means team cost dominates
+(the M5 reading, 0.0073 -> 0.0222 ms over 1 -> 6 at k=2); falling means compute-bound; **flat
+above some count means saturation**, and in that case the deficit on that host is not a thread
+problem and this whole line does not address it. Registered: if MKT's k=2 curve is flat rather
+than rising, the thread rule is NOT the fix for MKT's narrow-k deficit, and saying so is the
+result. The two hosts may simply be bound by different things at k=2, and one rule in worker
+count would then be the wrong shape for both.
