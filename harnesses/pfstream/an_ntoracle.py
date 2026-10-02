@@ -244,7 +244,48 @@ for k in ks:
 print("  counts snapped to the nearest reachable value: %s" % dict(snaps))
 
 print()
-print("REGISTERED PREDICTION 2, scored as registered: |rule count - measured argmin| <= 1.")
+print("=" * 78)
+print("EVERY REGISTERED PREDICTION OVER THESE NUMBERS, EACH CLAUSE SCORED SEPARATELY.")
+print("A registration holding N predictions over one measured quantity must name all N: a report")
+print("that names only the one that passes lets the prose choose the verdict. And a conjunction")
+print("must score each clause -- 'at least 80% AND no cell worse than 2' can pass on its share")
+print("and fail on its tail.")
+print("=" * 78)
+P2_WIDTHS = [4, 12, 16, 20, 24]
+pooled_d, byw = [], {}
+for k in ks:
+    cells = [(key, k) for key in sorted(TEST) if (key, k) in live]
+    d = [abs(r_sqrt_meas(c) - best(c)[0]) for c in cells if r_sqrt_meas(c) is not None]
+    byw[k] = d
+    pooled_d.extend(d)
+print()
+print("PREDICTION 2 -- registered scope: k in %s, 'within +/-1 at every one of those widths'." % P2_WIDTHS)
+print("The registration names no share, so the verdict prints at the same three thresholds")
+print("prediction 1 gets; both were written at the same time and have the same hole.")
+for k in P2_WIDTHS:
+    d = byw.get(k, [])
+    if d:
+        print("   k=%-3d n=%-3d within 1: %5.1f%%" % (k, len(d), 100.0 * sum(1 for x in d if x <= 1) / len(d)))
+for thr in (50.0, 80.0, 100.0):
+    shares = [100.0 * sum(1 for x in byw[k] if x <= 1) / len(byw[k]) for k in P2_WIDTHS if byw.get(k)]
+    ok = shares and min(shares) >= thr
+    print("   threshold %5.0f%%: prediction 2 %s%s" % (thr, "HOLDS" if ok else "FAILS",
+          "" if ok else "  (lowest width %.1f%%)" % min(shares)))
+print()
+print("PREDICTION 3 -- registered as a CONJUNCTION over all (matrix,width) cells:")
+w1 = 100.0 * sum(1 for x in pooled_d if x <= 1) / max(len(pooled_d), 1)
+gt2 = sum(1 for x in pooled_d if x > 2)
+print("   clause A  'within +/-1 on at least 80%% of cells'  pooled %.1f%% of n=%d  ->  %s"
+      % (w1, len(pooled_d), "HOLDS" if w1 >= 80 else "FAILS"))
+print("   clause B  'and no cell off by more than 2'         %d cell(s) off by >2  ->  %s"
+      % (gt2, "HOLDS" if gt2 == 0 else "FAILS"))
+if gt2:
+    print("       by width: %s" % {k: sum(1 for x in v if x > 2) for k, v in byw.items()
+                                    if any(x > 2 for x in v)})
+print("   NOTE: clause A is POOLED as registered and holds; per width, %s sit below 80%%."
+      % [k for k, v in byw.items() if v and 100.0 * sum(1 for x in v if x <= 1) / len(v) < 80])
+print()
+print("PER-WIDTH DETAIL, which is not any registered statistic:")
 print("The four columns are exhaustive and are asserted to sum to 100%.")
 print("%4s %6s %9s %9s %9s %9s" % ("k", "n", "exact", "off by 1", "off by 2", "off by >2"))
 for k in ks:
