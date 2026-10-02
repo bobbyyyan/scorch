@@ -77,6 +77,47 @@ def main(argv):
           % (len(models), len(methods), len(sparsities),
              len(models) * len(methods) * len(sparsities), len(st)))
 
+    # POOL CONSTANCY ACROSS SPARSITY. The set of layers pruned does not depend on the sparsity it
+    # was pruned to, so within a fixed (model, method) the pool size must be CONSTANT across
+    # sparsity. This is the only check here that can see an ABSENT file: a walk over what exists
+    # counts what is there and cannot count what is not, so a stratum quietly missing members
+    # looks exactly like a smaller stratum. It also replaces an inference -- a pool difference
+    # that happened to equal a count remembered from another run, which is the same shape as an
+    # arithmetic coincidence that once carried a wrong mechanism about a matrix name.
+    print()
+    print("POOL CONSTANCY ACROSS SPARSITY (the check that can see absent files)")
+    bymm = collections.defaultdict(dict)
+    for (model, method, sp), v in st.items():
+        bymm[(model, method)][sp] = len(v)
+    absent_total = 0
+    for mm in sorted(bymm):
+        sizes = bymm[mm]
+        mx = max(sizes.values())
+        varies = len(set(sizes.values())) != 1
+        print("  %-12s %-26s %s%s"
+              % (mm[0], mm[1],
+                 ",".join("%s:%d" % (sp, sizes[sp]) for sp in sorted(sizes, key=float)),
+                 "   VARIES" if varies else "   constant"))
+        if varies:
+            full = set()
+            for sp in sizes:
+                full |= {k for k, _p in st[(mm[0], mm[1], sp)]}
+            leaf = lambda key: key.rsplit("/", 1)[-1]
+            allleaves = {leaf(k) for k in full}
+            for sp in sorted(sizes, key=float):
+                if sizes[sp] == mx:
+                    continue
+                have = {leaf(k) for k, _p in st[(mm[0], mm[1], sp)]}
+                miss = sorted(allleaves - have)
+                absent_total += len(miss)
+                print("    %-6s short by %d; absent layer(s): %s%s"
+                      % (sp, mx - sizes[sp], ", ".join(miss[:3]),
+                         " ... (%d more)" % (len(miss) - 3) if len(miss) > 3 else ""))
+    print("  absent files implied by the invariant: %d" % absent_total)
+    if absent_total == 0:
+        print("  ^ zero, so no stratum is quietly missing members and any explanation that")
+        print("    attributes a pool difference to exclusions has no pool difference to explain")
+
     picked, short, empty, degen = [], [], [], []
     print()
     print("  %-12s %-22s %-6s %6s %5s %6s %8s" % ("model", "method", "sparse", "pool", "took",

@@ -118,8 +118,23 @@ if not ctrl: missing.append("no negative control (no width at or below k=%d)" % 
 if nvec != [1, 2, 3, 4]: missing.append("nvec coverage is %s, not 1..4" % nvec)
 if not full: missing.append("no full-tail width")
 if not mask: missing.append("no masked-tail width")
+# PARTITION ASSERTION. ctrl, arm and the half-vector width must account for every width in the
+# grid. They do not automatically: with exact_hi = 3 a float32 k=4 is excluded from ctrl (4 > 3)
+# and from arm (k == halfvec), so it would sit in the grid and in no printed category, visible
+# only through a conditional note. Same principle as the analyser's width partition, one axis
+# down.
+accounted = len(ctrl) + len(arm) + (1 if halfvec is not None and halfvec in ks else 0)
+if accounted != len(set(ks)):
+    unplaced = [k for k in set(ks) if k not in ctrl and k not in arm and k != halfvec]
+    missing.append("ctrl %d + arm %d + half-vector %d accounts for %d of %d widths; unplaced %s"
+                   % (len(ctrl), len(arm),
+                      1 if halfvec is not None and halfvec in ks else 0,
+                      accounted, len(set(ks)), unplaced))
 if missing:
     sys.exit("REFUSE: the grid does not cover the kernel's branch axes: " + "; ".join(missing))
+print("    PARTITION: ctrl %s + arm %s + half-vector %s = %d of %d widths, all accounted"
+      % (len(ctrl), len(arm), 1 if halfvec is not None and halfvec in ks else 0,
+         accounted, len(set(ks))))
 print("    COVERS nvec 1..4, both tail states, and a negative control")
 PY
 
@@ -177,6 +192,12 @@ for p in 1 2 3 4; do
   done
 done
 echo "F64_SCREEN_ALL_PASSES_DONE $(date +%H:%M:%S)  nonzero rc $failed"
-printf "passes 4\nbuilds 4\nnonzero_rc %s\ncsvs %s\nks %s\nkeys %s\ndtype %s\n" \
-  "$failed" "$(ls "$OUT"/ss64_*.csv 2>/dev/null | wc -l | tr -d ' ')" "$KS" "$NK" "$DTYPE" > "$OUT/f64screen.done"
+# POOL IS RECORDED, not only compared to a threshold. The guard above refuses a pool below half
+# the request, but comparability with another run of this screen wants the pool EQUAL to that
+# run's, not merely above a floor -- and our kernel and MKL scale differently with thread count,
+# so an undersized allocation that passes the floor moves the ratio by an unknown amount.
+# Recording it turns a threshold judgement into an exact cross-run comparison a reader can make.
+printf "passes 4\nbuilds 4\nnonzero_rc %s\ncsvs %s\nks %s\nkeys %s\ndtype %s\npool %s\nthreads %s\n" \
+  "$failed" "$(ls "$OUT"/ss64_*.csv 2>/dev/null | wc -l | tr -d ' ')" "$KS" "$NK" "$DTYPE" \
+  "$POOL" "$THREADS" > "$OUT/f64screen.done"
 cat "$OUT/f64screen.done"

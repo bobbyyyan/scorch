@@ -142,22 +142,33 @@ def main(argv):
     n_keys = int(decl["keys"]) if decl.get("keys", "").isdigit() else None
     n_bp = (int(decl["builds"]) * int(decl["passes"])
             if decl.get("builds", "").isdigit() and decl.get("passes", "").isdigit() else None)
-    if n_keys is None or n_bp is None:
-        n_bp = n_bp or len(names)
-        n_keys = n_keys or len({k for (k, _w) in cell})
-        print("  (keys/builds/passes not all declared; falling back to %d keys and %d pass-files,"
-              % (n_keys, n_bp))
-        print("   which weakens this check toward the data it is checking -- say so rather than")
-        print("   present it as independent.)")
+    fell_back = []
+    if n_keys is None:
+        n_keys = len({k for (k, _w) in cell})
+        fell_back.append("key count (now %d, taken from the rows)" % n_keys)
+    if n_bp is None:
+        n_bp = len(names)
+        fell_back.append("pass-file count (now %d, taken from the files present)" % n_bp)
+    if fell_back:
+        # Name which factor fell back, not just that one did, and name which of the four failures
+        # the refusal below can still catch. A refusal advertising four catches while running in
+        # a mode with two is the misleading part.
+        print("  DEGRADED: %s" % "; ".join(fell_back))
+        print("  In this mode the check still catches a declared width that produced no rows and")
+        print("  a row dropped before the mkl-partner test. It can NO LONGER catch a key the")
+        print("  cache never resolved (absent from the rows, so the key count shrinks in step")
+        print("  with the observation) nor a pass-file that never arrived (the file count counts")
+        print("  what arrived) -- which are exactly the two the declaration exists for.")
     expected = n_keys * len(declared) * n_bp
     print("expected readings = %d keys x %d declared widths x %d pass-files = %d; observed %d"
           % (n_keys, len(declared), n_bp, expected, observed))
     if expected != observed:
-        return ("REFUSE: %d readings expected from the declaration but %d present (%+d). This "
-                "catches a key the cache never resolved, a declared width that produced no rows, "
-                "a pass-file that never arrived, and a row dropped before the mkl-partner test -- "
-                "none of which a counter incremented beside its own append can see."
-                % (expected, observed, observed - expected))
+        catches = ("a declared width that produced no rows, and a row dropped before the "
+                   "mkl-partner test" if fell_back else
+                   "a key the cache never resolved, a declared width that produced no rows, a "
+                   "pass-file that never arrived, and a row dropped before the mkl-partner test")
+        return ("REFUSE: %d readings expected from the declaration but %d present (%+d). In this "
+                "mode the check covers: %s." % (expected, observed, observed - expected, catches))
     print("  ASSERTED equal, so no key, width or pass-file is silently missing")
 
     # ---- classify every cell once.
