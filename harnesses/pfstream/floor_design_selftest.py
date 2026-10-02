@@ -194,9 +194,46 @@ mentions("report: names the within axis", text, "WITHIN-class range")
 mentions("report: names the between axis", text, "BETWEEN-class range")
 mentions("report: prints the between value that the old check missed", text, "BETWEEN-class range 3.00")
 
+plant("the sign table in the docstring is measured, not asserted -- including that the sign is "
+      "INERT at S=4, the configuration this project runs")
+from math import gcd
+
+
+def _leaders_for_sign(S, sign):
+    M = S * S
+    sig = [[(b + sign * s) % S for b in range(S)] for s in range(S)]
+    pp = {}
+    for m in range(M):
+        a_, b_ = divmod(m, S)
+        pp[m] = [S * ((a_ + s) % S) + sig[s][b_] for s in range(S)]
+    ld = [m for s in range(S) for m in range(M) if pp[m][s] == 0]
+    return ld, sorted({FD.alignment_class(m) for m in ld}), len(FD.classes_of(range(M)))
+
+
+TABLE = {3: (1, 3), 4: (4, 4), 5: (2, 2), 6: (4, 4)}
+for S_ in sorted(TABLE):
+    plus = len(_leaders_for_sign(S_, +1)[1])
+    minus = len(_leaders_for_sign(S_, -1)[1])
+    eq("sign table S=%d (b+s)" % S_, plus, TABLE[S_][0])
+    eq("sign table S=%d (b-s)" % S_, minus, TABLE[S_][1])
+eq("the sign is inert at S=4: both signs tie", _leaders_for_sign(4, +1)[1],
+   _leaders_for_sign(4, -1)[1])
+istrue("the sign differs at S=3, which is the only case in the table where it does",
+       len(_leaders_for_sign(3, +1)[1]) != len(_leaders_for_sign(3, -1)[1]))
+eq("at S=5 neither sign reaches the ceiling of 4", (len(_leaders_for_sign(5, +1)[1]),
+                                                    len(_leaders_for_sign(5, -1)[1])), (2, 2))
+# The discarded closed form, kept as an assertion so it cannot be reintroduced: the (b-s) leader
+# class is s mod 4 only when 4 divides S.
+eq("the abandoned rule 'leader class = s mod 4' fails at S=5", _leaders_for_sign(5, -1)[1], [16, 32])
+eq("gcd(S+1,4) separates the (b+s) rows", [gcd(S_ + 1, 4) for S_ in (3, 4, 5, 6)], [4, 1, 2, 1])
+
+plant("CLASS_SPACING is derived from the two class constants and matches the observed period")
+eq("derived spacing equals the observed class period", FD.CLASS_SPACING, FD.class_period())
+eq("and that period is 4 for class = 16(1+m) mod 64", FD.class_period(), 4)
+
 plant("plant-count floor, so plants appended after the entry point cannot go undefined")
-if N_PLANTS < 16:
-    FAIL.append("only %d plants ran; the file is meant to hold at least 16" % N_PLANTS)
+if N_PLANTS < 18:
+    FAIL.append("only %d plants ran; the file is meant to hold at least 18" % N_PLANTS)
 N_ASSERT += 1
 
 print("%d plants, %d assertions" % (N_PLANTS, N_ASSERT))

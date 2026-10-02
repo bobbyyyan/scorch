@@ -69,8 +69,20 @@ done
 M=${#MEMBERS[@]}
 [ "$M" -gt 0 ] || { echo "REFUSE: no member directories under $RUN -- run floorsetup.sh first"; exit 1; }
 
-SCHED=$OUT/schedule.txt
+# RUN IDENTITY WITHOUT DELETING ANYTHING. The CSV names carry only (tag, slice), and this
+# directory is never cleaned, so a run that stops early leaves earlier attempts' files in place
+# for every (tag, slice) it did not reach -- and a completion marker built from `ls | wc -l` would
+# then count a mixture of two schedules as one complete run. Two attempts were abandoned in this
+# directory on 2026-10-01, so that is a live hazard rather than a hypothetical one.
+# Clearing floor_*.csv at startup would destroy the evidence of the abandoned run, which is its
+# own hazard beside a live measurement. So identity is added instead of deletion: this run names
+# itself, keeps its own schedule file, and writes a manifest of exactly the files it wrote with
+# their digests. A reader partitions the directory by manifest rather than by glob.
+RUNID=$(date +%Y%m%dT%H%M%S)-$$
+SCHED=$OUT/schedule_$RUNID.txt
+MANIFEST=$OUT/run_$RUNID.manifest
 python floor_design.py "$M" "$SLICES" --emit "$SCHED" || exit 1
+SCHED_SHA=$(shasum -a 256 "$SCHED" | cut -c1-16)
 nsched=$(wc -l < "$SCHED")
 [ "$nsched" -eq "$SLICES" ] || { echo "REFUSE: schedule has $nsched lines for $SLICES slices"; exit 1; }
 
@@ -78,18 +90,32 @@ NK=$(wc -l < "$KEYS")
 PER=$(( (NK + SLICES - 1) / SLICES ))
 echo "members $M  keys $NK  slices $SLICES  per-slice $PER  reps $REPS  ks $KS"
 echo "members in index order: ${MEMBERS[*]}"
+echo "run id $RUNID  schedule $SCHED  schedule sha256 $SCHED_SHA"
+{
+  echo "# runid $RUNID"
+  echo "# started $(date +%Y-%m-%dT%H:%M:%S)"
+  echo "# schedule $SCHED sha256 $SCHED_SHA"
+  echo "# members $M slices $SLICES reps $REPS ks $KS keys $NK"
+  echo "# columns: tag slice rc rows sha256_16 path"
+} > "$MANIFEST"
 
 ran=0
+failed=0
 for s in $(seq 1 "$SLICES"); do
   start=$(( (s - 1) * PER + 1 ))
   sed -n "${start},$((start + PER - 1))p" "$KEYS" > "$OUT/keys_s$s.txt"
   nk=$(wc -l < "$OUT/keys_s$s.txt")
   [ "$nk" -gt 0 ] || { echo "slice $s EMPTY -- stopping"; break; }
   # The order comes from the audited file, so the caption below cannot drift from what runs.
-  order=$(awk -v want="$s" '$1 == want { $1 = ""; print; exit }' "$SCHED")
+  order=$(awk -v want="$s" '$1 == want { $1 = ""; sub(/^ /, ""); print; exit }' "$SCHED")
   [ -n "$order" ] || { echo "REFUSE: schedule has no line for slice $s"; exit 1; }
-  nord=$(echo $order | wc -w)
-  [ "$nord" -eq "$M" ] || { echo "REFUSE: slice $s lists $nord members, expected $M"; exit 1; }
+  # SET EQUALITY, not a count. The property the design audit establishes is that each slice is a
+  # PERMUTATION of the members; a cardinality check passes a line naming one member M times, and
+  # this seam is exactly what the claim "bash runs the order that was audited" rests on.
+  got_set=$(printf "%s\n" $order | sort -n | tr "\n" " ")
+  want_set=$(seq 0 $(( M - 1 )) | tr "\n" " ")
+  [ "$got_set" = "$want_set" ] || { echo "REFUSE: slice $s is not a permutation of the $M members."
+    echo "        got  [$got_set]"; echo "        want [$want_set]"; exit 1; }
   names=""
   for j in $order; do names="$names ${MEMBERS[$j]}"; done
   echo "=== slice $s: $nk keys, member order$names"
@@ -101,12 +127,39 @@ for s in $(seq 1 "$SLICES"); do
       --ks "$KS" --reps "$REPS" --target-ms 15 \
       --build "$tag" --slice "s$s" --pass-tag "s$s" >> "$OUT/run.log" 2>&1
     rc=$?
-    printf "  %s rc=%s rows=%s\n" "$tag" "$rc" "$(wc -l < "$OUT/floor_${tag}_s${s}.csv" 2>/dev/null || echo 0)"
+    csv=$OUT/floor_${tag}_s${s}.csv
+    rows=$(wc -l < "$csv" 2>/dev/null || echo 0)
+    printf "  %s rc=%s rows=%s\n" "$tag" "$rc" "$rows"
     ran=$(( ran + 1 ))
+    [ "$rc" -eq 0 ] || failed=$(( failed + 1 ))
+    printf "%s %s %s %s %s %s\n" "$tag" "s$s" "$rc" "$rows" \
+      "$(shasum -a 256 "$csv" 2>/dev/null | cut -c1-16 || echo none)" "$csv" >> "$MANIFEST"
   done
 done
-echo "DONE $(date +%H:%M:%S)  invocations $ran of $(( M * SLICES ))"
-# The sentinel a comparator requires, written only after every CSV is closed. It carries the
-# count, so a reader can tell a complete run from one that stopped on an empty slice.
-ls "$OUT"/floor_*.csv 2>/dev/null | wc -l > "$OUT/floorcsv.done"
-echo "csv files: $(cat "$OUT/floorcsv.done")"
+want=$(( M * SLICES ))
+echo "DONE $(date +%H:%M:%S)  invocations $ran of $want, nonzero rc $failed"
+# The sentinel is written only after every CSV is closed. It reports what THIS run wrote, counted
+# from its own manifest rather than from a glob over a directory it does not own, and it carries
+# the nonzero-rc count -- so "64 attempted" and "64 succeeded" are distinguishable, which two
+# markers built from a file count and an unconditional counter were not.
+wrote=$(grep -c "^p" "$MANIFEST" 2>/dev/null || echo 0)
+{
+  echo "runid $RUNID"
+  echo "schedule_sha256 $SCHED_SHA"
+  echo "manifest $MANIFEST"
+  echo "wrote $wrote of $want"
+  echo "nonzero_rc $failed"
+  echo "glob_count_in_dir $(ls "$OUT"/floor_*.csv 2>/dev/null | wc -l | tr -d " ")"
+  if [ "$failed" -ne 0 ] || [ "$wrote" -ne "$want" ]; then
+    echo "status INCOMPLETE"
+  else
+    echo "status COMPLETE"
+  fi
+} > "$OUT/floorcsv.done"
+cat "$OUT/floorcsv.done"
+# The glob count is reported beside the manifest count ON PURPOSE: if they differ, files from an
+# earlier attempt are present in the directory and a reader must partition by manifest.
+if [ "$wrote" -ne "$(ls "$OUT"/floor_*.csv 2>/dev/null | wc -l | tr -d " ")" ]; then
+  echo "NOTE: the directory holds more floor CSVs than this run wrote, so it contains at least"
+  echo "      one earlier attempt. Partition by $MANIFEST; nothing has been deleted."
+fi

@@ -39,14 +39,27 @@ the imbalance. The slice label goes in every output row so the analysis can re-c
 the window it actually uses.
 """
 import sys
+from math import gcd as _gcd
 
-CLASS_SPACING = 4           # members m and m+4 share an alignment class
 CLASS_STRIDE = 16           # class = (CLASS_STRIDE * (1 + m)) mod CLASS_MODULUS
 CLASS_MODULUS = 64
+# The spacing is a CONSEQUENCE of the two constants above, not an independent knob: the smallest
+# p with CLASS_STRIDE*p == 0 mod CLASS_MODULUS. Spelling it as a literal 4 left a constant that
+# looked enforced while nothing derived from it, so changing it would have had no effect.
+CLASS_SPACING = CLASS_MODULUS // _gcd(CLASS_STRIDE, CLASS_MODULUS)
 
 
 def alignment_class(m):
     return (CLASS_STRIDE * (1 + m)) % CLASS_MODULUS
+
+
+def class_period(n=64):
+    """The observed period of alignment_class in m, which CLASS_SPACING must equal."""
+    base = [alignment_class(m) for m in range(n)]
+    for p in range(1, n):
+        if all(base[m] == base[m + p] for m in range(n - p)):
+            return p
+    return None
 
 
 def classes_of(members):
@@ -59,13 +72,27 @@ def classes_of(members):
 def latin_square(S):
     """Cyclic Latin square of order S: every row and every column is a permutation of 0..S-1.
 
-    The sign is load-bearing. Either sign gives constant column sums, so either satisfies the
-    equal-position-sum condition. But the member that LEADS slice s is the one with a = -s mod S
-    and sigma[s][b] = 0, so the choice fixes which members ever run first -- and running first is
-    where a cold page cache lands. With (b + s) the leaders are the multiples of S+1, whose
-    classes collapse to one whenever S+1 shares a factor with the class spacing (S=3 puts all
-    three leaders in one class). With (b - s) the leader of slice s is S*((-s) mod S) + s, whose
-    class is s mod CLASS_SPACING, so the leaders spread as far as the slice count allows.
+    EITHER SIGN SATISFIES THE BALANCE CONDITION. Both have equal column sums, so both give equal
+    per-member position sums, so both are balanced within and between class and both give every
+    member every position block. They differ only in WHICH members lead a slice, because the
+    leader of slice s is the member with a = -s mod S and sigma[s][b] = 0.
+
+    THE SIGN IS INERT AT S=4, WHICH IS THE CONFIGURATION THIS PROJECT RUNS. Measured leader-class
+    coverage against a class spacing of 4, with the reachable ceiling min(S, 4):
+
+        S   gcd(S+1, 4)   (b+s)     (b-s)    reachable
+        3        4        1 of 4    3 of 4        3
+        4        1        4 of 4    4 of 4        4
+        5        2        2 of 4    2 of 4        4
+        6        1        4 of 4    4 of 4        4
+
+    So the sign is load-bearing only at S=3 of these, and at S=5 NEITHER sign reaches the ceiling.
+    No closed form in a comment here would be trustworthy: a first attempt at one claimed the
+    (b-s) leader class is s mod 4, which holds only when 4 divides S -- at S=5 the leaders are
+    {0,21,17,13,9}, classes {0,1}. The audit computes the coverage and the check compares it to
+    the reachable number, so the sign is chosen by measurement rather than by the rule above.
+    (b-s) is kept because it is the one that differs from the other at S=3 and ties everywhere
+    else in the table, so it is never worse over the range measured.
     """
     return [[(b - s) % S for b in range(S)] for s in range(S)]
 
@@ -74,6 +101,10 @@ def schedule(M, S):
     """Member -> position per slice. Returns (pos, how) or (None, why_it_cannot_be_built)."""
     if S < 1 or M < 1:
         return None, "M=%d and S=%d must both be positive" % (M, S)
+    obs = class_period()
+    if obs != CLASS_SPACING:
+        return None, ("the alignment class repeats every %s members but CLASS_SPACING says %d, so "
+                      "the class grouping below would be wrong" % (obs, CLASS_SPACING))
     if S * S == M:
         sigma = latin_square(S)
         pos = {}
