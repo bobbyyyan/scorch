@@ -194,9 +194,9 @@ def main(argv):
         rows, cols = int(shape[0]), int(shape[1])
         nnz = int(indptr[-1])
         if nnz:
-            w = int(np.diff(indptr.astype(np.int64)).max())
-            if w > widest[0]:
-                widest = (w, key)
+            row_nnz = int(np.diff(indptr.astype(np.int64)).max())
+            if row_nnz > widest[0]:
+                widest = (row_nnz, key)
         for k in ks:
             # nnz == 0 is handled in ONE place, inside stats_for, so this guard has reachable
             # input. An earlier version skipped such keys before the call AND kept this branch,
@@ -226,14 +226,17 @@ def main(argv):
             print("  %d of %d keys" % (n, len(keys)))
 
     print("rows %d ; (key, k) pairs skipped for nnz 0: %d" % (len(rows_out), zero))
+    if not rows_out:
+        return "REFUSE: no keys produced a row; nothing was measured"
     # The number that shows the memory bound held. If this exceeds CHUNK_NNZ the peak followed
-    # the widest row rather than the block budget, and the 144 MB figure did not apply.
+    # the widest row rather than the block budget, and the 144 MB figure did not apply. Printed
+    # AFTER the refusal above: an earlier version printed it first, so a corpus where every key
+    # had nnz == 0 emitted "widest row seen: 0 nonzeros in None" and only then refused -- a
+    # status line that reads like a measurement sitting above its own refusal.
     span_max = max((k * itemsize - 1) // LINE + 2 for k in ks)
     print("widest row seen: %d nonzeros in %s ; block budget %d -> peak about %.0f MB at span %d%s"
           % (widest[0], widest[1], CHUNK_NNZ, 24.0 * span_max * max(CHUNK_NNZ, widest[0]) / 1e6,
              span_max, "" if widest[0] <= CHUNK_NNZ else "  (ROW-BOUND, not block-bound)"))
-    if not rows_out:
-        return "REFUSE: no keys produced a row; nothing was measured"
     fh = sys.stdout if out == "-" else open(out, "w", newline="")
     w = csv.DictWriter(fh, fieldnames=list(rows_out[0].keys()))
     w.writeheader()

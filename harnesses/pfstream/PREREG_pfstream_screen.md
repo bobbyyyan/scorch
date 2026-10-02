@@ -1937,7 +1937,10 @@ independent of matrix size, which is what the first version of this paragraph cl
 takes at least one row per block so it always progresses, so a row wider than the budget is
 processed whole and the peak follows the widest row. A row holds at most `min(cols, nnz)`
 nonzeros, so over this collection only **23 of 4584** keys can exceed the budget at all, and the
-worst case is `ss/rajat31` at `24 * 3 * 4,690,002` = **338 MB**. That is a bound and not an
+worst case is `ss/rajat31` at `24 * 3 * 4,690,002` = **338 MB**. Those 23 bounds span 338 MB down
+to 149 MB, so no short list of names brackets them — ranked by the bound rather than by nonzero
+count, it is rajat31 338, NLR 300, AS365 274, patents 272, 333SP 267, and `FullChip`, which is
+easy to reach for as the obvious large one, is 10th at 215 MB. That is a bound and not an
 observation — rajat31's mean degree is 4.33, so reaching it needs one row holding 23% of the
 matrix — and the run now prints the widest row it actually saw, flagged `ROW-BOUND` when it
 exceeds the budget, so the 144 MB case is checkable rather than assumed. Either way the blocking
