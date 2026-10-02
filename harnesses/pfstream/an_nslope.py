@@ -17,6 +17,7 @@ import argparse
 import collections
 import csv
 import itertools
+import math
 import os
 import random
 import statistics
@@ -85,16 +86,23 @@ def main(argv):
         if n > nfull:
             print("  %3d   SKIPPED: only %d pass-files exist" % (n, nfull))
             continue
+        # EXHAUSTIVE OR SAMPLED MUST BE READABLE FROM THE ROW. A sampled min/max is an inward-
+        # biased estimate of the true range; an enumerated one IS the range. A conclusion that
+        # rests on the extremes has to say which kind it rests on.
+        total = math.comb(nfull, n)
         combos = list(itertools.combinations(range(nfull), n))
-        if len(combos) > A.subsets:
+        exhaustive = len(combos) <= A.subsets
+        if not exhaustive:
             combos = [tuple(rng.sample(range(nfull), n)) for _ in range(A.subsets)]
         vals = []
         for cb in combos:
             sub = [full[i] for i in cb]
             vals.append(sum(1 for c in complete if all(cell[c][f] > 1.0 for f in sub)))
-        print("  %3d %9d %9d %9.1f %9d %9.2f"
-              % (n, len(vals), min(vals), statistics.median(vals), max(vals),
-                 sum(vals) / len(vals)))
+        print("  %3d %9s %9d %9.1f %9d %9.2f   %s"
+              % (n, "%d/%d" % (len(vals), total), min(vals), statistics.median(vals), max(vals),
+                 sum(vals) / len(vals),
+                 "EXHAUSTIVE: min/max are the TRUE range" if exhaustive
+                 else "sampled: min/max are inward-biased"))
     print()
     print("  The count can only FALL as N rises, by construction: an intersection over more")
     print("  readings is a subset. A difference between two such counts measured at different N")
