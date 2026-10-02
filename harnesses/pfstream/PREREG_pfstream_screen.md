@@ -1989,3 +1989,83 @@ This is the third instance today of one expression being load-bearing in two dir
 one direction examined, and the same shape as the other two: `max(1, 64 // S)` answers both "rows
 per line" and "lines per row", and `64 // 48 == 1` was checked as arithmetic and never as a
 premise. Correcting the arithmetic was not the same as correcting the question.
+
+
+## Amendment 27 — PRELIMINARY one-pass DLMC float32 read, and four corrections to it
+
+**Status: superseded on arrival of the 16-pass run.** One reading per cell per build, so
+per-cell noise is not separable from effect; what makes it readable is n = 392 matrices per
+width. Filed because it answers the question that was blocking a float32 `PFD=0` decision, and
+corrected here because the first version of this table carried four defects, all found by the
+verifying session, which recomputed every number from the raw rows and reproduced all of them.
+
+Evidence sealed at `~/.cache/scorch-codex/spmm-beat-mkl/chain212-dlmc-f32-p1/` — four CSVs plus
+`PROVENANCE.md`, `SHA256SUMS` (5 entries, digest field width 64) and a verified
+`SHA256SUMS.sha256`. Digests were taken on the producing host before transport and verified
+after: `3f1bca86` nopf, `873af62d` ship, `729295c8` shpb, `52325a3c` strm. Before sealing, the
+only local copy was a session scratchpad under `/private/tmp`, which is how chain205's evidence
+was lost.
+
+### The result
+
+Ratio of our kernel's time to the `ship` object's, **geometric median of per-cell ratios** —
+the paired form, which holds the cell fixed. Below 1.0 is faster.
+
+| k | nopf/ship | strm/ship | shpb/ship (inter-object floor) | oursb/ours (repeat floor, median abs dev) | ours/mkl | % ahead of MKL |
+|---|---|---|---|---|---|---|
+| 2 | 1.0235 | 0.9991 | 1.0122 | 0.094% | **1.4489** | **14.0%** |
+| 8 | 0.9615 | 0.9834 | 1.0091 | 0.086% | 1.0934 | 32.4% |
+| 12 | 0.9984 | 1.0083 | 1.0061 | 0.081% | 1.0183 | 43.4% |
+| 16 | 1.0030 | 1.0091 | 1.0198 | 0.074% | 0.8759 | 69.6% |
+| 20 | 1.0106 | 1.0061 | 1.0156 | 0.075% | 0.7457 | 94.9% |
+| 24 | 1.0123 | 1.0108 | 1.0215 | 0.089% | 0.6659 | 98.2% |
+| 32 | 1.0150 | 1.0072 | 1.0240 | 0.083% | 0.6584 | 99.2% |
+
+**The recorded k=32 harm does not reproduce.** At k=32 `nopf` is slower on 253 of 392 matrices,
+which alone looks like the 115-matrix SuiteSparse result replicating — but the floor pair is
+slower on **291 of 392**, larger on both the median and the count. Read against 1.0 rather than
+against the floor, most of this table would have been called a regression.
+
+**The deficit that matters is against MKL at narrow k**, not any arm: 1.4489 at k=2 with only
+14.0% of 392 matrices ahead, against a floor of 1.0122. Same direction and the same region as
+the float64 SuiteSparse deficit. Amendment 26's predictor has **not** been run on these cells;
+computing its contrast before the registered procedure runs on the full data would void the
+pre-registration, and the verifying session, which holds the same cells, has not run it either.
+
+### Four corrections
+
+**1. There is a tighter floor in the same files and the first version did not use it.** The `arm`
+column holds `ours`, `oursb`, `mkl`, and `oursb` is not a second code path: `mrgate.py:124` binds
+`{"ours": ours, "oursb": ours, ...}` — the same callable twice — documented at `mrgate.py:19` as
+the noise floor. So `oursb/ours` is a repeat reading of an identical configuration in one
+process, and `batch` counts are identical on all 2744 cells, 0 differing. Its median absolute
+deviation is 0.074-0.094%, which is **7x to 29x tighter** than the inter-object `shpb/ship`
+offset of +0.61% to +2.40%. That is a second independent instrument agreeing that the offset is
+object-level and not timing, and it prices the k=2 control violation exactly: `nopf` reads +2.35%
+raw where no code can differ, the inter-object floor is +1.22%, and the repeat is +0.09%, so
+essentially all of the excess is object-level. **Caveat that limits it:** the repeat's p95 reaches
+3.90% at k=12, comparable to the offset itself, so the tightness holds for the median statistic
+and not for individual cells — a floor must be formed by the same cell statistic as the contrast
+it bounds, which is the defect corrected in amendment 23.
+
+**2. "Grows monotonically with k" was false.** `shpb/ship` by width is 1.0122, 1.0091, 1.0061,
+1.0198, 1.0156, 1.0215, 1.0240 — three of six consecutive steps go the wrong way. The shape is a
+U with its minimum at k=12, and k=2 is the third smallest of seven. The maximum is at the widest
+width, so the contrast with the recorded layout artefact (largest at the *narrowest* width) does
+survive; but the non-monotonicity sits in exactly the narrow-k region that comparison is about,
+so the comparison is weaker than "monotonically" claimed.
+
+**3. The functional was never named, and it changes two verdicts.** The table above is the paired
+form and is the right estimator here: the cells, widths, host and run are shared, so the pairing
+is available, and discarding it only adds variance. But under the unpaired alternative — a ratio
+of per-width geometric medians — the k=8 headline moves from a 3.85% win to a 0.40% loss, and
+"nopf beats the floor" reverses at k=12 (1.0216 vs 1.0152) and at k=20 (1.0207 vs 1.0134). The
+robust statement is therefore: **nopf beats the inter-object floor at k = 8, 16, 24 and 32 under
+both functionals, and is functional-dependent at k = 12 and k = 20.** At k=32 the conclusion
+survives but the margin shrinks from 0.90 points to 0.22. This is the cross-functional defect
+already withdrawn once on this branch, reappearing in a column for which no functional had been
+stated.
+
+**4. The width list was incomplete.** Under the paired functional `nopf` sits below the floor at
+k = 8, 12, 16, 20, 24 and 32 — **six of seven**, everything but k=2. The first version named
+12, 16, 24 and 32, treating k=8 separately as an outright win and omitting k=20 entirely.
