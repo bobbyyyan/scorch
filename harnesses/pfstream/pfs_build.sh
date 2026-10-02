@@ -19,10 +19,30 @@
 # ship where the prefetch earns its keep (the coverage is extended, not removed). One object
 # beating both arms. Failing either clause is a result.
 set -u
-STAGE=/matx/u/bobbyy/pfsstage
-ROOT=/scr/bobbyy/pfs
-source /scr/bobbyy/venv/bin/activate || exit 1
+# HOST PARAMETERISATION. The three paths below were hardcoded to MKT, which made this script
+# unrunnable on the second confirmation host -- and a one-host perf claim is not a claim here.
+# The MKT values are kept as the defaults so that path is byte-unchanged; redwood overrides them.
+# PFS_ACTIVATE is SOURCED, so a conda host points it at a shim that does the conda activation
+# rather than this script learning two environment managers.
+STAGE=${PFS_STAGE:-/matx/u/bobbyy/pfsstage}
+ROOT=${PFS_ROOT:-/scr/bobbyy/pfs}
+ACTIVATE=${PFS_ACTIVATE:-/scr/bobbyy/venv/bin/activate}
+
+# FAIL CLOSED ON EACH, with the value printed. A missing stage tree made `cp -r` fail per-tag and
+# the build then ran against whatever was already in $ROOT/$tag from a previous run -- stale
+# objects that pass every digest check in this file because they are internally consistent.
+[ -f "$ACTIVATE" ] || { echo "REFUSE: PFS_ACTIVATE=$ACTIVATE is not a file"; exit 1; }
+source "$ACTIVATE" || exit 1
+for f in src pyproject.toml scorch_build.py; do
+  [ -e "$STAGE/$f" ] || { echo "REFUSE: PFS_STAGE=$STAGE has no $f -- wrong stage tree"; exit 1; }
+done
+# AND THE ENVIRONMENT MUST ACTUALLY HAVE TORCH. Without this the activation can succeed while
+# importing the wrong interpreter, and the failure surfaces 200 lines into a build log as a
+# missing header rather than as a wrong environment.
+python -c "import torch, sys; sys.stderr.write('torch %s at %s\n' % (torch.__version__, sys.executable))" \
+  || { echo "REFUSE: the activated environment cannot import torch"; exit 1; }
 mkdir -p "$ROOT" || exit 1
+echo "stage $STAGE  root $ROOT  activate $ACTIVATE"
 echo "host $(hostname)  g++ $(g++ -dumpversion)  nproc $(nproc)  $(date +%H:%M:%S)"
 
 declare -A DEFS
