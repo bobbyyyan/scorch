@@ -2451,12 +2451,46 @@ Tested on the target host rather than assumed, and both paths fired on real inpu
 producers differ because the worktree has advanced since job 17693884 staged them, which the
 comment now says, so a future refusal reads as the gate working rather than as a fault.
 
-**Two shell facts that made this worth testing rather than reading.** `bash -n` reported "syntax
-ok" on the new block without evaluating it, so it was vacuous for exactly the construct in
-question. And `declare -A` needs bash 4+, while macOS ships 3.2 — under which the array is
-simply empty and every comparison would be against `""`. The count assertion added beside the
-loop (`[ "${#WANT[@]}" -eq 5 ]`) caught that locally: it printed `REFUSE: WANT holds 0 entries,
-expected 5` rather than passing. A fail-closed gate on a shell that cannot express it.
+**Two shell facts that made this worth testing rather than reading, and I got the second one
+backwards.** `bash -n` reported "syntax ok" on the new block without evaluating it, so it was
+vacuous for exactly the construct in question — and under bash 3.2 it returns 0 on the whole
+thing. And `declare -A` needs bash 4+, while macOS ships 3.2. I wrote that under 3.2 "the array
+is simply empty and every comparison would be against `""`", and concluded the gate was
+fail-closed there. **That is wrong in both the mechanism and the direction.**
+
+What 3.2 actually does: `["mrgate.py"]=` is parsed as an *indexed* subscript, `mrgate.py` is
+evaluated arithmetically, and the resulting `syntax error: invalid arithmetic operator` does not
+stop the script even under `set -u`. Every `${WANT[$f]}` lookup then errors, the erroring
+expansion means `[` never receives two operands, and the enclosing `if` takes **neither** branch
+— so neither REFUSE nor OK runs and control falls past the loop. Measured on bash 3.2 against
+deliberately stale files with the count assertion removed:
+
+    script fake.sbatch spooled; producer digest gate:
+    ./want32.sh: line 7: mrgate.py: syntax error: invalid arithmetic operator
+    GATE PASSED -- proceeding to the measurement
+    SCRIPT EXIT=0
+
+**Fail-open, and worse than printing nothing, because the log then asserts the gate ran.** So
+`[ "${#WANT[@]}" -eq 5 ]` was not belt-and-braces — it was the only barrier, and the failure it
+prevents is *acceptance*, not a confusing refusal. Nothing that has run is affected: mkt1 is bash
+5.2 and both paths were tested there. The exposure is latent and not hypothetical, since this
+harness family is run on the Mac.
+
+Fixed by a `BASH_VERSINFO` check placed *before* the `declare`, which is fail-closed by
+construction rather than downstream. Tested on both shells: refuses under 3.2 with
+`REFUSE: this gate needs bash 4+ ... this is 3.2.57(1)-release`, exit 1, and passes under bash
+5.2 on mkt1, exit 0. The count assertion stays and is now a genuine second barrier.
+
+**The gate was enforceable for five producers and auditable for four.** Digesting the worktree
+confirms `mrgate.py` `a55e07bf03e1fb34`, `csrresolve.py` `1872f707045dc14e`, `arm_screen.sh`
+`78f73444e60c62c3` and `dlmc_corpus.py` `22afdbe4c3b5b3f3`, all tracked. `dlmc_keys.txt` was
+neither in the worktree nor tracked, so the repo held a digest of a file it did not contain: a
+reader could verify that `/scr`'s list matched the pin but not that the pin was the right list,
+and could not regenerate it either, since `dlmc_corpus.py` requires an npz cache and refuses on
+the raw `.smtx` tree. That is the file the block's own comment argues hardest about. Now
+committed — 392 keys, 32,613 bytes — so all five are both enforceable and auditable. A corpus key
+list is a reproducibility *input*, not a benchmark result, which is what the no-committed-results
+convention covers.
 
 **Correction to amendment 28's wording.** It said the fetched key list digest matched "the digest
 `pfs_screen_dlmc.sbatch` pinned at startup". Given the above, that was a comparison against a

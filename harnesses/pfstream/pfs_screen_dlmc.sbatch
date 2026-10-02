@@ -55,6 +55,27 @@ set -u
 # arm_screen.sh at 266ca5fc and dlmc_corpus.py at 61f54f46, both since superseded. A future run
 # must restage /scr/bobbyy/pfs from the worktree or this gate will refuse -- which is the gate
 # working, not a fault. Update a value here only together with the file it names.
+# SHELL VERSION GUARD, AND IT IS FAIL-CLOSED BY CONSTRUCTION RATHER THAN DOWNSTREAM.
+# `declare -A` needs bash 4+. Under bash 3.2 -- which is what macOS ships, and this harness
+# family does get run on the Mac -- the construct does NOT merely produce an empty array. The
+# subscript ["mrgate.py"] is parsed as an INDEXED subscript and `mrgate.py` is evaluated
+# arithmetically, which prints "syntax error: invalid arithmetic operator" and does not stop the
+# script even under `set -u`. Every ${WANT[$f]} lookup then errors, the erroring expansion means
+# the `[` test never receives two operands, and the enclosing `if` takes NEITHER branch -- so
+# neither the REFUSE nor the OK line runs and control falls past the loop.
+#
+# Measured on bash 3.2 against deliberately stale files with the count assertion removed: the
+# script printed the gate header, one syntax error, then "GATE PASSED", and exited 0. That is
+# FAIL-OPEN, and worse than printing nothing, because the log then asserts the gate ran. An
+# earlier comment here claimed the opposite -- that comparisons against an empty string would
+# refuse -- which is what the behaviour would be if the array were merely empty. It is not.
+#
+# `bash -n` returns 0 on this whole construct under 3.2, so a syntax check cannot find it.
+[ "${BASH_VERSINFO[0]:-0}" -ge 4 ] || {
+  echo "REFUSE: this gate needs bash 4+ for 'declare -A'; this is ${BASH_VERSION:-unknown}."
+  echo "        Under bash 3.2 the digest loop falls through and reports a pass on stale files."
+  exit 1
+}
 declare -A WANT=(
   ["mrgate.py"]="a55e07bf03e1fb34644072da299f4e34645f3d4c1363f45aaa3b4fd382163fc8"
   ["csrresolve.py"]="1872f707045dc14e149fd53e845fee4b60e206b48132b144ee8217c227bfba78"
@@ -77,6 +98,9 @@ done
 # Print the count that shows the loop was not empty. An unset or misspelled WANT key would make
 # every iteration compare against "" and refuse, so a silent pass is not reachable -- but a
 # shortened FILE LIST would skip a producer without any refusal, and the count catches that.
+# The count assertion below stays, and the reason is the REVERSE of what was first written
+# here: the failure it prevents is ACCEPTANCE, not a confusing refusal. With the version guard
+# above it is a genuine second barrier rather than the only one.
 echo "  gated ${#WANT[@]} producers against stored digests"
 [ "${#WANT[@]}" -eq 5 ] || { echo "REFUSE: WANT holds ${#WANT[@]} entries, expected 5"; exit 1; }
 
