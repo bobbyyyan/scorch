@@ -3195,3 +3195,75 @@ the 192 dissolves, the positive set of 183 and the silent set of 9 vanish **toge
 predictor is not merely unscored: **its negative control is gone**, and a mechanism without the
 population that gave it a negative control stays unfalsifiable even if some other deficit set turns
 up later. Re-registering it would need a new control, not just a new target.
+
+---
+
+## Amendment 38 — the floor's pathology is specific to MKT/f32/DLMC, and on redwood the prefetch deletion is REAL but NOT ACTIONABLE
+
+The blocking instrument question was whether the floor — the bar every arm claim is read against
+— is understood. It is now measured on a second host, a second dtype and a second corpus, from
+data already on disk. Tool staged and digest-verified, self-test exit 0 on redwood before any
+number was read.
+
+### The floor does not behave the same way on the two measurements, and the difference is large
+
+| | MKT, float32, DLMC | redwood, float64, SuiteSparse |
+|---|---|---|
+| floor median range | **+0.237% to +1.735%**, all seven positive | **−0.057% to +0.332%**, two of seven **negative** |
+| largest median at | k=24 (non-monotone, neither end) | k=10, and the spread is inside the noise |
+| floor cells-better | 58–159 of 392 | 160–217 of 417 |
+| floor z against half | **−3.7 to −13.9 sd, off half at 7 of 7 widths** | −4.8 to +0.8 sd, **within ±2 at 4 of 7** |
+
+So the non-monotone, uniformly-positive, strongly-asymmetric floor recorded on MKT is **not a
+universal property of two same-config objects**. On redwood the same `ship`/`shpb` pair has a
+median offset indistinguishable from zero at every width and sits near half at most of them.
+
+**That is the answer to the question and it narrows rather than resolves.** The recorded layout
+artefact (1–2.6%, largest at the narrowest width) does not describe either measurement: MKT's is
+smaller and non-monotone, redwood's is absent. Whatever produces MKT's floor is a property of that
+host, dtype or corpus, and because the MKT floor is the bar for every MKT arm claim, **MKT arm
+verdicts carry a dependency redwood's do not.** The DLMC k=8 result at −6.222% against a +0.474%
+floor is far enough outside to be unaffected; the marginal ones — k=12 at 0.465 pp outside, and
+k=32 on the boundary — sit inside that dependency and should not be strengthened until the floor's
+cause is named.
+
+### And the test/decision-rule split earns its keep immediately, with opposite answers
+
+On redwood f64, `nopf` — deleting the register-block prefetch:
+
+| k | paired median d | CI95 | paired verdict | band verdict |
+|---|---|---|---|---|
+| 2 | −1.444% | [−1.794, −1.115] | FASTER than floor | inside, no verdict |
+| 4 | −2.789% | [−3.270, −2.378] | FASTER than floor | inside, no verdict |
+| 6 | −1.949% | [−2.338, −1.547] | FASTER than floor | inside, no verdict |
+| 8 | −1.806% | [−2.254, −1.517] | FASTER than floor | inside, no verdict |
+| 10 | −1.734% | [−1.992, −1.379] | FASTER than floor | inside, no verdict |
+| 12 | −1.176% | [−1.481, −0.981] | FASTER than floor | inside, no verdict |
+| 16 | −1.184% | [−1.525, −0.957] | FASTER than floor | inside, no verdict |
+
+**Existence: yes, at all seven widths, CI excluding zero at every one.** Corroborated by the sign
+test at the four widths where redwood's floor is clean (k=6, 8, 12, 16, floor z within ±2):
+`nopf` reads **+13.5, +11.6, +9.5, +9.5 sd**. Three independent lines agree.
+
+**Actionability: no, at all seven widths.** Every effect is smaller than the per-cell artefact
+between two same-config objects. By the standing rule — nothing inside the noise floor counts —
+this does not ship on redwood f64.
+
+That is exactly the configuration amendment 31 split the two columns for, and it is the first time
+they have disagreed across a whole grid. One verdict string would have had to pick one and would
+have been wrong either way: "no verdict" would have hidden a real 1.2–2.8% effect confirmed three
+ways, and "FASTER" would have implied something shippable.
+
+### A live demonstration of the digest defect, now harmless
+
+Every row of the paired table prints the **same** `i:9bbfbcaecab8` — because n = 417 at all seven
+widths, so the resample is identical by construction. That is precisely the failure predicted for
+the old index-only digest: one constant-looking string down the whole column, reproducible from a
+substituted dataset. Every `v:` differs (`9253e8db6ed4`, `f77be398e311`, `4a7641d5bc6c`, …). The
+fix is doing visible work on its first real grid.
+
+### What this does not change
+
+Redwood f64 has **no deficit** — 0 cells behind MKL at any width. So the prefetch deletion here
+would be a further improvement on a corpus already won, not a fix for anything, and it is below
+the actionability bar in any case. The 328 k=2 float32 DLMC cells remain without a mechanism.
