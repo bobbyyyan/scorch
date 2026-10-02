@@ -228,6 +228,23 @@ RULES = [("shipped", r_shipped), ("policy", r_policy),
          ("adopt G=%d" % bestG, lambda c: r_adopt(c, bestG)),
          ("sqrt/measT1", r_sqrt_meas), ("sqrt/modelT1", r_sqrt_model)]
 print()
+print("REGRET'S DENOMINATOR HAS A WINNER'S CURSE AND IT IS LARGE. `best(c)` is the MINIMUM over")
+print("roughly twelve readings -- about six reachable counts at two repeats each -- so it sits")
+print("below the true best count's time even when every count is identical, and every regret")
+print("below is inflated by that amount. The size is not a guess: on the same sweep, production's")
+print("own count against `best` reads 1.1856 at k=2 while a permutation null that shuffles each")
+print("cell's readings among its counts reads 1.1818, an excess of 1.0032. At the other widths")
+print("the excess is BELOW 1 (0.886-0.953). So on this host the apparent per-cell headroom is")
+print("essentially all selection, and `there is N% to recover` does not survive it.")
+print()
+print("WHAT STILL STANDS AND WHAT DOES NOT. Rule-against-rule comparisons share this denominator,")
+print("so the bias largely cancels in their DIFFERENCE and the ordering of the columns below is")
+print("still informative. What does not survive is any absolute reading of a regret figure as")
+print("recoverable time, including `the sqrt rule reaches 1.0000`: a rule that lands on a")
+print("noise-selected argmin has fitted the noise, which is the definition of the overfitting")
+print("this project is supposed to refuse. The NULL row below is the regret a rule choosing")
+print("counts at random earns on shuffled readings, and no column is evidence unless it beats it.")
+print()
 print("TEST HALF, LIVE CELLS ONLY. Regret = time(rule's count) / time(best measured count).")
 print("Paired with the share above 1.10, because a central tendency cannot see a tail.")
 hdr = "%4s %5s" % ("k", "n")
@@ -252,6 +269,45 @@ for k in ks:
         row += " | %6.4f %5.1f%%" % (gm(rg), 100.0 * sum(1 for x in rg if x > 1.10) / max(len(rg), 1))
     print(row)
 print("  counts snapped to the nearest reachable value: %s" % dict(snaps))
+
+# THE NULL ROW. Within a cell, readings are exchangeable among counts under the hypothesis that
+# the count does not matter; shuffling them and recomputing regret for an arbitrary count gives
+# the regret that buys nothing. Computed per width on the same cells, with the same `best`.
+import random as _random
+print()
+print("THE NULL, same cells and same denominator: regret of an arbitrary count on SHUFFLED")
+print("readings. A rule is evidence only to the extent it beats this.")
+print("%4s %5s %10s %10s   %s" % ("k", "n", "null", "best rule", "beats null by"))
+for k in ks:
+    cells = [(key, k) for key in sorted(TEST) if (key, k) in live]
+    rng = _random.Random(20261002 + k)
+    nullv = []
+    for c in cells:
+        d = ms[c]
+        flat = [x for v in d.values() for x in v]
+        sizes = [(n, len(v)) for n, v in sorted(d.items())]
+        for _ in range(40):
+            rng.shuffle(flat)
+            i, sh = 0, {}
+            for n, cnt in sizes:
+                sh[n] = flat[i:i + cnt]
+                i += cnt
+            pick = rng.choice(sorted(sh))
+            bmin = min(min(v) for v in sh.values() if v)
+            if bmin > 0 and sh[pick]:
+                nullv.append(min(sh[pick]) / bmin)
+    if not nullv:
+        print("%4d %5d   no shuffleable cell at this width, so no null" % (k, len(cells)))
+        continue
+    rules_r = []
+    for nm, f in RULES:
+        rg = [at(c, f(c))[0] / best(c)[1] for c in cells if f(c) is not None]
+        if rg:
+            rules_r.append((gm(rg), nm))
+    nz = gm(nullv)
+    br, bn = min(rules_r) if rules_r else (float("nan"), "-")
+    print("%4d %5d %10.4f %10.4f   %s is %.4f below the null"
+          % (k, len(cells), nz, br, bn, nz - br))
 
 print()
 print("=" * 78)

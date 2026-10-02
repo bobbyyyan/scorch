@@ -70,7 +70,7 @@ print("object(s): %s     pool(s): %s" % (shas, pools))
 if len(shas) > 1:
     print("REFUSE: %d distinct objects in one sweep. A curve pooled over two objects is not a"
           % len(shas))
-    print("        curve; the layout artefact between objects is 1-2.6%% at narrow k.")
+    print("        curve; the layout artefact between objects is 1-2.6% at narrow k.")
     raise SystemExit(1)
 
 # (key, k) -> resolved count -> [ms]
@@ -81,39 +81,169 @@ for r in rows:
     except (KeyError, ValueError):
         continue
 
+# PRODUCTION'S OWN COUNT, taken from the override-0 rows, which is what a caller that sets no
+# override gets. Recorded per cell rather than assumed, and noted as the one reading that is not
+# reproducible across processes: `nt_cap = override > 0 ? override : omp_get_max_threads()`, so
+# override 0 reads ambient OpenMP state. Within this sweep it is the right label because the
+# object that answered and the kernel that was timed were in the same process.
+prod_count = {}
+for r in rows:
+    try:
+        if int(r["nthreads"]) == 0:
+            prod_count[(r["key"], int(r["k"]))] = int(r["resolved"])
+    except (KeyError, ValueError):
+        continue
+
 ks = ([int(x) for x in A.ks.split(",")] if A.ks
       else sorted({k for (_key, k) in cell}))
 
 print()
-print("TIME AGAINST RESOLVED WORKER COUNT. The per-cell ratio is time(largest reachable count)")
-print("over time(smallest reachable count), each the median of its repeats.")
-print("%4s %6s %6s %9s %9s %9s %9s %s"
-      % ("k", "live", "flat", "median", "p25", "p75", "max", "verdict"))
+print("TWO CANDIDATE STATISTICS, BOTH REPORTED, BECAUSE THEY DISAGREE AND THE CHOICE DECIDES")
+print("THE VERDICT. On the pooled M5 curve the endpoint ratio reads 0.9615 (FLAT) and max/min")
+print("reads 1.2362 (RISING). An endpoint ratio cannot see a non-monotone shape at all: a curve")
+print("that falls 19% and rises 19% returns to its start and reads flat, which is exactly the")
+print("shallow U this sweep measures. max/min sees any spread but cannot say whether the spread")
+print("is a trend or one bad count. Reporting one of them alone would be choosing the answer.")
+print()
+print("EACH STATISTIC CARRIES ITS OWN NULL, COMPUTED THE WAY THE STATISTIC IS COMPUTED. The")
+print("cell-level A/A floor (1.02-1.61%) is a TWO-reading same-count comparison, so it bounds a")
+print("two-point endpoint ratio and does NOT bound an extreme over ~12 draws -- the null of an")
+print("extreme widens with the number of draws. So the null here is a PERMUTATION within each")
+print("cell: its readings are exchangeable among counts under the hypothesis that the count does")
+print("not matter, so shuffling them and recomputing the same statistic gives that statistic's")
+print("own floor on that cell's own noise. Reported as the null's median, beside the observed.")
 
+
+def perm_null(counts, stat, nperm=200, seed=20261002):
+    """Median of `stat` over permutations that shuffle a cell's readings among its counts."""
+    import random
+    flat = [x for v in counts.values() for x in v]
+    sizes = [(c, len(v)) for c, v in sorted(counts.items())]
+    rng = random.Random(seed)
+    out = []
+    for _ in range(nperm):
+        rng.shuffle(flat)
+        i, shuf = 0, {}
+        for c, n in sizes:
+            shuf[c] = flat[i:i + n]
+            i += n
+        v = stat(shuf)
+        if v is not None:
+            out.append(v)
+    return st.median(out) if out else float("nan")
+
+
+def stat_endpoint(counts):
+    lo, hi = min(counts), max(counts)
+    a, b = st.median(counts[lo]), st.median(counts[hi])
+    return (b / a) if a > 0 else None
+
+
+def stat_maxmin(counts):
+    meds = [st.median(v) for v in counts.values() if v]
+    return (max(meds) / min(meds)) if meds and min(meds) > 0 else None
+
+
+def shape(counts):
+    """Where the minimum sits: the registration's dichotomy presupposes monotonicity."""
+    cs = sorted(counts)
+    meds = [st.median(counts[c]) for c in cs]
+    i = meds.index(min(meds))
+    if i == 0:
+        return "rising" if meds[-1] > meds[0] else "flatish"
+    if i == len(meds) - 1:
+        return "falling"
+    return "interior-min"
+
+
+STATS = (("endpoint hi/lo", stat_endpoint), ("max/min", stat_maxmin))
+print()
+print("%4s %6s %6s  %-15s %9s %9s %9s %9s %s"
+      % ("k", "live", "flat", "statistic", "median", "null", "p25", "p75", "verdict"))
 verdicts = {}
 for k in ks:
-    cells = [(ck, counts) for ck, counts in cell.items() if ck[1] == k]
-    ratios, n_flat = [], 0
-    for _ck, counts in cells:
-        if len(counts) < 2:
-            n_flat += 1
-            continue
-        lo, hi = min(counts), max(counts)
-        t_lo, t_hi = st.median(counts[lo]), st.median(counts[hi])
-        if t_lo > 0:
-            ratios.append(t_hi / t_lo)
-    if not ratios:
+    cells = [(ck, c) for ck, c in cell.items() if ck[1] == k]
+    live = [(ck, c) for ck, c in cells if len(c) >= 2]
+    n_flat = len(cells) - len(live)
+    if not live:
         print("%4d %6d %6d   NO CELL AT THIS WIDTH CAN VARY ITS WORKER COUNT, so no verdict"
               % (k, 0, n_flat))
-        verdicts[k] = "unable"
+        verdicts[k] = {name: "unable" for name, _ in STATS}
         continue
-    rs = sorted(ratios)
-    med = st.median(rs)
-    v = "RISING" if med >= RISING else ("FLAT" if med <= FLAT else "NEITHER")
-    verdicts[k] = v
-    print("%4d %6d %6d %9.4f %9.4f %9.4f %9.4f %s"
-          % (k, len(rs), n_flat, med,
-             rs[int(0.25 * (len(rs) - 1))], rs[int(0.75 * (len(rs) - 1))], rs[-1], v))
+    verdicts[k] = {}
+    for name, fn in STATS:
+        obs = sorted(x for x in (fn(c) for _ck, c in live) if x is not None)
+        nul = sorted(x for x in (perm_null(c, fn) for _ck, c in live)
+                     if x == x)
+        if not obs:
+            verdicts[k][name] = "unable"
+            continue
+        med = st.median(obs)
+        v = "RISING" if med >= RISING else ("FLAT" if med <= FLAT else "NEITHER")
+        verdicts[k][name] = v
+        print("%4d %6d %6d  %-15s %9.4f %9.4f %9.4f %9.4f %s"
+              % (k, len(obs), n_flat, name, med,
+                 st.median(nul) if nul else float("nan"),
+                 obs[int(0.25 * (len(obs) - 1))], obs[int(0.75 * (len(obs) - 1))], v))
+
+print()
+print("WHERE EACH CELL'S MINIMUM SITS. The registration asks whether the curve is \"flat ... rather")
+print("than rising\", a dichotomy that presupposes a monotone curve. A cell whose minimum is")
+print("INTERIOR is neither, and forcing it to one side is the error both statistics above make in")
+print("opposite directions. The census decides whether the registered question is even well posed")
+print("on this host, so it is printed before any verdict is read.")
+print("  %4s %7s %9s %9s %9s %9s" % ("k", "live", "rising", "falling", "interior", "flatish"))
+for k in ks:
+    live = [c for ck, c in cell.items() if ck[1] == k and len(c) >= 2]
+    if not live:
+        continue
+    cnt = collections.Counter(shape(c) for c in live)
+    print("  %4d %7d %9d %9d %9d %9d"
+          % (k, len(live), cnt["rising"], cnt["falling"], cnt["interior-min"], cnt["flatish"]))
+
+print()
+print("THE QUANTITY THE DECISION ACTUALLY NEEDS, which is neither of the two above: how much")
+print("better the best reachable count is than the count PRODUCTION resolves to. That is the")
+print("headroom a thread rule could recover, and it is well defined whatever the shape.")
+print()
+print("IT CARRIES THE LARGEST SELECTION BIAS OF THE THREE AND SO IT GETS THE SAME NULL. `best`")
+print("is the MINIMUM of about six noisy per-count medians, and a minimum over six draws sits")
+print("below the truth even when every count is identical -- so this statistic reads above 1")
+print("on pure noise, by construction, and the raw value is not the headroom. The permutation")
+print("null is the winner's curse itself, measured on this cell's own noise, and the EXCESS")
+print("over it is the part a thread rule could actually recover.")
+print("  %4s %7s %9s %9s %9s %9s %9s" % ("k", "cells", "median", "null", "excess", "p75", "p95"))
+for k in ks:
+    gains, nulls = [], []
+    for ck, c in cell.items():
+        if ck[1] != k or len(c) < 2:
+            continue
+        prod = prod_count.get(ck)
+        if prod is None or prod not in c:
+            continue
+
+        def gain(counts, _p=prod):
+            if _p not in counts or not counts[_p]:
+                return None
+            b = min(st.median(v) for v in counts.values() if v)
+            cu = st.median(counts[_p])
+            return (cu / b) if b > 0 and cu > 0 else None
+
+        g = gain(c)
+        if g is None:
+            continue
+        gains.append(g)
+        nulls.append(perm_null(c, gain))
+    if not gains:
+        print("  %4d       0   no cell has a reading at the count production resolves to" % k)
+        continue
+    gs, ns = sorted(gains), sorted(x for x in nulls if x == x)
+    med, nul = st.median(gs), (st.median(ns) if ns else float("nan"))
+    print("  %4d %7d %9.4f %9.4f %9.4f %9.4f %9.4f"
+          % (k, len(gs), med, nul, med / nul if nul == nul and nul > 0 else float("nan"),
+             gs[int(0.75 * (len(gs) - 1))], gs[int(0.95 * (len(gs) - 1))]))
+print("  'excess' is median/null. At 1.00 the apparent headroom is entirely the winner's curse")
+print("  and a thread rule has nothing to recover; above 1.00 it is the recoverable part.")
 
 print()
 print("THE THRESHOLDS ARE FIXED IN THIS FILE, NOT CHOSEN HERE: >=%.2f RISING, <=%.2f FLAT,"
@@ -155,19 +285,28 @@ print("   and the counts are NOT a common support -- each cell contributes only 
 print("   reachable counts, so a count with few cells is a different population, not a trend.)")
 
 print()
-print("REGISTERED CONCLUSION, stated as the registration requires:")
-v2 = verdicts.get(2, "unable")
-if v2 == "FLAT":
-    print("  k=2 is FLAT in worker count on this host. The deficit here is NOT team width, the")
-    print("  thread rule is not this host's fix, and that is the result rather than a setback.")
-elif v2 == "RISING":
-    print("  k=2 RISES with worker count on this host, so team width is a real cost at k=2 here")
-    print("  and the thread rule is a candidate. It is not thereby shown to CLOSE the deficit:")
-    print("  that needs the regret table in an_ntoracle.py and a measured ours/mkl.")
-elif v2 == "unable":
-    print("  NO VERDICT: no k=2 cell on this host can vary its worker count, so this sweep")
-    print("  cannot address the registration at all. Printed because an absent verdict must")
-    print("  not be read as a flat one.")
+print("REGISTERED CONCLUSION. The registration offers two outcomes and this host's measured")
+print("shape is neither, so the conclusion is stated in three parts rather than forced.")
+v2 = verdicts.get(2, {})
+ve, vm = v2.get("endpoint hi/lo", "unable"), v2.get("max/min", "unable")
+if ve == "unable" and vm == "unable":
+    print("  NO VERDICT: no k=2 cell on this host can vary its worker count, so this sweep cannot")
+    print("  address the registration at all. Printed because an absent verdict must not be read")
+    print("  as a flat one.")
 else:
-    print("  k=2 is INDETERMINATE on this host: between the registered thresholds. Reported as")
-    print("  indeterminate rather than rounded to the nearer side.")
+    print("  1. THE TWO STATISTICS: endpoint hi/lo says %s, max/min says %s." % (ve, vm))
+    if ve != vm:
+        print("     They DISAGREE, so no single verdict is available from this instrument and the")
+        print("     registered dichotomy cannot be settled by picking one. Each is reported above")
+        print("     against its own permutation null.")
+    else:
+        print("     They AGREE, so the verdict does not depend on which was chosen.")
+    print("  2. THE SHAPE: see the census above. The registration's words -- flat rather than")
+    print("     rising -- presuppose a monotone curve, and a cell with an INTERIOR minimum is")
+    print("     neither. Where interior minima dominate, the registered question is not well")
+    print("     posed on this host and reporting that is the honest result.")
+    print("  3. WHAT IT MEANS FOR THE THREAD RULE, which is what the registration was for: read")
+    print("     the headroom table. A thread rule can only recover the gap between production's")
+    print("     count and the best reachable one. If that median is at the floor, the rule has")
+    print("     nothing to recover here whatever the curve's shape, and if it is well above the")
+    print("     floor the rule has headroom even on a curve that reads flat end to end.")
