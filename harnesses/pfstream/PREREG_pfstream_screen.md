@@ -1930,6 +1930,17 @@ registered now:
    identically to a consecutive one. If the deficit were B-line sharing, k=8 should hold few
    behind cells; it holds 9 of 192, and k=16 holds none.
 
+**Cost and coverage, stated before the sweep runs unattended.** `lines_per_row` is row-blocked
+at 2,000,000 nonzeros, so peak working memory is about `24 * span * CHUNK_NNZ` bytes — roughly
+144 MB — independent of matrix size. Unblocked it was `24 * span * nnz`, which is **2.09 GB** at
+the collection's largest matrix (28,967,291 nonzeros), and **75 of 4584 keys exceed 1e7
+nonzeros**, so that cost would have landed late in a 418 × 7 sweep and on the slowest keys.
+Blocking changes no answer, because the total is a sum over independent rows, and the self-test
+asserts that by recomputing with the block shrunk to 3. `span` is `(S-1)//64 + 2`: 2 for
+`S ≤ 64`, 3 for `64 < S ≤ 128`, and `span ≥ 4` needs `S ≥ 193`, which **no registered width
+reaches** — float64 tops out at S=128 (k=16) and the float32 DLMC set at S=128 (k=32). So the
+registered runs exercise exactly the spans the self-test covers, which it asserts as `[2, 3]`.
+
 **What it does not license.** No threshold, no cache-size constant, no per-matrix rule. The
 script's output is continuous and classifies nothing. If the mechanism survives, the change it
 motivates is a B-side access-order change, and under the project's performance convention that
@@ -1948,9 +1959,16 @@ consequences, all of which were live in the committed file:
   covering **183**. The 19 cells at k=6 and k=10 were outside the *implementation*, and I had
   recorded them as outside the *mechanism*.
 - The traffic column charged 1.0 lines per nonzero at every k ≥ 6. Measured against exact
-  extents it was right at k ∈ {2, 4, 8}, wrong in both directions at k=6, and understated by
-  exactly **2x** at k = 10, 12 and 16 — where the docstring invited comparison against a 12-byte
-  A-side cost, so the comparison read 64 against 12 where its own assumption gives 128.
+  extents, the two models are **identical at k ∈ {2, 4, 8} and differ at k ∈ {6, 10, 12, 16}** —
+  four of seven float64 widths, not five. At k=6 the error runs in both directions: lines per
+  nonzero spans **[0.75, 2.00]** over column patterns, so the old model reads 1.333x *over* for
+  four consecutive columns and 2.0x *under* for columns {1, 5}. At k = 10, 12 and 16 it
+  understates by exactly 2x, and the docstring there invited comparison against a 12-byte A-side
+  cost, so the comparison read 64 against 12 where its own assumption gives 128. Two cautions
+  that came out of measuring rather than reasoning: whether a width differs is
+  **pattern-dependent** — at k=6 the models agree on adjacent columns and diverge on separated
+  ones, so the honest form is "differs on at least one pattern" — and `brows_per_line` is *not*
+  the discriminator, since k=4 has `bpl = 2` and agrees while k=12 has `bpl = 1` and differs.
 - The "free negative control" at k ≥ 6 tested that the analysis code had no bug, not that the
   mechanism was absent. It could not distinguish "sharing is irrelevant here" from "this
   instrument has no resolution here", and the second was the case.
