@@ -32,6 +32,16 @@ def ref_lines(indptr, indices, S):
 
 
 NASSERT = 0
+NGROUPS = 0
+
+
+def group(label):
+    """Print a group header and count it. NGROUPS was a literal `11` baked in at patch time,
+    which is the defect this file's footer was fixed to avoid: adding a group without editing
+    that line printed the old count. Counted where the header prints, so the two cannot drift."""
+    global NGROUPS
+    NGROUPS += 1
+    print(label)
 
 
 def chk(label, got, want, tol=1e-9):
@@ -52,7 +62,7 @@ def chki(label, got, want):
         FAIL.append(label)
 
 
-print("GROUP 1 -- k=2 float64 (S=16), the width the deficit concentrates at")
+group("GROUP 1 -- k=2 float64 (S=16), the width the deficit concentrates at")
 lpn, pack, S, sh = stats_for(np.array([0, 4]), np.array([0, 1, 2, 3]), 2, 8)
 chki("S", S, 16); chki("shares_line (16 %% 64 != 0)", sh, 1)
 chk("4 consecutive columns: lines_per_nnz (1 line / 4 nnz)", lpn, 0.25)
@@ -61,7 +71,7 @@ lpn, pack, _, _ = stats_for(np.array([0, 4]), np.array([0, 4, 8, 12]), 2, 8)
 chk("4 scattered columns: lines_per_nnz", lpn, 1.0)
 chk("4 scattered columns: pack (16 of 64 bytes used)", pack, 0.25)
 
-print("GROUP 2 -- k=6 float64 (S=48), where `64 // S == 1` wrongly reported no sharing")
+group("GROUP 2 -- k=6 float64 (S=48), where `64 // S == 1` wrongly reported no sharing")
 lpn, pack, S, sh = stats_for(np.array([0, 4]), np.array([0, 1, 2, 3]), 6, 8)
 chki("S", S, 48); chki("shares_line (48 %% 64 != 0)", sh, 1)
 chk("4 consecutive: lines_per_nnz = 3 lines / 4 nnz", lpn, 0.75)
@@ -70,7 +80,7 @@ lpn, pack, _, _ = stats_for(np.array([0, 2]), np.array([1, 2]), 6, 8)
 chk("2 straddling columns: lines_per_nnz = 3 / 2", lpn, 1.5)
 chk("2 straddling columns: pack = 96 / 192", pack, 0.5)
 
-print("GROUP 3 -- k=8 and k=16 float64: S %% 64 == 0, so NO column pattern can matter")
+group("GROUP 3 -- k=8 and k=16 float64: S %% 64 == 0, so NO column pattern can matter")
 for k, want_lpn in ((8, 1.0), (16, 2.0)):
     lpnA, packA, S, sh = stats_for(np.array([0, 4]), np.array([0, 1, 2, 3]), k, 8)
     lpnB, packB, _, _ = stats_for(np.array([0, 4]), np.array([0, 400, 8000, 12]), k, 8)
@@ -79,27 +89,27 @@ for k, want_lpn in ((8, 1.0), (16, 2.0)):
     chk("k=%d scattered reads IDENTICALLY (no signal)" % k, lpnB, lpnA)
     chk("k=%d pack pinned at 1.0 (every fetched byte used)" % k, packA, 1.0)
 
-print("GROUP 4 -- the 2x understatement the old model had at k=10 and k=12")
+group("GROUP 4 -- the 2x understatement the old model had at k=10 and k=12")
 for k in (10, 12):
     lpn, pack, S, sh = stats_for(np.array([0, 4]), np.array([0, 1000, 2000, 3000]), k, 8)
     chki("k=%d shares_line (old model said no signal)" % k, sh, 1)
     chk("k=%d scattered: lines_per_nnz = 2.0, old model charged 1.0" % k, lpn, 2.0)
     chk("k=%d scattered: pack = %d / 128" % (k, 8 * k), pack, (8.0 * k) / 128.0)
 
-print("GROUP 5 -- float32: the dtype must reach the arithmetic, not be carried by the k label")
+group("GROUP 5 -- float32: the dtype must reach the arithmetic, not be carried by the k label")
 lpn, pack, S, sh = stats_for(np.array([0, 8]), np.arange(8), 2, 4)
 chki("k=2 f32 S", S, 8); chki("k=2 f32 shares_line", sh, 1)
 chk("k=2 f32: 8 consecutive columns in one line", lpn, 0.125)
 chk("k=2 f32: pack", pack, 1.0)
 chki("k=16 f32 shares_line (S=64, exclusive)", stats_for(np.array([0, 2]), np.array([0, 9]), 16, 4)[3], 0)
 
-print("GROUP 6 -- multi-row, so the row/line key packing is exercised")
+group("GROUP 6 -- multi-row, so the row/line key packing is exercised")
 ip = np.array([0, 4, 8]); ix = np.array([0, 1, 2, 3, 0, 4, 8, 12])
 lpn, pack, _, _ = stats_for(ip, ix, 2, 8)
 chk("row0 1 line + row1 4 lines = 5 over 8 nnz", lpn, 0.625)
 chk("pack = 128 useful / 320 fetched", pack, 0.4)
 
-print("GROUP 7 -- the vectorized path against the brute-force reference")
+group("GROUP 7 -- the vectorized path against the brute-force reference")
 rng = np.random.default_rng(20261002)
 mism = ncmp = ntrial = ndup = 0
 spans = set()
@@ -140,7 +150,7 @@ print("    so the duplicate path is exercised by this comparison and not only by
 chki("trials exercising duplicate columns is nonzero", ndup > 0, True)
 chki("spans exercised by GROUP 7", sorted(spans), [2, 3])
 
-print("GROUP 7b -- the reference has discriminating power: it REJECTS the superseded model")
+group("GROUP 7b -- the reference has discriminating power: it REJECTS the superseded model")
 # GROUP 7 passing shows the two implementations agree. It does not show the comparison could
 # fail. Running the same reference against the model this file replaced -- whole B rows per
 # line -- must DISAGREE, otherwise GROUP 7 is a check that cannot go red.
@@ -159,7 +169,7 @@ caught = sum(1 for k in (2, 4, 6, 8, 10, 12, 16)
              if ref_lines(ip_d, ix_d, 8 * k) != old_model_lines(ip_d, ix_d, 8 * k))
 chki("widths at which the reference catches the old model", caught, 4)
 
-print("GROUP 7c -- the answer is invariant to the row-blocking size")
+group("GROUP 7c -- the answer is invariant to the row-blocking size")
 # Row blocking is a memory bound, not a model change: the total is a sum over independent
 # rows. Shrinking the block to 3 nonzeros must not move any answer.
 import bstream_locality as _bl
@@ -184,17 +194,21 @@ finally:
     _bl.CHUNK_NNZ = keep
 chki("blocked == unblocked over 12 matrices x 3 widths", moved, 0)
 
-print("GROUP 7d -- the int64 packing predicate, planted at values no corpus can reach")
+group("GROUP 7d -- the int64 packing predicate, planted at values no corpus can reach")
 from bstream_locality import fits_int64
 MAXI = np.iinfo(np.int64).max
 chki("fits_int64 accepts the collection's extremes (9888048 rows, stride 9380004)",
      fits_int64(9888048, 9380004), True)
 chki("fits_int64 REFUSES a product past int64", fits_int64(MAXI // 2, 4), False)
 chki("fits_int64 at exactly the boundary", fits_int64(MAXI // 1000, 1000), True)
-chki("fits_int64 one step past it", fits_int64(MAXI // 1000 + 2, 1000), False)
+# The ADJACENT failing value, not two past it. Mutation table over these five plants:
+# `<` instead of `<=` is caught by the boundary plant, but a predicate one value too
+# PERMISSIVE -- `nrows <= MAXI // stride + 1`, which admits a real wrap of up to `stride` --
+# survives every other plant here and is caught only by this one.
+chki("fits_int64 at the adjacent failing value (+1)", fits_int64(MAXI // 1000 + 1, 1000), False)
 chki("degenerate stride is accepted rather than dividing by zero", fits_int64(10, 0), True)
 
-print("GROUP 8 -- the pack assertion fires on its own failing input")
+group("GROUP 8 -- the pack assertion fires on its own failing input")
 # A repeated column index inflates the numerator without touching the denominator. Eight
 # copies of column 0 at k=2 float64: 8*16 = 128 useful bytes charged against one 64-byte line.
 _, pack, _, _ = stats_for(np.array([0, 8]), np.zeros(8, dtype=np.int64), 2, 8)
@@ -202,7 +216,6 @@ chk("8 duplicate columns -> pack 2.0, above the asserted bound", pack, 2.0)
 chki("that value would be REFUSED by the bound in main()", pack > 1.0, True)
 chki("nnz 0 returns None", stats_for(np.array([0, 0]), np.array([], dtype=np.int64), 2, 8), None)
 
-NGROUPS = 11
 print()
 if FAIL:
     print("FAILED %d: %s" % (len(FAIL), FAIL))

@@ -1931,8 +1931,17 @@ registered now:
    behind cells; it holds 9 of 192, and k=16 holds none.
 
 **Cost and coverage, stated before the sweep runs unattended.** `lines_per_row` is row-blocked
-at 2,000,000 nonzeros, so peak working memory is about `24 * span * CHUNK_NNZ` bytes — roughly
-144 MB — independent of matrix size. Unblocked it was `24 * span * nnz`, which is **2.09 GB** at
+at 2,000,000 nonzeros, so peak working memory is about `24 * span * max(CHUNK_NNZ, widest row)`
+bytes — roughly **144 MB** at span 3 *when no single row exceeds the budget*. It is **not**
+independent of matrix size, which is what the first version of this paragraph claimed: the loop
+takes at least one row per block so it always progresses, so a row wider than the budget is
+processed whole and the peak follows the widest row. A row holds at most `min(cols, nnz)`
+nonzeros, so over this collection only **23 of 4584** keys can exceed the budget at all, and the
+worst case is `ss/rajat31` at `24 * 3 * 4,690,002` = **338 MB**. That is a bound and not an
+observation — rajat31's mean degree is 4.33, so reaching it needs one row holding 23% of the
+matrix — and the run now prints the widest row it actually saw, flagged `ROW-BOUND` when it
+exceeds the budget, so the 144 MB case is checkable rather than assumed. Either way the blocking
+is worth it: 338 MB is 6.2x better than the 2.09 GB it replaced. Unblocked it was `24 * span * nnz`, which is **2.09 GB** at
 the collection's largest matrix (28,967,291 nonzeros), and **75 of 4584 keys exceed 1e7
 nonzeros**, so that cost would have landed late in a 418 × 7 sweep and on the slowest keys.
 Blocking changes no answer, because the total is a sum over independent rows, and the self-test
