@@ -63,7 +63,15 @@ live = {c for c in ms if len(ms[c]) >= 2}
 # registered reason from a harness fault, which is the one thing it existed to do. Excluding
 # flat cells empties it rather than cleaning it. What replaces it is printed below with its own
 # n, so an empty control reads as empty instead of as a pass.
-clampbound = {c for c in live if max(ms[c]) >= max(1, min(pool, caprows[c]))}
+# MY FIRST REPLACEMENT CONTROL WAS DEGENERATE: `max(reachable) >= clamp` selected 345 of 345
+# live cells, because override 0 can resolve above the pool so the reachable maximum always
+# reaches the clamp. A control that selects everything discriminates nothing -- the same failure
+# as the stratum control it replaced, one definition later. The discriminating quantity is
+# whether the measured OPTIMUM sits at or above the clamp, which is where a rule naming a count
+# at the clamp is forced to read the floor. Printed per width as `argmin>=cap` alongside the
+# strictly-greater count, so a zero reads as "the clamp never excludes the optimum" -- itself a
+# clean result -- rather than as a pass.
+# computed at the print site below, after best() exists
 print("%d keys (%d fit / %d test)  widths %s  pool %d  per-worker cost %.2f us"
       % (len(keys), len(FIT), len(TEST), ks, pool, A.percore_us))
 print("cells: %d total, %d with >=2 reachable counts (LIVE), %d excluded as single-configuration"
@@ -87,21 +95,28 @@ for k in ks:
     print("%4d %8d %9.3f%% %9.3f%%" % (k, len(sp), st.median(sp) * 100, floor95[k]))
 
 
-print()
-print("REPLACEMENT CONTROL, with its n so an empty one cannot read as a pass: LIVE cells whose")
-print("largest reachable count already equals the clamp min(pool, rows/16). A rule cannot ask for")
-print("more there, so every rule naming a count at or above the clamp must read the floor.")
-print("  live cells: %d   of those, clamp-bound: %d (%.1f%%)   flat cells excluded: %d"
-      % (len(live), len(clampbound), 100.0 * len(clampbound) / max(len(live), 1), len(ms) - len(live)))
-if len(clampbound) < 20:
-    print("  WARNING: fewer than 20 clamp-bound live cells, so this control is underpowered and")
-    print("           a quiet reading from it means little.")
-
-
 def best(c):
     d = ms[c]
     n = min(d, key=lambda n: min(d[n]))
     return n, min(d[n])
+
+
+def best_argmin_at_or_above_cap(c):
+    return best(c)[0] >= max(1, min(pool, caprows[c]))
+
+
+print()
+print("REPLACEMENT CONTROL, with its n so an empty one cannot read as a pass: LIVE cells whose")
+print("measured OPTIMUM sits at or above the clamp min(pool, rows/16). A rule naming a count at")
+print("the clamp is forced to read the floor there.")
+clampbound = {c for c in live if best_argmin_at_or_above_cap(c)}
+print("  live cells %d   optimum AT or above the clamp: %d (%.1f%%)   strictly above: %d"
+      % (len(live), len(clampbound), 100.0 * len(clampbound) / max(len(live), 1),
+         sum(1 for c in live if best(c)[0] > max(1, min(pool, caprows[c])))))
+if len(clampbound) < 20:
+    print("  NOTE: fewer than 20 such cells. A quiet reading from this control means little, and")
+    print("        a count of zero strictly above the clamp means the clamp never excludes the")
+    print("        optimum -- which is a result about the clamp, not a pass for the rule.")
 
 
 def at(c, n):
