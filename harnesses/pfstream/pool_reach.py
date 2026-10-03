@@ -74,6 +74,11 @@ def main():
     # inside a partial allocation omp_get_num_procs() is the allocation and NOT
     # os.cpu_count(), and a conclusion written in terms of omp_get_num_procs() while
     # quoting os.cpu_count() names a value no process in the run ever saw.
+    # Caveat: this is not necessarily the OpenMP runtime the extension is linked against
+    # -- scorch_build.py links PyTorch's bundled libgomp on Linux. Both derive the answer
+    # from the cpuset so they should agree, but if they ever diverged this number would be
+    # wrong in the one place it is load-bearing. Exporting omp_get_num_procs() from
+    # scorch_ops would read the runtime the kernel actually uses.
     procs = None
     for lib in ("libgomp.so.1", "libgomp.so", "libomp.so"):
         try:
