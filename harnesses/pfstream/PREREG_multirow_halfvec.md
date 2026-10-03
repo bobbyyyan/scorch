@@ -190,6 +190,8 @@ no floor term, and it is the one that decides the arm.**
 
 - **The per-cell verdict is inside the floor.** Over the 51, the two-build spread between
   chain207's `.text`-identical replication pair is min 0.10%, p25 1.82%, **median 5.40%**, p75
+> **Not transferable (amendment 9(4)):** this is a chain207 6-pass figure. The screen is 4 passes, so it does not transfer as a threshold. The point being made with it, that a count is a threshold in disguise, is unaffected.
+
   9.92%, p95 26.31%, max 52.80%. 26 of 51 exceed 5%.
 - **At the pass line the two byte-identical builds straddle it.** Scoring "does gain g reach
   parity" separately per build: at g = 1.1475, build `aa` says **27** and build `bb` says **20**,
@@ -308,6 +310,8 @@ rate**, and **k=8's 2 is inside the null's observed range at every width and not
 Recomputing p95 of the two-build spread per width against the published ratio-floor row:
 `max/min − 1` agrees to ≤0.008 at four of five widths (0.2573/0.2774/0.2930/0.3085/0.2974 against
 0.2607/0.2783/0.2858/0.3010/0.2960) while `|r−1|` is low by 0.02–0.05 everywhere. **So the
+> **Not transferable (amendment 9(4)):** this is a chain207 6-pass figure. The screen is 4 passes, so it does not transfer as a threshold. The reasoning about the functional -- that the floors row is a fraction -- is unaffected and stands.
+
 functional is the two-sided spread and the gate floor at DLMC k=4 is 27.7%, not 0.28%.** The board's
 own arithmetic confirms it: 1258 cells behind on `aa` at k=4 with only 8 clearing the floor is
 impossible at 0.28%. The SuiteSparse figures (0.0482 / 0.0355 / 0.0449 / 0.0576 / 0.0848) are left
@@ -477,6 +481,8 @@ unreachability, which stands; **the better reason is that it was a different def
 
 | population | n | median CV of the 12 per-pass ratios | median S |
 |---|---|---|---|
+> **Not transferable (amendment 9(4)):** this is a chain207 6-pass figure. The screen is 4 passes, so it does not transfer as a threshold. The CV contrast is the finding here and still holds; only the absolute levels are 6-pass.
+
 | floor-gated | 2 | **26.8%** | 1.5652 |
 | sign-only | 51 | **16.0%** | 1.1510 |
 | all k=4 (1200-key sample) | 1200 | **15.9%** | — |
@@ -719,6 +725,8 @@ requires `0.95(n−1)` to be a half-integer, i.e. **n ≡ 11 (mod 20)**. Verifie
 | full-board floor | 19100 | 0 | 0.05 | unambiguous |
 | no-regression pool | 3769 | 9 | 0.60 | unambiguous |
 | **displacement n (the NEW condition)** | **51** | **11** | **0.50** | **EXPOSED** |
+
+> **Not transferable (amendment 9(4)):** this is a chain207 6-pass figure. The screen is 4 passes, so it does not transfer as a threshold. The immunity argument of this amendment concerns the `pct` index convention and is unaffected.
 
 **So the p95 ratio-floor row and the 27.7% gate threshold are provably unaffected.** That is the
 reassurance amendment 4 did not have: the floor side — the thing everything was compared *against* —
@@ -1114,6 +1122,8 @@ rather than a reduction: the sign-only 51's membership, the sealed 8's membershi
 the one cell in their intersection.
 
 ### 5. The condition 4 null is not an identity, and the reason is worth stating
+
+> **Not transferable (amendment 9(4)):** this is a chain207 6-pass figure. The screen is 4 passes, so it does not transfer as a threshold. Superseded further by amendment 10: the 5.00% is wrong on its own terms (the floor is two-sided, the count one-sided) and is now MEASURED at 2.33-2.76%. The ARGUMENT of this section is unchanged and is what amendment 11(5) cites.
 
 The 5.00% exceedance the p95 floor implies would be a tautology if the floor were
 computed on the same readings it is applied to. It is not: the floor comes from the

@@ -43,6 +43,22 @@ def geo(v):
     return math.exp(statistics.median([math.log(x) for x in v]))
 
 
+def fmt_sep(lo, hi):
+    """Format a bootstrap interval with its WIDTH, always.
+
+    `[+2.00, +2.00]` reads as precision. `width 0.00` reads as broken. They are the same
+    interval. A degenerate bootstrap -- one where the resampling has nothing to resample
+    over, as happens when a verification plant is a uniform rescale of the very quantity
+    it is compared against -- collapses every replicate to one value, and that is a notice
+    rather than a result. It was read as reassurance twice in this project before anyone
+    noticed, because zero is legible as a number and invisible as a pair of endpoints that
+    happen to match. So the width is printed by every call site, not by some of them.
+    """
+    return "[%+6.2f, %+6.2f] pp of S-1  width %5.2f%s" % (
+        100 * lo, 100 * hi, 100 * (hi - lo),
+        "  <- DEGENERATE, the resampling had nothing to vary" if hi - lo < 1e-12 else "")
+
+
 def boot_sep(arm, flo, seed, B=2000, stat="tail"):
     """CI for functional(arm) - functional(floor) by resampling CELLS, paired in both.
 
@@ -300,8 +316,8 @@ def main(argv):
             fv = [abs(math.log(fd[c])) for c in cells]
             lo, hi, h, n = boot_sep(av, fv, seed=97 + k)
             print("   k=%-3d n=%4d  geomean %s/%s = %.4f   separation p95(arm)-p95(floor)"
-                  " = [%+5.2f, %+5.2f] pp of S-1  -> %s"
-                  % (k, n, FIRE, ARM, geo([d[c] for c in cells]), 100 * lo, 100 * hi,
+                  " = %s  -> %s"
+                  % (k, n, FIRE, ARM, geo([d[c] for c in cells]), fmt_sep(lo, hi),
                      "FIRES" if lo > 0 else "inside the floor"))
             print("          index matrix sha %s, B=2000, resampled on the cell" % h)
 
@@ -316,7 +332,7 @@ def main(argv):
             lo, hi, h, n = boot_sep(av, fv, seed=211)
             print("   n=%4d  geomean %s/%s = %.4f" % (n, ARM, FLOOR_BUILDS[0],
                                                       geo([d[c] for c in cells])))
-            print("   separation p95(arm) - p95(floor) = [%+5.2f, %+5.2f] pp of S-1" % (100 * lo, 100 * hi))
+            print("   separation p95(arm) - p95(floor) = %s" % fmt_sep(lo, hi))
             print("          index matrix sha %s, B=2000, resampled on the cell" % h)
             print("   EQUIVALENCE, not failure to detect: neutrality is the interval CONTAINING")
             print("   zero, and that is only evidence of neutrality because the same construction")
@@ -363,8 +379,7 @@ def main(argv):
             fv = [fd[c] for c in cells]
             lo, hi, h, n = boot_sep(dv, fv, seed=409, stat="center")
             print("   n=%3d  arm geomean %.4f   A/A geomean %.4f" % (n, geo(dv), geo(fv)))
-            print("   the arm's speedup over the A/A contrast = [%+.2f, %+.2f] pp of S-1"
-                  % (100 * lo, 100 * hi))
+            print("   the arm's speedup over the A/A contrast = %s" % fmt_sep(lo, hi))
             print("          index matrix sha %s, B=2000, resampled on the cell, stat=center" % h)
             print("   -> %s" % ("DISPLACED beyond the floor" if lo > 0 else "inside the floor"))
 
