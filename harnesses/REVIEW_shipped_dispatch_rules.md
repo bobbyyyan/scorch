@@ -171,26 +171,75 @@ sealed floor would still hold. Peer reviewer's observation.
 
 **A correction to the second reason, which is narrower than first committed.** "They never reach
 the memo" is true for the analytic levels and **false for the learned one.** `_degree_pays`
-(`:466`) is `nnz / max(1, J) > max(_DEG_FLOOR, 2.0 * (J * 4 * N) / C)`; at `nnz = 0` the left side
-is exactly 0.0 and the right is `max(64.0, a non-negative term)`, so it is False **for every N, J
-and C** rather than at the five widths I sampled -- a theorem, not a sweep, and the peer reviewer's
-point. (Precisely: unconditional at the default `_DEG_FLOOR = 64`; an override would need both a
-negative floor *and* a negative `SCORCH_LLC_BYTES` to reach the right side below zero.) But
-`_eligible_learned(J, N, C)` is `_operand_over_cache(J, N, C)` and **reads no nnz at all**, so it
-is not structurally False here, and my five N values simply all sat below the cache boundary:
+(`:483-490`, the expression at **`:490`**) is
+`nnz / max(1, J) > max(_DEG_FLOOR, 2.0 * (J * 4 * N) / C)`; at `nnz = 0` the left side is exactly
+0.0 and the right is `max(64.0, a term)`, so it is False **for every N, J and every C != 0** rather
+than at the five widths I sampled -- a theorem, not a sweep, and the peer reviewer's point.
 
-| J | N | `_operand_over_cache` | `_eligible_learned` | `is_candidate(level="learned")` |
+**The quantifier has one reachable exception, and it is not a False.** At `C = 0` the right side
+divides by zero and `_degree_pays` **raises `ZeroDivisionError`**. `C = 0` is reachable without
+touching the floor: `query_llc`'s env guard is `if env:` (`:366-369`) and the *string* `"0"` is
+truthy, so `SCORCH_LLC_BYTES=0` memoises `C = 0`; `_operand_over_cache` is then `J*4*N > 0` =
+True, so the call reaches the division. Verified: `query_llc() -> 0`,
+`_operand_over_cache(512, 16384, 0) = True`, `_degree_pays -> ZeroDivisionError: float division by
+zero`. A negative floor with negative `C` does return True, as earlier stated; `C = 0` reaches
+neither True nor False. **A quantifier must range only over values where the expression is
+defined**, and both the peer's "the second term is non-negative" and my transcription of it had the
+same hole.
+
+**And the learned conjunct is not structurally False.** `_eligible_learned(J, N, C)` is
+`_operand_over_cache(J, N, C)`, which **reads no nnz at all**; my five N values simply all sat at
+or below the cache boundary. The deciding quantity is the **product `J * 4 * N`**, so a sweep over
+J and N separately reads as more evidence than it is -- of the three rows I first published, the
+two True ones are the *same* product:
+
+| J | N | `J * 4 * N` | | `_operand_over_cache` |
 |---|---|---|---|---|
-| 512 | 8192 | False | False | False |
-| 512 | **16384** | True | **True** | **True** |
-| 2048 | **4096** | True | **True** | **True** |
+| 512 | 8192 | 16777216 | = **1.0000 C** | False -- by *equality*, which pins the boundary |
+| 512 | 16384 | 33554432 | = 2.0000 C | True |
+| 2048 | 4096 | 33554432 | = 2.0000 C | True -- **same product, not a second confirmation** |
 
-So an all-zero operand *does* become a candidate at the learned level once `J * 4 * N > C`
-(C = 16777216 on this host), and `is_candidate` is False at analytic, balanced and max for every N
-tested. This does not revive the hazard -- the operands are identical, so the replay is still
-correct -- but it removes one of the two independent reasons at one level, and the remaining reason
-is the one about correctness rather than reachability. It is also outside every width we measure:
-our screens run N <= 32.
+Reduced to the quantity itself, at the tightest granularity the expression allows (`J = 1`, step 4):
+product `C + 0` is False and `C + 4` is True, which is what shows the comparison is strict `>`
+rather than something coarser.
+
+**So an all-zero operand does become a learned candidate once `J * 4 * N > C`, and that is the
+DEFAULT, not an opt-in.** `_LEARNED_WIDEN = os.environ.get("SCORCH_AUTOTUNE_WIDEN", "1") == "1"`
+(`:1061`), so the gate at `:555` --
+`if level == "learned" and _LEARNED_WIDEN and _load_learned_model() is not None` -- needs no
+configuration. My measured `is_candidate(level="learned") == True` also *proves a spec loads on
+this host*, since the third conjunct had to be non-None for it to fire.
+
+**The conjunct that actually bounds it is the model, and that bound is width-independent.**
+`_load_learned_model` rejects on `spec["machine_id"] != _machine_id()` (`:1234`), `_machine_id()`
+hashes `platform.system()` among its five components (`:883`), and both tracked specs are
+`platform: Darwin`. So on **redwood and MKT no spec resolves at any N**, `is_candidate` falls
+through to `_degree_pays`, and the theorem makes it False. `SCORCH_AUTOTUNE_MODEL` (`:1206-1207`)
+opens no hole -- an explicit path still passes the machine_id check. This sits *beside* the width
+caveat rather than replacing it, because the width caveat is what covers a Darwin host that does
+have its own model. Peer reviewer's point.
+
+**The width caveat is DLMC-specific, and SuiteSparse is ruled out by something stronger.** At
+N = 32 the gate needs `cols > C/128` = 131072 at 16 MB or 294912 at the Linux 36 MB fallback. From
+`chain209-dlmc-dims`: DLMC's maximum `cols` is **4608**
+(`dlmc/rn50/extended_magnitude_pruning/0.8/bottleneck_2_block_group4_1_1`), so **0 of 3846** clear
+it under either C, and the 26 `nnz == 0` keys top out at 2048 cols -- product 262144 at N = 32,
+a factor of **64 below C**. That half needs no run either, with the margin named. On SuiteSparse,
+though, **292 of 4584 keys clear `cols * 4 * 32 > C`** at 16 MB (165 at 36 MB; max cols 4690002 at
+`ss/rajat31/rajat31`), so `N <= 32` is **not** a bound there. What rules the hazard out on
+SuiteSparse is width-independent: the sealed census has **zero `nnz == 0` keys** on that corpus.
+
+**Two shipped comments assert the opposite default, and they are not mine to amend.** `:552-554`
+reads "DEFAULT: learned uses the analytic gate (no widening)" and `:1506-1509` reads "by default it
+uses the analytic gate + the `_scattered` pre-gate below". The first sentence of each is true (the
+condition *is* `_LEARNED_WIDEN`); the default sentence is false against `:1061`. The second
+misdescribes two behaviours, because `:1555` is `if not _LEARNED_WIDEN and not _scattered(a, J)` --
+under the real default the `_scattered` pre-exclusion is **skipped**, not applied. Both sit between
+two correct statements of the same fact: the justification block at `:1052-1061` ends
+"SCORCH_AUTOTUNE_WIDEN=0 reverts to the analytic gate", and `docs/source/user_guide/autotuning.md:177`
+says "default is widened". **Queued for Bobby as the ninth item** -- this is production source, and
+the choice between rewording the comments and flipping the default is his. Found by the peer
+reviewer; verified here at all five sites.
 
 **So the hazard has zero reachable instances on DLMC, for two independent reasons, and that is a
 measurement rather than a reading.** Scope, exactly: exact on DLMC because all 3846 matrices are
