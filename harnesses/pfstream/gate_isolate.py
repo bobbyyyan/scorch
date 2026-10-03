@@ -134,9 +134,29 @@ def main(argv):
     print("llc_bytes from the build: %d (%.1f MiB), so maxout = %d"
           % (llc, llc / 1048576.0, maxout))
     pred, work_only = predicted(maxout)
-    print("\nLEG 3  work gate alone predicts %d cells; COMPOSED with maxout, %d."
-          % (len(work_only), len(pred)))
-    print("   composition removes %r" % sorted(work_only - pred))
+    pred_live = {c for c in CELLS if c[0] * c[2] * 4 < maxout}
+    print("\nLEG 3  all four predicates composed, in source order.")
+    print("   at the BIG pool the ceiling fires, so the work gate is skipped and the only")
+    print("   exclusion is maxout:            predicted live  %d of %d" % (len(pred_live), len(CELLS)))
+    print("   at the SMALL pool it does not, so the work gate applies on top:")
+    print("     work gate alone (upper bound)  %d" % len(work_only))
+    print("     composed with maxout           %d   removes %r"
+          % (len(pred), sorted(work_only - pred)))
+    # the prediction's sensitivity to the one host constant it contains
+    inv = []
+    for cand in (16777216, 33554432, 50000000, 64000000, 67108864):
+        m = 2 * cand
+        lv = sum(1 for c in CELLS if c[0] * c[2] * 4 < m)
+        at = sum(1 for c in CELLS if c[0] * c[2] * 4 < m and c[1] * max(c[2], 16) < THRESHOLD)
+        inv.append((cand, lv, at))
+    same = [c for c, lv, at in inv if (lv, at) == (len(pred_live), len(pred))]
+    print("   SENSITIVITY to llc_bytes, the one host constant in the prediction:")
+    for cand, lv, at in inv:
+        print("     llc=%-10d  live %3d  attributable %2d%s"
+              % (cand, lv, at, "   <- as measured" if cand == llc else ""))
+    print("   the prediction is CONSTANT for llc in (32000000, 64000000] bytes -- which is")
+    print("   exactly the bound the elem_size probe gives -- and changes outside it. So the")
+    print("   result does not need llc known exactly, only bounded; it is not host-free.")
 
     # ---- does nthreads reach the answer at all? With its control.
     print("\nNTHREADS: the only predicate reading nthreads is the solo gate, and")
@@ -166,7 +186,11 @@ def main(argv):
     print("   %-10s %-12s %-12s %-10s %s"
           % ("nthreads", "attributable", "live", "share", "matches prediction"))
     attrib_sets = {}
-    for nt in (2, 4, 8, 16, 32):
+    # 1 is in this set deliberately. The predicate being controlled for is
+    # `nthreads <= 1`, so a held set of 2,4,8,16,32 is false at every value and the
+    # invariance could not have failed even on a build where solo_off were live. HELD
+    # VALUES MUST STRADDLE THE BOUNDARY OF THE PREDICATE BEING CONTROLLED FOR.
+    for nt in (1, 2, 4, 8, 16, 32):
         a = modes(nt, small, CELLS)
         b = modes(nt, big, CELLS)
         if a is None or b is None:

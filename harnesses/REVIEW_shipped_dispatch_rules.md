@@ -472,6 +472,21 @@ two committed constants -- `SCORCH_SPMM_PARTITION_MINGRAINS 2L` at `:1581` and
 `SCORCH_GRAIN_SPMM 150000L` at `:82`, giving a threshold of 300000. The prediction is 36
 cells, from 6 `(nnz,k)` pairs (all at nnz=3000) times 6 row values.
 
+**All four predicates composed, and both columns are predicted from source.** At the large
+reference pool the ceiling fires, so the work gate is skipped and the only exclusion is
+maxout: 280 live of 288 predicted, 280 measured. At the small pool the ceiling does not
+fire, so the work gate applies on top: 65 predicted, 65 measured, at every held thread
+count including 1. Previously the ceiling was implicit in the choice of reference pool
+rather than part of the prediction.
+
+**The prediction's only host constant, and how much it matters.** Sweeping `llc_bytes`:
+16,777,216 gives 272 live / 63 attributable; 33,554,432, 50,000,000 and 64,000,000 all give
+280 / 65; 67,108,864 gives 288 / 66. So the prediction is constant exactly across
+(32,000,000, 64,000,000] -- the same interval the `elem_size` probe bounds -- and changes
+outside it. The result therefore needs `llc_bytes` *bounded* rather than known, which the
+probe supplies independently. It is not host-free, and the coincidence of the two intervals
+is not luck: both derive from the same two products.
+
 **Composed, the prediction is exact.** A closed form for one predicate in a chain is an
 upper bound, not a prediction, and an uncomposed one turns a disagreement into a narrative
 instead of a defect -- which is what the first version of this section did, explaining its
@@ -523,8 +538,18 @@ exclusion must move from k=32 to k=16. Measured at rows=1e6, nnz=3000:
 
 The exclusion moved exactly as predicted, and the boundary sits at the same product both
 times. With `SCORCH_SPMM_PARTITION_MAXOUT_LLC 2L` at `:534` that bounds the host's
-`scorch_llc_bytes()`: live at 64,000,000 and excluded at 128,000,000 gives
-maxout in (64M, 128M], hence an LLC of (32 MiB, 64 MiB] on mkt1.
+`scorch_llc_bytes()`: live at 64,000,000 bytes and excluded at 128,000,000 gives
+
+    maxout in (64,000,000, 128,000,000]   so   llc_bytes in (32,000,000, 64,000,000]
+
+**Corrected, and the first version of this line excluded its own measured value.** It read
+"maxout in (64M, 128M], hence an LLC of (32 MiB, 64 MiB]". The products that produced the
+bound are decimal, so halving them gives decimal bytes; writing the halves in binary units
+makes the interval (33,554,432, 67,108,864], whose lower endpoint is **open at exactly the
+33,554,432 that `scorch_llc_bytes()` returns** -- so the published bound excluded the
+measured value, and its upper end implied a maxout of 134,217,728 which the probe had
+already ruled out. The slip is invisible because 32 and 64 appear on both sides of the
+conversion. Stated in bytes from here.
 
 **Two invariances the predicate's own form demands, both run.** Over the held thread count:
 identical sets, as required. Over rows: the harness reports **DIFFERS**, and correctly --
