@@ -2045,8 +2045,19 @@ remaining differences are only the two already recorded: 6 basenames and 16 dupl
 > **3368**: 4594 MKT paths minus 1226 matched, exactly as it must be, since redwood's other 3358
 > keys use forms that cannot exact-match a uniformly-qualified list. So the true claim is
 > **one-sided containment** -- redwood's qualified subset is contained in MKT's key set -- not a
-> bijection. **Print all three `comm` sides, or the output cannot rule out that the second input
-> was empty, substituted, or the first input again.**
+> bijection.
+>
+> **And the rule I first wrote from this -- "print all three `comm` sides, or the output cannot
+> rule out what the second input was" -- is itself false.** The three sides satisfy two identities,
+> `left_only + common = |A|` and `right_only + common = |B|`, so the third column adds exactly one
+> new number, `|B|`, and nothing else. "Exactly as it must be" was the concession. Against the
+> three failure modes: an **empty** second input is excluded by the common count being 1226 rather
+> than 0, not by the third column; a **substituted** second input with 4594 lines and 1226 matches
+> produces identical output in all three columns; and a **self-comparison** is separated only by
+> `|B|`, 4584 against 4594, which is identification by **cardinality, not identity** -- the same
+> weakness as a log line reading `corpus 3820 matrices`. It is a partition identity of the same
+> shape as `ahead = n - behind - band`, where the total summing correctly let a misrouted cell
+> through.
 
 **The basename comparison -- which the finding above rests on -- is unchanged.** It was correct,
 and is now correct for a checkable reason rather than by luck.
@@ -2147,3 +2158,67 @@ generated lists are relative to the `ss` directory. Group-qualified entries are 
 are 3-component in the census and 2-component generated, both 3358. Each label is right in its own
 frame, and the two are not comparable without naming which. Verified: my list has 1226 three-
 component and 3358 two-component keys.
+
+### What actually discriminates: the CONTENT of the 3368, derived then summed
+
+A peer proposed a decomposition whose terms come from the basename census and the 7/8 mirror
+partition, with no merge involved, and it is falsifiable by a form census of the MKT-only keys.
+Measured:
+
+| MKT-only keys whose basename is in | count | predicted |
+|---|---|---|
+| redwood's **group-qualified** class | **8** | 8 |
+| redwood's **non-qualified** class | **3360** | 3352 + 8 |
+| neither | **0** | 0 |
+
+8 + 3360 = 3368, and the mirror structure closes independently: the 3368 keys span 3359 distinct
+basenames, so **9** surplus paths -- which is 1 + 8, not 16, for a reason that confirms the
+partition rather than complicating it. Where redwood stores a mirrored basename **qualified**, its
+own path matches MKT and only the twin is MKT-only, so the 6 pairs contribute 1 each and `pwt`'s
+triple contributes 2: 8 keys over 7 basenames, 1 surplus. Where redwood stores one **flat**, its
+2-component form matches neither MKT path, so **both** are MKT-only: 8 pairs, 16 keys over 8
+basenames, 8 surplus.
+
+**This is a bijection claim with nothing left over because the terms were derived independently and
+then summed -- not because a subtraction forced them to**, which is the difference between it and
+the claim retracted above.
+
+## The backstop job's gate was the defect this document had already named
+
+Job 17701571 was queued with a skip condition of `total rows >= 34380` -- a **total**, which
+`REVIEW_shipped_dispatch_rules.md` already said was insufficient in this very file: "A total is
+satisfied by one key with 6 rows and another with 12." Publishing the rule and then writing the
+violation into a control path is the failure mode this project has on record twice.
+
+**And it was worse here than in the sentinel case it repeats.** There the total was a reported
+*field*, so a wrong value at least appears in an artefact. Here it was a control-flow decision
+whose passing branch **writes nothing** -- the job would exit 0 silently and partial data would
+become complete data with no record that a check had been made.
+
+**Fixed by cancel-and-resubmit, because `sbatch` spools its own copy at submit and editing the
+staged file cannot change a queued job.** The spooled content was captured first, while the job was
+still queued, since it is unrecoverable afterwards: `scontrol write batch_script 17701571 -` gives
+`b825da8309043311`, identical to the local file, with the bad gate at line 13. Job 17701571
+cancelled; job **17701584** submitted, spooled digest `0e154a9b737704fd`, also identical to
+`harnesses/pfstream/k4dip_dlmc.sbatch` as committed here.
+
+**The new gate counts keys with exactly 9 rows and requires 3820, with zero short and zero over,
+and its passing branch is LOUD** -- the per-key census prints either way, so a skip leaves a
+record.
+
+**Shown to fire on the defect it forbids**, which a gate asserting a property the defect also has
+would not. Injecting a file with the correct total and an uneven distribution:
+
+| file | total | exactly-9 | short | over | new gate | old total gate |
+|---|---|---|---|---|---|---|
+| injected | 34380 | 3818 | 1 | 1 | **RE-MEASURE** | SKIP |
+| complete | 34380 | 3820 | 0 | 0 | **SKIP** | SKIP |
+
+Both directions: it catches the injected defect and does not wrongly refuse a complete file.
+
+**One trap inside the verification itself.** The first run of that test was executed under `zsh`,
+which does not word-split unquoted variables, so `set -- $CENSUS` produced one word and both
+verdicts were reached by `[` erroring rather than by the comparison -- reporting "catches it" and
+"wrongly refuses" for the same wrong reason. The sbatch script is `#!/bin/bash`, where splitting
+works, so the script was never affected; the *test* was. Re-run under `bash`, which is what the job
+uses, it gives the table above. **Run a verification under the interpreter the artefact declares.**
