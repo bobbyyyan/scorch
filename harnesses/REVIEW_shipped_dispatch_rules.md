@@ -874,18 +874,35 @@ theoretical null P(all 120 positive) is 10^-36.1; under C1's own observed rate, 
 Min-of-reps and median-of-reps agree to 0.005 us with comparable arm spreads, so the
 estimator choice is not carrying it.
 
-### Why, and it is in the git history rather than in the measurement
+### A proposed explanation, WITHDRAWN, and the error is worth more than the claim was
 
-`dcf2e1f` calibrated the threshold and states its separator as "the cells where the
-partition falls more than 10% behind **the shared counter**". At that commit
-`SCORCH_SPMM_PARTITION_DEFAULT` was **0** -- the shared counter was what shipped, and the
-partition was an opt-in. `dcf2e1f` also shipped the gate at `MINGRAINS` default **0**, off.
+An earlier version of this section argued that the threshold had been calibrated against a
+mode the gate does not gate. The reasoning: `dcf2e1f` states its separator as "the cells
+where the partition falls more than 10% behind **the shared counter**", and at that commit
+`SCORCH_SPMM_PARTITION_DEFAULT` was **0**, so -- the argument went -- back-stealing was not
+what "the partition" meant, and `8ccd104` introduced it when it flipped the default to 3.
 
-`8ccd104` then flipped four defaults in one commit, two of which interact:
-`PARTITION_DEFAULT` 0 -> **3** (back-stealing) and `MINGRAINS` 0 -> **2** (gate on). So the
-threshold calibrated when the alternative to mode 0 was the then-current partition was
-carried over unchanged to gate **back-stealing**, which that same commit introduced as the
-default. The gate's constant was never re-fit against the mode it now gates.
+**That is wrong, and the policy header at `dcf2e1f` says so in terms.** Its comment on the
+same macro reads: "0 = one global atomic counter, which is what ships today ...; 3 =
+contiguous home ranges with stealing from the back of a victim's range." Same number, same
+semantics, at the calibrating commit. `steal` appears 41 times in that commit's `spmm.h`.
+And its `SOLO_OFF` comment eleven lines above describes "what the `p3` arm means on the tiny
+cells partway through a study whose other arms are already measured" -- so that study had a
+p3 arm and had already measured others. `8ccd104` changed which mode SHIPS. It did not
+introduce the mode, and the contrast the gate decides was 0 against 3 before and after.
+
+The error is the generalisable part: **a default flip tells you what shipped, not what was
+swept.** A calibration grid studying a feature that is off by default must set it
+explicitly, so `PARTITION_DEFAULT 0` carries no information about which arms the study ran.
+The same commit's stated method -- "priced as its own arm first, then flipped" -- makes it
+likely that mode 3 *was* priced before being made default, which is the opposite of what the
+withdrawn argument assumed.
+
+What remains open is narrower and empirical: `dcf2e1f`'s separator column is labelled only
+"the partition", so whether it is mode 3, a pooled aggregate over variants, or the
+non-stealing partition with p3 priced separately is a question about that grid's arm labels.
+Answering it also answers the base-rate question below, since the same grid holds both. The
+grid is not readable from this tree.
 
 ### And x86 at pool <= 16 was never measured, by that commit's own account
 
