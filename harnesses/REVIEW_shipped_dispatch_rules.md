@@ -663,18 +663,33 @@ is a chosen constant of exactly the kind this project does not ship, and `bibd_1
 (66, 495) is a combinatorial design matrix -- genuinely sparse, genuinely an operator,
 and thin. The share's sensitivity to c is therefore the honest statement:
 
-| c | operands | k<=16 region | share | k=32 region | share |
-|---|---|---|---|---|---|
-| 2 (shipped) | 4446 | 2069 | **46.54%** | 1294 | **29.10%** |
-| 3 | 4438 | 2061 | 46.44% | 1286 | 28.98% |
-| 5 | 4404 | 2027 | 46.03% | 1252 | 28.43% |
-| 17 | 4326 | 1949 | 45.05% | 1174 | 27.14% |
-| 65 | 4190 | 1816 | 43.34% | 1042 | 24.87% |
-| 257 | 3953 | 1597 | 40.40% | 827 | 20.92% |
+**And the bracket must vary only the incompleteness.** The first version of this table
+swept `min(shape) >= c` over the whole corpus, which also discards every SQUARE matrix
+below c x c -- operators this very section argues are legitimate, and small ones, so they
+sit preferentially *inside* the small-nnz region being measured. At c = 17 that sweep
+removed 120 entries where only 97 thin candidates exist below 17; the excess 23 were
+square. The span it produced, 6.14 pp, measures the share and the operator definition
+moving together. Restricting the cutoff to non-square entries gives the sensitivity to
+the incompleteness alone, with the square count the naive sweep would have taken shown
+beside it:
 
-Over a 128-fold range of c the share moves 6.1 pp, so the headline figure does not hinge
-on the incompleteness. It is reported at c = 2 because that is the only value needing no
-chosen constant, with the range above as its sensitivity.
+| c | operands | k<=16 region | share | k=32 region | share | squares spared |
+|---|---|---|---|---|---|---|
+| 2 (shipped) | 4446 | 2069 | **46.536%** | 1294 | **29.105%** | 0 |
+| 3 | 4439 | 2062 | 46.452% | 1287 | 28.993% | 1 |
+| 5 | 4405 | 2028 | 46.039% | 1253 | 28.445% | 1 |
+| 17 | 4349 | 1972 | 45.344% | 1197 | 27.524% | 23 |
+| 65 | 4292 | 1918 | 44.688% | 1144 | 26.654% | 102 |
+| 257 | 4187 | 1831 | 43.731% | 1060 | 25.316% | 234 |
+
+Over a 128-fold range of c the share moves **2.81 pp** at k<=16 and 3.79 pp at k=32,
+against the 6.14 pp the contaminated sweep reported. So the headline does not hinge on the
+incompleteness, and the margin is twice what the first version claimed. The divergence
+between the two sweeps begins at c = 17 and not before, because nothing square in this
+cache has min(shape) below 5. The denominator moves with c in both (an excluded entry
+leaves numerator and denominator together), which is stated because the two conventions
+differ by over a point at the widest cutoff and a share alone does not say which was used.
+Reported at c = 2: the only cutoff needing no chosen constant.
 
 **A suffix list over-counts, which is why it is not the test.** Of the 158 entries matching
 `_(b|B|C|E|iv|x|rhs)` with `min(shape) > 1`, **70 are square** -- `LF10_E` at 18 x 18 and
