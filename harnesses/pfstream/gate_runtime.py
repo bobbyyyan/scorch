@@ -569,8 +569,12 @@ for route, ea, eb, want in ROUTES:
                     print("           %-16s rate %.4f (%3d of %3d)   exact P(all %d "
                           "positive) = 10^%.1f" % (nm, rate, cnt, nn, len(d), tail(rate)))
                 else:
-                    print("           %-16s rate %.4f (%3d of %3d)   z = %+6.2f%s"
-                          % (nm, rate, cnt, nn, z,
+                    # The theoretical row's rate is 0.5 BY DEFINITION, so printing a
+                    # fraction beside it invites a reader to check 60/121 against 0.5000 and
+                    # find a mismatch that is not one.
+                    where = "by definition" if nm == "theoretical" else "%d of %d" % (cnt, nn)
+                    print("           %-16s rate %.4f (%-13s)  z = %+6.2f%s"
+                          % (nm, rate, where, z,
                              "" if nm == "theoretical" else "  (two-proportion)"))
             # NO RELATION IS ASSERTED. Three earlier versions of this line each claimed one
             # -- that the nulls coincide, that they differ, that coinciding rates make the
@@ -580,14 +584,32 @@ for route, ea, eb, want in ROUTES:
             # spreads, measured at 2.04 apart in z on cells whose rates were identical. So
             # the only thing said here is which null BINDS, chosen on the statistic that
             # decides rather than on the rate beside it.
+            # Taking the weakest statistic across differently-constructed tests is the
+            # conservative choice and is deliberate. But the label must name the COMPARISON
+            # rather than the null, because a wider test binds at an IDENTICAL rate: when a
+            # floor's observed rate happens to equal 0.5, its two-proportion form still
+            # reads lower than the theoretical z, and calling that "the binding null"
+            # credits the null with what the estimator is doing. So the line says which of
+            # the two is carrying it.
             if unanimous:
+                # Selection is on rate alone here (max tail is max rate), so the ambiguity
+                # below cannot arise in this branch.
                 b = max(nulls, key=lambda x: tail(x[1]))
-                print("         the BINDING null is %s: least extreme exact tail, 10^%.1f"
+                print("         the BINDING null is %s: least extreme exact tail, 10^%.1f "
+                      "(selected on rate, since the tail is a function of it)"
                       % (b[0], tail(b[1])))
             else:
                 b = min(nulls, key=lambda x: x[4])
-                print("         the BINDING null is %s: smallest statistic, z = %+.2f"
-                      % (b[0], b[4]))
+                shared = [o[0] for o in nulls
+                          if o[0] != b[0] and abs(o[1] - b[1]) < 1e-12]
+                if shared:
+                    print("         the binding COMPARISON is %s, z = %+.2f -- but its rate "
+                          "equals %s, so what binds here is the TEST, not the null"
+                          % (b[0], b[4], " and ".join(shared)))
+                else:
+                    print("         the BINDING null is %s: smallest statistic, z = %+.2f "
+                          "(and its rate differs from the others, so the null is doing the "
+                          "work)" % (b[0], b[4]))
         print("       median-of-reps A-B %+8.3f us  vs min-of-reps %+8.3f  gap %+.3f "
               "CI [%+.3f, %+.3f] %s"
               % (statistics.median(dmed), statistics.median(d),

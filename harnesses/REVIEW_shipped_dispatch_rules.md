@@ -894,9 +894,13 @@ introduce the mode, and the contrast the gate decides was 0 against 3 before and
 The error is the generalisable part: **a default flip tells you what shipped, not what was
 swept.** A calibration grid studying a feature that is off by default must set it
 explicitly, so `PARTITION_DEFAULT 0` carries no information about which arms the study ran.
-The same commit's stated method -- "priced as its own arm first, then flipped" -- makes it
-likely that mode 3 *was* priced before being made default, which is the opposite of what the
-withdrawn argument assumed.
+And the inverted prior is in the same comment, in the past tense: that study is described
+as one "whose other arms are already measured". A study with measured arms, at a commit
+whose header documents mode 3 by number, makes it likely that mode 3 *was* among them --
+the opposite of what the withdrawn argument assumed. (The following sentence there, "priced
+as its own arm first, then flipped", is `SOLO_OFF`'s own prospective plan for itself, not a
+declared project method, so it is the weaker of the two citations and not the one this
+rests on.)
 
 What remains open is narrower and empirical: `dcf2e1f`'s separator column is labelled only
 "the partition", so whether it is mode 3, a pooled aggregate over variants, or the
