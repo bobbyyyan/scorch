@@ -3173,8 +3173,11 @@ check reports its own resolved count instead of quietly intersecting.
 | **100-256** | 1276 | **+2.83%** | [+2.62, +3.03] | **-11.72%** | +9.30% |
 | **256+** | 712 | **+2.13%** | [+1.90, +2.36] | **-15.60%** | +3.27% |
 
-Pooled +1.02% [+0.84, +1.20]. **Both high bands are bumps with CIs above zero, which is registered
-branch 1: the inversion is host-caused.** The 2x2 closes with both MKT cells bumps and both redwood
+Pooled +1.02% [+0.84, +1.20] -- which is forced by the four band values and their n's:
+`exp(sum n_b log(1+dip_b) / 3820) - 1` = 1.0155%. **Both high bands are bumps with CIs above zero,
+which is registered branch 1: the inversion is host-caused.** The reviewing peer had registered the
+opposite branch -- that the sign tracks the corpus, predicting a dip here -- and it is **refuted**,
+recorded as scored rather than quietly dropped. The 2x2 closes with both MKT cells bumps and both redwood
 cells dips:
 
 | | redwood | MKT |
@@ -3200,7 +3203,26 @@ hypothesis rather than one of two, and it is still not demonstrated.
 | all | 11460 | | | **9408 (82.1%)** | |
 
 **All three widths are below parity on geomean** -- even k=8, the best of them, is 5.4% slower than
-MKL. `oursb` reproduces `ours` to four decimals at every width.
+MKL.
+
+**On the `ours`/`oursb` agreement, which is this single-pass cell's only replication and therefore
+its bound.** "Reproduces to four decimals at every width" is contradicted by the table's own k=4
+row, 0.8335 against 0.8336, which differs *at* the fourth decimal. The figures, and they separate
+two things the phrase ran together:
+
+| | geomean agreement, relative | per-cell `|ours-oursb|/min`: median / p95 |
+|---|---|---|
+| DLMC k=2 / k=4 / k=8 | 0.0017% / 0.0084% / 0.0056% | 0.085 / 0.559% · 0.070 / 0.502% · 0.093 / 0.512% |
+| SuiteSparse k=2 / k=4 / k=8 | 0.0238% / 0.0023% / 0.0062% | 0.107 / **3.238%** · 0.088 / 1.424% · 0.090 / 1.730% |
+
+So the **aggregate** agreement is tight -- at most 2.26e-4 absolute, 0.024% relative, over six cells
+-- and it does **not** bound the **per-cell** spread, which has a median near 0.09% and a p95 of up
+to 3.2% on SuiteSparse. Two objects agreeing on a geomean over thousands of matrices says almost
+nothing about how well either pins one matrix. **That is the quantitative form of the "counts bound,
+geomeans do not" caveat**: a cell whose ratio sits within ~3% of 1.0 can change its behind/ahead
+label between two functionally equivalent objects, so the behind-counts are an upper bound by an
+amount this table sizes, while a geomean of 0.7195 over 3820 matrices is unaffected. Peer
+reviewer's catch; the per-cell decomposition is measured here.
 
 **The registered secondary is answered: yes, by a wide margin.** k=2's behind-MKL share is **89.8%**
 on DLMC against **61.9%** on SuiteSparse (63.1% operands-only). By band it runs 67.7% -> 94.1% ->
