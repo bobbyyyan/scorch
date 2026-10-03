@@ -247,6 +247,10 @@ echo "  base: .text $BT bytes;  symbols all $NA, rest $NR, kernels $NK, unresolv
 echo
 echo "  rest_displ is the verdict number: all symbols EXCEPT those the define may change."
 echo "  kern_displ is the same question asked of the SpMM kernels only, reported as a detail."
+echo "  ovx_mvd    is how many EXCLUDED symbols moved for this arm -- the bounded set in which an"
+echo "             over-exclusion could matter. Names are in <root>/<tag>/overexcluded.txt; every"
+echo "             member should be a float64 instantiation, and any float32-path name there is a"
+echo "             finding. Measured on ship vs rvec: 31 of 31 are float64 instantiations."
 echo
 printf "  %-5s %-9s %12s %11s %6s %6s %10s %10s  %s\n" \
   tag axis text_bytes delta rest kern rest_displ kern_displ verdict
@@ -269,6 +273,13 @@ for tag in $TAGS; do
   fi
   read -r JR DR <<<"$(rvlf_disp "$ROOT/base/sym.rest" "$ROOT/$tag/sym.rest")"
   read -r JK DK <<<"$(rvlf_disp "$ROOT/base/sym.kern" "$ROOT/$tag/sym.kern")"
+  # OVER-EXCLUSION, MEASURED PER ARM. |excluded| is the wrong quantity -- an over-excluded symbol
+  # that never moves changes no displacement count. The ones that can change a verdict are those
+  # that MOVED for this arm, and that set is bounded by what the define perturbed, so it is short
+  # enough to read. Written to a file rather than summarised, because the question it answers is
+  # "is any of these a float32-path name", which only the names can answer.
+  rvlf_overexcluded_moved "$ROOT/base/sym" "$ROOT/$tag/sym" > "$ROOT/$tag/overexcluded.txt"
+  read -r OE OM OB <<<"$(head -1 "$ROOT/$tag/overexcluded.txt")"
   # THE INVARIANT THAT CATCHES A CROSS PRODUCT. With one row per name the join cannot exceed the
   # smaller table. Checked rather than assumed, because this exact failure has now occurred twice
   # in this script from two different causes and both times produced a plausible number.
@@ -291,8 +302,8 @@ for tag in $TAGS; do
   else
     V="brackets from below"
   fi
-  printf "  %-5s %-9s %12s %11s %6s %6s %10s %10s  %s\n" \
-    "$tag" "$AX" "$T" "$((T-BT))" "$JR" "$JK" "$DR" "$DK" "$V"
+  printf "  %-5s %-9s %12s %11s %6s %6s %10s %10s %8s  %s\n" \
+    "$tag" "$AX" "$T" "$((T-BT))" "$JR" "$JK" "$DR" "$DK" "$OB" "$V"
 done
 echo
 echo "Keep the candidates whose verdict is not UNUSABLE and whose deltas STRADDLE $TARGET_DELTA."

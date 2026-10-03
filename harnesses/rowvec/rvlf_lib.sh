@@ -43,7 +43,23 @@ rvlf_pick_demangler() {
 }
 
 RVLF_KPAT='scorch_spmm_row_(narrow_exact|narrow_rowvec|regblock|gather)<(float|scalar_t)|spmm_csr_v2_core<float'
-RVLF_XPAT='double|_f64|F64|<double'
+# MATCHES A FLOAT64 INSTANTIATION, NOT THE STRING "double". A first version was
+# `double|_f64|F64|<double` -- in which the `<double` branch is subsumed (anything matching it
+# contains `double`) so it read as adding template-argument specificity while adding nothing, and
+# the operative branch matched `double` as a substring ANYWHERE. Measured, that over-excluded real
+# float32 code:
+#
+#   scorch_sparse_softmax_csr_float(at::Tensor, at::Tensor, double, int)
+#   scorch_sparse_attention_csr_float(at::Tensor, ..., double, int)
+#
+# float32 kernels whose SCALE PARAMETER is a double, plus their OpenMP outlined bodies. Matching
+# the instantiation forms instead puts them back in `rest` (5 attention entries, from 0) while
+# every float64 instantiation stays excluded -- checked by name, not assumed.
+#
+# `_f64` and `F64` match zero symbols in this object. They are kept because they cost nothing and
+# a future constant could use that spelling, but they are inert today and should not be read as
+# doing work.
+RVLF_XPAT='<double|_double|double const[*]|double[*]|_f64|F64'
 
 # ONE ROW PER NAME, CARRYING ITS SORTED ADDRESS LIST. A name<TAB>addr table is NOT join-safe:
 # `nm` emits 1190 lines for 1093 distinct names here -- 83 names repeat, from weak and local
@@ -106,4 +122,44 @@ rvlf_join_check() {  # $1 base table  $2 tag table -> prints REFUSE... or OK joi
     echo "REFUSE: join matched 0 names -- not a null displacement"; return 1; fi
   echo "OK joined=$j displaced=$d"
   return 0
+}
+
+
+# OVER-EXCLUSION, MEASURED RATHER THAN ARGUED. XPAT matches `double` as a substring anywhere, so a
+# float32 symbol carrying it incidentally -- a `std::vector<double>` parameter, a
+# `duration<double>` in a timing helper, a `double`-returning clock, or `F64` inside a constant
+# name -- silently leaves `rest`.
+#
+# The obvious check is the wrong one. Filtering `grep -E 'double' | grep -v '<double'` to "find the
+# incidental ones" DISCARDS them: `vector<double>` and `duration<double>` both contain the string
+# `<double`, so the second grep removes precisely the cases being hunted while keeping only
+# bare-`double` names like a clock helper.
+#
+# And |excluded| is the wrong QUANTITY. An over-excluded symbol that never moves costs nothing --
+# its absence from `rest` changes no displacement count. The over-exclusions that can change a
+# verdict are exactly those that MOVED for that arm, and that set is bounded by what the define
+# actually perturbed, so it is small by construction and short enough to read by eye.
+#
+# Unlike a name-based filter this cannot be silently incomplete: it enumerates over the symbols
+# present rather than over the patterns someone thought to write -- the same reason the
+# hand-written coreId/coreIf rule was replaced by an assertion.
+#
+# Scope, so this is not over-sold: `rest` feeds only the refusals, the verdict and the printed
+# row. This script times nothing -- the floor is measured in a later job over whatever arms
+# survive selection -- so the failure mode here is LOSING A USABLE ARM, never biasing a number.
+rvlf_moved() {  # $1 base .all  $2 tag .all -> names whose address SET differs
+  LC_ALL=C join -t"$RVLF_TAB" -j 1 -o 1.1,1.2,2.2 "$1" "$2" \
+    | awk -F"$RVLF_TAB" '$2 != $3 { print $1 }' | LC_ALL=C sort
+}
+
+rvlf_overexcluded_moved() {  # $1 base prefix  $2 tag prefix  -> prints the count then the names
+  local w; w=$(mktemp -d)
+  # excluded = all minus rest, on the BASE side (the reference population)
+  LC_ALL=C comm -23 <(cut -f1 "$1.all" | LC_ALL=C sort) \
+                    <(cut -f1 "$1.rest" | LC_ALL=C sort) > "$w/excluded"
+  rvlf_moved "$1.all" "$2.all" > "$w/moved"
+  LC_ALL=C comm -12 "$w/excluded" "$w/moved" > "$w/both"
+  echo "$(wc -l < "$w/excluded") $(wc -l < "$w/moved") $(wc -l < "$w/both")"
+  cat "$w/both"
+  rm -rf "$w"
 }
