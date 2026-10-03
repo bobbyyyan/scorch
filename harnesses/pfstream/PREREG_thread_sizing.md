@@ -1864,7 +1864,7 @@ registered verdict turned on *"four of the six non-behind keys sit at `<=2`"*.
 
 ### Confirmed at the source, and the confounding is near-total
 
-`an_xtab_resolved_behind.py` at `6a1dd1…` now counts liveness the way `nt_k2curve.py` does —
+`an_xtab_resolved_behind.py` at `db9b303887050e68` now counts liveness the way `nt_k2curve.py` does —
 distinct `resolved` values for the cell across every override row — and prints both tables:
 
 | | `<=2` | `3-7` | `>=8` |
