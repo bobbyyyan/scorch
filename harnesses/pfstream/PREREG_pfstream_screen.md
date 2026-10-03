@@ -3708,6 +3708,12 @@ MKT's f32/DLMC floor read as pathological — does not follow MKT around.
 
 MKT f64, paired against the floor, n=418 per width:
 
+> **HOST/n INCONSISTENCY, amendment 53(b), unresolved.** This width set {2,4,6,8,10,12,16} with
+> ~418 keys is what `chain212-dlmc-f32-p1/PROVENANCE.rev7.md` identifies as the **redwood**
+> float64 run (417 keys), and it flags **418** as the pre-exclusion count that stale harness
+> references still carry. Either the host label or the n here is wrong. The CSVs are not in the
+> sealed ledger, so quote the +0.429% with the host unstated until it is settled.
+
 | k | median d | CI95 | verdict | deficit cells at this width |
 |---|---|---|---|---|
 | **2** | **+0.429%** | **[+0.274, +0.611]** | **SLOWER than floor** | **129 of 192** |
@@ -4210,6 +4216,9 @@ thesis needs. **Stated at the column level: exactly one of five widths contains 
 | 0.9574 | **1.0987** | 0.9491 | 0.8179 | 0.7699 |
 
 `1.0987/0.9574 = 1.1476` and `1.0987/0.9381 = 1.1712`, so at degree ≥256 the half-vector width is
+> **SUPERSEDED BY AMENDMENT 53(a).** The figures in this table and the sentences quoting them are
+> ratios of two BAND MEDIANS, which pair nothing. Paired within a cell the contrasts are
+> +14.62% and +11.83% against floor contrasts of 0.92% and 0.91% — 15.8× and 13.0×.
 **14.8% and 17.1% worse than its two immediate width neighbours** — three adjacent widths, three
 different kernels, one host, the same matrices and the same readings. **That contrast is immune to
 the 12-against-16 reading difference entirely**, because it never compares across screens.
@@ -4432,6 +4441,9 @@ and the shuffled arm order argues against the analogous transfer for the arm flo
 | claim at degree ≥256 | observed | floor | ratio |
 |---|---|---|---|
 | k=4 exceeds 1.0 | 9.87% above 1.0 | **4.51%** | **2.2×** |
+> **SUPERSEDED BY AMENDMENT 53(a).** The figures in this table and the sentences quoting them are
+> ratios of two BAND MEDIANS, which pair nothing. Paired within a cell the contrasts are
+> +14.62% and +11.83% against floor contrasts of 0.92% and 0.91% — 15.8× and 13.0×.
 | k=4 against k=8 | 1.1712 (17.1%) | 1.0148 (1.5%) | **11.6×** |
 | k=4 against k=2 | 1.1476 (14.8%) | 0.9925 (0.75%) | **19.7×** |
 
@@ -4535,3 +4547,123 @@ is `(arm − base)/base − (floor − base)/base` with `base = ship`, `floor = 
 objects — so the duplicate baseline enters as a **subtracted second term**, not as the denominator.
 **The conclusion is unaffected and is in fact slightly stronger than the description**: the residual
 is a difference of two independent object offsets rather than one.
+
+---
+
+## Amendment 53 — the width contrast was a ratio of two band medians, not a paired statistic; and the one local arm-screen ledger is not the one that can carry the three-contrast bound
+
+Two things, both arising from checks against a peer's findings 149 and 150. The first corrects a
+number I published. The second corrects a claim I was about to publish.
+
+### (a) `S(4)/S(X)` — the disagreement was reduction order, and the paired form is the right one
+
+Finding 149 reported `S(4)/S(X)` = 1.1476 / 1.1711 / 1.3433 / 1.4271 for X = 2/8/16/32 at mean
+degree ≥ 256; I had read 1.1611 / 1.0885 / 1.2720 / 1.3629 from the same CSVs while agreeing
+exactly on `R_ours` and `R_mkl`. Neither column was the paired statistic, and that is the whole
+explanation:
+
+- the published figures are **ratios of two band medians** — `median(S at k=4) / median(S at k=X)`,
+  which pairs nothing and lets a cell present at one width and absent at the other move the answer;
+- my figures were medians of a per-cell ratio computed over a key set that differed by width.
+
+`S(4)/S(X) = R_ours/R_mkl` is an identity **inside one cell**. It does not survive either
+reduction, and the gap between the two columns is the size of that non-survival rather than a
+disagreement about any measured quantity. Recomputed as a contrast paired within a cell — each
+key contributing the ratio-of-ratios separately for each of the two same-configuration objects:
+
+| pair | observed | excess | 95% CI | A/A floor on the SAME contrast | ratio |
+|---|---|---|---|---|---|
+| 4 vs 2 | 1.1462 | +14.62% | [+13.64, +15.67] | +0.92% | 15.8× |
+| 4 vs 8 | 1.1183 | +11.83% | [+10.34, +12.92] | +0.91% | 13.0× |
+| 4 vs 16 | 1.2850 | +28.50% | [+25.75, +30.56] | +1.22% | 23.4× |
+| 4 vs 32 | 1.3872 | +38.72% | [+36.47, +41.49] | +0.97% | 40.1× |
+
+n = 712 keys, redwood DLMC float32, chain207. The floor column is the same contrast's ratio
+between the two byte-identical objects, so it is an A/A **of the contrast** rather than of the
+underlying ratio — the right comparator, because the contrast is what the claim quotes.
+
+**What changes.** The k=4 claim stands and its two neighbour comparisons both tighten in
+construction while one shrinks in size: the 4-vs-8 figure falls from the **17.1%** I published to
+**11.83%**, and the 4-vs-2 figure from 14.8% to 14.62%. The floor contrasts I quoted as 0.75% and
+1.5% become 0.92% and 0.91%, so the margins are 15.8× and 13.0× rather than 19.7× and 11.6×.
+**Supersedes** the "14.8% / 17.1% against 0.75% / 1.5%" sentence wherever it appears above.
+
+The identity is also what makes finding 149's framing correction right: the step is almost entirely
+on the k=2 side of our own curve (`R_ours` 1.1101 at X=2) and on the k=8 side of MKL's
+(`R_mkl` 0.8958 at X=8), so a `spmm_halfvec=0` arm moves `R_ours` only and its k=8-side contrast
+partly reads a quantity the intervention cannot touch. That re-read is registered and unchanged.
+
+### (b) The three-contrast bound finding 150 proposes is correct in construction and cannot be run on the ledger that is local
+
+Finding 150's static claims check out, and I verified each rather than taking it on report:
+
+- `SCORCH_SPMM_REGBLOCK_PFSTREAM` has exactly two source sites, `spmm.h:2259` (defining the
+  `SCORCH_SPMM_PFLIM` parameter) and `spmm.h:2295` (the body), plus the `#ifndef` default at
+  `scorch_policy.h:738-739`. `SCORCH_SPMM_PFLIM` has four **call** sites — `spmm.h:4884`, `:4885`,
+  `:6346`, `:6347`, and additionally `:4970` and `:4974`. All six call `scorch_spmm_row_regblock`,
+  so the conclusion holds: both macros are regblock-only.
+- `SCORCH_NARROWK_EXACT_MINDEG` ships at `0L` (`scorch_policy.h:561-562`), so the exact kernel's
+  `nnz_total < mindeg * A0_size` decline at `spmm.h:4190` cannot fire in a release build. Finding
+  150 is right that this is the proof and not a gloss.
+
+**One refinement the message does not name, and it is the load-bearing one.** `:4970` and `:4974`
+are the *half-vector* instantiation, and `halfvec_exact = (B1_size == LH)` is **true** at double
+k=2 on AVX2, where `scorch_simd_half<double>::lanes == 2`. That block sits *ahead* of the
+exact-width kernel (`spmm.h:4896`, and the comment at `:4893-4895` says so: "HALFVEC=1 is the exact
+half-vector width (float k=4, double k=2)"). So the control is inert at f64 k=2 for **two**
+reasons, not one, and the second is a shipped constant rather than a dispatch order:
+`SCORCH_SPMM_HALFVEC_F64` ships at **0** (`scorch_policy.h:1514-1515`). The registration already
+says this (`:542`, "two independent mechanisms keep it inert"), so nothing is overturned — but the
+dependency is on a value that `spmm.h:4127` makes a **runtime** read under `SCORCH_TUNE_HOOKS`, and
+these are hooks builds. Verified: no pfstream script sets `SCORCH_SPMM_HALFVEC`. The control
+survives; it has one more precondition than the message's argument gives it.
+
+**Then the construction itself.** I ran it, and the run is reported here as a defect in my own
+reading rather than as a result. The only arm-screen CSVs in the sealed ledger are
+`chain212-dlmc-f32-p1/ss64_{ship,shpb,strm,nopf}_p1.csv`. I read them as float64 from the `ss64_`
+prefix. **That is exactly what that ledger's own provenance forbids** — `PROVENANCE.rev7.md`,
+section "why the filenames must not be trusted": the names predate the CORPUS/PREFIX parameters and
+are byte-identical to what redwood was concurrently writing for a different corpus *and a different
+dtype*. The discriminators it supplies settle it against me: the keys are four-component DLMC keys,
+and the width set is {2,8,12,16,20,24,32}, which the file identifies as **MKT float32**; the
+float64 run is the concurrent **redwood** one at {2,4,6,8,10,12,16}.
+
+So the numbers below are MKT **float32** DLMC, pass 1 of 4, a partial superseded by a completed
+run. At f32 k=2 the arms are still inert — `narrow_exact` owns float32 k ∈ {1,2,3}, and
+`halfvec_exact` is at k=4 for float32 with `halfvec_under` requiring `spmm_halfvec >= 2` where it
+ships at 1 — so the construction is valid on this grid; it is the dtype label that was wrong.
+
+| contrast at the inert k=2 | location | 95% CI | |
+|---|---|---|---|
+| `shpb − ship` (**byte-identical pair**) | +1.225% | [+0.700, +1.565] | excludes 0 |
+| `nopf − shpb` | +1.439% | [+1.159, +1.571] | excludes 0 |
+| `strm − shpb` | −1.251% | [−1.547, −0.962] | excludes 0 |
+| `strm − nopf` | −2.362% | [−2.616, −2.142] | excludes 0 |
+
+n = 392 keys matched across all four objects, one reading per key.
+
+**The bound is not reachable from these.** The pair whose objects are required to be byte-identical
+in `.text` (`pfs_build.sh:174-176`) reads **+1.225% excluding zero** here, which is the same
+positive MKT-f32-DLMC offset amendment 44 already reported at up to +1.735%. With one pass per
+object, each arm is one process launch, so a process-level offset of that size is indistinguishable
+from a layout offset of that size — and the three object contrasts, at 1.25% to 2.36%, are 1.0× to
+1.9× the floor they would have to clear. Finding 150's construction needs the multi-pass **float64**
+ledger, and no `nopf` CSV other than this one exists under `~/.cache/scorch-codex`. So the 0.429%
+threshold is neither corroborated nor widened by anything I can read locally.
+
+**A labelling defect in amendment 44, found on the way and not settled.** Its table is headed "MKT
+f64, paired against the floor, n=418 per width" over widths {2,4,6,8,10,12,16}. chain212's
+provenance identifies that width set together with ~417 keys as the **redwood** float64 run, and
+flags **418** specifically as the pre-exclusion corpus count that stale harness references still
+carry (`Pothen/barth4` was excluded on a measured shape disagreement between the hosts). Either the
+host label or the n in that table is wrong. The underlying CSVs are not local, so I am recording
+the inconsistency rather than resolving it, and the +0.429% should be quoted with the host
+unstated until it is.
+
+### Registered, unchanged
+
+The re-read rule from amendment 44 stands as written — report each width's `|d|` beside the k=2
+control and treat any width whose CI does not exclude ±0.429% as unreadable rather than null — with
+finding 150's caveat accepted: the magnitude is an extrapolation across a kernel boundary, and the
+direction of the error is conservative, because the layout artefact is largest at the narrowest
+width and k=2 is the narrowest.
