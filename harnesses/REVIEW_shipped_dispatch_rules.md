@@ -83,6 +83,33 @@ first call for the process. **Thread count is not the variable.** Adding `nthrea
 would partition the cache without changing a decision, because there is no thread-dependent
 decision to protect; the defect is the probe's width resolution.
 
+**The structural form of that claim, which holds on every host rather than on the four thread
+counts swept.** The sweep establishes equivalence over the levels and the one host it covered. A
+census of which decision signatures *accept* a thread count settles it everywhere:
+
+    _signature(a, N)            _panel_width(N, C)
+    _eligible(J, nnz, N, C)     _eligible_learned(J, N, C)
+
+None takes a thread argument, and parsing their bodies gives **zero `global` statements and zero
+`os.*` reads in all four** -- so the dependence cannot enter through a module global or an
+environment read either, which is the residual a signature census alone would leave open. `C` comes
+from `query_llc()` (`:358-405`): it reads `SCORCH_LLC_BYTES`, `platform.system()`, sysctl and
+sysfs, caches into `_llc_bytes`, and is the **whole** LLC, never divided by a worker count. `nt` is
+`nthreads if nthreads is not None else -1` (`:1517`) and reaches `_dispatch_decision`,
+`_tilej_args`/`_tileijk_args` and `baseline_fn(nthreads)` -- the executor and the caller's
+baseline, never a decision.
+
+**The one thread-related read in the file, named rather than left implicit.** `os.cpu_count()`
+occurs exactly once, at `:883` inside `_machine_id()`. That is a host-identity hash selecting
+*which* learned spec loads, not a per-call thread count entering a per-call decision, so it leaves
+eligibility and panel width thread-independent. It is the only hit in the file for
+`get_num_threads|cpu_count|OMP_NUM_THREADS|sched_getaffinity`.
+
+The census is the stronger half, and the sweep is still worth having: neither a signature list nor
+a body parse can see a dependence entering below the pybind boundary in C++, which only measurement
+reaches. The structural claim is the peer reviewer's; the body parse, the `query_llc` reading and
+the `cpu_count` exception are mine.
+
 **The cost, with the base named, because the base inverts the ranking.** Timing each pick by
 seeding the memo and calling the production entry, two interleaved passes per pick, M5 at nt=6:
 
@@ -1797,7 +1824,11 @@ not evidence for k=4.
 ## The same ranks on the {2,4,8} subset, computed before MKT's result lands
 
 MKT's screen measures three widths, {2, 4, 8}. Restricting the two rows above to those three
-columns, so that a three-width rank from MKT is never cross-quoted against a five-width one:
+columns, so that a three-width rank from MKT is never cross-quoted against a five-width one.
+**Independently co-registered**: the peer reviewer registered the same restriction first, in the
+same six figures and with the same cross-quoting warning, and recomputed the ranks under the
+higher-is-better reading as SS [2,4,8] and DL [8,2,4]. Two independent derivations agreeing digit
+for digit is worth more than either alone, and this paragraph is not a correction to theirs:
 
 | | normalised values, k=2 / k=4 / k=8 | k=4's rank |
 |---|---|---|
@@ -1813,8 +1844,12 @@ DLMC one.
 0-32 band. Recomputing DLMC's ordering from a different base *and* the opposite convention -- the
 `chain207-dlmc-redwood` degree-band table, median ours/mkl where lower is better, deg>=256 over
 deg 16-64 -- gives k=8 1.0743, k=2 1.0755, k=4 1.2154. Same ordering, so **k=4 last on DLMC is
-base-robust**. The k=2-versus-k=8 ordering is **not**: 7.0 pp apart under this base, 0.11% apart
-under that one. Only k=4's position should be carried across bases.
+base-robust**. The k=2-versus-k=8 ordering is **not**, and the separation is stated in one unit
+because the two bases use opposite conventions: as a **difference** between the two widths' values
+it is 7.000 pp under this base against 0.120 pp under that one, **58x**; as a **ratio minus one**,
+11.93% against 0.112%, **107x**. Either form supports the conclusion. A mixed pair -- "7.0 pp
+against 0.11%" -- reads as 64x, which is neither, and a later citation would pick whichever
+reading suited it. Only k=4's position should be carried across bases.
 
 ### One feature of the SuiteSparse sequence a width-specific account does predict
 
