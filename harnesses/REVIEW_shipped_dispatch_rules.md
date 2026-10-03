@@ -1806,7 +1806,7 @@ matrices, 4000 resamples:
 |---|---|---|---|---|
 | 0-32 | 4167 | -2.82% [-3.40, -2.22] | 1051 | **+0.95%** [+0.61, +1.31] |
 | 32-100 | 308 | -6.13% [-7.58, -4.60] | 781 | -2.39% [-3.01, -1.74] |
-| 100-256 | 58 | **-11.23%** [-14.13, -8.57] | 1275 | **-11.72%** [-12.55, -10.85] |
+| 100-256 | 58 | **-11.23%** [-14.13, -8.57] | 1276 | **-11.72%** [-12.59, -10.85] |
 | 256+ | 51 | **-9.66%** [-12.45, -6.80] | 712 | **-15.60%** [-17.24, -13.90] |
 
 Sign counts at 100-256 are 51 of 58 and 1083 of 1275. Every interval excludes zero, the two
@@ -3048,7 +3048,14 @@ both bases — or the two shares are differently defined and not comparable.
 become the primary one and the band-matched registration quoted `-15.60`.** Two tables in one
 document giving different `n` for one band, the later claiming primacy and the earlier still
 carrying the superseded pair. Fixed at `:1810`, not by appending a note: it now reads
-`712, -15.60% [-17.24, -13.90]`. Peer reviewer's finding, and the **fourth** time this session a
+`712, -15.60% [-17.24, -13.90]`. **And the row above it was stale for the same reason and was missed
+on the first pass** -- `:1809` carried `1275 | -11.72% [-12.55, -10.85]` where the exact column gives
+`1276 | [-12.59, -10.85]`. I fixed one row of a two-row table and reported it as done, which is the
+same failure one more time; it was found by sweeping every rounded-column figure in the file and
+classifying each hit, not by being told. Of the eight hits, seven are legitimate: the side-by-side
+comparison at `:2091-2092` and the shift table at `:2149-2150` exist to show both columns, `:2881`
+and this section name the superseded pair deliberately, and `:2154`/`:2180` are per-seed bootstrap
+values that only resemble it. Peer reviewer's finding, and the **fourth** time this session a
 correction failed to reach every site -- after the withdrawal 77 lines below its claim, the "two of
 three" sentence under its rebuilt table, and the `:466` citation inside a list asserting all 27 were
 re-resolved.
