@@ -991,9 +991,10 @@ Measured per configuration, against the larger of that cell's own two controls:
 | 8 | 1765x | 6416x | 3856x | 2284x |
 | 16 | 12185x | 3675x | 1200x | 377x |
 
-The minimum is **227x** at pool 2, k=8. The upper end is not a stable quantity -- a floor
-that happens to land near zero inflates the ratio without saying anything -- so the claim
-is the minimum. Note that the published 100-to-1000 figure was wrong in *both* directions:
+The minimum is **227x** at pool 2, k=8. The upper end is not a stable quantity: the largest
+entries divide by floors of 0.001-0.002 us, which is a timer quantum rather than a
+measurement, and a ratio against a quantum is one over the quantum. The claim is the
+minimum. Note that the published 100-to-1000 figure was wrong in *both* directions:
 arrived at by an invalid method, and understating the measured separation by an order of
 magnitude at the top. It needed correcting irrespective of which way it moved.
 
@@ -1012,9 +1013,23 @@ A reading at or above pool 8's level would mean the turn is not a trend. And the
 supplies a prior for it at `:1600`: its pool-24 anchor is 0.785, which in this file's
 time-ratio convention is **1.274** -- below pool 16 and consistent with a continuing
 decline. Different host and different population, so suggestive rather than matched.
-The header's own `:1605-1612` says the same thing a second way: with the ceiling disabled
-so the gate fires at pool 24, "that is the configuration x86 measured at 4-9% cost" -- same
-sign as this whole table, far below the pool 8 peak.
+The header's `:1605-1612` carries a second x86 cost figure, "that is the configuration x86
+measured at 4-9% cost" -- same sign as this whole table and far below the pool 8 peak. But
+it is **not an independent source**: `git log -S` places both it and the 0.785 in
+`3b676df`, which closes "Both knobs stay off until the crossed grid runs on both", so its
+4-9% predates the crossed grid that `8ccd104` reports as 7.0% and 8.5%. Those two values
+lie inside 4-9, both are described as the whole x86 corpus ungated, and neither message
+states its grid -- consistent with two grids and equally consistent with one corpus
+summarised twice, in mild tension with `8ccd104`'s "uniformly at every k". So the honest
+count is **two commits with independence not established**, not three sources. This sweep
+is independent of both.
+
+`3b676df` also settles the slash direction from the figure's own commit rather than from
+the clause around it: "the counter wins 1.0303 -- while every home-range variant loses (no
+stealing 0.9826, front-stealing 0.9682). On redwood the same comparison is 0.785 **the
+other way**." The counter winning at 1.0303 and the partition winning at 0.785 are both
+true under exactly one reading, a performance ratio, which converts to 1.274 in this file's
+time-ratio convention.
 
 **One qualification the gate's own criterion supplies.** `dcf2e1f` defines materiality as
 "falls more than 10% behind". At pool 2 all four ratios -- 1.068, 1.099, 1.077, 1.086 --
@@ -1028,6 +1043,24 @@ winning at pool 6 -- is an ARM reading, identified by `8ccd104`'s test line and 
 redwood"). Nothing in the header claims the counter wins at low pool on x86, which is the
 row that was empty. Pool 6 is not measured here; it lies between pool 4 at +3.75 us and
 pool 8 at +14.12 us, both positive.
+
+### Why the gate reaches x86 at all: the ceiling is a two-host discriminator
+
+`3b676df` states the design in terms: "the resolved worker count is 24 on redwood and 6 on
+the M5, because the composition adoption takes the caller's pool, so a ceiling anywhere in
+**7..23** lets the gate fire on one host and not the other." And the header at `:1605-1612`
+gives the purpose: "A ceiling between the two pools makes the gate PROVABLY INERT on the
+larger host."
+
+So 16 was not chosen as a pool threshold with a measured crossover behind it. It was chosen
+to separate two specific machines by their resolved worker counts, and any value in 7..23
+separates them equally well. Every one of those values also admits **x86 at a worker count
+below the ceiling** -- a configuration that is neither of the two hosts the ceiling was
+built to distinguish, and that appears in no grid either commit reports.
+
+That is an account of why the predicate's reach exceeds its evidence, and it is a reading
+of the two commits rather than an inference. It is still not a cause of the regression
+measured above: it explains why nobody had looked, not why mode 0 is slower when they do.
 
 ### The apparatus checked its own premises on these runs
 
