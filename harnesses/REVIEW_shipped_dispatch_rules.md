@@ -3684,8 +3684,66 @@ which moves `.text` by 90272 bytes. It would therefore understate the artefact r
 comparison. The artefact is a property of a specific object pair, not a constant. So the right
 design is **several** inert-at-k=2 defines of differing perturbation size, reporting the **spread**,
 which bounds the tier instead of point-estimating it. `SCORCH_SPMM_REGBLOCK_PFD=0` is a second
-candidate: at k=2 and k=3 `exact_width` is nonzero so the register block is never reached, making it
-inert there, while it changes code the k>=4 widths use.
+candidate -- **and it is not usable, for a reason that is the subject of items 1 and 2 above.**
+`spmm.h:5087` is `if (exact_width) {` ahead of every register-block case (`:5172`, `:5201`,
+`:5202`), and `:4528` additionally gates the workspace path on `!exact_width`. So its inertness at
+k=2 needs `EXACT_UNROLL != 0` **and** `exact_lo_ <= 2` **and** `exact_hi_ >= 2` **and**
+`MINDEG == 0` -- the same conjunction as the HALFVEC=2 vacuity. Under `MINDEG > 0` it goes live at
+k=2 on exactly the matrices below that mean degree. In a design whose whole point is a spread over
+arms, an arm whose inertness is conditional contaminates the spread on a subset of the corpus
+instead of failing visibly. Withdrawn. Peer reviewer's catch.
+
+### 5. The stronger axis is dtype, and the selection is a measurement rather than a guess
+
+Width is the wrong axis to look for an inert perturbation on. Every per-dtype constant is selected
+by a `std::is_same<scalar_t, float>::value` ternary (`spmm.h:4139`, `:4144`, `:4158`, `:4163`,
+`:4356`, `:4364`), `constexpr` in the non-hooks branch, so **a `_F64`-only knob cannot alter the
+float32 instantiation's emitted code at any width, on any matrix, under any `EXACT_HI`, `MINDEG` or
+`EXACT_UNROLL`.** The file asserts the property in the mirror direction at `:4350-4353`, which is
+as close to a source-level proof as this gets:
+
+> "a dtype whose row count is 0 folds multirow_ok -- and the whole dispatch that reads it -- to
+> nothing. That is what keeps the float64 object byte-identical while float32 gains the kernel."
+
+Candidates, ordered by strength of inertness argument rather than convenience:
+
+| tag | define | default | inertness | perturbation |
+|---|---|---|---|---|
+| `hv64` | `SCORCH_SPMM_HALFVEC_F64=1` | 0 (`policy.h:1515`) | dtype, structural | medium |
+| `mr64` | `SCORCH_SPMM_MULTIROW_ROWS_F64=2` | 0 (`:620`/`:626`) | dtype, structural | largest available |
+| `both` | both of the above | | dtype, structural | composes monotonically |
+| `hv00` | `SCORCH_SPMM_HALFVEC_F32=0` | 1 (`:1512`) | width + short-circuit | small (DCE) |
+
+Ruled out, recorded so no build is spent on them: the **`EXACT_HI` family** changes what is
+*called*, never what is emitted -- the exact-kernel instantiations come from the compile-time
+`switch (exact_width)` at `:5122` and `:5294`, which is exactly why the census found `hi01` holding
+ship's full 15-symbol set at the same digest. And `REGBLOCK_PFD`, per item 4 above.
+
+**One unproven build, flagged rather than assumed.** `spmm.h:4570` records that
+`-DSCORCH_SPMM_MULTIROW_ROWS=2` "failed outright on `sp_row_units was not declared`". The repair is
+immediately below at `:4573` (`constexpr long sp_row_units = 0;`), so `mr64` should build -- but by
+that comment's own account no release object has ever been built with it. A build failure there is
+a finding, not a setback.
+
+**The honest limit on the dtype axis, and why it costs no job time to settle.** A `_F64` knob
+leaves the float32 code's *content* identical and perturbs only its *placement*. Whether the linker
+actually moves it depends on emission order, which no amount of source reading settles: if the
+float32 symbols land at unchanged addresses, **the pair measures nothing** and its `.text` delta is
+irrelevant. That is checkable from `nm` alone. So `harnesses/rowvec/rvlf_select.sh` builds each
+candidate and reports two numbers per arm -- the `.text` delta, and how many float32 SpMM symbols
+changed **address** -- then keeps the ones that are not `UNUSABLE` and whose deltas straddle
+ROWVEC's own 90272-byte perturbation. Selection becomes a measurement, and bracketing **from
+above** is reachable by composing `_F64` knobs even if no single one clears 90 KB.
+
+It refuses to run while a screen job of this family is `RUNNING`, because a concurrent build
+contends for the cores and memory bandwidth the live job is timing on -- which would put the
+contention inside the floor it exists to measure. Verified to fire: invoked while 17704079 was
+running, it exited rc=1 naming the job.
+
+Because the candidates are inert at **every** float32 width rather than only at k=2, that job
+measures the layout tier across the whole grid in one pass, and so also answers the question the
+withdrawn table had appeared to answer: whether the tier varies with width. Nothing currently known
+bears on that.
 
 ### 4. Byte-neutrality at ROWVEC=0: what the evidence supports, and what it does not
 
