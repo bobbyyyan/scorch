@@ -3109,7 +3109,19 @@ the selection is not marginal -- and no choice of window can inflate or deflate 
 reviewer's correction, of a framing they had themselves supplied and I had carried in their name.
 **State a margin, not a count, when the count depends on a window you chose.** The same caution
 applies to my own "eight hits" in the sweep above: that number is grep-pattern-relative, a different
-pattern returns a different eight, and only the per-item classification transfers. SuiteSparse's closest approach to any edge is **0.033**, which is why
+pattern returns a different eight, and only the per-item classification transfers.
+
+**And the table above prints the raw gap beside the ratio deliberately, because the derived form
+hides a class of error the raw one shows.** The peer's first version of this table had `137.50x`
+where the census gives `135.94x`, from typing `255.3125` for `255.320312500` -- and a ratio to a
+rounding resolution looks equally plausible at either value, so the published figure carried no
+tell. The raw degree does: `255.3125` against five neighbours all ending in longer binary fractions
+is visibly odd. **Deriving a quantity to make it robust against one distortion (the window) removed
+the only signal that would have caught another (the transcription)**, so both columns are published.
+The deeper rule, which is the peer's and which they state against themselves: when the artefact is
+reachable, compute from the artefact, never from a message about it -- a quoted value is evidence
+about what someone read, not about what the file says, and here the same sealed census had been
+queried twice in the preceding minutes. SuiteSparse's closest approach to any edge is **0.033**, which is why
 2-decimal and exact agree there in every band. **Convention-invariance is a property of a
 collection's distance-to-edge distribution, so it has to be re-derived per corpus and never carried
 across one.** Peer reviewer's scoping; both censuses recomputed here.
