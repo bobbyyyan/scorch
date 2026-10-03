@@ -1057,14 +1057,21 @@ to separate two specific machines, and many values separate them equally well.
 
 **But the quoted range does not transfer to the shipped predicate, and the header records
 why.** At `3b676df` the test was `gate_maxthreads > 0 && (long)nthreads > gate_maxthreads`
--- the RESOLVED worker count. The shipped test at `:2614` is `pool > gate_maxthreads`. That
-change is a falsification, not a refactor: per `:1587-1592`, "The first version of this
-compared the resolved count, and the ARM grid falsified it: the gated and
-gated-with-a-ceiling-of-16 arms must read identically on a six-thread host, and they
-differed by 0.7%", because the resolved count "is raised per shape and is bounded by
-omp_get_num_procs(), which is 18 there". So 7..23 was derived for a quantity that varies
-*within* a host and is being reused for one that does not. The arithmetic coincides at the
-two anchors, where `3b676df` reports the resolved count as 6 and 24; the populations do not.
+-- the RESOLVED worker count. The shipped test at `:2614` is `pool > gate_maxthreads`. What
+happened between them is narrower than a change of comparand, and more interesting: the
+range was derived under an EQUALITY between the two quantities, which the ARM grid later
+falsified. `3b676df` says the resolved count is 24 and 6 "**because** the composition
+adoption takes the caller's pool" -- so the two were taken to coincide for the shapes in
+question, and the comment three lines above that commit's own test already said "where the
+pool is small enough" while the code compared `nthreads`. Comment and code therefore
+appeared to agree. The ARM grid exercised shapes where the count is raised above the pool
+and broke the equality: per `:1587-1592`, "the gated and gated-with-a-ceiling-of-16 arms
+must read identically on a six-thread host, and they differed by 0.7%", because the
+resolved count "is raised per shape and is bounded by omp_get_num_procs(), which is 18
+there". So the 0.7% was the symptom and not the discovery, and the shipped `pool`
+comparison is a correction toward what had always been documented. Either way 7..23 does
+not transfer: it was computed where a per-shape quantity and a per-call-site one were
+assumed equal, and they are not.
 
 **And the range is off by one under either comparator.** Both versions block with
 `count > ceiling`, so the gate fires iff `count <= ceiling`, and the ceilings that fire at
@@ -1088,9 +1095,18 @@ measured above: it explains why nobody had looked, not why mode 0 is slower when
 **One name doing double duty, and it is the distinction the code was changed over.**
 `3b676df` calls the ARM figure of 6 a "resolved worker count"; the header at `:1593` calls
 the same 6 the "pool the surrounding pipeline runs"; the same passage gives that host's
-`omp_get_num_procs()` as 18; and `:1601` calls the host "the M5's 12". Four quantities in
-one neighbourhood, with 6 labelled two incompatible ways -- and the header's own paragraph
-says those two are different quantities and that conflating them cost a falsified version.
+`omp_get_num_procs()` as 18; and `:1601` calls the host "the M5's 12". And the shipped block defines `pool`
+itself as `nthreads_override > 0 ? nthreads_override : omp_get_max_threads()`, a fifth
+quantity. So the neighbourhood holds a resolved worker count of 6, a pipeline pool of 6, an
+`omp_get_num_procs()` of 18, "the M5's 12", and an `omp_get_max_threads()` fallback -- with
+6 labelled two incompatible ways, inside the paragraph whose own subject is that those two
+are different and that conflating them cost a falsified version.
+
+For this concern's measurements the ambiguity does not propagate: the harness passes
+`nthreads_override`, so its `--pool` is the compared quantity exactly rather than a proxy
+for it, and the work proxy in the same block is `nnz * (k > 16 ? k : 16)`, the documented
+`nnz*max(k,16)` unchanged from `3b676df` under older variable names. The predicate did not
+move when the comparand did.
 
 ### The apparatus checked its own premises on these runs
 
