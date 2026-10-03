@@ -109,7 +109,7 @@ is defined against MKL — and the ~1.1% x86 cost per environment variable an ar
 > amendment 2 (question changed) and amendment 6(c) (estimator). Condition 4 again:
 > amendment 7 (stratifier withdrawn). Condition 2 stands as
 > written. The gated-cell range quoted below and in amendments 2-3 is WITHDRAWN by
-> amendment 6(a) as not reproducible.
+> amendment 6(a), and REINSTATED with its unit named by amendment 8: 34.6-54.6% of S-1.
 , registered before the run
 
 > **CONDITIONS 1, 3 AND 4 BELOW ARE SUPERSEDED — DO NOT SCORE THEM.** Condition 1 is replaced by
@@ -340,9 +340,10 @@ whole run confounded.
 ---
 
 # Amendment 2 — amendment 1's floor-gated primary is withdrawn: it can only return zero
-> **Superseded in part by amendment 6(a):** the gated-cell range for "gain needed"
-> quoted in this amendment is withdrawn as not reproducible from the sealed ledger. The
-> gate membership counts 2/8/34 are withdrawn with it.
+> **Superseded by amendments 6(a) and 8:** the gated-cell range quoted in this
+> amendment is withdrawn, and replaced by 34.6-54.6% of S-1 (median 45.6% of S-1) over
+> the sealed population of 8 at k=4. The membership counts 2/8/34 stay withdrawn; the
+> sealed count under the geometric middle is 8.
 
 
 Still before any timing. Amendment 1 replaced condition 3 because its pass line exceeded the
@@ -438,9 +439,10 @@ differing from ship by **+4385** instruction lines, `mrhv4` differing from `mrhv
 ---
 
 # Amendment 3 — the two criteria select nearly DISJOINT populations, and my gate and my report used different reductions
-> **Superseded in part by amendment 6(a):** the gated-cell range for "gain needed"
-> quoted in this amendment is withdrawn as not reproducible from the sealed ledger. The
-> gate membership counts 2/8/34 are withdrawn with it.
+> **Superseded by amendments 6(a) and 8:** the gated-cell range quoted in this
+> amendment is withdrawn, and replaced by 34.6-54.6% of S-1 (median 45.6% of S-1) over
+> the sealed population of 8 at k=4. The membership counts 2/8/34 stay withdrawn; the
+> sealed count under the geometric middle is 8.
 
 
 Still before any timing.
@@ -528,8 +530,9 @@ defect's transferable form, and it is a different one from what was reported.
 
 ## (d) My reconstruction still differs from the sealed analyser, and the sealed definition governs
 
-> **Resolved by amendment 6(a), in the other direction:** the sealed definition does not
-> govern, because it cannot be recovered. The number is withdrawn.
+> **Resolved by amendment 8:** the sealed definition does govern and IS recoverable --
+> `an_c207.py:181-189`, `both` beyond the ratio floor over all cells. Transcribing it
+> reproduces eleven published figures to the digit.
 
 
 My gated count at k=4 is **2**; the sealed analysis headlines **8**; a second reader reconstructs
@@ -553,9 +556,10 @@ explained by the reduction mismatch in (c), which affects the reported gain and 
 ---
 
 # Amendment 4 — `pct` has no single index convention: it flips with n, and that is the whole 2-against-8
-> **Superseded in part by amendment 6(a):** the gated-cell range for "gain needed"
-> quoted in this amendment is withdrawn as not reproducible from the sealed ledger. The
-> gate membership counts 2/8/34 are withdrawn with it.
+> **Superseded by amendments 6(a) and 8:** the gated-cell range quoted in this
+> amendment is withdrawn, and replaced by 34.6-54.6% of S-1 (median 45.6% of S-1) over
+> the sealed population of 8 at k=4. The membership counts 2/8/34 stay withdrawn; the
+> sealed count under the geometric middle is 8.
 
 
 Still before any timing. This is an instrument defect in the canonical estimator, not a choice.
@@ -754,6 +758,11 @@ And the width-contrast blast radius (≤1.91 pp) is from a different ledger and 
 independently recomputed; it is mine, not confirmed.
 
 # Amendment 6 — the gated-cell range is withdrawn, not corrected; and the scoring path uses the geometric middle
+> **(a) IS ITSELF WITHDRAWN by amendment 8.** The range was always reproducible; I
+> withdrew it on a wrong conversion of my own (`S = 1/(1-g)` where my column was
+> `1 - 1/S`). The sealed predicate is `an_c207.py:181-189` and reproduces eleven
+> published figures. (b) and (c) stand.
+
 
 Written 2026-10-02, with the four-build screen running and no reading from it yet scored.
 
@@ -900,3 +909,102 @@ record, and the descriptive table needs it. Its guard earned its place on the fi
 by catching that chain207's keys carry a leading `dlmc/` component that a path relative
 to `~/dlmc` does not -- without it the run would have produced 3846 perfectly plausible
 dispersion values for a population overlapping the ledger in zero keys.
+
+# Amendment 8 — amendment 6(a) is itself withdrawn: the range was always reproducible and I withdrew it on a unit error of my own
+
+Written 2026-10-02, still before any reading from the screen is scored.
+
+Amendment 6(a) withdrew the gated-cell range as "not reproducible from the sealed
+ledger". That withdrawal was wrong. The range reproduces exactly, and so do ten other
+published figures. The reason I concluded otherwise was a conversion error in the
+amendment's own load-bearing sentence.
+
+### The error
+
+Amendment 6(a) argues: *"A cell needing 38% gain has S = 1.61, i.e. a deficit of 61% --
+more than twice the floor the gate is supposed to apply, so the published lower endpoint
+is not consistent with a 0.2783 gate at all."*
+
+1.6129 is 1/(1 - 0.38). That is the inverse of the convention my own table was computed
+in. My column was `1 - 1/S`, so a cell needing 38% by that column has **S = 1.38**, and
+1.38 > 1.2783 clears the gate comfortably. The entire inconsistency was manufactured by
+applying the wrong direction of my own conversion. The inference also would not have
+followed in the other direction: a larger deficit clears a floor more easily, not less.
+
+### The two tables were never in conflict; they were in different units over different populations
+
+The sealed criterion is recorded, at `an_c207.py:181-189`:
+
+    s = [c for c in ok if Sa[c] > 1 and Sb[c] > 1 and f(c)]
+    HEAD = run("both beyond RATIO floor  <- THE HEADLINE",
+               lambda c: dev(Sa[c]) > FR[c[1]] and dev(Sb[c]) > FR[c[1]])
+
+Transcribing it reproduces, from the sealed CSVs and nothing else: 19100 complete cells
+(the file's own `EXPECT_CELLS`), the per-width ratio floors
+0.2607 / 0.2783 / 0.2858 / 0.3010 / 0.2960, the headline count 1/8/1/0/0 = 10 cells over
+10 matrices, and the board medians 0.885 / 0.925 / 0.885 / 0.793 / 0.741. Eleven
+independent values to the digit. The procedure is identified, not conjectural.
+
+My amendment-6 table differed in two ways, both of which I had stated and neither of
+which I accounted for: it restricted to the sign-only 51, and it admitted on
+**max(aa, bb)** where the sealed predicate requires **both**. And then the remaining gap
+was units: I reported `1 - 1/S` and the figure I was checking against was `S - 1`. The
+same eight endpoints appear in both tables once converted.
+
+### The reinstated figures, with the unit inside the range
+
+The sealed k=4 gated cells, n=8, each cell's S being the geometric middle of the two
+builds:
+
+| S | S - 1 | 1 - 1/S |
+|---|---|---|
+| 1.5462 | 54.6% | 35.3% |
+| 1.5202 | 52.0% | 34.2% |
+| 1.4695 | 46.9% | 31.9% |
+| 1.4645 | 46.4% | 31.7% |
+| 1.4470 | 44.7% | 30.9% |
+| 1.3929 | 39.3% | 28.2% |
+| 1.3741 | 37.4% | 27.2% |
+| 1.3458 | 34.6% | 25.7% |
+
+**34.6-54.6% of S-1, median 45.6% of S-1.** Equivalently 25.7-35.3% of 1-1/S, median
+31.3%. Amendments 2 and 3's "38.1-56.0%" remain withdrawn as a third thing, but the
+figure that replaces them is this one, not nothing.
+
+My own population -- cells of the 51 clearing the floor on max(aa,bb) -- is a sensible
+set and its table was also correct: 22.0-41.4 / 23.0-42.2 / 23.1-42.2 / 21.8-43.1 percent
+of 1-1/S for the lower / geometric / arithmetic / upper middles, at n = 6 / 9 / 9 / 23. It
+is simply not the sealed headline's set, and the two differ because the gated set and the
+51 are nearly disjoint -- amendment 3(a)'s finding, recurring.
+
+### The unit convention, registered for everything downstream
+
+**A range is the most unit-ambiguous object there is**, because both endpoints read as
+plausible under either convention, so neither endpoint looks wrong. From here, every
+ratio-derived percentage in this document and in `score_mrhv.py` names its unit *inside*
+the number: "45.6% of S-1", never a bare "45.6%".
+
+Which unit is correct is decidable and it is not a matter of taste. A mechanism
+delivering a speedup of factor g brings a cell to parity exactly when S <= g, so the
+column that may be compared against a mechanism stated as a factor is **S - 1**.
+Amendment 6 set `1 - 1/S` ranges against "a 7.7-12.4% mechanism" that was verified as
+factors -- a mismatch across the word "against", and the third appearance of the same
+conversion in one commit. In `1 - 1/S` units a x1.124 speedup is a 11.03% time reduction,
+not 12.4%. This does not move the 0-of-N conclusion of amendment 2, which is definitional
+in either unit.
+
+### One self-contradiction, owned
+
+Amendment 6(c) adopts `red = exp(median(log v))` as "`an_c207.py:57`" while amendment
+6(a), in the same commit, says the sealed definition "is not recorded anywhere I hold".
+The first sentence answers the second. I read the file for one purpose and did not carry
+what I had just read across to the other half of the same commit. 6(c) stands; 6(b)
+stands; 6(a) is replaced by this amendment.
+
+### What is unaffected
+
+The qualitative claim amendment 4 rests on needs none of this and is unchanged: the
+choice of middle moves gate membership by a factor of 3.8 on a fixed population and a
+fixed floor, 6 to 23 over the 51; in the sealed population it is 8 under the geometric
+middle. The sign-only 51 remains convention-free and reduces nothing. No live scoring
+path reads any of the withdrawn or reinstated figures.
