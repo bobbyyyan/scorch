@@ -1122,6 +1122,11 @@ a genuine prediction about a different sample. The plant's seven null widths rea
 2.50-5.83%, straddling it -- a calibration, not a restatement.
 
 # Amendment 10 — condition 3 secondary was two-sided where the effect is one-sided, and read "inside the floor" across the entire registered mechanism range
+> **Corrected by amendment 11:** this amendment's verification plant was DEGENERATE
+> (zero-width intervals), so it proved unbiasedness and not power; and its defect table
+> was computed on a different A/A construction than the scorer builds, understating the
+> defect threefold. Amendment 11 carries the power measurement and the corrected table.
+
 
 Written 2026-10-02, screen still on pass 1, nothing from it scored. Found by a peer
 session reading `score_mrhv.py`; reproduced here with my own code before changing anything.
@@ -1218,3 +1223,97 @@ twice (functional and population), condition 3 secondary building its own and di
 from the registered word. Every site where a number meets a floor needs checking against
 what sits on the other side of the comparison -- the sidedness, the functional, and the
 population, each separately.
+
+# Amendment 11 — amendment 10's verification proved the estimator unbiased and said nothing about its power; and the defect was three times worse than recorded
+
+Written 2026-10-02, screen on pass 1, nothing scored. Both items from a peer session,
+both reproduced here before changing anything.
+
+### 1. The verification plant was degenerate
+
+Amendment 10 reports the corrected statistic recovering a plant as
++2.00 / +5.00 / +10.00 / +15.00 / +25.00 / +50.00 pp of S-1 and calls that exact
+recovery. It is exact recovery, and **every one of those intervals has zero width.** I
+printed `[+2.00, +2.00]` and read a collapsed interval as a clean result.
+
+The cause is algebra, not noise. The plant was `arm = floor / g`, so inside every
+bootstrap replicate `geo(arm) = geo(floor) / g` identically, every replicate equals
+`g - 1`, and the interval is a point. The pairing divides the plant straight back out,
+because the plant *was* the floor rescaled. Confirmed: at x1.010 and x1.100 the widths
+are 0.00 pp.
+
+**So that table establishes the estimator is unbiased, and nothing whatever about whether
+it can detect anything.** A degenerate plant reports certainty at any effect size,
+including x1.0001.
+
+### 2. The power, measured the way the screen is actually wired
+
+The screen's contrasts share a denominator and have independent numerators: the floor is
+`ours` on mr0b against `ours` on mr0, and the arm is `ours` on mrhv against `ours` on
+mr0. Emulated on chain207 by borrowing a different arm for the independent third reading
+-- floor `ours_bb/ours_aa`, arm `oursb_bb/ours_aa / g` -- over the 51 at k=4:
+
+| plant | arm geomean | A/A geomean | separation, pp of S-1 | width | verdict |
+|---|---|---|---|---|---|
+| x1.000 | 0.9854 | 1.0058 | [-0.78, +4.68] | 5.46 | inside -- the null, correctly contains 0 |
+| x1.010 | 0.9756 | 1.0058 | [+0.21, +5.73] | 5.52 | DISPLACED |
+| x1.030 | 0.9567 | 1.0058 | [+2.19, +7.82] | 5.63 | DISPLACED |
+| x1.050 | 0.9384 | 1.0058 | [+4.18, +9.91] | 5.74 | DISPLACED |
+| **x1.077** | 0.9149 | 1.0058 | **[+6.86, +12.74]** | 5.88 | DISPLACED -- bottom of the registered range |
+| x1.100 | 0.8958 | 1.0058 | [+9.14, +15.15] | 6.01 | DISPLACED |
+| **x1.124** | 0.8767 | 1.0058 | **[+11.52, +17.66]** | 6.14 | DISPLACED -- top of the registered range |
+
+**The corrected statistic detects the registered 7.7-12.4% mechanism with its lower bound
+at +6.86 pp or better.** The broken one needed x1.50.
+
+The limit, which cuts against the figure: the x1.000 row is centred on +1.95 pp rather
+than 0, because `oursb` runs about 2% faster than `ours` throughout that ledger. The
+interval contains zero so the null is valid, but a conservative reading subtracts the
+offset and puts first detection nearer x1.03-x1.05 -- still inside the registered range.
+This emulation carries that offset only because an independent third reading had to be
+borrowed from a different arm. The real screen's mr0 and mr0b are the **same** arm on two
+byte-identical objects, so it should not carry it, and the floor row of the actual run is
+the check on that.
+
+### 3. "The A/A displacement" names four different quantities, and amendment 10 used the wrong one
+
+Over the same 51 cells at k=4, p95 of the per-cell |log|:
+
+| construction | p95, of S-1 |
+|---|---|
+| object pair on `ours` (bb/aa) -- **what `paired()` builds** | **39.77%** |
+| object pair on `oursb` (bb/aa) | 33.29% |
+| arm pair inside one build | 21.34% (aa) / 21.60% (bb) |
+| object pair on S = ours/mkl -- the sealed `an_c207.py` form | 19.14% |
+
+The sealed form divides MKL out of both sides, so common-mode noise cancels and the floor
+is half the size. Amendment 10's table was computed on that last form while the scorer
+builds the first, which is why my numbers and the peer's differed with neither being
+wrong. **Recomputed on the distribution the scorer actually sees, the defect is about
+three times worse than amendment 10 records**: the minimum sits at x1.10, not x1.05, and
+nothing fires below x1.50. `score_mrhv.py`'s docstring now carries the corrected table and
+the list of four constructions.
+
+### 4. "Reduce last or not at all" does not transfer to a floor
+
+That rule is why the sign-only 51 is estimator-invariant, and it is a rule about a
+**predicate**. A floor is a statistic *of* the noise, so reducing shrinks the very thing
+being bounded. Same A/A, same 51 cells, same width:
+
+| floor computed over | n | p95, of S-1 |
+|---|---|---|
+| per-cell geometric middles of 6 pass-paired readings | 51 | 39.77% |
+| raw pass-paired readings, no per-cell step | 306 | 128.37% |
+
+A factor of 3.2 from the reduction alone. Both halves have to be stated together: reduce
+last in the predicate, and reduce the floor to **exactly** the level of the quantity it
+bounds. That is amendment 10's "one floor object, three statistics" generalized -- the
+population and the functional have to match, and so does the reduction depth.
+
+### 5. One clause on condition 4's null, recorded as a limit rather than a defect
+
+The measured null is computed from the same mr0/mr0b readings the floor is derived from,
+restricted from 3820 cells to 3769, so that row is near-definitional rather than an
+independent prediction. What makes the comparison informative is that the **arm** row is
+independent of the floor, which is amendment 9(5)'s argument unchanged. The two columns
+should not be read as two independent estimates.
