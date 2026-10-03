@@ -3149,3 +3149,68 @@ queried twice in the preceding minutes. SuiteSparse's closest approach to any ed
 2-decimal and exact agree there in every band. **Convention-invariance is a property of a
 collection's distance-to-edge distribution, so it has to be re-derived per corpus and never carried
 across one.** Peer reviewer's scoping; both censuses recomputed here.
+
+## MKT DLMC {2,4,8}: the registered test fires branch 1 — the inversion is HOST-caused
+
+Job 17701502 dlmc phase, `rows=34380 expect 34380`, rc=0, `FAIL=0`, done 06:47:11. Transported
+with a producing-host digest (`bb24617ccf82f7ec…`, byte-identical locally). 3820 keys x 3 widths x
+3 arms, balanced.
+
+**Corpus checks, before the statistic.** All 3820 measured keys resolve in the sealed census and
+**zero disagree on `(rows, nnz)`**, so unlike SuiteSparse there is nothing to exclude. The measured
+band counts are **1051 / 781 / 1276 / 712**, exactly the sealed census's exact-convention census,
+which confirms the binning end to end. One trap caught loudly rather than silently: the harness
+reads `dlmc_keys_nopfx.txt`, so measured keys lack the census's `dlmc/` prefix and the first join
+resolved **0 of 3820** -- the `corpus_key_resolution_mkt` failure mode, visible only because the
+check reports its own resolved count instead of quietly intersecting.
+
+### The registered result
+
+| band | n | MKT DLMC | 95% CI | redwood DLMC | MKT SuiteSparse |
+|---|---|---|---|---|---|
+| 0-32 | 1051 | +0.29% | [-0.12, +0.69] | +0.95% | +1.86% |
+| 32-100 | 781 | -1.91% | [-2.40, -1.40] | -2.39% | +10.95% |
+| **100-256** | 1276 | **+2.83%** | [+2.62, +3.03] | **-11.72%** | +9.30% |
+| **256+** | 712 | **+2.13%** | [+1.90, +2.36] | **-15.60%** | +3.27% |
+
+Pooled +1.02% [+0.84, +1.20]. **Both high bands are bumps with CIs above zero, which is registered
+branch 1: the inversion is host-caused.** The 2x2 closes with both MKT cells bumps and both redwood
+cells dips:
+
+| | redwood | MKT |
+|---|---|---|
+| SuiteSparse | dip -3.24% | bump +2.56% |
+| DLMC | dip -11.72 / -15.60 (high bands) | **bump +2.83 / +2.13** |
+
+**And the host difference is confined to high degree, which neither branch predicted.** At deg
+32-100 the two hosts nearly agree (-1.91% against -2.39%) and at 0-32 MKT's CI spans zero. The
+divergence is 14.55 pp at 100-256 and 17.73 pp at 256+. So the effect is host-caused *and*
+degree-gated, appearing only above degree 100 -- a sharper target for the mechanism than "the host"
+alone. The standing candidate remains that `-march=native` builds AVX2 on redwood and Zen4 AVX-512
+on MKT, so the 128-bit `scorch_simd_half<float>` path is not the same code; that is now the leading
+hypothesis rather than one of two, and it is still not demonstrated.
+
+### The board, which is the milestone's actual question and is worse than SuiteSparse
+
+| k | n | geomean | median | behind MKL | `oursb` geomean |
+|---|---|---|---|---|---|
+| 2 | 3820 | **0.7195** | 0.6389 | **3431 (89.8%)** | 0.7195 |
+| 4 | 3820 | 0.8335 | 0.7897 | 3271 (85.6%) | 0.8336 |
+| 8 | 3820 | 0.9461 | 0.9300 | 2706 (70.8%) | 0.9461 |
+| all | 11460 | | | **9408 (82.1%)** | |
+
+**All three widths are below parity on geomean** -- even k=8, the best of them, is 5.4% slower than
+MKL. `oursb` reproduces `ours` to four decimals at every width.
+
+**The registered secondary is answered: yes, by a wide margin.** k=2's behind-MKL share is **89.8%**
+on DLMC against **61.9%** on SuiteSparse (63.1% operands-only). By band it runs 67.7% -> 94.1% ->
+99.7% -> **100.0%**, so at degree 256+ **every one of 712 matrices is behind MKL at k=2**. DLMC
+needs no second base: its 26 `nnz == 0` keys are excluded upstream, so the corpus is already
+operands-only.
+
+**What this does to the milestone's target.** The k=4 half-vector thread was chasing a
+redwood-specific artefact -- on MKT that width shows a bump, not a dip, on both corpora. The live
+deficit is **narrow-k on MKT across both collections, worst at k=2 and worst on DLMC**, and it is
+large: 82.1% of DLMC cells and 41.8% of SuiteSparse cells behind MKL at these widths. Scope
+unchanged: one pass per cell, so per-cell counts bound rather than confirm; a geomean of 0.7195
+over 3820 matrices does not.
