@@ -1807,7 +1807,7 @@ matrices, 4000 resamples:
 | 0-32 | 4167 | -2.82% [-3.40, -2.22] | 1051 | **+0.95%** [+0.61, +1.31] |
 | 32-100 | 308 | -6.13% [-7.58, -4.60] | 781 | -2.39% [-3.01, -1.74] |
 | 100-256 | 58 | **-11.23%** [-14.13, -8.57] | 1275 | **-11.72%** [-12.55, -10.85] |
-| 256+ | 51 | **-9.66%** [-12.45, -6.80] | 713 | **-15.59%** [-17.25, -13.91] |
+| 256+ | 51 | **-9.66%** [-12.45, -6.80] | 712 | **-15.60%** [-17.24, -13.90] |
 
 Sign counts at 100-256 are 51 of 58 and 1083 of 1275. Every interval excludes zero, the two
 corpora's intervals **overlap** at 100-256, and the effect is monotone in degree on both.
@@ -3040,3 +3040,41 @@ two `_B` are `cols==1`; `bone010_C` and `boneS10_C` are `rows==3` and the two `_
 150. If that sensitivity is ever carried to the MKT side the shift is **4 keys**. Peer reviewer's
 note. The DLMC side must use the same predicate — one path per basename, shape-checked where a census exists, and the share reported on
 both bases — or the two shares are differently defined and not comparable.
+
+
+### Reconciling the 713/-15.59 and 712/-15.60 pair, and scoping convention-invariance to one corpus
+
+**The DLMC 256+ row at `:1810` published `n=713, -15.59%` while `:2084` said the exact column had
+become the primary one and the band-matched registration quoted `-15.60`.** Two tables in one
+document giving different `n` for one band, the later claiming primacy and the earlier still
+carrying the superseded pair. Fixed at `:1810`, not by appending a note: it now reads
+`712, -15.60% [-17.24, -13.90]`. Peer reviewer's finding, and the **fourth** time this session a
+correction failed to reach every site -- after the withdrawal 77 lines below its claim, the "two of
+three" sentence under its rebuilt table, and the `:466` citation inside a list asserting all 27 were
+re-resolved.
+
+**Which column is right, stated rather than assumed, because the promotion deserves a reason.** The
+disputed key's exact degree is **255.998046875**, which is below the `lo <= deg < hi` edge of 256 and
+therefore in band 100-256; `"%.2f"` renders it `256.00` and moves it up. The exact convention
+reports the matrix's degree and the rounded one reports a rendering of it, so exact is primary and
+the harness-native format is the stale site -- even though the harness emits the rounded form, which
+is the argument for the other side and is why the pair is stated rather than silently replaced.
+
+**And "the census is convention-invariant in every band" is a SuiteSparse result that does not
+transfer.** Re-derived on DLMC over its 3820 non-degenerate keys (census 3846 minus the 26 `nnz==0`,
+all of which sit at degree 0 and so in band 0, exactly as the 14 dropped SuiteSparse keys did):
+
+| convention | DLMC band census |
+|---|---|
+| 2-decimal `"%.2f"`, harness-native | 1051 / 781 / **1275** / **713** |
+| exact `nnz/rows` | 1051 / 781 / **1276** / **712** |
+| integer rounding | 1048 / 784 / 1272 / 716 |
+
+The first row is exactly the published `:1810` table, which identifies the convention from the
+artefact. The difference between the first two rows is **one key**. The reason is the corpus's
+distance-to-edge distribution, not the convention: DLMC holds **185 keys at degree exactly 256.000**
+-- pruned dense-256 blocks such as `rows 128, nnz 32768` -- and one at 255.998046875, so 186 sit
+within 0.01 of the edge. SuiteSparse's closest approach to any edge is **0.033**, which is why
+2-decimal and exact agree there in every band. **Convention-invariance is a property of a
+collection's distance-to-edge distribution, so it has to be re-derived per corpus and never carried
+across one.** Peer reviewer's scoping; both censuses recomputed here.
