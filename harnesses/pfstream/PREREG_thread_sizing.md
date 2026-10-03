@@ -1423,7 +1423,15 @@ amendment 13 said — so on redwood the figures were wrong and the sign was righ
 widths amendment 13 published are the only two that reverse. Those six are outside the
 registration, so this is not scoring on the outcome — but a verdict generalized past its registered
 width, resting on the only two contrary widths, is contradicted at three quarters of what was
-measured. And the verdict itself was **on the wrong host**: element 2 names MKT, where it holds at
+measured.
+
+> **A cleaner statement of the same structure, from a peer session, worth preferring to the one
+> above.** Element 2 names k=2 and element 4 names k=32, so **the two widths amendment 13 published
+> are the two REGISTERED widths**, not a selection out of eight. The six that go the registered way
+> are unregistered scope and do not overturn a k=2 verdict. What the recomputation shows is that
+> **the two hosts disagree at exactly the two registered widths and agree with the registered
+> direction at the unregistered ones** — 8 of 8 on MKT, 6 of 8 on redwood. The wrong-host point in
+> (a) stands on its own and needs none of the width counting. And the verdict itself was **on the wrong host**: element 2 names MKT, where it holds at
 all eight.
 
 ### (d) Element 3, re-scored on measurements instead of against a prediction
