@@ -4109,11 +4109,28 @@ kernels.**
 - **k=8** takes the full-width register block, mask-free — `:2096`: *"At float k=8 and double k=4
   the last vector is full and regblock is already mask-free."*
 
-**One inference of mine was wrong and is recorded rather than dropped.** I first read the deficit as
-"k=4 is the first width above the narrow-k exact kernel's range." The header is explicit at `:2096`
-that the range is **float k=1..7**, so k=4 is inside it — and it is the half-vector arm *placed
-ahead of it* that takes the width. **A memory entry stating the exact kernel owns float k in
-{1,2,3} is stale against this header and should be read as path-specific.**
+**Two inferences of mine were wrong and both are recorded rather than dropped.**
+
+First: I read the deficit as *"k=4 is the first width above the narrow-k exact kernel's range."*
+`:2096` is explicit that the **instantiated** range is float k=1..7, so k=4 is inside it, and it is
+the half-vector arm *placed ahead of it* that takes the width.
+
+Second, and this one corrects a claim I published in the first version of this amendment: I then
+wrote that a project note recording the exact kernel as owning float k in {1,2,3} was *"stale
+against this header."* **It is not stale — it is the shipped routing and the header's 1..7 is the
+instantiated range.** `scorch_policy.h:1518` defines `SCORCH_NARROWK_EXACT_HI` as **3**, and
+`spmm.h:4147-4149` caps rather than raises it (`exact_cap_ = exact_f32_ ? 7 : 3`), so a release
+build routes float k ∈ {2,3} to `narrow_exact` and k=4 reaches the half-vector arm. The same note
+already states that conclusion directly — *"Width 4 is not the full-width kernel.
+`SCORCH_SPMM_HALFVEC_F32` ships at 1 and `scorch_simd_half<float>::lanes == 4`, so `halfvec_exact`
+is true at k=4"* — verified here at `spmm.h:2205` (`lanes = 4`) and `scorch_policy.h:1512`
+(`HALFVEC_F32 1`).
+
+**So the kernel boundary is not a new finding; the measurement against MKL at it is.** What is new
+is that k=4 at mean degree ≥64 is the **only** cell of the degree × width table above 1.0, and that
+its two neighbours — a different kernel each — are 6–7% faster than MKL on the same matrices.
+**Reading an instantiated range as a routing range is how I got there, and a cap that only ever
+lowers a bound makes the header's number an upper limit rather than the value.**
 
 ### Registered before it runs, because `spmm_halfvec` is an existing switch and this must not become a special case
 
