@@ -3667,6 +3667,11 @@ is the mechanism that turns it into a crash.
 
 ## Amendment 44 — the floor decomposes: its LOCATION is a dtype/corpus property, its DISPERSION is a host property
 
+> **AMENDED BY AMENDMENT 46.** The 2x2 had an empty cell and only the DISPERSION claim was
+> identified by it. The fourth cell is now measured and it **refutes** the stronger
+> location reading: the offset belongs to the (MKT, float32/DLMC) COMBINATION, not to
+> float32/DLMC generally.
+
 Amendments 38 and 41 could only state the floor's anomaly disjunctively — "a property of that host,
 dtype or corpus" — because all three changed between the two measurements available. MKT float64
 on SuiteSparse holds dtype and corpus fixed against redwood and holds host fixed against MKT
@@ -3818,3 +3823,135 @@ beside `SKIPPED oracle.csv: lacks arm,build`.
 Amendment 18 quoted prediction 1's null as "50% to 79%". The true range over the per-threshold
 reachable-cell counts is **55.2% to 78.6%** (15/26, 22/28, 16/29). The verdict is unaffected — the
 pass is uninformative either way — but the range was loose in the direction that understated it.
+
+---
+
+## Amendment 46 — the floor's 2×2 had an empty cell; filled, it refutes the location claim and cannot test the dispersion claim
+
+Amendment 44 read the floor as two functionals and claimed a factor for each. A peer session
+pointed out that the design identifies only one of them:
+
+|  | float32 / DLMC | float64 / SuiteSparse |
+|---|---|---|
+| **MKT** | present | present |
+| **redwood** | **MISSING** | present |
+
+**DISPERSION was identified.** It needs the host held fixed across configurations (MKT float64
+3.20–4.72 pp against MKT float32 3.30–4.89 pp, nearly equal) and the configuration held fixed
+across hosts (redwood float64 6.11–9.03 pp, 1.9× wider — and the ratio holds at *both* endpoints,
+6.11/3.20 = 1.909 and 9.03/4.72 = 1.913, which is a stronger statement than a ratio of midpoints).
+
+**LOCATION rested on one row and a resemblance.** MKT float32 against MKT float64 shows the offset
+moving with dtype-or-corpus, and redwood float64 resembles MKT float64. That licenses *"the offset
+tracks dtype or corpus"* and *"it does not follow MKT around"*. It does **not** license *"float32
+/DLMC is where it lives"*, which additionally assumes no host × configuration interaction. Both
+statements appear at equal strength in amendment 44 and the second one is a cell short.
+
+### The fourth cell was already sealed, three times over
+
+`chain207-dlmc-redwood` (`aa`/`bb`, *"two builds with byte-identical `.text` in separate
+processes"*, six passes each, 3820 DLMC matrices × 5 widths), `chain210-dlmc-replicate-redwood`
+(bound to chain207's objects by `.text a79b5d20b322c5ac`), `chain211-dlmc-redwood` (`base`/`bsb_`
+sharing a full sha256, `PROVENANCE:15-19` *"that pair IS the floor"*). redwood, DLMC, float32.
+
+**That is the same construction as this screen's floor pair, verified at source rather than
+assumed.** `pfs_build.sh:160` prints *"EMISSION CHECK (.text digests; the floor pair must AGREE,
+the arms must DIFFER)"*; `:174` comments *"The floor pair: same configuration, equal-length paths,
+so .text must be identical"*; `:176` REFUSES when `ship` and `shpb` disagree. So both are pairs of
+separately built, `.text`-identical objects measured in separate processes, and the sealed ledgers
+are the right quantity — not, as it first appeared, two differing objects of one configuration.
+
+### One script, one functional — and two defects fixed before it produced a number
+
+`an_floor2x2.py` recomputes every cell from raw rows under one definition: per cell the median over
+readings for each build, then `d = (m[B] − m[A]) / m[A]` per cell, then p05/p50/p95 over cells per
+width. Reading the sealed numbers out of their own analysis files would have compared two
+functionals rather than two hosts.
+
+**Defect one: a refusal that named the wrong cause.** The sealed ledgers key on
+`dlmc/<model>/<method>/<sparsity>/<layer>` and the screen lists on `<model>/…`, so an unnormalised
+join matches zero keys. The first version counted post-filter rows and printed *"REFUSE: no row
+carries arm='ours'"* — true of the filtered stream, false of the file, and it sends a reader to the
+wrong column. It now counts arm matches and join survivors separately and names the join.
+
+**Defect two: the percentile convention, which is the exact failure this script exists to
+prevent.** `an_f64_arms.py:103-107` rounds (`int(round(q * (len(v) - 1)))`); the first version of
+this script truncated. Truncation always takes the lower index, so it reports a lower p05 and a
+lower median and therefore a slightly **wider band** — the one quantity being compared across
+hosts. **The bias does not cancel, for two separate reasons.** It is not uniform within a
+population: at n=392, q=0.05 is index 19 against 20 and q=0.50 is 195 against 196, while q=0.95
+lands on 371 under both, so two of the three statistics move and one does not. And the cells of
+this 2×2 do not have equal n, so the per-cell bias differs between the numbers being compared. At
+n=20, q=0.05 is the minimum against the second-smallest. `pct` is now copied from
+`an_f64_arms.py`, including its `None`-on-empty — nan compares False to everything, so an empty
+population would make every "outside the band" test read "inside". Measured effect of the fix on
+this cell: band widths moved 0.24 to 1.64 pp and the location median moved −0.195% to −0.166%; no
+verdict changed, which is why it is reported as a convention defect and not as a result.
+
+### The fourth cell: redwood / DLMC / float32, same 392 keys, matched widths
+
+392 of 392 requested keys matched after stripping `dlmc/`; width 4 dropped as absent from the
+float32 screen; 687600 rows read, 229200 carrying `arm=ours`, 23520 surviving the join.
+
+| k | cells | median | p05 | p95 | width |
+|---|---|---|---|---|---|
+| 2 | 392 | −0.200% | −17.838% | +13.427% | 31.27 pp |
+| 8 | 392 | −0.087% | −22.774% | +28.533% | 51.31 pp |
+| 16 | 392 | −0.156% | −20.350% | +27.183% | 47.53 pp |
+| 32 | 392 | −0.176% | −19.132% | +26.258% | 45.39 pp |
+
+### LOCATION: the stronger reading is REFUTED
+
+MKT float32/DLMC reads **+0.237% to +1.735%, all seven widths positive.** redwood float32/DLMC
+reads **−0.200% to −0.087%** — opposite in sign and smaller in magnitude than MKT's *smallest*
+width. Same corpus, same 392 keys, same dtype, same functional; host is the only difference.
+
+**And the claim is robust to the one thing that could soften it.** A median is nearly insensitive
+to per-cell noise, which the pass-count sweep confirms directly — at k=2 the location reads
++0.117%, −0.088%, −0.037%, −0.116%, −0.200% over 2, 3, 4, 5 and 6 passes. The sign is not stable,
+so the honest statement is **|location| ≤ 0.20% and indistinguishable from zero**, against MKT's
++0.237% to +1.735%. Either way it is not MKT's offset.
+
+**So three of the four cells sit at or across zero and exactly one is displaced.** A single
+displaced cell in a 2×2 is an interaction, not a main effect of either factor: the offset belongs
+to the **(MKT, float32/DLMC) combination**. Amendment 44's weaker statements stand — it tracks
+dtype or corpus, and it does not follow MKT around — and *"float32/DLMC is where it lives"* is
+withdrawn.
+
+### DISPERSION: this cell cannot test the host claim, and the reason is measurable
+
+31.3 to 51.3 pp here against 3.2 to 9.0 pp in the three screens. **Before reading that as a
+refutation of the host claim, two differences in measurement design, both measured rather than
+asserted:**
+
+1. **Readings per cell: 6 against 16.** The pass-count sweep gives the scaling empirically rather
+   than by assumption — at k=2 the band reads 65.21, 44.88, 40.98, 33.09, 31.27 pp over 2 to 6
+   passes, which is `width ∝ n^-0.668`, steeper than the `n^-0.5` of pure independent noise.
+   Extrapolated to 16 readings: **1.90×**.
+2. **Measurement window per reading: `mrgate.py:29` targets 25 ms; chain207's readings total a
+   median of 5.69 ms** (p05 3.42, p95 7.21, computed as `ms × batch` on the matched keys). At
+   `1/√t`, that is **2.1×**.
+
+Together **4.0×** of an observed **6.4× to 9.5×** (31.27/4.89 to 31.27/3.30). The residual is
+**1.6× to 2.4×**, against the independently measured redwood/MKT ratio of **1.9×**.
+
+**That is consistency, not identification, and the difference matters.** The decomposition has
+three multiplicative factors, two measured here and the third being the quantity under test, and an
+after-the-fact product of three factors landing inside a 1.6–2.4 window is weak evidence. **The
+dispersion row of the 2×2 therefore stays identified from the three screens alone; the fourth cell
+neither confirms nor refutes it.** What the fourth cell does establish is that **a band is not
+comparable across runs whose readings-per-cell and measurement window differ**, which is a stronger
+caution than the corpus-mix one already recorded — and that caution applies to the three screens as
+much as to this cell.
+
+### Two things the fourth cell does not close
+
+**dtype and corpus are still confounded.** float32 is always DLMC in these screens and float64
+always SuiteSparse. Separating them needs float64-on-DLMC or float32-on-SuiteSparse. *"Dtype or
+corpus"* remains the most that can be said, and this cell does not change it.
+
+**And the SuiteSparse full-collection A/A must not be substituted for a missing cell.** Its p95 runs
+near 38% at 1e4–1e6 nnz against these 3–9 pp bands, with a strong inverted-U in matrix size, so the
+floor depends heavily on the corpus's size mix; a cross-corpus substitution would manufacture a host
+effect in whichever direction the mixes differ. DLMC-to-DLMC on a matched key list is what makes
+this cell clean, and it is the only reason it was worth computing.

@@ -12,7 +12,10 @@ The functional, stated once so it cannot drift between invocations:
     per cell (key, k):  m[b] = median over all rows of build b, chosen arm
     per cell:           d = (m[B] - m[A]) / m[A]
     per width:          median(d), p05(d), p95(d), and the count of d < 0
-This matches `an_f64_arms.py`'s `rel(a, b, pop)` followed by `pct(.., 0.05/0.5/0.95)` exactly.
+This matches `an_f64_arms.py`'s `rel(a, b, pop)` followed by `pct(.., 0.05/0.5/0.95)` exactly --
+and `pct` is copied from `an_f64_arms.py:103-107` rather than rewritten, because the first version
+rewrote it with truncation where the published tool rounds and the docstring still said "exactly".
+A claim of identity between two implementations is only worth making if one of them is the other.
 
 WHAT A FLOOR PAIR IS, and why the pair name is an argument rather than a default: the two builds
 must be the same configuration built separately, so their `.text` is identical and only the object
@@ -33,9 +36,25 @@ NEED = {"build", "key", "k", "arm", "ms"}
 
 
 def pct(v, q):
+    """Byte-for-byte `an_f64_arms.py:103-107`, including the empty case.
+
+    A FIRST VERSION TRUNCATED (`int(q * (len(v) - 1))`) while claiming in the docstring to match
+    the published tool, which ROUNDS. Truncation always takes the lower index, so it reports a
+    lower p05 and a lower median and therefore a slightly WIDER band -- the one quantity this
+    script exists to compare across hosts. The bias does not cancel, for two reasons that are
+    separate: it is not uniform WITHIN a population (at n=392, q=0.05 is index 19 against 20 and
+    q=0.50 is 195 against 196, while q=0.95 lands on 371 either way, so two of the three
+    statistics move and one does not), and the cells of the 2x2 do not have equal n (different
+    corpora, different width sets), so the per-cell bias differs between the numbers being
+    compared. At n=20, q=0.05 is the minimum against the second-smallest.
+
+    The empty case returns None rather than nan for the same reason the published tool does:
+    None raises on comparison and fails closed, while nan compares False to everything, so an
+    empty population would make every "outside the band" test read "inside".
+    """
     if not v:
-        return float("nan")
-    i = int(q * (len(v) - 1))
+        return None
+    i = min(len(v) - 1, max(0, int(round(q * (len(v) - 1)))))
     return v[i]
 
 

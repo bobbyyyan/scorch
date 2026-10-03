@@ -202,6 +202,32 @@ def main(argv):
     # as covering.
     if tot != len(cell):
         return "REFUSE: internal inconsistency, verdicts %d vs cells %d" % (tot, len(cell))
+    # ---- EMIT THE BEHIND SET AT ONE WIDTH, so the next measurement runs on the population the
+    # goal is stated over rather than on a corpus list that happens to be staged. The width is
+    # REQUIRED rather than defaulted: "the behind set" is a different set at every width here
+    # (328 at k=2, 2 at k=32), and a defaulted width would silently pick one.
+    dump = dumpw = None
+    for i, a in enumerate(argv):
+        if a == "--dump-behind" and i + 1 < len(argv):
+            dump = argv[i + 1]
+        if a == "--dump-width" and i + 1 < len(argv):
+            dumpw = int(argv[i + 1])
+    if dump and dumpw is None:
+        return "REFUSE: --dump-behind needs --dump-width; the behind set differs at every width"
+    if dump:
+        _bk = sorted(k for (k, w), obs in cell.items()
+                     if w == dumpw and all(t / m > 1.0 for (_b, _p, t, m) in obs))
+        if not _bk:
+            return ("REFUSE: no cell is behind in every reading at k=%d, so the file would be "
+                    "empty and the next measurement would read as a clean null" % dumpw)
+        with open(dump, "w") as fh:
+            fh.write("".join(x + "\n" for x in _bk))
+        print()
+        print("WROTE %s: %d keys behind in EVERY reading at k=%d" % (dump, len(_bk), dumpw))
+        print("  This count must match the per-width table above at k=%d; it is computed from the"
+              % dumpw)
+        print("  same `cell` dict by the same predicate, so a mismatch is a routing defect.")
+
     # ---- MEMBERSHIP OF A NAMED KEY SET IN THE BEHIND SET.
     # Registered in PREREG_thread_sizing amendment 21: the question "does the <=2-worker headroom
     # group intersect the deficit set" is a JOIN, and a join answered by an uncommitted script is
