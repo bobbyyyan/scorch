@@ -1629,3 +1629,99 @@ and it changes to the one the project's goal is stated over. No rule, threshold 
 by this measurement under any outcome — a kernel change would need a runtime-testable separating
 property, and "resolves to `<=2` workers" is a property of the policy being tested, not an
 independent one.
+
+---
+
+## Amendment 22 — the registered reach condition is in the wrong units, the control was missing, and the deficit's own prevalence bounds this mechanism before any of it runs
+
+Three defects in amendment 21(c), raised by a peer session and verified here. The job it registered
+(17698162) is cancelled and resubmitted under the amended design, with the thresholds fixed below
+**before** any of it is read.
+
+### (a) 83.7% against 17.0% bounds the mechanism with no measurement at all
+
+The float32 DLMC board reads **328 of 392 keys behind MKL in all 16 readings at k=2 = 83.7%.** The
+`<=2`-worker group is **9 of 53 live cells = 17.0%** on the only corpus where it has been measured
+(9 of 72 keys = 12.5%).
+
+**Even if every `<=2` cell were behind, a 17.0%-prevalence property cannot account for an
+83.7%-prevalence deficit.** It is short by a factor of **4.9×** and leaves **66.7 percentage points**
+unexplained. That is arithmetic over two already-published numbers.
+
+**A mechanism's prevalence has to be comparable to the prevalence of what it explains.** This is the
+reach question, not the effect question, and the two have different comparators: amendment 20's
+1.3454 is an effect size and says nothing about how much of the deficit the effect can reach.
+
+### (b) Condition 2's threshold was in the wrong units, so it passes at a value that refutes the claim
+
+Amendment 21(c) registered: *"If the `<=2`-worker group on the 328 is smaller than 5% of the set,
+the mechanism cannot account for the deficit however large its per-cell excess."*
+
+Right instinct — bound the reach rather than only detect the effect — **wrong units.** 5% sits
+**3.4× below the unselected 17.0%** and **16.7× below the 83.7%** that is the thing to be explained.
+**At the only value ever measured, 17.0%, the condition PASSES while the mechanism explains at most
+a fifth of the deficit.** A threshold that cannot distinguish "reaches a fifth" from "reaches most"
+is not a reach condition.
+
+**CONDITION 2, AMENDED AND FIXED NOW.** Let `s328` be the `<=2` share among the live k=2 cells of
+the 328 deficit keys.
+
+- `s328 >= 0.50` — the mechanism reaches the majority of the deficit; a causal claim is available.
+- `0.25 <= s328 < 0.50` — reported as a share with **no causal claim**: "reaches `s328` of the
+  deficit", and the remaining 1 − `s328` needs a different mechanism.
+- `s328 < 0.25` — **reported as a bound on reach, not as a pass.** Three quarters of the deficit
+  would remain, so thread sizing cannot be its principal cause whatever the per-cell excess.
+
+The boundaries are stated in units of the explained quantity: a mechanism cannot be the principal
+cause of something it reaches in under a quarter of cases, and reaching over half is the weakest
+version of "most". **This does not make the measurement vacuous** — `s328` could be far above 17.0%,
+which is exactly the question, and the unselected 17.0% is not even a clean prior because
+`adg_keys.txt` was stratified on eight row counts and a purposive sample over row counts may
+over-represent the small-work tail amendment 21(a) identified.
+
+### (c) The control was missing, and it is free and in the same run
+
+Running the oracle on the 328 alone yields an `s328` **with nothing to compare it against**, and the
+existing 17.0% is not a clean comparator for the reason just given. **The 64 keys of the 392 that are
+NOT behind at k=2 are the clean control: same corpus, same run, same instrument, and outside the
+population being certified** — which is the one property a control inside its own population cannot
+have.
+
+**CONDITION 4, REGISTERED NOW.** Let `s64` be the `<=2` share among the live k=2 cells of those 64
+keys. The discriminating statistic is **`s328 - s64`**. If a bootstrap CI on that difference contains
+zero, **the mechanism does not track the deficit whatever its per-cell excess** — the `<=2` share is
+then a property of the corpus and not of being behind MKL. Its power is limited and stated with it:
+64 keys, of which the live subset will be smaller, so a null result here is weak and a positive one
+is not.
+
+The run therefore sweeps **all 392 keys**, and the split into 328 and 64 happens in analysis, so both
+shares come from one process on one object. The 328-only job is cancelled rather than supplemented,
+because two jobs would put the arm and its control in different processes — the one difference this
+project has repeatedly measured as larger than the effects it looks for.
+
+### (d) The 20-key cross-tabulation needs no new run, and tests the association directly
+
+`comm -12` over sorted copies of the two committed lists: `adg_keys.txt` (72) and `dlmc_keys.txt`
+(392) share **exactly 20 keys — ten `rn50/…` and ten `transformer/…`.** So for 20 keys both the
+thread-count curve and the ours-vs-MKL verdict already exist on disk.
+
+**Amendment 21(b)'s join lost its power by conditioning on the predictor.** Nine keys drawn from 72
+against a 20-key shared set have expected overlap `9 × 20/72 = 2.5`, so observing 1 is unremarkable;
+conditioning on `<=2` keeps one cell while conditioning on nothing keeps twenty. The symmetric
+question is a cross-tabulation at k=2 of resolved-count group (`<=2` / `3-7` / `>=8`) against
+behind-in-all, over those 20 keys.
+
+**Its power is stated before it runs and it is low.** With 83.7% of keys behind at k=2 the marginal
+is extreme — roughly 17 of the 20 will be behind — so the test reduces to whether the few non-behind
+keys sit at `>=8`. **Registered reading: only a cross-tabulation in which every non-behind key sits
+at `>=8` counts as support, because any other arrangement is reachable by chance at this marginal.**
+Measured and statable beats a one-cell join, and that is the whole of the claim.
+
+### A correction to amendment 21(a), which overstated how many columns separate the group
+
+Amendment 21(a) reported rows 64–2048, nnz 11059–23655 and degree 10.24–172.80 as three facts. The
+degree extremes are **not independent**: `11059/64 = 172.797` and `20971/2048 = 10.2397`, so the
+degree range is the same two cells read a second way. **The honest statement is that one shape column
+separates the group — `nnz`, tightly, 11059 to 23655 across all nine — and the other two do not.**
+And on the clamp: `rows=64` gives `rows/16 = 4`, so the ceiling was 4 and production chose 2 beneath
+it, which is the ceiling-not-the-count point in its sharpest form.
