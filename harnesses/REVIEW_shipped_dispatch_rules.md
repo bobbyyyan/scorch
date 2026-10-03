@@ -2698,3 +2698,77 @@ the column stating it went unread.
 
 Job 17701623 cancelled while PENDING. **Gate work stops here** -- the proportionality rule being
 applied is: report what changes a verdict, not what could. This one changed three.
+
+## MKT SuiteSparse, {2,4,8}: the k=4 dip INVERTS, and k=2 is the width behind MKL
+
+Job 17701502, build `ship` (hooks-clean, so MKL comparisons are not taxed), ss phase complete
+04:41:07 with `rows=41346 expect 41346`, rc=0. Transported with a producing-host digest
+(`5762e6913dc283d4…`, byte-identical locally). Read in the order registered before the numbers were
+seen.
+
+**Corpus restriction, step 1.** 4594 measured paths -> 4578 distinct basenames, which is exactly
+the common set with redwood's sealed census (`chain209-dlmc-dims/ss_dims.csv`): 6 redwood-only
+(`bone010_B/C/M`, `boneS10_B/C/M`), **0 MKT-only**, and 15 basenames covering 31 paths, so
+4578 + 16 duplicates = 4594 closes as a partition. Computed with Python set operations, not `comm`.
+
+**Step 2, the mirrored-path shape check — and it mattered.** 8 of the 31 mirrored paths disagree
+with redwood's sealed `(rows, nnz)`, and those 8 are exactly the basenames that disagree *with each
+other* on MKT. They are genuinely different matrices sharing a name across groups:
+`Newman/football` is 115x1226 against `Pajek/football` 35x118; `Pothen/barth` 6691x46187 against
+`Nasa/barth` 6691x26439. In every one of the 8, exactly one path matches redwood — so
+dedup-by-basename would have chosen arbitrarily, and the `barth4` precedent (exclude) is right.
+Excluded: barth, barth4, barth5, ex3sta1, football, fxm3_6, fxm4_6, pf2177. **4570 matrices kept.**
+
+**Step 3, non-operands: 148 here against the registered 150, and both are correct.** Redwood's
+census has 150 keys with `min(rows, cols) == 1`; two of them (`bone010_B`, `boneS10_B`) are among
+the 6 redwood-only basenames, so MKT measures 148. The 127 `cols==1` / 23 `rows==1` split
+reproduces. Dropping them moves no verdict below.
+
+**THE BOARD.** Speedup = `mkl_ms / ours_ms`, so above 1.0 is ours faster:
+
+| k | n | geomean | median | behind MKL | `oursb` geomean |
+|---|---|---|---|---|---|
+| 2 | 4570 | **0.9480** | 0.8850 | **2828 (61.9%)** | 0.9482 |
+| 4 | 4570 | 1.1074 | 1.0681 | 1864 (40.8%) | 1.1074 |
+| 8 | 4570 | 1.2300 | 1.2612 | 1038 (22.7%) | 1.2299 |
+| all | 13710 | | | **5730 (41.8%)** | |
+
+`oursb` reproduces `ours` to four decimals at all three widths, which is the internal consistency
+check that the two our-side builds are the same measurement.
+
+**The width curve is MONOTONE INCREASING in k — 0.9480 -> 1.1074 -> 1.2300 — so there is no k=4 dip
+on this host and corpus at all.** The registered paired statistic
+`log r_4 - mean(log r_2, log r_8)` confirms it with the sign reversed:
+
+| paired k=4 statistic | pooled | deg 0-32 | 32-100 | 100-256 | 256+ |
+|---|---|---|---|---|---|
+| redwood SuiteSparse (registered) | **-3.24%** | -2.82 | -6.13 | -11.23 | -9.66 |
+| MKT SuiteSparse (measured) | **+2.56%** | +1.86 | +10.95 | +9.30 | +3.27 |
+| MKT 95% CI | [+2.07, +3.06] | [+1.34, +2.38] | [+9.54, +12.41] | [+6.54, +12.42] | [+1.46, +5.17] |
+
+Every band is a bump with a CI excluding zero. **So the k=4 deficit is not a property of the kernel
+family: it reverses sign between the two confirmation hosts on the same collection.** A plausible
+mechanism is already on record -- redwood compiles AVX2-only and MKT compiles Zen4 AVX-512 under
+`-march=native`, and `scorch_simd_half<float>` is a 128-bit `__m128` form, so the half-vector width
+is not the same code on the two hosts. That is a mechanism to test, not a conclusion.
+
+**Against the registered prediction, which was wrong.** I registered "k=4 ranks 2nd most robust of
+3 on SuiteSparse" from redwood's normalised table. MKT reads **1st of 3** -- but the rank is close
+to meaningless here, because the three widths' top-band normalised values are 0.8088 / 0.8204 /
+0.8095, a spread of **1.2 pp** against redwood's 18.7 pp. The honest statement is not "the rank
+moved by one" but **"the quantity that discriminated the widths on redwood does not discriminate
+them on MKT"**, and separately the paired statistic's sign flipped. Registering a rank was the
+wrong choice of prediction: a rank cannot express "the spread collapsed", so it would have read as
+a near-miss either way.
+
+**What this means for the standing task.** On MKT SuiteSparse at narrow widths, scorch is **not**
+ahead of MKL: 41.8% of 13710 cells are behind, concentrated at k=2 (61.9%, geomean 0.9480, median
+0.8850). The deficit deepens with degree -- at k=2, 59% of matrices are behind in deg 0-32 and
+92% at deg 256+. **k=2 on MKT, not k=4, is the live problem.**
+
+**Scope, stated.** One pass (`p1`), one reading per cell, so the per-cell "behind" counts are an
+upper bound on a confirmed deficit -- the established standard elsewhere in this work is "behind in
+every reading" over 12-16 readings. A geomean of 0.9480 over 4570 matrices is not noise; an
+individual cell at 0.98 may be. One host for this board: the matching redwood screen at these three
+widths does not exist yet, and the redwood figures quoted above come from a different screen
+(`chain207`, five widths), so the cross-host comparison is of statistics, not of a shared design.
