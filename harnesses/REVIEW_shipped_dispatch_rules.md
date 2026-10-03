@@ -2034,10 +2034,19 @@ finds in both files.
 | redwood 3-component vs MKT | 931 common, 295 rw-only | **1226 common, 0 rw-only** |
 | basenames: common / rw-only / MKT-only | 4578 / 6 / 0 | **4578 / 6 / 0, unchanged** |
 
-**All 1226 of redwood's group-qualified keys exact-match MKT's**, 1:1 with nothing left over. So
-the two caches agree perfectly on group labelling wherever redwood records a group, and the
-"295-310 group-name disagreements" that the wrong number implied **do not exist**. The remaining
-differences are only the two already recorded: 6 basenames and 16 duplicate paths.
+**All 1226 of redwood's group-qualified keys exact-match MKT's** -- 0 of them one-sided. So the
+"295-310 group-name disagreements" that the wrong number implied **do not exist**, and the
+remaining differences are only the two already recorded: 6 basenames and 16 duplicate paths.
+
+> **CORRECTED.** This first read "1:1 with nothing left over", which is false and was not
+> supported by what I printed. I reported `comm -12` and `comm -23` and **never printed
+> `comm -13`** -- the MKT-only count, which is the column that distinguishes a real cross-dataset
+> match from a self-comparison, because a self-comparison also zeroes the left-only side. It is
+> **3368**: 4594 MKT paths minus 1226 matched, exactly as it must be, since redwood's other 3358
+> keys use forms that cannot exact-match a uniformly-qualified list. So the true claim is
+> **one-sided containment** -- redwood's qualified subset is contained in MKT's key set -- not a
+> bijection. **Print all three `comm` sides, or the output cannot rule out that the second input
+> was empty, substituted, or the first input again.**
 
 **The basename comparison -- which the finding above rests on -- is unchanged.** It was correct,
 and is now correct for a checkable reason rather than by luck.
@@ -2093,11 +2102,48 @@ pair are operators, so a cross-host comparable set loses **2** real matrices, no
 Pooled geomeans move k=2 1.7351 -> 1.7113, k=4 1.9346 -> 1.8979, k=8 2.3038 -> 2.2707, deepening
 the pooled dip -3.24% -> -3.72%.
 
-**The distortion is real, runs against the dip, and cannot touch the finding** -- because a matrix
-with `min(rows, cols) == 1` has mean degree at most 1 and therefore lands in band 0-32 by
-construction. 149 of the 150 are in that band and one is in 32-100. The two high-degree bands that
-carry the entire k=4 result contain **none** of them and move by exactly 0.00 pp. That is
-disjointness by construction rather than a caveat.
+**The distortion is real, runs against the dip, and does not touch the finding** -- but "by
+construction" was wrong for 23 of the 150, and the sentence that said so was refuted by the next
+sentence in its own paragraph ("149 in that band and one is in 32-100" cannot be true if the bound
+holds).
+
+With `deg = nnz/rows` (`mrgate.py:143`), the two halves of the predicate behave differently:
+
+| | bound on degree | measured max |
+|---|---|---|
+| `cols == 1` (127 keys) | **deg <= 1 structurally** -- one column puts at most one entry in each row | 1.0000 |
+| `rows == 1` (23 keys) | **none** -- `deg == nnz`, which the predicate does not bound | nnz 1 (x20), 5, 6, **64** |
+
+So the 64-nonzero one-row matrix is the entry in band 32-100, and the disjointness from the
+high-degree bands is a **fact about this corpus with a thin margin** -- 64 against a band edge of
+100 -- not a property of the predicate. A single one-row matrix with nnz >= 256 would land in the
+256+ band, where it would be 1 of 51 and that band carries the entire k=4 result.
+
+**The safe form, which is what to run on any corpus: read `max(nnz)` over the `rows == 1` entries
+and compare it to the band edges.** Here that is 64 < 100, so the two high-degree bands contain
+none of the 150 and move by exactly 0.00 pp -- verified, with the margin named, rather than
+asserted structurally.
 
 What does change: SuiteSparse's low-degree dip is **-3.34%**, not -2.82%, which widens rather than
 narrows its separation from DLMC's +0.95% at the same band.
+
+### The diagnostic worth keeping over the locale rule
+
+A peer reproduced my `931 / 295` **from redwood's list alone**, comparing its own subsets against
+its own full list under the two locales -- no MKT data enters it. That is stronger than "the merge
+desynchronised": the step carried no information about the second dataset at all.
+
+**So the test is: if a cross-dataset comparison's output is reproducible from one dataset alone, it
+told you nothing about the other.** That is cheaper than auditing a merge, needs no knowledge of
+which tools are order-sensitive, and also catches an empty, substituted, or self-compared second
+input -- which a locale audit does not. It is the same failure as a validation whose two quantities
+share a residual, and the same remedy: ask what the output would be if the second input were
+absent.
+
+**One apparent label conflict that is a frame difference, not a defect.** The peer's component
+counts are off by one from mine because the sealed census keys carry an `ss/` prefix and my
+generated lists are relative to the `ss` directory. Group-qualified entries are therefore
+**4-component in the census and 3-component in the generated list**, both 1226; flat-plus-suffixed
+are 3-component in the census and 2-component generated, both 3358. Each label is right in its own
+frame, and the two are not comparable without naming which. Verified: my list has 1226 three-
+component and 3358 two-component keys.
