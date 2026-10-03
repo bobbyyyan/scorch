@@ -1725,3 +1725,65 @@ degree range is the same two cells read a second way. **The honest statement is 
 separates the group — `nnz`, tightly, 11059 to 23655 across all nine — and the other two do not.**
 And on the clamp: `rows=64` gives `rows/16 = 4`, so the ceiling was 4 and production chose 2 beneath
 it, which is the ceiling-not-the-count point in its sharpest form.
+
+---
+
+## Amendment 23 — the only direct test of the association runs OPPOSITE to the hypothesis, and that is a prediction for the job now running
+
+Amendment 22(d) registered the 20-key cross-tabulation and its reading before running it.
+`an_xtab_resolved_behind.py` at `eb71b2c2f0034df2`, on MKT's existing oracle (38016 rows, 72 keys
+with a production count at k=2) against the float32 DLMC board's behind set (328 of 392 = 83.7%,
+emitted by `an_f64_vs_mkl.py --dump-behind`):
+
+| resolved group | behind | not | total | behind share |
+|---|---|---|---|---|
+| `<=2` | 3 | 4 | 7 | **42.9%** |
+| `3-7` | 0 | 0 | 0 | n=0 |
+| `>=8` | 11 | 2 | 13 | **84.6%** |
+| TOTAL | 14 | 6 | 20 | 70.0% |
+
+**The `<=2` cells are HALF as likely to be behind MKL as the `>=8` cells, 42.9% against 84.6%.**
+The hypothesis was that the thread-sizing headroom and the deficit live in the same cells. The only
+direct test of that association puts them in *different* cells.
+
+**Registered reading, applied: NOT SUPPORT.** Four of the six non-behind keys sit at `<=2`, and
+amendment 22(d) registered support as requiring *every* non-behind key at `>=8`.
+
+**Three things said precisely, because the result is weak and favourable to nothing.**
+
+1. **n=20 and Fisher's two-sided exact p on the collapsed 2×2 `[[3, 4], [11, 2]]` is 0.1219.** The
+   association is **not established**. What is established is that the point estimate is in the
+   opposite direction to the hypothesis, which is a different and smaller claim.
+2. **The marginal here is 70.0%, not the corpus's 83.7%.** The power argument registered in
+   amendment 22(d) assumed ~17 of 20 behind; the shared 20 are less behind than the corpus, which
+   gave the table more discriminating room than registered — so the low-power caveat is *milder*
+   than it was written, and the registered reading still returns NOT SUPPORT.
+3. **The `3-7` group is empty among the shared 20**, so this is a 2×2 and not the 2×3 the
+   registration described. Nothing was collapsed to make it so.
+
+### The directional prediction this makes for job 17698209, registered before it reports
+
+If the `<=2` share is *lower* among behind cells than among non-behind ones, then **condition 4's
+statistic `s328 - s64` should be NEGATIVE.** That is registered now, from data independent of the
+run: the 20-key table is the old 72-key oracle against the screen's board; the running job sweeps
+all 392 keys fresh.
+
+- **`s328 - s64` negative, CI excluding zero** — the `<=2`-worker headroom is *anti*-correlated with
+  the deficit. Thread sizing closes for the deficit, not because the headroom is absent but because
+  it is somewhere else, and the 20-key table predicted it.
+- **CI containing zero** — condition 4's registered verdict applies unchanged: the share is a corpus
+  property, not a deficit property.
+- **`s328 - s64` POSITIVE, CI excluding zero** — the 20-key table is refuted by a larger sample on
+  its own corpus, and the reach question falls back to condition 2's bands on `s328` alone. **This
+  is the outcome that would reopen the mechanism**, and naming it now is the point of writing this
+  before the job reports.
+
+### And the instrument's own guard, because the first version could not have produced a table
+
+A first version selected production's count by filtering rows on `probe_ovr == 0`. If that column
+never holds 0 the filter yields an empty `res` map, every shared key drops, and the output reads
+*"all shared keys are behind, NOT SCOREABLE: this is the marginal doing the work"* — a sentence that
+is true of an empty table and describes a measurement. It now reads `res_ovr0` from **every** row of
+the cell and REFUSES if a key carries more than one value, so the grouping cannot depend on row
+order. The Fisher implementation is validated against two published tables before use: the
+tea-tasting `[[3,1],[1,3]]` at 0.4857142857 and `[[1,9],[11,3]]` at 0.0027594.
