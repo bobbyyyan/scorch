@@ -1136,22 +1136,42 @@ key, and the diagnostic that found it costs nothing.
 
 ### How much this matters, measured rather than implied
 
-The gate fires only at pool <= 16, and **neither x86 benchmark host runs a pool that low by
-default**: `torch.get_num_threads()` reads **64** on mkt1 (128 CPUs, so half) and the
-header gives redwood's as 24. At those pools `:2614` zeroes `mingrains` and the predicate
-is unreachable. So the configuration measured above is not the one that produces this
-project's MKL comparisons, and this finding does **not** move the MKL scoreboard on either
-host at default settings.
+The gate fires only at pool <= 16, so the question is what pool a caller actually gets.
+**It is not a host constant -- it tracks the allocation**, measured on mkt1:
 
-Where it does bite is x86 with a deliberately constrained pool -- `torch.set_num_threads(8)`,
-a container CPU limit, a narrow Slurm allocation -- which is a real pattern and not the
-default one. Combined with the prevalence figures above, the exposed population at pool <= 16
-is 2069 of 4446 SuiteSparse operands at k <= 16 and 1154 of 3820 DLMC matrices, at a cost of
+| allocation | affinity | `torch.get_num_threads()` | `omp_get_max_threads()` | gate |
+|---|---|---|---|---|
+| `-c 8` | 8 | 8 | 8 | **fires** |
+| `-c 16` | 16 | 16 | 16 | **fires** |
+| `-c 32` | 32 | 32 | 32 | inert |
+| `-c 64` | 64 | 64 | 64 | inert |
+| `-c 128` | 128 | 64 | 64 | inert |
+
+So the gate fires **with nothing set by the caller** under any allocation of 16 or fewer
+CPUs, which on a shared cluster is an ordinary way to run rather than a special
+configuration. An earlier version of this section measured one allocation size, reported
+`torch.get_num_threads()` as 64, called that "the default", and concluded the predicate was
+unreachable except under a deliberately constrained pool. That under-stated the finding: no
+deliberation is required.
+
+What remains true is the narrower claim: at a **full-node** allocation both x86 hosts are
+above the ceiling -- 64 on mkt1, and the header gives redwood's pool as 24 -- so the runs
+that produce this project's headline MKL comparisons do not exercise the gate, and this
+finding does not move those numbers.
+
+Combined with the prevalence figures above, the exposed population wherever the gate does
+fire is 2069 of 4446 SuiteSparse operands at k <= 16 and 1154 of 3820 DLMC matrices, at
 6.8% to 62.3% depending on pool.
 
-Stating this prominently because the alternative is a finding that reads as a 62% regression
-in shipped code without the clause that makes it a non-default configuration. Both halves
-are true and only together.
+**Two production paths read two different quantities, and they agree here.**
+`scorch_spmm_partition_mode` takes `nthreads_override`, and `prebuilt_kernels.py` declares
+`nthreads: Optional[int] = None`, passing the override only when it is not None and calling
+`kernel_fn(*args)` otherwise -- in which case the policy receives 0 and `:2612` falls back
+to `omp_get_max_threads()`. The comment at `:292` confirms the override is supplied only for
+the drop-in SpMM. So the predicate's input differs by call path, and an inertness claim has
+to name the quantity per path rather than quote one number. On this host they coincide at
+every allocation size measured above, so the boundary is the same either way; on a host where
+torch's count and libgomp's diverge it would not be.
 
 ### Scope
 
