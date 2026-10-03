@@ -636,6 +636,72 @@ the output-bytes predicate. They inflate the region exactly as column vectors do
 With both halves, non-operators are 125 + 23 = 148, the operand denominator is 4446, and
 the shares are 46.5% and 29.1% -- 0.93 and 0.92 pp below the uncomposed 47.47% and 30.02%.
 
+**The shape predicate is better than the filename one and is still not complete.**
+Showing a filename match misses 80% of the non-operators does not show that
+`min(shape) == 1` catches all of them, and the complement was untested: an entry can be a
+non-operator and still have `min(shape) > 1`. A multi-input state-space `B` is n x m, a
+multi-output `C` is m x n. Measured on the cache, the complement is **not empty**:
+
+| min(shape) of the 1066 non-square entries | count |
+|---|---|
+| 1 (the shipped predicate's catch) | 148 |
+| 2-4 | 41 |
+| 5-16 | 56 |
+| 17-64 | 57 |
+| 65-256 | 105 |
+| >= 257 | 659 |
+
+`boneS01_C` is 3 x 127224, `inlet_B` is 11730 x 2, `rail_1357_B` is 1357 x 7. And the
+families confirm the role: 26 base names hold both a degenerate and a thin member, e.g.
+`bips07_1693_iv` at (13275, 1) beside `bips07_1693_B` at (13275, 4) and `bips07_1693_C` at
+(4, 13275) -- a four-input power-system model, where the single-input members are the n x 1
+the shipped predicate already catches.
+
+**No cutoff completes it, which is why the fix is a bracket and not a wider predicate.**
+The distribution above is continuous from 2 upward with no gap, so any `min(shape) >= c`
+is a chosen constant of exactly the kind this project does not ship, and `bibd_12_4` at
+(66, 495) is a combinatorial design matrix -- genuinely sparse, genuinely an operator,
+and thin. The share's sensitivity to c is therefore the honest statement:
+
+| c | operands | k<=16 region | share | k=32 region | share |
+|---|---|---|---|---|---|
+| 2 (shipped) | 4446 | 2069 | **46.54%** | 1294 | **29.10%** |
+| 3 | 4438 | 2061 | 46.44% | 1286 | 28.98% |
+| 5 | 4404 | 2027 | 46.03% | 1252 | 28.43% |
+| 17 | 4326 | 1949 | 45.05% | 1174 | 27.14% |
+| 65 | 4190 | 1816 | 43.34% | 1042 | 24.87% |
+| 257 | 3953 | 1597 | 40.40% | 827 | 20.92% |
+
+Over a 128-fold range of c the share moves 6.1 pp, so the headline figure does not hinge
+on the incompleteness. It is reported at c = 2 because that is the only value needing no
+chosen constant, with the range above as its sensitivity.
+
+**A suffix list over-counts, which is why it is not the test.** Of the 158 entries matching
+`_(b|B|C|E|iv|x|rhs)` with `min(shape) > 1`, **70 are square** -- `LF10_E` at 18 x 18 and
+`ted_B` at 10605 x 10605 are descriptor-system mass and input matrices that are perfectly
+good SpMM operators. A square matrix is an operator whatever its suffix. The two tests that
+carry the finding above use no list: the `min(shape)` histogram and the mixed-family count.
+
+**This does not change the region list, and that is a different question from the share.**
+A 4 x 13275 CSR times a 13275 x 16 dense is a valid SpMM and a valid kernel cell; whether a
+user would ever call it is workload realism. The denominator matters for the prevalence
+claim, where counting a right-hand side as an operand inflates it. The emitted list feeds a
+runtime A/B that needs valid shapes, not realistic ones, so it stays at 2069 members.
+
+**The one-row count rests on a property that was implied and is now printed.** All 23
+one-row entries leaving the k=32 region requires nnz < 9375 for every one of them. That is
+not free: `LF10000_C` is 1 x 19998, and a dense row would give nnz*32 = 639936, outside the
+region, so a dense-row `_C` would break the count. Measured max nnz among the 23 is **64**
+(`inlet_C`, shape (1, 11730), nnz 64), so the arithmetic holds -- these are sparse output
+maps picking out a handful of states, not dense ones.
+
+**The pp shifts are rounded from the difference, not differenced from rounded inputs.**
+47.475 - 46.536 = 0.939 and 30.017 - 29.105 = 0.912, so **0.94 and 0.91**; the previously
+published 0.93 and 0.92 came from differencing 47.47 - 46.54 and 30.02 - 29.10, off by one
+hundredth in *opposite* directions. Pre-rounding an input can move a difference either way,
+so it is not a conservative simplification. And the 0.939 pp bundles two corrections of very
+different size: composition is **0.022 pp** and operand exclusion is **0.917 pp**.
+
 **The denominator counted vectors as matrices.** SuiteSparse ships the right-hand side of
 each linear system alongside the operator, and a one-column entry stored as CSR has
 `len(indptr)-1 = rows` with very few nonzeros -- so a predicate selecting on *small nnz*
