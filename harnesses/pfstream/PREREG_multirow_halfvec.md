@@ -631,3 +631,92 @@ sensitivity above is the bound — but every future threshold applied through `p
   at it: the consistently-behind population is **quieter** than the corpus. That strengthens
   amendment 3(b)'s conclusion rather than weakening it. And the CV needs its own functional named for
   the same reason the median did — 26.8% published against 41.4% recomputed as stdev-over-mean.
+
+---
+
+# Amendment 5 — the convention's exposed set in closed form, and the one n in this run that lands in it
+
+Still before any timing. Verified independently rather than taken on report; all six checks below
+reproduce exactly.
+
+## The closed form, which predicts any n instead of enumerating
+
+At `q=0.5`, `pct`'s index is the **upper** median iff `n ≡ 0 (mod 4)` and the **lower** median iff
+`n ≡ 2 (mod 4)`. **Zero mismatches over every even n in [2, 4000].** Odd n is unambiguous —
+`q*(n−1)` is an integer, zero fractional indices over every odd n in [1, 4001].
+
+Published population sizes: 2 LOWER, 4 UPPER, 6 LOWER, 8 UPPER, 12 UPPER, 68 UPPER, 78 LOWER,
+108 UPPER, 152 UPPER, 298 LOWER, 328 UPPER.
+
+## The consequence that matters more than the inconsistency: it flips when the population changes by TWO
+
+| | |
+|---|---|
+| n=68 UPPER | → n=70 LOWER |
+| n=78 LOWER | → n=80 UPPER |
+| n=108 UPPER | → n=110 LOWER |
+| n=298 LOWER | → n=300 UPPER |
+| n=328 UPPER | → n=330 LOWER |
+
+Every one of those is a published population size sitting one step from a boundary. **A filter edit,
+a dropped key or a re-grouping silently changes the estimator.**
+
+**One line for the record on amendment 31.** Its replication gate refused at n=328/108 and passed at
+n=298/78 — and 328 and 108 are **UPPER** while 298 and 78 are **LOWER**, so **the three attempts
+were not estimator-identical**. That does not move amendment 31's result (at n=78/152/298 the
+exposure is one adjacent order statistic out of tens to hundreds, already bounded at ≤1.91 pp), but
+the whole purpose of that gate was to establish the grouping, so it belongs in the record.
+
+## The exposure is bounded by q, derivably — and the floor side is immune
+
+At `q=0.5` **every** even n hits the half-integer, which is why the medians moved. At `q=0.95` it
+requires `0.95(n−1)` to be a half-integer, i.e. **n ≡ 11 (mod 20)**. Verified: all 1000 such n in
+[2, 20000], and no others.
+
+| quantity | n | n mod 20 | `0.95(n−1)` frac | |
+|---|---|---|---|---|
+| DLMC board floor | 3820 | 0 | 0.05 | unambiguous |
+| full-board floor | 19100 | 0 | 0.05 | unambiguous |
+| no-regression pool | 3769 | 9 | 0.60 | unambiguous |
+| **displacement n (the NEW condition)** | **51** | **11** | **0.50** | **EXPOSED** |
+
+**So the p95 ratio-floor row and the 27.7% gate threshold are provably unaffected.** That is the
+reassurance amendment 4 did not have: the floor side — the thing everything was compared *against* —
+is immune by arithmetic, not by coincidence. Only the per-cell medians on the other side of the
+comparison moved.
+
+## The one forward hazard, and it is exactly where this run is headed
+
+**n=51 is 11 (mod 20).** `0.95 × 50 = 47.5`, a half-integer resolved to index 48 by the rounding mode
+rather than by any stated rule. And the replacement secondary condition registers the displacement
+floor **at n=51**. So of every population in this run, the single one whose p95 falls in the exposed
+class is the one the new condition uses.
+
+The value is determined, so this is not yet an error — but it is determined by a rounding mode
+instead of a declared convention, on the one n where that happens to matter.
+
+**Registered now, before the run:** the n=51 displacement floor is computed as the **upper** order
+statistic at index `ceil(0.95 × (n−1)) = 48`, stated explicitly, and the scoring output prints both
+the index and the convention beside the value. The 0.5 quantiles throughout the scoring path use
+`statistics.median`, which averages the two middle values and so **has no index to choose** — naming
+it is a real fix and not a different arbitrary choice.
+
+## The design rule, promoted, because it would have pre-empted three failed conditions
+
+**When a threshold must be applied, prefer the formulation that reduces LAST or not at all.**
+
+An estimator's index cannot move a conjunction over raw readings. That is why the sign-only 51
+recomputes identically under every convention while every magnitude-threshold-on-a-per-cell-median
+criterion in this document failed review — conditions 3, 3a, and the gain-needed column, in one
+stroke. The surviving criterion's robustness is a property of **where the reduction sits**, not of
+the care taken writing it.
+
+## Scope limits, recorded
+
+The `n mod 4` rule is derived for `q=0.5` specifically, where `q*(n−1)` is a half-integer for all
+even n. For an arbitrary quantile the exposed set is whatever n makes `q*(n−1)` land on a
+half-integer — the general form of the `n ≡ 11 (mod 20)` result — and **only q=0.5 and q=0.95 have
+been checked.** Any other quantile used anywhere needs its own modulus computed.
+
+And the width-contrast blast radius (≤1.91 pp) is from a different ledger and has not been
+independently recomputed; it is mine, not confirmed.
