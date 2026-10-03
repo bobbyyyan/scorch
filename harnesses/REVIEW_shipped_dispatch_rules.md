@@ -3765,11 +3765,29 @@ everywhere. Symbol presence cannot answer this question for this kernel.
 | `hi01` | 15 | `2f0811de5f5e9d5f` |
 | `rvec` (ROWVEC=1) | **9** | `7148b5cf30fbc722` |
 
-`rvec` loses exactly the seven instantiations at K in {2,3,4} -- the widths whose row fits a
+`rvec` loses exactly the **seven** instantiations at K in {2,3,4} -- the widths whose row fits a
 128-bit register (8, 12 and 16 bytes) -- and keeps K in {5,6,7}, which the new kernel delegates to
 the scalar one. So the set difference is a **positive, path-invariant demonstration that the define
 took effect**, and it is what makes the zero above informative rather than empty. `hi01` keeping
 ship's full set confirms the define changes which kernel is *called*, not which is instantiated.
+
+**Seven is the loss; the net set-size change is six, and stating only one of them invites a
+misreading.** A peer differenced the census counts (15 - 9 = 6) and concluded the loss was six.
+Both directions, enumerated rather than counted:
+
+| | count | members |
+|---|---|---|
+| in `ship`, not `rvec` | **7** | K=2 (U=4,8), K=3 (U=4,8), K=4 (U=2,4,8) |
+| in `rvec`, not `ship` | **1** | `narrow_exact<float, 6, 2>` |
+| in both | 8 | K=5 (U=2,4,8), K=6 (U=4,8), K=7 (U=2,4,8) |
+
+Partition: 7 + 8 = 15 and 1 + 8 = 9, both totals reproduced. The new K=6 variant appears because
+`rvec` reaches the scalar kernel at K=6 through the delegation branch, which shifts the inliner's
+decisions. So a net difference of -6 conceals a gain on the other side -- the same shape as
+`partition_identity_hides_misrouting`, where a total that is an identity hides a misrouted member.
+The 3-vs-2 divisibility argument offered alongside it does not hold either: `ship` carries U in
+{4,8} at K=2 and K=3 but U in {2,4,8} at K=4, so 2+2+3 = 7 is not uniform per K. **The number to
+publish is the pair, not either half.**
 
 Whole-object, also path-invariant: pre-edit and new `ship` both define **1190** symbols, **1093**
 distinct names, identical name-set digest `083bdf576880beea`.
@@ -3853,3 +3871,53 @@ expectation of 11035. What settles it is **set identity** -- the distinct `(key,
 to the row count within each file, and that set identical across the four files, with `LC_ALL=C`
 fixed on both the sort and the consumer. `ss_float32_ship_s0.csv` is 11035 rows (1226 x 3 x 3 plus
 header), which is necessary and is not the check.
+
+
+### 7. The displacement metric was a cross product twice, from two different causes
+
+The fix in item 6 keyed the join on the whole name. That was necessary and not sufficient, and the
+second failure was caught by the control rather than by review.
+
+**`nm -C` emits 1190 lines for 1093 distinct names** in this object -- 83 names appear more than
+once, from weak and local aliases, COMDAT folding, and pybind holder templates at up to three
+addresses each. `join` on a key present k times in one file and m times in the other emits k*m
+rows, so a `name<TAB>addr` table is not join-safe. Measured on `ship` vs `shpb`, whose `.text` is
+byte-identical so the true displacement is exactly 0: the name-keyed version read **56**, with
+`joined` = 1412 against a table of 1190.
+
+**A join returning more rows than its smaller input is the tell**, and it is now an assertion
+rather than something to notice: the table carries one row per name with its sorted address list,
+which makes `joined <= min(table sizes)` an invariant, and the script refuses when it is violated.
+A name whose address *set* differs is the definition of displaced, which is the right definition
+when a name legitimately has several addresses.
+
+| pair | all_j | all_d | rest_d | kern_j | kern_d | expectation |
+|---|---|---|---|---|---|---|
+| `ship` vs `shpb` | 1093 | 0 | **0** | 28 | 0 | must be 0, `.text` byte-identical |
+| `ship` vs `rvec` | 1076 | 1020 | 974 | 21 | 21 | must be nonzero |
+| `ship` vs `hi01` | 1093 | 7 | **6** | 28 | **0** | 208-byte `.text` delta |
+
+**The `hi01` row is the peer's enumeration point, measured.** The kernel pattern reports zero
+displaced while six symbols outside it moved. Had the verdict rested on the kernel pattern it would
+have asserted a bit-identity that was never tested -- and the float32 path is demonstrably wider
+than the pattern: `spmm_csr_float_v2_core` does not match it at all, and `spmm_csr_float_v2` is a
+live `T` symbol on that path.
+
+**So the population is defined by exclusion rather than by a list of names.** Counting over *all*
+symbols fails the other way -- a `_F64` knob is supposed to move the float64 code, so `all` is
+never zero for it and `UNUSABLE` becomes unreachable again. `rest` is every defined symbol minus
+those the define is entitled to change, matched by naming `double`/`f64`. Forgetting a float32
+function name now leaves it in `rest` by default instead of dropping it silently, which is the
+fail-closed direction. Over-excluding can only shrink `rest` and make `UNUSABLE` easier to reach,
+which is the conservative direction for a verdict that sends an arm away.
+
+The two `_omp_fn` clones of `spmm_csr_v2_core<float, false>` -- where the parallel region's body
+actually runs -- do appear in the kernel subset, but only because the clone suffix leaves the
+prefix intact. That is luck, and it is another reason the verdict does not rest on that pattern.
+
+**And one shortcut closed before it was taken.** `rvec/ship` and `hi01/ship` at k=8 will give two
+readings of different character, which is a real gain. Their *difference* is not a placement
+estimate: both arms change float32 content, differently -- `hi01` moves a compile-time `exact_hi_`
+inside `spmm_csr_v2_core<float>`, `rvec` adds a kernel -- so subtracting them differences two
+mixtures rather than isolating the component they differ in. The `_F64` arms remain the only ones
+where content is provably fixed.

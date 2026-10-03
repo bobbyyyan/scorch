@@ -119,7 +119,8 @@ TAGS="base hv64 mr64 both hv00"
 #              Closer in kind to ROWVEC, which is why it is kept despite the weaker inertness
 #              argument.
 # Measured on the existing ROWVEC objects: ship vs hi01 has a 208-byte .text delta and displaces
-# ZERO of 28 tracked float32 symbols, while ship vs rvec displaces 21 of 22 joined. So delta and
+# ZERO of 28 tracked float32 symbols, while ship vs rvec displaces 21 of 21 JOINED (22 tracked,
+# one of which -- narrow_exact<float, 6, 2> -- is absent from ship, so it cannot join). So delta and
 # displacement are close to independent, and selecting on delta alone would have been wrong.
 declare -A AXIS
 AXIS[hv64]="placement"
@@ -190,16 +191,55 @@ echo "                   pair measures nothing and the .text delta is irrelevant
 # every kernel here -- so `join` emitted the cross product and counted address pairs between
 # DIFFERENT symbols. With n symbols sharing `void` the count was bounded below by n*(n-1), so
 # `[ "$D" = 0 ]` was unreachable and the UNUSABLE verdict this script exists to produce could
-# never fire. The failure direction was the harmful one: a pair that moved nothing read as usable
-# and would have cost job time. Splitting address from name on nm's TYPE column also removes the
-# $9 truncation, which cut signatures at seven tokens and dropped the type field.
-PAT='scorch_spmm_row_(narrow_exact|narrow_rowvec|regblock|gather)<(float|scalar_t)|spmm_csr_v2_core<float'
-symtab() {  # $1 = .so, $2 = output path
+# never fire. Measured on ship vs shpb, whose .text digests are IDENTICAL so the true displacement
+# is exactly 0: the old pipeline read 514. Splitting address from name on nm's TYPE column also
+# removes the $9 truncation, which cut signatures at seven tokens and dropped the type field.
+#
+# AND THE POPULATION IS NOW DEFINED BY EXCLUSION, NOT BY A LIST OF NAMES. A pattern enumerating
+# kernel families cannot be trusted in a REFUSAL: the float32 execution path is wider than any
+# list I thought to write. Checked rather than assumed -- `spmm_csr_float_v2_core` does not match
+# the kernel pattern at all, and `spmm_csr_float_v2` is a live T symbol on that path. If an
+# untracked function moves, a name-keyed metric reads zero and UNUSABLE asserts a bit-identity
+# that was never tested.
+#
+# Counting over ALL symbols instead fails the other way: a _F64 knob is SUPPOSED to move the
+# float64 code, so `all displaced` is never zero for it and UNUSABLE becomes unreachable again.
+# So the population is every defined symbol MINUS the ones the define is allowed to change,
+# identified by naming double/f64. Forgetting a float32 function name now leaves it in `rest` by
+# default rather than dropping it silently, which is the fail-closed direction.
+KPAT='scorch_spmm_row_(narrow_exact|narrow_rowvec|regblock|gather)<(float|scalar_t)|spmm_csr_v2_core<float'
+# The exclusion: symbols the _F64 arms are entitled to move. Deliberately broad -- over-excluding
+# shrinks `rest` and can only make UNUSABLE easier to reach, which is the conservative direction
+# for a verdict that sends an arm away.
+XPAT='double|_f64|F64|<double'
+# ONE ROW PER NAME, CARRYING ITS SORTED ADDRESS LIST. A name<TAB>addr table is NOT join-safe:
+# `nm -C` emits 1190 lines for 1093 distinct names in this object -- 83 names appear more than
+# once (weak/local aliases, COMDAT folding, pybind holder templates at up to 3 addresses each) --
+# and `join` on a key present k and m times emits k*m rows. That is the same cross product as the
+# return-type bug in a different guise, and it was caught by the ship/shpb negative control:
+# those two have byte-identical .text so their displacement MUST be 0, and the name<TAB>addr
+# version read 56 with `joined` (1412) exceeding the table size (1190). A join emitting more rows
+# than its input is the tell.
+#
+# Collapsing to one row per name makes `joined <= min(table sizes)` an invariant the output can be
+# checked against, and makes a name whose address SET differs the definition of displaced -- which
+# is the right definition when a name legitimately has several addresses.
+symtab() {  # $1 = .so, $2 = prefix; writes <prefix>.all, .rest, .kern as name<TAB>addr,addr,...
   nm -C --defined-only "$1" 2>/dev/null \
-    | grep -E "$PAT" \
     | sed 's/^\([0-9a-f]*\) \([A-Za-z]\) /\1\t\2\t/' \
     | awk -F'\t' 'NF>=3 { print $3 "\t" $1 }' \
-    | LC_ALL=C sort -t'\t' -k1,1 > "$2"
+    | LC_ALL=C sort -u \
+    | awk -F'\t' '{ if ($1==p) a=a","$2; else { if(p!="") print p"\t"a; p=$1; a=$2 } }
+                   END { if(p!="") print p"\t"a }' \
+    | LC_ALL=C sort -t'\t' -k1,1 > "$2.all"
+  grep -Ev "$XPAT" "$2.all" > "$2.rest" || true
+  grep -E  "$KPAT" "$2.all" > "$2.kern" || true
+}
+disp() {    # $1 = base table, $2 = tag table; echoes "joined displaced"
+  local j d
+  j=$(LC_ALL=C join -t"$(printf '\t')" -j 1 "$1" "$2" | wc -l)
+  d=$(LC_ALL=C join -t"$(printf '\t')" -j 1 -o 1.2,2.2 "$1" "$2" | awk -F'\t' '$1 != $2' | wc -l)
+  echo "$j $d"
 }
 textsize() { # $1 = .so, $2 = output bin path; echoes the size or returns nonzero
   objcopy -O binary --only-section=.text "$1" "$2" 2>/dev/null || return 1
@@ -211,51 +251,62 @@ BSO=$(ls "$ROOT/base"/src/scorch_ops*.so | head -1)
 BT=$(textsize "$BSO" "$ROOT/base/text.bin") || {
   echo "REFUSE: objcopy could not extract .text from the base object, so every delta below"
   echo "        would be computed against nothing"; exit 1; }
-symtab "$BSO" "$ROOT/base/f32syms.txt"
-NB=$(wc -l < "$ROOT/base/f32syms.txt")
-echo "  base: .text $BT bytes, $NB float32 SpMM symbols tracked"
-[ "$NB" -gt 0 ] || { echo "REFUSE: zero float32 symbols tracked, so 'displaced' could only read 0"; exit 1; }
+symtab "$BSO" "$ROOT/base/sym"
+NA=$(wc -l < "$ROOT/base/sym.all"); NR=$(wc -l < "$ROOT/base/sym.rest"); NK=$(wc -l < "$ROOT/base/sym.kern")
+echo "  base: .text $BT bytes;  symbols all $NA, rest $NR (all minus double/f64), kernels $NK"
+for pair in "all:$NA" "rest:$NR" "kernels:$NK"; do
+  n=${pair#*:}
+  [ "$n" -gt 0 ] || { echo "REFUSE: zero symbols in the '${pair%%:*}' population, so its"
+                      echo "        displacement count could only read 0"; exit 1; }
+done
 echo
-printf "  %-5s %-9s %12s %12s %7s %7s %10s  %s\n" tag axis text_bytes delta tracked joined displaced verdict
+echo "  rest_displ is the verdict number: all symbols EXCEPT those the define may change."
+echo "  kern_displ is the same question asked of the SpMM kernels only, reported as a detail."
+echo
+printf "  %-5s %-9s %12s %11s %6s %6s %10s %10s  %s\n" \
+  tag axis text_bytes delta rest kern rest_displ kern_displ verdict
 for tag in $TAGS; do
   [ "$tag" = "base" ] && continue
   so=$(ls "$ROOT/$tag"/src/scorch_ops*.so 2>/dev/null | head -1)
-  [ -n "$so" ] || { printf "  %-5s %12s\n" "$tag" "NO OBJECT -- build failed, see build.log"; continue; }
+  [ -n "$so" ] || { printf "  %-5s %s\n" "$tag" "NO OBJECT -- build failed, see build.log"; fail=1; continue; }
   # A TOOL FAILURE MUST NOT ARRIVE WEARING A MEASUREMENT VERDICT. The base side was guarded and
-  # the tag side was not: a failing nm left an empty symbol file, the join yielded nothing, and
-  # the row printed "UNUSABLE -- float32 code did not move". Each tag now reports its own tracked
-  # and joined counts, and a zero in either is a REFUSAL rather than a reading.
+  # the tag side was not: a failing nm left an empty table, the join yielded nothing, and the row
+  # printed "UNUSABLE -- float32 code did not move".
   T=$(textsize "$so" "$ROOT/$tag/text.bin") || {
-    printf "  %-5s %12s\n" "$tag" "REFUSE: objcopy failed on this object"; fail=1; continue; }
-  symtab "$so" "$ROOT/$tag/f32syms.txt"
-  NT=$(wc -l < "$ROOT/$tag/f32syms.txt")
-  if [ "$NT" -eq 0 ]; then
-    printf "  %-5s %12s %12s %7s  %s\n" "$tag" "$T" "$((T-BT))" "0" \
-      "REFUSE: nm tracked 0 symbols here -- a tool failure, not a null displacement"
+    printf "  %-5s %s\n" "$tag" "REFUSE: objcopy failed on this object"; fail=1; continue; }
+  symtab "$so" "$ROOT/$tag/sym"
+  TR=$(wc -l < "$ROOT/$tag/sym.rest"); TK=$(wc -l < "$ROOT/$tag/sym.kern")
+  if [ "$TR" -eq 0 ] || [ "$TK" -eq 0 ]; then
+    printf "  %-5s %-9s %12s %11s %6s %6s  %s\n" "$tag" "${AXIS[$tag]:-content}" "$T" "$((T-BT))" \
+      "$TR" "$TK" "REFUSE: nm tracked 0 in a population here -- a tool failure, not a null"
     fail=1; continue
   fi
-  # Join coverage reported beside the displacement: a name present in one object and not the other
-  # drops out of the join silently, which is the same shape of loss as a dropped manifest line.
-  J=$(LC_ALL=C join -t"$(printf '\t')" -j 1 "$ROOT/base/f32syms.txt" "$ROOT/$tag/f32syms.txt" | wc -l)
-  D=$(LC_ALL=C join -t"$(printf '\t')" -j 1 -o 1.2,2.2 \
-        "$ROOT/base/f32syms.txt" "$ROOT/$tag/f32syms.txt" \
-      | awk -F'\t' '$1 != $2' | wc -l)
+  read -r JR DR <<<"$(disp "$ROOT/base/sym.rest" "$ROOT/$tag/sym.rest")"
+  read -r JK DK <<<"$(disp "$ROOT/base/sym.kern" "$ROOT/$tag/sym.kern")"
+  # THE INVARIANT THAT CATCHES A CROSS PRODUCT. With one row per name the join cannot exceed the
+  # smaller table. Checked rather than assumed, because this exact failure has now occurred twice
+  # in this script from two different causes and both times produced a plausible number.
+  MR=$(( NR < TR ? NR : TR ))
+  if [ "$JR" -gt "$MR" ]; then
+    printf "  %-5s %s\n" "$tag" "REFUSE: join returned $JR rows against a smaller table of $MR -- a cross product"
+    fail=1; continue
+  fi
   AD=$((T - BT)); [ "$AD" -lt 0 ] && AD=$((-AD))
   AX=${AXIS[$tag]:-content}
-  if [ "$J" -eq 0 ]; then
-    V="REFUSE: join matched 0 names -- not a null displacement"
-    fail=1
-  elif [ "$D" -eq 0 ] && [ "$AX" = "placement" ]; then
-    # Content is provably identical on this axis, so nothing moving means nothing differs.
-    V="UNUSABLE -- float32 content identical AND unmoved, so this pair is an A/A"
-  elif [ "$D" -eq 0 ]; then
+  if [ "$JR" -eq 0 ]; then
+    V="REFUSE: join matched 0 names in 'rest' -- not a null displacement"; fail=1
+  elif [ "$DR" -eq 0 ] && [ "$AX" = "placement" ]; then
+    # Content provably fixed on this axis AND nothing outside the excluded set moved.
+    V="UNUSABLE -- content provably fixed and nothing moved: this pair is an A/A"
+  elif [ "$DR" -eq 0 ]; then
     V="usable (content axis) -- unmoved, but the emitted float32 code differs"
   elif [ "$AD" -ge "$TARGET_DELTA" ]; then
     V="BRACKETS FROM ABOVE"
   else
     V="brackets from below"
   fi
-  printf "  %-5s %-9s %12s %12s %7s %7s %10s  %s\n" "$tag" "$AX" "$T" "$((T-BT))" "$NT" "$J" "$D" "$V"
+  printf "  %-5s %-9s %12s %11s %6s %6s %10s %10s  %s\n" \
+    "$tag" "$AX" "$T" "$((T-BT))" "$JR" "$JK" "$DR" "$DK" "$V"
 done
 echo
 echo "Keep the candidates whose verdict is not UNUSABLE and whose deltas STRADDLE $TARGET_DELTA."
