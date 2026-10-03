@@ -658,6 +658,30 @@ the positivity test the others were unreachable. It then discarded the element s
 the filter. Its docstring described a selection the code did not make, and its twelve-matrix
 cross-check could not cover a dtype the loop could not reach.
 
+**The row axis is now checked rather than taken from a directory name.** `len(indptr) - 1`
+is the row count for CSR and the **column** count for CSC, and the output-bytes predicate
+reads rows -- so the composed column rested on the cache being called `csrcache`. The
+archives carry `shape`, and `len(indptr) - 1 == shape[0]` holds for all 4594 with zero
+disagreements. The number that makes that non-vacuous: **1066 of the 4594 are non-square**,
+and only those can discriminate CSR from CSC, since a square matrix satisfies the check
+under either layout.
+
+A `format == b'csr'` check was written first and is not used, because **no file in this
+cache carries a `format` member** -- they are not scipy `save_npz` archives, and a check
+that exempts a missing key passes on all 4594 while proving nothing. The check I expected
+to be weak is the strong one and the one I expected to be decisive is absent.
+
+**The one matrix composition removes is the same matrix at both widths**: `Hamrle3_b.npz`,
+nnz=440 over 1,447,360 rows. Its nnz is below the k=32 region's own bound too, so the
+counts of 1 and 1 are one matrix and not two -- which the counts alone left open.
+
+**A guard that could not run.** The unreadable-files branch had `%d` on one string and its
+argument on another, so it raised `TypeError` before reaching its `return 1` -- and it
+executes only when files are unreadable, which is exactly the condition it exists to
+report. It fails closed by accident, a traceback also being a non-zero exit, but the named
+count and clean exit it claims never happened. Third guard on this branch that could not
+fire on its own input.
+
 Two things about that, in opposite directions. It was **one-signed**: a true int64 index
 read as int32 doubles the inferred nnz against an upper-bound predicate, so matrices with
 real nnz in [9375, 18750) were dropped and none was added -- the published figure was a
