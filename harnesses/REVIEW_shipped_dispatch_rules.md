@@ -3236,3 +3236,70 @@ deficit is **narrow-k on MKT across both collections, worst at k=2 and worst on 
 large: 82.1% of DLMC cells and 41.8% of SuiteSparse cells behind MKL at these widths. Scope
 unchanged: one pass per cell, so per-cell counts bound rather than confirm; a geomean of 0.7195
 over 3820 matrices does not.
+
+## The k=2 deficit has a mechanism: our cost is width-independent, MKL's is not
+
+Characterising the 0.7195 rather than the k=4 contrast, on the MKT DLMC cell (3820 keys, build
+`ship`). **The deficit is strongly structured, not uniform**, so the first question -- is a gated
+rule even available -- answers yes:
+
+| mean degree `nnz/rows` | n | k=2 | k=4 | k=8 |
+|---|---|---|---|---|
+| 0-4 | 110 | **1.3092** | 1.3736 | 1.3461 |
+| 4-16 | 493 | 0.9280 | 0.9976 | 1.0047 |
+| 16-64 | 1006 | 0.6762 | 0.7463 | 0.8799 |
+| 64-256 | 1499 | **0.6693** | 0.8109 | 0.9351 |
+| 256+ | 712 | 0.6992 | 0.8438 | 0.9762 |
+
+We are **ahead** of MKL below degree 4 and sit at ~0.67-0.70 from degree 16 up. The bulk is tight --
+p5 0.5543, p25 0.5939, p50 0.6389 -- which is the signature of one mechanism rather than a spread of
+causes, and 10.2% of keys are still ahead (best 1.6388).
+
+### The diagnostic: neither implementation is compared to itself until now
+
+Each implementation's own time, k=8 as the base. Perfect work-scaling would be 0.25; **1.00 means
+the narrower width costs the same**:
+
+| mean degree | n | ours k2/k8 | mkl k2/k8 | ours k4/k8 | mkl k4/k8 |
+|---|---|---|---|---|---|
+| 0-4 | 110 | 0.931 | 0.905 | 0.919 | 0.938 |
+| 4-16 | 493 | 0.912 | 0.843 | 0.912 | 0.906 |
+| 16-64 | 1006 | 0.956 | **0.735** | 0.951 | 0.807 |
+| 64-256 | 1499 | 0.931 | **0.667** | 0.926 | 0.803 |
+| 256+ | 712 | 0.885 | **0.634** | 0.882 | 0.762 |
+
+Absolute geomean ms at degree 64-256, the largest-deficit band:
+
+| k | ours | mkl | ours/mkl |
+|---|---|---|---|
+| 2 | 0.02455 | 0.01643 | 1.494 |
+| 4 | 0.02441 | 0.01980 | 1.233 |
+| 8 | 0.02635 | 0.02464 | 1.069 |
+
+**Our kernel is near parity at k=8 (1.069) and loses ground purely because MKL converts a narrower
+B into less time and we do not.** Our k=2 time is 93% of our k=8 time; MKL's is 67% of its own. So
+the k=2 deficit is not a k=2 defect -- it is the absence of a width benefit that MKL collects.
+
+### Why, and what it implies for a fix
+
+This is consistent with a mechanism already on record rather than a new hypothesis. `narrow_k` is
+`B1_size <= 4 * SL` with `nvec = ceil(B1_size / SL)` and `SL = scorch_simd<float>::lanes = 8`
+(`spmm.h:2153` wraps `__m256`), so k=2, k=4 and k=8 all run **nvec = 1**: one vector operation per
+nonzero in every case, with 2, 4 and 8 lanes useful respectively. The per-nonzero cost is then set
+by the dependent index-load-plus-FMA chain, not by the vector width -- which is exactly the
+4-cycle-per-nonzero ceiling measured in `ffast_math_wont_reassociate_gathers`, where a sparse `+=`
+through an indirect load stays one accumulator register. **A width-independent per-nonzero cost
+predicts a flat ours-vs-k curve, and that is what the table shows**, including the k=4 row at 0.926
+where the 128-bit half-vector form already gives full lane use and still buys nothing.
+
+So the lever is **not** wider or narrower vectors: it is amortising the per-nonzero overhead by
+processing **more nonzeros per iteration** when the lanes are underused -- unrolling along nnz
+instead of along k. The gate writes itself from the quantity that makes it safe: it can only fire
+where `k < SL` leaves lanes idle, so at k=8 it is provably inert, which is the neutrality property
+the performance convention asks for. And the degree dependence is explained rather than tuned
+around: at degree under 4 there are too few nonzeros per row to amortise anything and we are already
+ahead, which is where the gate would not fire.
+
+**Not yet established:** that MKL's advantage *is* nnz-amortisation rather than something else, and
+that an unrolled narrow-k inner loop recovers it without harming the k=8 path. Both are measurable.
+This is a hypothesis with a mechanism and a provably-inert gate, not a result.
