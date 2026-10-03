@@ -961,10 +961,69 @@ how many winning cells that grid held, which the commit never states. So 14.5% i
 false-positive rate for the gate without those counts, and the right comparison is against
 P(outcome | region) measured on the original grid.
 
+### The pool sweep, which is the axis that could have reversed this
+
+The shipped comment at `:1595-1603` says the gate's sign depends on the pool and the
+ceiling exists to make that dependence explicit, so a single pool could not speak for the
+predicate. Four pools x four widths, 120 cells each, 144 rows parsed with none unplaced.
+Positive = the gate selects the slower mode; the ratio is mode 0 over mode 3.
+
+| pool | k=2 | k=4 | k=8 | k=16 |
+|---|---|---|---|---|
+| 2 | +1.99 us, x1.068 | +2.44, x1.099 | +2.50, x1.077 | +3.01, x1.086 |
+| 4 | +3.75 us, x1.174 | +4.25, x1.232 | +4.27, x1.185 | +4.28, x1.185 |
+| 8 | +14.12 us, x1.618 | +12.83, x1.573 | +15.43, x1.623 | +13.71, x1.568 |
+| 16 | +12.19 us, x1.534 | +11.03, x1.489 | +12.01, x1.494 | +10.94, x1.460 |
+
+Every cell is positive, every interval excludes zero, and the sign count is 120 of 120 in
+15 of the 16 cells and 118 of 120 in the other. Tax-free cell scales run 20.5 to 34.6 us.
+The A/A floors over the same 16 configurations have a maximum absolute median of 0.029 us
+and most span zero -- three of the eight pool-and-control combinations contain at least one
+width whose interval excludes zero, at magnitudes of 0.01 to 0.029 us against effects of 2
+to 15 us, so they are measured and 100 to 1000 times too small to matter here.
+
+**The sign does not depend on the pool across the gate's whole active range on x86.** Only
+the magnitude does, and it grows: about 7-10% at pool 2, 17-23% at pool 4, and 46-62% at
+pools 8 and 16. A reversal at the low end was the outcome that would have made the gate
+defensible with only its threshold placement in question, and it does not occur.
+
+**One qualification the gate's own criterion supplies.** `dcf2e1f` defines materiality as
+"falls more than 10% behind". At pool 2 all four ratios -- 1.068, 1.099, 1.077, 1.086 --
+are *below* that bar. So at pool 2 the gate is harmful by a measurement that excludes zero
+and unanimous in sign, but not by the standard the gate itself was fit to. From pool 4
+upward it clears that bar by 1.7x to 6x.
+
+**And this does not contradict the comment's pool-6 anchor.** That anchor -- the counter
+winning at pool 6 -- is an ARM reading, identified by `8ccd104`'s test line and by
+`:1595-1603` itself ("The pool the surrounding pipeline runs is 6 there and 24 on
+redwood"). Nothing in the header claims the counter wins at low pool on x86, which is the
+row that was empty. Pool 6 is not measured here; it lies between pool 4 at +3.75 us and
+pool 8 at +14.12 us, both positive.
+
+### The apparatus checked its own premises on these runs
+
+| premise | reading |
+|---|---|
+| the shim flushed on every arm switch | 32401 flushes against 9720 switches, per width |
+| callers pass stable literals | 1 string-compare hit against 1.73e9 by pointer identity |
+| the estimator is not carrying the effect | min-of-reps and median-of-reps agree to 0.005 us |
+| concern #1's adoption path is inert | `omp_get_num_procs()` capped below 2*pool at every pool |
+
+The one non-literal caller in 1.7 billion lookups is why the cache owns its keys rather
+than borrowing them: with a borrowed pointer that single case could have left a dangling
+key, and the diagnostic that found it costs nothing.
+
 ### Scope
 
-One pool, one width, one host, 120 cells, isolated allocation. The pool axis is the one that
-can reverse the sign and the header reserves it explicitly at `:1595-1603`, anchoring the
-counter winning at pool 6 and the partition winning at pool 24; pool 8 reads with the pool
-24 end. A sweep over pools 2/4/8/16/20/24 x widths 2/4/8/16 is running. Above pool 16 the
-ceiling makes R1 a declined argument, which supplies a floor on the treatment's own cells.
+One host, float32, 120 cells per configuration, isolated allocations where concern #1
+cannot fire. Pools 20 and 24 are running: above the ceiling R1 becomes a declined argument,
+which supplies a floor on the treatment's own cells, and `8ccd104` already measured that
+construction at about 1% on redwood at pool 24 -- so those pools are a replication of a
+prior reading rather than a new instrument. A registered expectation for them: the floor
+should read at or below that 1%, and materially above it would indict the shim or the
+affinity cap rather than the gate.
+
+Not established: a cause. The explanation attempted above is withdrawn, and the remaining
+candidate questions are about `dcf2e1f`'s grid -- its arm labels, and the regressed and
+winning cell counts needed to convert its P(region | outcome) scores into the
+P(slower | region) measured here. That grid is not in this tree.
