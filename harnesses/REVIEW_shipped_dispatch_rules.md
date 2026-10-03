@@ -3556,3 +3556,126 @@ Whether +6.5% closes anything is not decided here -- MKT SuiteSparse k=2 stands 
 k=2 at 0.7195, so SuiteSparse would cross parity and DLMC would not. Job **17704056** runs all
 three builds over all 4594 SuiteSparse and 3820 DLMC keys; its result decides the default, and
 nothing above should be quoted as the production figure.
+
+## Amendment, registered before job 17704079 reports: the floor at k=2 is NOT measurable from this screen's control
+
+Three corrections to the section above, two of them from a peer reviewer and the third from this
+project's own recorded measurement, which turns out to go further than the peer's point.
+
+### 1. The vacuity rests on three constants, not one
+
+I scoped `SCORCH_SPMM_HALFVEC_F32=2`'s inertness to `SCORCH_NARROWK_EXACT_HI=3`. There are exactly
+three assignments to `exact_width` (`spmm.h:4249` init, `:4268` set, `:4293` zero), and two of the
+conditions keeping it nonzero are not `EXACT_HI`:
+
+- **`SCORCH_NARROWK_EXACT_UNROLL != 0`.** `spmm.h:4118` is
+  `int narrowk_exact = SCORCH_NARROWK_EXACT_UNROLL;` (default 4), and `:4250` gates the entire
+  block on it. At 0, `exact_width` never leaves its initialiser, `!exact_width` is true, and
+  `halfvec_under` fires at k=2 and k=3. The hook at `:4185` admits exactly `{0, 2, 4, 8}`, so 0 is
+  a legal arm value and not a hypothetical.
+- **`SCORCH_NARROWK_EXACT_MINDEG == 0`.** `:4291` zeroes `exact_width` when
+  `nnz_total < narrowk_exact_mindeg * A0_size`. The default `0L` makes the clause dead, but at any
+  MINDEG > 0 the inertness becomes **matrix-dependent**: the gate goes live on exactly the matrices
+  with mean degree below MINDEG and stays inert on the rest. The comment block above it sweeps a
+  MINDEG ladder over `{1,2,4,8}` on two hosts, so that is a configuration this line has run.
+
+So "vacuous at EXACT_HI=3" is right in the shipped configuration and understates the check. Under
+MINDEG > 0 the recorded 1.0997 would be a **mixture** of live and dead cells rather than uniformly
+dead, which is a different defect: a diluted real effect, not an absent one. Checking the
+historical arm needs all three constants as they stood when it was taken. Peer reviewer's
+correction; the three assignment sites and the `{0,2,4,8}` hook range are confirmed here.
+
+### 2. The k=8 negative control is valid, and for a reason stronger than I gave
+
+`exact_cap_ = exact_f32_ ? 7 : 3` (`spmm.h:4255`) caps `exact_hi_` at 7 for float32, so
+`exact_width` is 0 at k=8 under **any** `EXACT_HI` value, and both ROWVEC dispatch sites sit inside
+`if (exact_width)`. Neither `ship` nor `hi01` can reach k=8. The control does not depend on the
+shipped value of the constant it controls for.
+
+### 3. The floor I quoted is the wrong floor -- and the control cannot supply the right one
+
+The peer observed that `rvec/ship` at k=8 (0.9885) and `shpb/ship` (1.0053) are two estimates of
+unity 1.70 pp apart, and concluded the floor's spread is 1.70 pp rather than 0.53 pp. The
+conclusion that I quoted the wrong floor is right. The reason offered -- that they are the same
+measurement -- is not, and the correct reason is worse for the claim:
+
+- `shpb/ship` is **byte-identical `.text`** at equal-length paths. It measures run-to-run noise
+  only.
+- `rvec/ship` at k=8 is **different `.text`** (983314 against 1073586 bytes) executing the same
+  decision. It additionally carries the code-layout artefact.
+
+Those are two tiers, not two estimates of one quantity, and this project measured the tiers
+directly. chain185 (redwood, 37 SuiteSparse matrices, 8 balanced passes, float32) compared builds
+whose **decisions agree** at a given width, so the ratio reads the object rather than the policy:
+
+| width | identical-decision, different object | identical source |
+|---|---|---|
+| 1 | -1.14% | |
+| 2 | **-2.61%**, CI [0.9640, 0.9841], excludes parity | +0.27% |
+| 3 | +0.64% | equivalent |
+| 4 | +0.87% | |
+| 8 | **+0.14%** | |
+
+**The artefact is width-dependent and collapses by width 8.** So k=8 is an excellent control for
+*routing* -- it proves the define changed nothing it should not -- and a near-useless estimator of
+the layout floor **at k=2**, where the recorded artefact is up to 2.61% against the +0.14% that
+width 8 shows. Importing the control's spread to k=2 understates the floor by roughly nineteenfold.
+Against the recorded width-2 artefact the margin on the 31-matrix smoke is about **2.5x**, not the
+12.3x the identical-source floor suggests nor the 3.5x the control's spread suggests.
+
+**And none of this screen's four builds can measure it.** The estimate needs a pair with different
+`.text` that routes **identically at k=2**. `ship` vs `shpb` is identical `.text`; `ship` vs `rvec`,
+`ship` vs `hi01` and `rvec` vs `hi01` all route differently at k=2. That is a real gap in the
+design, not a limitation of the corpus size, and no amount of data from job 17704079 closes it.
+
+**What closes it, registered now rather than chosen after seeing the result.** A fifth object
+defined by `-DSCORCH_SPMM_HALFVEC_F32=0`, which is provably inert at k=2 and k=3: `halfvec_exact`
+is `B1_size == LH` (4 for float) and `halfvec_under` additionally requires `!exact_width`, false at
+both widths, so the define can only change k=4. It therefore gives a different `.text` that routes
+identically at k=2, k=3 **and** k=8 -- a different-object same-decision pair at all three widths,
+which is exactly the per-width floor chain185 says to measure rather than assume.
+
+It must be built into a **separate root at an equal-length path** (`/scr/bobbyy/rvlf/{ship,hv00}`,
+21 characters, matching `/scr/bobbyy/rvec/ship`), because `rvec_build.sh` begins each tag with
+`rm -rf` and job 17704079 is reading those objects right now. The artefact is then estimated
+entirely **within** that job, as a ratio of our own times between its two objects, so
+between-job drift does not enter it. Deferred until 17704079 completes: a concurrent build
+contends for the cores the live measurement is using.
+
+### 4. Byte-neutrality at ROWVEC=0: what the evidence supports, and what it does not
+
+The digest cannot settle this under a path-length difference, and the peer is right that it cannot
+be rescued. Splitting the question settles both halves without a further build:
+
+**Is the new kernel instantiated at 0?** A symbol census says zero `scorch_spmm_row_narrow_rowvec`
+symbols in `ship`. **That number is vacuous on its own**, and saying so is the point: `rvec`, where
+the kernel is live, also reports **zero**, because the kernel is small enough that GCC inlines it
+everywhere. Symbol presence cannot answer this question for this kernel.
+
+**What is non-vacuous** is the exact-kernel instantiation set, which is path-length invariant:
+
+| object | `narrow_exact` instantiations | set digest |
+|---|---|---|
+| pre-edit `/scr/bobbyy/pfs/ship` | 15 | `2f0811de5f5e9d5f` |
+| new `ship` (ROWVEC=0) | 15 | `2f0811de5f5e9d5f` |
+| `shpb` | 15 | `2f0811de5f5e9d5f` |
+| `hi01` | 15 | `2f0811de5f5e9d5f` |
+| `rvec` (ROWVEC=1) | **9** | `7148b5cf30fbc722` |
+
+`rvec` loses exactly the seven instantiations at K in {2,3,4} -- the widths whose row fits a
+128-bit register (8, 12 and 16 bytes) -- and keeps K in {5,6,7}, which the new kernel delegates to
+the scalar one. So the set difference is a **positive, path-invariant demonstration that the define
+took effect**, and it is what makes the zero above informative rather than empty. `hi01` keeping
+ship's full set confirms the define changes which kernel is *called*, not which is instantiated.
+
+Whole-object, also path-invariant: pre-edit and new `ship` both define **1190** symbols, **1093**
+distinct names, identical name-set digest `083bdf576880beea`.
+
+And at source level the `git diff` for `spmm.h` is **126 insertions, 0 deletions** -- no pre-edit
+line changed -- with both guards' `#else` branches reproducing the pre-edit macro text at its
+original indentation.
+
+**The claim those support:** at ROWVEC=0 the object defines the same 1093 symbol names with the
+same exact-kernel instantiation set as the pre-edit object, and no pre-edit source line was
+modified. That is what inert means operationally. **They do not support "byte-identical object",
+and it is not claimed.**
