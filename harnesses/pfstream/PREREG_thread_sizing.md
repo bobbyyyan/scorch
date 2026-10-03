@@ -2105,3 +2105,97 @@ three: not because it leans, but because nothing lets you reason about it withou
   **index** digest does not.
 - **Planted mutation**: substituting the unpinned numerator — the exact defect amendment 26 pins —
   gives **3 of 14 FAILED, rc=1**. The suite fires on the one defect it exists to catch.
+
+---
+
+## Amendment 28 — the excess is a RANK test, not a headroom test. Three numbers refute the gloss I published at every width on three hosts, and the closure language is withdrawn.
+
+A reviewing agent gave a counterexample. It reproduces exactly, through this script's own
+`perm_null`:
+
+> Three reachable counts timed at **1.0 / 1.2 / 2.0 µs**, **perfectly repeatable**, production
+> picking 1.2. True headroom `cur/best` = **1.2000** — production is 20% off the best count with
+> **zero measurement noise**. Measured null = **1.2000**. **Excess = 1.0000** — which the prose
+> labelled *"nothing to recover."*
+
+### Why, and it is structural rather than a tuning artefact
+
+The permutation shuffles readings **among** the counts, so the null's support is `{t_i / min(t)}`
+— the same set of ratios, reordered. **Its median is the MIDDLE-RANK count's ratio**, so per cell
+
+```
+gain / null  ≈  t_production / t_median-rank-count
+```
+
+**The excess asks whether production's count beats a TYPICAL reachable count. It never asks how far
+production is from the BEST one.** When production sits mid-rank the excess is 1.0 however large the
+real curve is.
+
+The permutation destroys the count→time mapping, **which is the signal**, so the null absorbs the
+winner's curse and the curve together. The curse was the right thing to correct — `best` is a
+minimum over ~6 noisy per-count medians and reads above 1 on pure noise — but this null
+**over-corrects by exactly the amount of real structure present.**
+
+### What the numbers actually say, restated
+
+**The headroom is the `median` column, uncorrected.** On MKT at k=2:
+
+| population | `cur/best` (the headroom) | excess (the rank) |
+|---|---|---|
+| ALL 53 live cells | **1.1430 — 14.3%** | 0.9996 |
+| `<=2` workers (n=9) | **1.3859 — 38.6%** | 1.3454 |
+| `3-7` (n=11) | 1.1478 — 14.8% | 0.9243 |
+| `>=8` (n=33) | **1.0701 — 7.0%** | 0.9358 |
+
+**So "there is no headroom at k=2 on MKT" is wrong. There is 14.3% pooled, 38.6% in the
+small-count group and 7.0% in the large-count group** — all inflated by a winner's curse this
+statistic does not isolate, and none of it zero.
+
+### What survives and what does not
+
+**The registered verdicts stand as verdicts.** Amendment 5 registered *"the excess over the
+winner's-curse null — median(cur/best) divided by its within-cell permutation null, **the statistic
+defined in `nt_k2curve.py`**"*. Elements 1–4 were predictions about **that** statistic and they
+scored as reported: element 1 FAILS at 0.9996, element 2 HOLDS at all eight widths, element 3
+FAILS, element 4's control FIRES. **A prediction about a named statistic is scoreable even when the
+statistic is misinterpreted.**
+
+**Every interpretive gloss is withdrawn.** *"Production's count is already at least as good as an
+arbitrary one"* is correct and is a **rank** claim. *"There is none at k=2"*, *"nothing to
+recover"*, *"34.5% recoverable headroom"* (amendment 20) and *"1.5–5.9% recoverable at k=8..32"*
+(amendment 19) are all misreadings of a rank as a magnitude. Element 2's finding survives in better
+form: the `<=2` group's **raw** headroom is 1.3859 against the `>=8` group's 1.0701, so the
+direction and the ordering hold on the uncorrected quantity too.
+
+### The closure language is withdrawn, and the reviewer's second argument is the one that kills it
+
+Amendments 18–20 said thread sizing is *"closed as a mechanism for the narrow-k deficit."* **The
+defensible claim is "these proposed rules have not demonstrated a useful improvement."** Rejecting
+the sqrt model does not establish that the current policy is optimal.
+
+**And my structural argument against thread sizing was wrong.** I argued that an unchanged worker
+count cannot explain a width-dependent deficit. It can: **if team-setup overhead is roughly fixed
+and useful work scales with k, the overhead's share falls as k rises**, so one fixed, too-wide
+count hurts proportionally *most* at narrow k — which is the deficit's shape exactly. The
+measurement that would separate the two is a fixed-worker-count sweep at matched work, not a
+re-reading of this statistic.
+
+### The correct correction, named but NOT applied
+
+The winner's curse needs **sample splitting**: choose `best` on one half of each count's readings
+and evaluate `cur/best` on the other. That removes the selection bias **without** destroying the
+count ordering. At `--reps 2` it leaves one reading per half, so it is weak on the existing sweeps
+and would need `--reps 4`.
+
+**Not swapped here.** Replacing a pre-registered estimator is Bobby's call. The source now carries
+the counterexample, the algebra and the alternative at the read point (`nt_k2curve.py` at
+`ce4e3f84ad69f88b`), and the printed prose states what the number is rather than what I wanted it
+to be.
+
+### The reusable form
+
+**A null built by permuting the treatment labels tests EXCHANGEABILITY, which is a rank question.
+If the quantity of interest is a magnitude relative to an optimum, a label permutation absorbs the
+very structure being measured and the statistic reads null at any effect size.** Check a candidate
+null by feeding it a noise-free case with a known answer — three numbers were enough here, and the
+statistic had already been published on three hosts and eight widths.

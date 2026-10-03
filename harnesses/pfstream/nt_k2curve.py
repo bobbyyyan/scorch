@@ -573,12 +573,52 @@ for k in ks:
           % (k, ea, len(a), eb, len(b),
              "AS REGISTERED" if ea > eb else "REVERSED -- the registration predicted <=2 LARGER"))
 print()
-print("  'excess' is median/null. At 1.00 the apparent headroom is entirely the winner's curse")
-print("  and a thread rule has nothing to recover; above 1.00 it is the recoverable part.")
+# ================================================================================================
+# THE EXCESS IS A RANK TEST, NOT A HEADROOM TEST. THIS WAS PUBLISHED WRONG AT EVERY WIDTH ON THREE
+# HOSTS AND THE COUNTEREXAMPLE IS THREE NUMBERS.
+#
+# Timings 1.0 / 1.2 / 2.0 us on three reachable counts, PERFECTLY repeatable, production picking
+# 1.2. True headroom cur/best = 1.2000 -- production is 20% off the best count with zero noise.
+# Run through `perm_null` above: null = 1.2000, excess = 1.0000, which the prose below labels
+# "nothing to recover".
+#
+# WHY, and it is structural rather than a tuning artefact. The permutation shuffles the readings
+# AMONG the counts, so the null's support is {t_i / min(t)} -- the same set of ratios, reordered.
+# Its median is therefore the MIDDLE-RANK count's ratio, and per cell
+#     gain / null  ~  t_production / t_median-rank-count
+# So the statistic asks whether production's count beats a TYPICAL reachable count. It does not
+# ask how far production is from the BEST one. When production sits mid-rank the excess is exactly
+# 1.0 however large the real curve is.
+#
+# The permutation destroys the count -> time mapping, which IS the signal, so the null absorbs the
+# winner's curse AND the curve together. The curse was the right thing to correct for -- `best` is
+# a minimum over ~6 noisy per-count medians and reads above 1 on pure noise -- but this null
+# over-corrects by exactly the amount of real structure present.
+#
+# THE HEADROOM IS THE `median` COLUMN ITSELF, uncorrected: cur/best. The correct correction is
+# SAMPLE SPLITTING -- choose `best` on one half of each count's readings and evaluate cur/best on
+# the other -- which removes the selection bias without destroying the count ordering. At --reps 2
+# that is one reading per half, so it is weak here, and it is a DIFFERENT estimator from the one
+# prereg amendment 5 registered.
+#
+# NOT SWAPPED HERE. Replacing a pre-registered estimator is Bobby's call; this comment reports the
+# defect and its size at the read point, and the prose below now says what the number is.
+# ================================================================================================
+print("  'excess' is median/null -- A RANK TEST, NOT A HEADROOM TEST. See the block above this")
+print("  print in the source: timings 1.0/1.2/2.0 with production at 1.2 and ZERO noise give")
+print("  excess exactly 1.0000 against a true headroom of 20%. The excess asks whether")
+print("  production's count beats a TYPICAL reachable count, because the permutation null's")
+print("  median is the MIDDLE-RANK count's ratio. THE HEADROOM IS THE `median` COLUMN ABOVE,")
+print("  uncorrected: cur/best. Read magnitudes there and read the excess only as a rank.")
+print("  (the original, now-withdrawn gloss: 'at 1.00 the apparent headroom is entirely the")
+print("  and a thread rule has nothing to recover -- WITHDRAWN, see the block in the source above:")
+print("  the excess is a RANK test and an excess of 1.00 is consistent with any amount of real")
+print("  headroom whatever; above 1.00 production ranks WORSE than a typical reachable count.")
 print()
 print("  AN EXCESS BELOW 1.00 IS NOT AN ABSENCE OF RESULT, IT IS THE SHIPPED PATH WINNING. It")
-print("  says production's count beats an ARBITRARY count by (1 - excess) of the null, so the")
-print("  rule is measurably better than chance rather than merely not leaving anything behind.")
+print("  says production's count beats an ARBITRARY count by (1 - excess) of the null -- a RANK")
+print("  statement, NOT a statement that no headroom exists. The headroom is the median column,")
+print("  uncorrected, and it is 1.1430 at MKT k=2 -- 14.3%, not zero.")
 print("  Printed with its sign, because reporting it as 'no headroom' inverts a positive result:")
 for k in ks:
     e = excess_by_k.get(k)
