@@ -539,7 +539,7 @@ nvec ∈ {1,2,4} with a full tail**, and that qualification travels with every n
 
 | k | nvec | tail | role |
 |---|---|---|---|
-| 2 | — | — | **negative control** — `exact_width` routes k ∈ {1,2,3} to `narrow_exact`; `halfvec_exact` would also be true here (`lanes == 2`) and is held off only by `SCORCH_SPMM_HALFVEC_F64` shipping at 0, so two independent mechanisms keep it inert |
+| 2 | — | — | **negative control** — `exact_width` routes k ∈ {1,2,3} to `narrow_exact`; `halfvec_exact` would also be true here (`lanes == 2`) and is held off only by `SCORCH_SPMM_HALFVEC_F64` shipping at 0, so two independent mechanisms keep it inert **[WRONG -- see amendment 54. `halfvec_exact` carries no `!exact_width`, so `SCORCH_SPMM_HALFVEC_F64 == 0` is the ONLY mechanism]** |
 | 4 | 1 | full | |
 | 6 | 2 | **masked** | |
 | 8 | 2 | full | |
@@ -4667,3 +4667,107 @@ control and treat any width whose CI does not exclude ±0.429% as unreadable rat
 finding 150's caveat accepted: the magnitude is an extrapolation across a kernel boundary, and the
 direction of the error is conservative, because the layout artefact is largest at the narrowest
 width and k=2 is the narrowest.
+
+---
+
+## Amendment 54 — the f64 k=2 control has ONE mechanism, not two; and the contrast's floor is signed but indistinguishable from zero
+
+Three corrections, all from checking a peer's finding 152 at source. Two are to things I wrote in
+amendment 53 one iteration ago.
+
+### (a) `halfvec_exact` carries no `!exact_width`, so the registration at `:542` is wrong
+
+The gate is a **disjunction** and the exact-width guard sits in only one disjunct
+(`spmm.h:4899-4904`):
+
+```
+const bool halfvec_exact = (B1_size == LH);
+const bool halfvec_under = (spmm_halfvec >= 2 && B1_size < LH && B1_size >= 2 && !exact_width);
+if (halfvec_exact || halfvec_under) { ... continue; }
+```
+
+The block `continue`s past the exact-width kernel at `:4978`. At float64 k=2, `LH == 2` makes
+`halfvec_exact` **true**, and `exact_width` is holding nothing off — it is only what runs once
+`spmm_halfvec` has already declined. So **one** mechanism keeps this control inert:
+`spmm_halfvec == 0` at `spmm.h:4055`. Under `SCORCH_TUNE_HOOKS` that is a runtime read at
+`spmm.h:4128`, not a folded constant, and these are hooks builds. The check that no pfstream script
+sets `SCORCH_SPMM_HALFVEC` is therefore load-bearing **with no redundancy behind it**.
+
+`:542`'s "two independent mechanisms keep it inert" is wrong as written and is marked in place. So
+is amendment 53's restatement that "the control is inert for two reasons" — that sentence is
+**withdrawn**; it repeated the registration's error while adding a precondition the registration
+had already stated.
+
+**The inversion, which is the useful part.** The same sentence is **true** of the float32 k=2
+reading amendment 53 substituted by accident. There `LH == 4`, so `halfvec_exact = (2 == 4)` is
+false, and `halfvec_under` needs `spmm_halfvec >= 2` where float32 ships **1**, *and* `!exact_width`
+where k=2 is in {1,2,3} — two conjuncts, each independently sufficient. **The dtype error moved the
+measurement onto the firmer control**, which does not excuse it but does change what the run is
+worth. Also noted: the kernel comment at `spmm.h:4892-4893` — "gated so it only takes widths that
+kernel does not already own" — describes `halfvec_under` and is false for `halfvec_exact` at
+float64, whose width *is* owned by `narrow_exact`.
+
+### (b) The contrast had one more reduction-order error, one level below the one amendment 53 fixed
+
+Amendment 53 fixed ratio-of-band-medians → paired-within-a-cell. It did **not** fix the pairing
+*inside* the cell. Each pass file carries exactly **one** reading per (key, width, arm, object) —
+verified directly; the `batch` column is the inner repetition count and differs by arm (886 for
+ours, 31 for mkl), so it is not a pairing index. The six readings come from six **pass** files, and
+the pass index is therefore a real pairing: pass *i*'s `ours` and pass *i*'s `mkl` ran in the same
+process against the same machine state.
+
+Amendment 53 took the median of `ours` and the median of `mkl` across passes and then divided,
+which discards that pairing. Pairing within the pass first, then reducing once:
+
+| pair | contrast | 95% CI | floor (same contrast, two byte-identical objects) | floor 95% CI |
+|---|---|---|---|---|
+| 4 vs 2 | **+15.48%** | [+14.54, +16.17] | −0.57% | [−2.00, +0.69] |
+| 4 vs 8 | **+12.95%** | [+11.72, +14.49] | −0.20% | [−2.44, +2.07] |
+| 4 vs 16 | **+29.36%** | [+27.62, +31.91] | +0.61% | [−1.24, +1.66] |
+| 4 vs 32 | **+39.28%** | [+37.95, +40.93] | +0.52% | [−0.93, +3.35] |
+
+n = 712 keys, redwood DLMC float32, deg ≥ 256. **This reproduces finding 152's four contrast
+figures and four floor figures exactly**, from the sealed CSVs, by a functional stated
+independently. **Supersedes amendment 53(a)'s 14.62 / 11.83 / 28.50 / 38.72 and its floors of
+0.92 / 0.91 / 1.22 / 0.97%.** Three published versions of this contrast now exist and only this one
+pairs at every level; the two superseded ones differ from it by 0.6–1.1 pp on the contrast and by
+*sign* on the floor.
+
+### (c) The floor is signed — but its CI includes zero, so it must not be a denominator
+
+Finding 152 proposed that my 4-of-4-positive floor clustered in 0.91–1.22% was the signature of a
+magnitude statistic (a percentile of |dev| or a CI half-width). **It was not**, and the test is
+metamorphic: swapping the two objects must give the reciprocal if the statistic is signed, and must
+leave it unchanged if it is a magnitude. Swapped, the four widths read +0.605 / +0.469 / −0.573 /
+−0.357% against −0.573 / −0.205 / +0.612 / +0.521% — opposite in sign, products 1.0003 to 1.0026
+rather than the ~1.018 a magnitude would give. Signed, in both amendment 53's version and this one.
+
+**But the correction underneath 152's reading is right, and it is a worse problem than the one it
+named.** The floor's CI **includes zero at all four widths**. Dividing a location by a location
+that is statistically zero gives a ratio with no bounded interpretation — the 15.8× and 13.0× of
+amendment 53, and the 27.0× / 63.2× / 47.9× / 75.4× these figures would produce, are all artefacts
+of how close the denominator lands to zero. **All of them are withdrawn.**
+
+The claim is a containment statement, which is what this screen's own standing rule asks for:
+
+| pair | contrast CI lower bound | floor CI upper bound | separation |
+|---|---|---|---|
+| 4 vs 2 | +14.54% | +0.69% | **13.9 pp** |
+| 4 vs 8 | +11.72% | +2.07% | **9.7 pp** |
+| 4 vs 16 | +27.62% | +1.66% | **26.0 pp** |
+| 4 vs 32 | +37.95% | +3.35% | **34.6 pp** |
+
+The k=4 half-vector width is slower than each of its four comparison widths by an interval that does
+not overlap the interval two byte-identical objects produce on the same statistic. That is the
+verdict, it is stronger than the ratio framing it replaces, and it divides nothing by zero.
+
+### (d) The 418 question was already withdrawn — amendment 53(b) should have cited it
+
+Amendment 53(b) recorded the "MKT f64, n=418" header as an unresolved inconsistency. The document
+had already resolved it: **amendment 39 is withdrawn by amendment 40** (`:3273-3278`), because
+`mrgate.py` does not deduplicate keys, so a 418-key list yields 2926 cells on *either* host — the
+denominator is diagnostic of the key list, not the host. The 418→417 step is one cache collision
+(`Nasa/barth4/barth4` and `Pothen/barth4/barth4`). And `:3099` already says "what I have NOT
+established is where 192 came from, and I am not going to guess." Quoting the +0.429% with the host
+unstated is therefore the **registered** position rather than a new finding, and needs no further
+work. Amendment 53(b)'s "unresolved" framing is corrected to a citation.
