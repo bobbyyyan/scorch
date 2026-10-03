@@ -5297,6 +5297,20 @@ nonzero pays a masked 256-bit load instead of a plain one and throws away half t
 `scorch_simd<T>` has no 128-bit form, so there is currently no way to express "four floats,
 full width, no mask" — which is exactly what k = 4 is.
 
+> **SUPERSEDED 2026-10-03.** The last sentence is no longer true, and "currently" is why it rots
+> without anyone editing it. A 128-bit form now exists -- `scorch_simd_half<float>` on `__m128`
+> with `lanes = 4`, at `spmm.h:2200` -- and the single-row kernel that uses it **ships enabled**:
+> `scorch_policy.h:1512` sets `SCORCH_SPMM_HALFVEC_F32` to 1. The sentences above it still hold
+> as a description of the *masked* 256-bit path, which `spmm.h:2192-2198` documents in the same
+> terms. What fell is only the claim that the half-width form cannot be expressed.
+>
+> This matters for anything citing this passage as a cause: a DLMC float32 board measured
+> 2026-10-03 puts k=4 lowest of eight widths (geomean 1.2508) **with
+> `SCORCH_SPMM_HALFVEC_F32` = 1 in the measured object**, so the deficit is not the absence of
+> this form. The still-disabled constant is `SCORCH_SPMM_MULTIROW_HALFVEC` (`:662`, ships 0),
+> which is the *conjunction* of multi-row and half-vector, not the half-vector itself. See
+> `harnesses/REVIEW_shipped_dispatch_rules.md`, the k=4 section.
+
 That also explains the per-width shape of the exact-width kernel's own result without appealing
 to the aligned load: it wins 6–8% at k = 2 and k = 3 because a scalar loop has no mask either,
 and it loses from k = 5 up because there the mask is over half full and `UNROLL*K` accumulators

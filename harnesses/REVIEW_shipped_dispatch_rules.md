@@ -1333,11 +1333,28 @@ extreme: 0.2629 at k=4 deg 1024, 0.2896 at k=4 deg 512, 0.3360 at k=4 deg 256 --
 slower than MKL, all `transformer/` and `rn50/` layers at 0.5 pruning, i.e. the *densest* rows
 in the collection.
 
-That is the population `SPMM_BEAT_MKL_RESULTS.md` names for the k=4 float32 mechanism:
-`scorch_simd<T>` has no 128-bit form, so k=4 issues `_mm256_maskload_ps` per nonzero and uses
-**4 lanes of 8**. Cost per nonzero is halved in useful work, and a long row pays it once per
-nonzero -- so the penalty should scale with degree, which is what the table shows. It also
-matches the independently measured direction in the half-vector study at deg>=256.
+**WITHDRAWN 2026-10-03, and the mechanism it named is not available.** This paragraph read:
+"`scorch_simd<T>` has no 128-bit form, so k=4 issues `_mm256_maskload_ps` per nonzero and uses
+4 lanes of 8", attributing the deficit to a missing 128-bit path whose absence would scale with
+degree. **The 128-bit path exists and already ships.** `scorch_policy.h:1512` sets
+`SCORCH_SPMM_HALFVEC_F32` to **1**, and `spmm.h:2200` defines `scorch_simd_half<float>` on
+`__m128` with `lanes = 4`. So the single-row half-vector kernel is live in the baseline object
+`mr0`, and the k=4 deficit measured below is measured **with it already active**. A missing
+128-bit form cannot explain a deficit observed while the 128-bit form is running.
+
+Note the two macros are different and only one ships off: `SCORCH_SPMM_HALFVEC_F32` = 1 at
+`:1512` (single-row), `SCORCH_SPMM_MULTIROW_HALFVEC` = 0 at `:662` (the conjunction), the latter
+carrying "Ships at 0: the mechanism is new and unmeasured, and the exclusion it lifts was
+measured." Conflating them is what produced the withdrawn sentence.
+
+**What the header says is being closed is the CONJUNCTION**, at `scorch_policy.h:655-658`: "the
+two mechanisms at this width are independent: the single-row 128-bit kernel drops the mask (11.5
+emitted instructions per nonzero against the masked path's 13.5), and multi-row adds streams.
+Being unable to have both is the gap this constant closes."
+
+**So the k=4 localisation stands and its cause is open.** The localisation is a geomean ordering
+and needs no mechanism; what is withdrawn is the account of why. The degree scaling in the table
+below is still a fact about the deficit, no longer evidence for the withdrawn cause.
 
 **This is a located deficit, not a fixed one.** The mechanism is a hypothesis that the
 screen's own treatment arms (`mrhv`, `mrhv4`, distinct objects `713b9353f62f55c0` and
@@ -1460,3 +1477,65 @@ implicit.
 |---|---|---|---|---|
 | p1.1 | mr0 | 91680 | 0 | 20:50:29 - 00:08:43 |
 
+
+## The screen's design: three cells of a 2x2, and the missing one carries both main effects
+
+Correcting the earlier reading here that "the baseline has multirow entirely absent, so
+`mr0 -> mrhv` moves multirow and half-vector together". The first half is right and the second
+mis-decomposes it. The shipped defaults are two *different* macros:
+
+| macro | `scorch_policy.h` | ships | what it controls |
+|---|---|---|---|
+| `SCORCH_SPMM_MULTIROW_ROWS` (`_F32` aliases it at `:623`) | `:620` | **0** | multi-row, absent from mr0 |
+| `SCORCH_SPMM_HALFVEC_F32` | `:1512` | **1** | single-row 128-bit, **live in mr0** |
+| `SCORCH_SPMM_MULTIROW_HALFVEC` | `:662` | **0** | the conjunction |
+
+So `mr0 -> mrhv` does not introduce the half-vector kernel. It introduces the **conjunction**,
+which is what `:655-658` says the constant is for. The design is:
+
+| | mrhv = 0 | mrhv = 1 |
+|---|---|---|
+| rows 0 | **mr0** (+ `mr0b`, byte-identical) | — |
+| rows 2 | **MISSING** | **mrhv** |
+| rows 4 | — | **mrhv4** |
+
+Three of four cells. The missing `(rows 2, mrhv 0)` is the only arm that makes both main effects
+identifiable: `mr0` vs `(2,0)` isolates multi-row, and `(2,0)` vs `mrhv` isolates the
+half-vector. It is one `-D`, and it is the configuration this study's own prereg describes at
+line 52 as "multi-row with the masked 256-bit kernel taking the width". **Recorded as a design
+gap, not requested mid-run** -- the screen is 41% through unit 2 of 16 and will not be disturbed.
+
+Consequence for the result: whatever the screen shows at k=4, the contrast `mr0 -> mrhv` is
+attributable to the conjunction as a package and to neither component alone.
+
+## Three corrections to the restricted table's reading
+
+**The widening figure changed comparand, and the fixed-comparand version is larger.** I wrote
+"7.7% to 10.5%", but the next-worst width is k=12 in the full table and k=2 in the restricted
+one. Holding the comparand at k=12: `1.3465/1.2508` = **7.65%** becomes `1.1204/0.9987` =
+**12.19%**. The gap widens more than claimed, so the published version was the conservative one.
+
+**The original pooled threshold moved both ends of the comparison in the headline's favour.** The
+per-width floor p05 spans **0.8135 at k=4 to 0.9484 at k=16**, against the single pooled 0.9394
+the first scoring used. That threshold therefore sat well *above* k=4's own floor -- counting
+more cells than k=4's floor would -- and essentially *at* k=16's, counting fewer than its own
+floor would. Inflating k=4 and deflating k=16 is exactly the comparison the headline made. The
+caveat belongs with it: those p05 values are measured on the restricted subpopulations, so this
+establishes the direction and is not a measurement of the original mis-scoring. The geomean leg
+is untouched by all of it.
+
+**The restriction selects at very different rates by width, which is a second bias beyond the
+toward-parity one.** Retained n runs from 175 at k=32 (4.6% of 3820) to 2139 at k=4 (56.0%), a
+12x range. So the cross-width comparison is between populations selected at very different
+rates, and "both tables agree on the ordering" is strongest where n is largest -- k=4 at 2139 --
+and thinnest at the right-hand end, where k=24 (n=255) and k=32 (n=175) carry much wider
+intervals than the ordering statement implies.
+
+**Why the restriction is biased toward parity, stated once properly.** Requiring
+`batch_mkl/batch_ours` within 1.2x keeps cells where the two arms' calibrated repeat counts are
+similar, and `mrgate.py:46-50` derives that count from each arm's own measured call time. So the
+filter conditions on the arms running at similar speed, which is a function of the very ratio
+being scored. Every geomean falls under it (k=32 1.6052 -> 1.2993) because cells where we are
+much faster are preferentially removed. It buys a floor matched in dispersion at the cost of
+conditioning on the outcome -- acceptable for a within-width noise comparison, not for a
+population estimate, and the reason the full table stays the headline figure.
