@@ -525,3 +525,109 @@ explained by the reduction mismatch in (c), which affects the reported gain and 
   k=2 is the width where `layout_artefact_by_width.md` records that the artefact's width ordering
   does **not** generalise across host/dtype/corpus. **A condition-2 trip must have the layout
   artefact ruled out before it is read as non-neutrality.**
+
+---
+
+# Amendment 4 — `pct` has no single index convention: it flips with n, and that is the whole 2-against-8
+
+Still before any timing. This is an instrument defect in the canonical estimator, not a choice.
+
+## The cause: banker's rounding inside one function
+
+```python
+def pct(v, q):                      # an_f64_arms.py:105-109, copied into three other harnesses
+    i = min(len(v) - 1, max(0, int(round(q * (len(v) - 1)))))
+    return v[i]
+```
+
+`round()` in Python is **round-half-to-even**. At `q=0.5` the index is `round((n-1)/2)`, so for even n:
+
+| n | (n−1)/2 | `round` | index is the | |
+|---|---|---|---|---|
+| 2 | 0.5 | 0 | **lower** median | |
+| 4 | 1.5 | 2 | **upper** median | |
+| 6 | 2.5 | 2 | **lower** median | ← inside a cell (6 passes per build) |
+| 8 | 3.5 | 4 | **upper** median | |
+| 12 | 5.5 | 6 | **upper** median | ← pooled across builds |
+| 68 | 33.5 | 34 | **upper** median | |
+| 78 | 38.5 | 38 | **lower** median | |
+| 152 | 75.5 | 76 | **upper** median | |
+| 298 | 148.5 | 148 | **lower** median | |
+
+**One function, and its convention is a function of the sample size.** The deg-323.3 row is explained
+exactly: `aa(6)` and `bb(6)` are **lower** medians (1.3813, 1.3637) and `pooled(12)` is the **upper**
+(1.6274). Two conventions in one row, from one call site.
+
+**So my sentence that `pct` was "copied verbatim across these harnesses so the convention cannot
+drift" is falsified by the arithmetic inside the function it describes.** Copying it verbatim pinned
+the *code* and not the *convention*. A second reader guessed a second code path; the cause is
+narrower and worse — there is one path and it is inconsistent with itself.
+
+## The size, on every number that depends on it
+
+**The gate count at k=4, which is where it is catastrophic:**
+
+| convention | gated cells at k=4 |
+|---|---|
+| `pct` as published (= lower here) | **2** |
+| averaged median | **8** |
+| lower median | 2 |
+| upper median | **34** |
+
+**A factor of 17 across conventions, on gate membership.** This closes item (d) of amendment 3 and
+closes it the opposite way to my reading there: the mismatch moved **membership**, not only the
+reported gain. It also identifies the sealed reduction as **averaged-median-like** — averaged
+reproduces the sealed headline at four of five widths, with k=8 (3 against 1) still unexplained.
+
+**Why it bites here and nowhere quiet:** an order-statistic median's index convention matters in
+proportion to the sample's dispersion. These cells have per-pass spreads of 2.5–6×, so the 3rd and
+4th of six sit **17.8%** apart on the deg-323.3 cell, and a threshold between them flips the verdict.
+On a low-dispersion cell the three conventions are indistinguishable, which is exactly why this was
+never worth naming until a threshold was applied to it.
+
+**The narrow rule: when a threshold is applied to an order statistic of a small, high-dispersion
+sample, the index convention is PART OF THE THRESHOLD.** Re-running the gate under both conventions
+is a one-line sensitivity check and here it spanned 2 to 34.
+
+**On the width-contrast conclusions, the sensitivity is small.** Recomputing the k=4 contrast under a
+single convention throughout shifts it by at most **1.91 pp** (4-vs-32: 40.96% published against
+39.04% all-averaged; 4-vs-8: 1.39 pp). Against separations of 9.7–34.6 pp, no conclusion moves.
+Amendment 31's bootstrap groups also mix conventions (n=78 lower, n=68 upper, n=152 upper, n=298
+lower), but at those n the difference is one adjacent order statistic out of tens to hundreds.
+
+## The reassurance, and it is structural
+
+**The sign-only 51 uses no median at all** — "behind MKL in all 12 readings" is a conjunction over raw
+readings. Recomputed: **51, convention-free by construction.** So this document's motivating
+population, and amendment 3's conclusion that the 51 are the better-conditioned target, are
+**untouched by any of this.**
+
+That is not luck. **The criterion that survived four rounds of review is the one with no reduction
+step in it**, and the criteria that kept failing — a magnitude threshold on a per-cell median — are
+the ones whose answer depended on an estimator's index.
+
+## What I am changing and what I am not
+
+**Changed:** the scoring path for this run will use one explicitly named convention (averaged median,
+`statistics.median`), computed in a new function, with the convention printed in the output header so
+it cannot be inferred wrongly from a label.
+
+**Not changed:** `pct` in `an_f64_arms.py`, `an_floor2x2.py` and `an_f64_vs_mkl.py`. Those are
+pre-registered estimators in registered screens, and correcting a pre-registered estimator is
+Bobby's call, not a verifier's. **Flagged for Bobby with the measured size**, rather than silently
+amended. The defect does not invalidate those screens' published conclusions — the ≤1.91 pp
+sensitivity above is the bound — but every future threshold applied through `pct` is exposed to it.
+
+## Two corrections accepted, and one range fixed again
+
+- **The 38.1% coincidence is a coincidence**: two different cells under two different reductions
+  (deg-314.9 at pooled-averaged 1.3808; deg-323.3 at aa-lower 1.3813). Not the same cell.
+- **"The gated cells need 36–57%" was mixed too** — in the very commit that withdrew the previous
+  range for being mixed. A cell must clear parity on **both** builds, so the requirement is
+  `max(aa, bb)`: **38.1–56.0%**. Third statement of this range, and the lesson is that **an endpoint
+  only has to come from somewhere**, which is why ranges are where mixed reductions keep surfacing.
+- **The corpus CV is 20.0% over all 3820 cells, not 15.9%** — mine was a 1200-key head-of-list sample
+  and is withdrawn as biased by the draw. So the sign-only 51 at 16.0% sit **below** the corpus, not
+  at it: the consistently-behind population is **quieter** than the corpus. That strengthens
+  amendment 3(b)'s conclusion rather than weakening it. And the CV needs its own functional named for
+  the same reason the median did — 26.8% published against 41.4% recomputed as stdev-over-mean.
