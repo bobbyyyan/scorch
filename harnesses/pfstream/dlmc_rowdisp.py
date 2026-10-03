@@ -9,13 +9,25 @@ A .smtx file is three lines: "rows, cols, nnz", then the CSR row pointer, then t
 column indices. The row pointer alone gives every row's nonzero count, so this reads
 two lines per file and never touches the indices.
 
-The guard that makes the output trustworthy: every key's rows and nnz are checked
-against the same key's `rows` and `nnz` columns in a results ledger. A substituted or
-differently-ordered corpus is invisible in a dispersion number -- it just reads as a
-different distribution -- so the only thing that separates a real reading from a wrong
-corpus is agreement with an independent record of the same matrices. A key whose rows
-or nnz disagree is reported and excluded; a nonzero exclusion count invalidates the run
-rather than shrinking it quietly.
+The guard, and exactly what it does and does not cover. Every key's rows and nnz are
+checked against the same key's `rows` and `nnz` columns in a results ledger, because a
+substituted or differently-ordered corpus is invisible in a dispersion number -- it just
+reads as a different distribution. A key that disagrees is reported and excluded, and a
+nonzero exclusion count invalidates the run rather than shrinking it quietly.
+
+But note which column that guard actually certifies. Once rows and nnz are validated and
+the pointer is checked to sum to nnz, `mean_deg` is nnz/rows exactly -- a function of the
+two validated scalars, carrying no information the ledger did not already hold. The three
+columns anything here acts on -- row_cv, max_over_mean, empty_rows -- all depend on the
+SHAPE of the row-length distribution, and no external record of row lengths exists in
+this project to check that against. A corpus with correct per-key rows and nnz but
+corrupted row pointers would pass the dimension check and produce wrong dispersion.
+
+So the shape is constrained from inside the file instead, by the one header field that is
+otherwise unused: every row's nonzero count must lie in [0, cols], since a row's entries
+occupy distinct columns. That is free, it is a real constraint on the distribution rather
+than on its mean, and it fires on precisely the corruption the dimension check cannot
+see. It is weaker than an independent record and is not a substitute for one.
 
 A ledger may qualify its keys with a leading component the filesystem path does not
 carry -- chain207's DLMC keys begin "dlmc/" while a path relative to ~/dlmc does not,
@@ -46,6 +58,15 @@ def row_counts(path):
         raise ValueError("row pointer has %d entries, header says %d rows"
                          % (len(ptr), rows + 1))
     counts = [ptr[i + 1] - ptr[i] for i in range(rows)]
+    # The shape constraint. A row's nonzeros sit in distinct columns, so no count may
+    # exceed cols, and a negative count means a non-monotone pointer. Neither is implied
+    # by the header agreeing with the ledger.
+    worst = max(counts) if counts else 0
+    if worst > cols:
+        raise ValueError("a row holds %d nonzeros but the matrix has %d columns" % (worst, cols))
+    if min(counts, default=0) < 0:
+        raise ValueError("row pointer is not monotone: smallest row length is %d"
+                         % min(counts))
     return rows, cols, nnz, counts
 
 
@@ -54,7 +75,10 @@ def dispersion(counts):
     total = sum(counts)
     mean = total / n
     if mean == 0.0:
-        return mean, float("nan"), float("nan"), 0
+        # Every row is empty exactly when the mean is zero, so the count is n, not 0.
+        # Unreachable on this corpus -- the smallest key has 6 nonzeros -- but a zero
+        # here would read as "no empty rows" on the one input where all of them are.
+        return mean, float("nan"), float("nan"), n
     var = sum((c - mean) ** 2 for c in counts) / n
     cv = math.sqrt(var) / mean
     return mean, cv, max(counts) / mean, sum(1 for c in counts if c == 0)

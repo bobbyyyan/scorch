@@ -843,6 +843,10 @@ statistic at index `ceil(0.95 x 50) = 48`, printed with its index and convention
 its value. The sign-only 51 remains convention-free: it reduces nothing.
 
 # Amendment 7 — condition 4's row-dispersion stratifier is withdrawn: it sorts cells by their own noise floor
+> **Mechanism confirmed and two claims corrected by amendment 9.** The floor spread is
+> measured on the size axis in 9(1). The reader's guard covered only its redundant
+> column (9(2)), and its "only source for mean degree" claim is wrong (9(3)).
+
 
 Written 2026-10-02 with the screen running and nothing from it scored. The instrument is
 `harnesses/pfstream/dlmc_rowdisp.py`, committed with this amendment; every number below
@@ -903,9 +907,10 @@ Any stratified table stays in the readout as description only, and each stratum 
 carries its **own** floor from the column above -- never the pooled 0.9232-population
 figure. No threshold is applied to a stratified number.
 
-The row-dispersion reader is kept and committed regardless: it is the only source in this
-project for per-key mean degree and empty-row counts checked against an independent
-record, and the descriptive table needs it. Its guard earned its place on the first run
+The row-dispersion reader is kept and committed regardless, for row_cv, max_over_mean and
+empty_rows, which the descriptive table needs. (The claim that it is the only source for
+per-key mean degree is **wrong and corrected in amendment 9(3)** -- the ledger's own `deg`
+column already carries it. Amendment 9(2) also corrects what its guard covers.) Its guard earned its place on the first run
 by catching that chain207's keys carry a leading `dlmc/` component that a path relative
 to `~/dlmc` does not -- without it the run would have produced 3846 perfectly plausible
 dispersion values for a population overlapping the ledger in zero keys.
@@ -1019,3 +1024,95 @@ choice of middle moves gate membership by a factor of 3.8 on a fixed population 
 fixed floor, 6 to 23 over the 51; in the sealed population it is 8 under the geometric
 middle. The sign-only 51 remains convention-free and reduces nothing. No live scoring
 path reads any of the withdrawn or reinstated figures.
+
+# Amendment 9 — the reader's guard certified its one redundant column; and no chain207 floor transfers to this run
+
+Written 2026-10-02 with the screen still on its first pass. Items (1) and (4) arrived from
+a peer session; (2), (3) and (5) are measured here.
+
+### 1. Amendment 7's mechanism, now measured on the size axis instead of inferred
+
+Amendment 7 attributed the CV terciles' 2.7x floor spread to the known inverted-U of the
+A/A floor by matrix size, arriving through a stratifier not chosen for size. That was an
+inference across axes. Measured directly -- p95 of the within-cell aa-vs-bb displacement
+at k=4 over all 3820 cells, banded by nonzero count:
+
+| nnz band | n | p95 floor, of S-1 |
+|---|---|---|
+| < 1e4 | 748 | 4.14% |
+| 1e4 - 1e5 | 1836 | 22.89% |
+| 1e5 - 1e6 | 1202 | 39.27% |
+| > 1e6 | 34 | 13.20% |
+
+A clean inverted U peaking at 1e5-1e6 nonzeros, and the CV terciles map onto it through
+low CV <-> high mean degree <-> larger matrices. The withdrawal now rests on a
+measurement rather than on a cross-axis argument.
+
+### 2. The dimension guard certified the one column that carries no information
+
+`dlmc_rowdisp.py` checked each key's rows and nnz against the ledger and called that
+coverage. But once rows and nnz are validated and the pointer is checked to sum to nnz,
+`mean_deg` is nnz/rows **exactly** -- a function of two already-validated scalars. The
+three columns condition 4 actually acted on (row_cv, max_over_mean, empty_rows) all
+depend on the *shape* of the row-length distribution, which nothing independent
+validates. So the guard's hazard statement was right and its coverage claim was inverted:
+it certified the redundant column and left the load-bearing ones open.
+
+The fix was already inside the file. `cols` was parsed from the header and never used for
+anything but output. Every row's nonzero count must lie in [0, cols], since a row's
+entries occupy distinct columns -- a free constraint on the distribution rather than on
+its mean. Both bounds are now enforced in `row_counts`.
+
+**Demonstrated on two dimensionally-correct corruptions**, each rewriting one key's row
+pointer while preserving its rows and nnz exactly, so the ledger check cannot see either:
+
+- *caught.* One row given 600 nonzeros in a 512-column matrix. The reader reports
+  `DIMENSION MISMATCH against the ledger: 0` -- the old guard was blind -- and
+  `UNREADABLE or internally inconsistent: 1` with the reason, and refuses to write.
+- *not caught, and this is the residual gap.* Every row set to the same length, 25 or 26.
+  Valid under every check in the file, and wrong: that key's row CV becomes 0. Every
+  guard passes and the corpus quantiles move in the fourth digit.
+
+The column bound is weaker than an independent record of row lengths and is not a
+substitute for one. No such record exists in this project, and the honest statement is
+that the shape columns rest on the corpus files being uncorrupted. Amendment 7's
+conclusion does not depend on them: it is a withdrawal, and a withdrawal does not need
+the withdrawn numbers to be right.
+
+Separately, `dispersion()` returned `empty_rows = 0` in the `mean == 0.0` branch, where
+every row is empty and the answer is n. Unreachable on this corpus -- the smallest key
+has 6 nonzeros over 64 rows -- but it would have read "no empty rows" on the one input
+where all of them are. Fixed.
+
+### 3. Amendment 7's provenance claim about the reader is wrong
+
+Amendment 7 says the reader is "the only source in this project for per-key mean degree
+and empty-row counts checked against an independent record". Mean degree was already in
+the ledger: the chain207 CSVs carry a `deg` column, and over all 3820 keys
+max |deg - nnz/rows| = 5.00e-03 with only 3 keys above 0.005 -- two-decimal rounding of
+the same quantity. The reader's unique contribution is row_cv, max_over_mean and
+empty_rows, which per item 2 are exactly the columns nothing independent validates.
+
+### 4. No floor or spread figure from chain207 transfers to this run
+
+chain207 is **6 readings per cell per build**; this screen is **4**. The same reduction
+over fewer readings is noisier, so this run's A/A floor will be wider, and every
+chain207-derived floor or spread quoted anywhere in this document is a 6-pass estimate
+that does not transfer as a threshold -- including the 27.7%-of-S-1 k=4 gate floor of
+amendment 1(g), the per-cell two-build spreads, and the CV figures of amendment 3(b).
+
+Verified rather than assumed: `score_mrhv.py` contains no floor constant at all. Every
+floor it uses is computed per width from this run's own mr0/mr0b pair, which are
+byte-identical objects built at one fixed absolute path.
+
+What *does* transfer, because each is a conjunction or a predicate over raw readings
+rather than a reduction: the sign-only 51's membership, the sealed 8's membership, and
+the one cell in their intersection.
+
+### 5. The condition 4 null is not an identity, and the reason is worth stating
+
+The 5.00% exceedance the p95 floor implies would be a tautology if the floor were
+computed on the same readings it is applied to. It is not: the floor comes from the
+mr0/mr0b A/A pair and the count comes from the arm contrast, so under no effect the 5% is
+a genuine prediction about a different sample. The plant's seven null widths read
+2.50-5.83%, straddling it -- a calibration, not a restatement.
