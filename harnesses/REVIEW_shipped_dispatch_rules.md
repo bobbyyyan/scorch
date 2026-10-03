@@ -110,6 +110,60 @@ a body parse can see a dependence entering below the pybind boundary in C++, whi
 reaches. The structural claim is the peer reviewer's; the body parse, the `query_llc` reading and
 the `cpu_count` exception are mine.
 
+### The census's own residual: the memo key is coarser than the functions it protects
+
+The statement above is about the thread count, which turns out not to be a decision input at all.
+The hazard concern #4 actually audits is more general: **a decision input that can differ between
+two calls in one process without changing the memo key.** `memo_key = (sig, level, baseline_tag)`
+(`:1523`). Taking the transitive closure of calls from `is_candidate` and `maybe_dispatch` -- 40
+functions, not the 4 either census listed, which is why the closure was computed rather than
+enumerated -- every decision input classifies as:
+
+| decision input | can differ between two calls in one process? | captured in the key? |
+|---|---|---|
+| M, J, nnz, N | yes | yes -- `_signature` returns `(M, J, nnz, N, 4 samples)` (`:428-453`) |
+| level | yes -- `_current_level` reads `_global_level` / `_tls` | yes, keyed directly |
+| baseline_tag | yes | yes, keyed directly |
+| `C` = `query_llc()` | no -- memoised into `_llc_bytes` on first call | n/a |
+| 8 module-level env reads (`:342,348,456,1038,1043,1046,1047,1061`) | no -- evaluated at import | n/a |
+| `os.cpu_count()` via `_machine_id()` (`:883`) | no -- host property, cached in `_machine_id_val` | n/a |
+| matrix **content** via `_locality_ratio` / `_degree_cv` | yes | **only through 4 sampled entries** |
+
+Every row but the last closes by reading. The last does not: **the key samples the matrix at 4
+points (`pos[M/3]`, `pos[2M/3]`, `crd[nnz/3]`, `crd[2nnz/3]`) while the decisions sample it at 64
+(`_LOC_NSAMP`, reaching `_scattered`) and 4096 (`_CV_NSAMP`, reaching `_degree_cv`).** The key is
+coarser than the functions it protects, so two matrices can share a key and decide differently.
+Both samplers use a fixed seed (`manual_seed(0)` / `manual_seed(1)`), so equal M draws the same
+rows and only the values read differ.
+
+**Measured on the real collection, locally, with neither host touched.** Reproducing `_signature`
+over all 3846 local DLMC matrices, then calling the *production* `_locality_ratio` / `_scattered` /
+`_degree_cv` on every surviving collision group (import resolved to
+`/Users/bobby/scorch-beat-mkl/src/scorch`, `_LOC_MIN=0.3`, `_LOC_NSAMP=64`, `_CV_NSAMP=4096`):
+
+| | keys | distinct | groups > 1 | keys in a collision group |
+|---|---|---|---|---|
+| `(M, J, nnz)` alone -- the bound | 3846 | 1860 | 202 | **2188 (56.89%)** |
+| full production signature | 3846 | 3823 | 3 | **26 (0.68%)** |
+
+The 4 sampled entries separate 2162 of the 2188, so **the dimension-only bound overstates the
+collision population by 84x** -- reported beside the exact figure rather than instead of it.
+
+**And the 26 are not a defect.** All three groups carry `nnz = 0`: they are exactly the 26 DLMC
+keys with no nonzeros (`chain209-dlmc-dims/dlmc_dims.csv`, sealed digest `ff167f71d50abf74`,
+manifest 9 of 9 OK) -- variational_dropout 0.98 layers pruned away entirely. Being all-zero they
+are *identical* as CSR operands: `_locality_ratio` 0.0, `_scattered` False and `_degree_cv` 0.0 for
+all 26, ranges exactly 0.000000. Replaying one's memo entry for another therefore returns the right
+answer rather than a misroute. They also never reach the memo at all -- `is_candidate` is False,
+and `_eligible` / `_eligible_learned` are False at N = 2, 4, 8, 256 and 2048, because
+`_degree_pays` cannot pass at nnz = 0.
+
+**So the hazard has zero reachable instances on DLMC, for two independent reasons, and that is a
+measurement rather than a reading.** Scope, exactly: exact on DLMC because all 3846 matrices are
+local. On SuiteSparse it stays a **bound** -- 1274 of 4584 keys (27.8%) share `(M, J, nnz)` with
+another key, largest group 94 at `(9801, 9801, 87025)` -- because the 4 sampled entries need the
+matrices, which live on the two hosts, and one of them is mid-measurement.
+
 **The cost, with the base named, because the base inverts the ranking.** Timing each pick by
 seeding the memo and calling the production entry, two interleaved passes per pick, M5 at nt=6:
 
