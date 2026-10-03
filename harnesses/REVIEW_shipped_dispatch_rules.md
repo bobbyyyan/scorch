@@ -1174,13 +1174,25 @@ inert in all six. The header gives redwood's pool as 24, likewise above. The run
 this project's headline MKL comparisons do not exercise the gate, and this finding does not
 move those numbers.
 
-**The two quantities agree by common cause, not by construction.** A reasonable objection to
-the table is that importing torch might call `omp_set_num_threads` with ATen's own computed
-value, in which case the two columns would be one measurement reported twice. Tested by
-loading `libgomp.so.1` directly and reading `omp_get_max_threads()` before and after the
-import in one process: 8 before and 8 after under `-c 8`, 32 and 32 under `-c 32`, with
-`omp_get_num_procs()` also equal to the allocation before the import. So all three track the
-cgroup independently and the columns are two observations.
+**The two columns are ONE measurement propagated, and the first test of this was vacuous.**
+The objection to the table is that importing torch might set the OpenMP count, making the
+two columns one reading. The first test -- `omp_get_max_threads()` before and after the
+import, reading 8/8 under `-c 8` and 32/32 under `-c 32` -- had no power to answer it:
+libgomp's default max-threads *is* `omp_get_num_procs()`, so the value already present
+equalled what a torch writing `omp_set_num_threads(torch.get_num_threads())` would have
+written. Both hypotheses predict "unchanged" there.
+
+Separated by making the pre-import value disagree with the cgroup. Under `-c 32`, after
+`omp_set_num_threads(5)`: `omp_get_max_threads()` reads **5 before the import and 5 after**,
+so torch does not write it -- but `torch.get_num_threads()` also reads **5**, so torch
+*reads* it. The dependence runs **cgroup -> libgomp -> torch**, a chain. So the columns are
+one quantity propagated rather than two observations, and the earlier claim that "all three
+track the cgroup independently" is withdrawn.
+
+The finding does not rest on it. `omp_get_num_procs()` equals the allocation *before* any
+torch is loaded, which is a cgroup fact with no torch in it, and that is what carries "the
+pool tracks the allocation rather than being a host constant". The gate reads one value and
+that value is the same under either account, so the boundary is unmoved.
 
 Combined with the prevalence figures above, the exposed population wherever the gate does
 fire is 2069 of 4446 SuiteSparse operands at k <= 16 and 1154 of 3820 DLMC matrices, at
