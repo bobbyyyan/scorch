@@ -1939,3 +1939,84 @@ it reads as more power, because the n goes up. The nine-key join kept 1 cell by 
 predictor; the 20-key table kept 20 by redefining the predictor to a superset of the effect's
 domain, and the effect's domain inside it was still 1 cell. **Apparent power 20, real power 1.**
 Print the undefined-cell count per group, always, beside the n.
+
+---
+
+## Amendment 26 — a share has TWO degrees of freedom and amendment 24 pinned one. The numerator predicate is worth 3.11×, and it crosses a band boundary in the mechanism's favour.
+
+Amendment 24 registered: *"`s328` is computed over all 328 deficit keys with non-live keys IN the
+denominator, the same base as the 83.7%."* **That names the denominator. It does not name the
+numerator predicate**, and amendment 25's own census is what decides it. Job 17698209 is still
+running and has produced no analysable CSV, so this is still free.
+
+### Three candidate shares on the reference corpus, from amendment 25's census
+
+| reading | value | band it falls in |
+|---|---|---|
+| all `<=2` over all keys | **28/72 = 38.9%** | a share with **no causal claim** |
+| live `<=2` over live cells | 9/53 = 17.0% | a bound on reach |
+| **live `<=2` over all keys** | **9/72 = 12.5%** | a bound on reach |
+
+**The unpinned sentence admits the first, which is 3.111× the third** — and the two land in
+*different bands*. A registered condition that licenses a causal claim must not have a numerator
+whose definition can move the reading across one of its own boundaries, least of all in the
+mechanism's favour.
+
+**The intent was unambiguous and only the sentence is defective.** Amendment 24 quotes `9/72 =
+12.5%` as *"the base-matched prevalence"*, and amendment 25 derives the same 9 as *"the cells where
+a thread rule can act AND the `<=2` excess applies."* Both are live-`<=2` over all keys. But the
+sentence is what gets read after the job lands.
+
+### CONDITION 2, NUMERATOR PINNED
+
+**`s328` = (keys among the 328 that resolve to `<=2` AND are live) / 328.** The all-`<=2` count and
+the live count are both printed beside it, so all three shares are recoverable from the output and
+no later reader has to guess which was meant.
+
+**Why "denominator all keys, numerator live-only" is consistent rather than a contradiction of
+amendment 24.** A non-live key reaches one worker count, so **a thread rule has nothing to choose
+there and it cannot be within a thread-sizing mechanism's reach — but it can perfectly well be
+behind MKL.** The denominator counts **what must be explained**; the numerator counts **where the
+mechanism can act**. Amendment 24 fixed the base; this fixes the predicate; a share needs both
+written down and neither implies the other.
+
+### CONDITION 4, SAME PREDICATE
+
+`s328 - s64` is a difference of **reach** shares, so **both terms take the live-and-`<=2`
+numerator**. Amendment 24's 5-percentage-point live-fraction tripwire catches a composition effect
+in the **denominator**; it does not catch a **numerator** that counts cells where the curve is
+undefined. If the 392-key corpus shows the same near-total confounding as the 72-key one — 19 of 28
+`<=2` cells non-live — an all-`<=2` numerator would report roughly three times the mechanism's
+reach on both sides of the difference.
+
+### What this makes the third unpinned degree of freedom found on one statistic
+
+Amendment 22 fixed the **units** (in terms of the explained quantity's prevalence). Amendment 24
+fixed the **base** (all keys, not live cells). This fixes the **numerator predicate** (live-and-
+`<=2`, not all-`<=2`). **Each was invisible until the one before it was fixed, and each was worth
+between 1.36× and 3.11× in the mechanism's favour.** The general question none of the three asked
+until now is **on which cells is this quantity defined at all** — the same question amendment 25
+answered for the cross-tabulation, one level up, and the one that would have pre-empted all three
+had it been asked when the condition was first written.
+
+### Two corrections to the audit trail, offered by the reviewing session and recorded because they change what the earlier findings rest on
+
+**The mechanism proposed for amendment 47's `9.5×` was wrong while the finding was right.** The
+review inferred that 9.5 required a comparator of 5.40 pp lying outside both published MKT ranges;
+it is `31.27/3.30 = 9.48`, both published endpoints sharing k=2's numerator. **The provable part —
+not width-matched, upper end understated — held and drove the correction; the proposed cause did
+not.** A right finding from a wrong inference is still a finding, and the inference still has to be
+withdrawn.
+
+**And the window factor was verified as arithmetic rather than as a premise.** `sqrt(25/5.69) =
+2.096` is correct and 25 ms was never the run's parameter. Checking a number's arithmetic is not
+checking where the number came from.
+
+**One strengthening of amendment 47 that follows for free.** The "does not close" conclusion is
+robust to *every* possible width-matching, not merely to the bound: the **smallest attainable**
+ratio is `31.27/4.89 = 6.394`, and `6.394/3.1266 = 2.045 > 1.9` already, so **no assignment of
+MKT's per-width bands can rescue closure.** Publishing MKT float32's four width-matched bands would
+narrow the currently 2.4×-wide window — which is set by the comparator's uncertainty and not by
+anything physical — without being able to change the verdict. **Deferred rather than done now: the
+data is on `mkt1` and job 17698209 is timing there, so even a short read competes with a live
+measurement.**
