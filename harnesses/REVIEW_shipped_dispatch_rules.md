@@ -1638,3 +1638,81 @@ above establish.
 conjunction would need in order to ship is the screen's own result plus the missing
 `(rows 2, halfvec 0)` arm, since without it `mr0 -> mrhv` attributes to the package and not to
 either component.
+
+## Scoping the cross-corpus claim: the SIGN of the degree trend is shared, the mechanism is not
+
+Three corrections to the section above, two of them material. The headline that survives is
+narrower than what was written.
+
+### "The two corpora overlap at 100-256" is true of one band in four
+
+| band | SuiteSparse CI | DLMC CI | relation |
+|---|---|---|---|
+| 0-32 | -3.40 .. -2.22 | +0.61 .. +1.31 | **disjoint, OPPOSITE SIGN** |
+| 32-100 | -7.58 .. -4.60 | -3.01 .. -1.74 | disjoint |
+| 100-256 | -14.13 .. -8.57 | -12.55 .. -10.85 | DLMC **contained** in SuiteSparse |
+| 256+ | -12.45 .. -6.80 | -17.25 .. -13.91 | disjoint |
+
+Three of four disjoint, and at low degree the sign flips (-2.82% against **+0.95%**). So the
+collections share the **monotonicity in degree, not the level** -- the curves are offset and cross
+zero in different places. A shared sign of the derivative is what a mechanism predicts and is
+what the conclusion needs, but the sentence "the two corpora's intervals overlap" invited the
+stronger reading and is corrected here. At 100-256 the right word is **containment** (1.70 pp
+inside 5.56 pp), which is the stronger claim -- weakened by the SuiteSparse band being n=58, so
+overlap between a wide interval and a narrow one is mostly a statement about the wide one.
+
+### The material correction: only DLMC shows k=4 as the worst-degrading width
+
+Each width's geomean normalised to its own deg 0-32 value, so 1.000 means that width does not
+degrade with degree:
+
+| | k=2 | k=4 | k=8 | k=16 | k=32 | nbr geo | k=4/nbr |
+|---|---|---|---|---|---|---|---|
+| **SuiteSparse** 32-100 | 0.816 | 0.697 | 0.638 | 0.652 | 0.650 | 0.722 | 0.966 |
+| 100-256 | 0.781 | 0.592 | 0.538 | 0.567 | 0.529 | 0.648 | 0.913 |
+| 256+ | 0.682 | 0.540 | 0.495 | 0.476 | 0.455 | 0.581 | 0.930 |
+| **DLMC** 32-100 | 0.678 | 0.660 | 0.687 | 0.709 | 0.797 | 0.683 | 0.967 |
+| 100-256 | 0.616 | 0.539 | 0.618 | 0.704 | 0.830 | 0.617 | 0.874 |
+| 256+ | 0.587 | **0.520** | 0.657 | 0.694 | 0.785 | 0.621 | 0.836 |
+
+**Every width degrades with degree on both collections**, so "the dip grows because the
+neighbours improve" is refuted outright -- that was the live alternative and it is dead.
+
+But the two corpora then disagree on what is special. **On DLMC, k=4 degrades fastest of all five
+widths** (0.520 against 0.587 / 0.657 / 0.694 / 0.785), which is what a k=4-specific
+degree-dependent cost predicts. **On SuiteSparse it does not**: k=8, k=16 and k=32 all degrade
+*more* than k=4 (0.495, 0.476, 0.455 against 0.540), and the outlier is **k=2 being unusually
+robust** at 0.682. So on SuiteSparse the dip is produced by k=2 holding up, not by k=4 collapsing.
+
+**Consequence, stated plainly: the claim "this is the two-corpus confirmation the no-overfitting
+standard asks for" was too strong and is withdrawn in that form.** What is confirmed on both
+corpora is that k=4 falls below the interpolation of its neighbours and that the gap grows with
+degree. What is confirmed on **DLMC only** is that k=4 is the width responsible. A dispatch change
+keyed on k=4 therefore still rests on one collection for its mechanism, and SuiteSparse
+contributes the degree dependence rather than the width attribution. The absolute parity numbers
+are unaffected.
+
+### The reduction is a geometric mean, so subgroup arithmetic is valid here
+
+Checked rather than assumed, because this project's `red` helper is `exp(median(log v))`, which
+does not decompose. The n-weighted reconstruction of the pooled k=4 geomean from the four bands
+is **exact to four decimals on both corpora** -- 1.9346 against 1.9346 (SuiteSparse, n=4584) and
+1.2508 against 1.2508 (DLMC, n=3820). The implied deg<100 figures follow: 1.9597 over n=4475 and
+**1.5839 over n=1832**, so k=4 at low degree on DLMC is within 2% of that collection's best width.
+
+### 712 against 713 is ONE KEY and not a boundary convention -- but the convention moves 26%
+
+The earlier half-vector study reports n=712 for "DLMC float32, deg >= 256"; the band partition
+here gives 713. Resolved: the bands are `lo <= deg < hi`, and on DLMC
+
+    keys with deg == 256.0 exactly : 186
+    keys with deg >= 256           : 713
+    keys with deg > 256            : 527
+
+so neither convention yields 712, and the discrepancy is a single key the earlier filter dropped
+rather than a predicate difference. It is left as a one-key gap, not reconciled.
+
+**The convention itself matters far more than the off-by-one.** 186 of 713 keys sit at exactly
+degree 256, so `>=` against `>` moves this population by **26%**. Any claim stated as "deg >= 256"
+on this corpus must name the side the boundary belongs to; the n summing to the corpus total
+proves the bands partition but not which convention they use.
