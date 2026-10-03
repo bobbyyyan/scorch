@@ -3115,9 +3115,29 @@ pattern returns a different eight, and only the per-item classification transfer
 hides a class of error the raw one shows.** The peer's first version of this table had `137.50x`
 where the census gives `135.94x`, from typing `255.3125` for `255.320312500` -- and a ratio to a
 rounding resolution looks equally plausible at either value, so the published figure carried no
-tell. The raw degree does: `255.3125` against five neighbours all ending in longer binary fractions
-is visibly odd. **Deriving a quantity to make it robust against one distortion (the window) removed
-the only signal that would have caught another (the transcription)**, so both columns are published.
+tell. **Deriving a quantity to make it robust against one distortion (the window) removed the
+signal that would have caught another (the transcription)**, so all three columns are published.
+
+**But the column that catches it is `shape`, not the raw degree -- an earlier revision of this
+paragraph credited the wrong one.** `255.3125` is *structurally valid*: times 512 it is exactly
+130720, so a real matrix with `rows 512, nnz 130720` has precisely that degree, four nonzeros from
+the true key. It is a short value, not an impossible one. What rejects it is that `rows` and `nnz`
+are integers **from which the degree and the gap are both forced**: 130724/512 = 255.3203125, and
+the typed value fails that division. The two checks cover different mutations:
+
+| typed | decimals | x 512 | integer? | visibly odd? |
+|---|---|---|---|---|
+| 255.3125 | 4 | 130720 | yes | yes -- what actually happened |
+| 255.3203120 | 7 | 2042562496/15625 | **no** | **no** -- same length as its neighbours |
+| 255.3203125 | 7 | 130724 | yes | — the true value |
+
+The appearance heuristic catches the typo that occurred and would have passed the one that did not;
+the division rejects both. **So the rule is not "publish the raw value beside the derived one" but
+"publish the quantities the derived ones are forced from, so a single-cell error becomes an internal
+inconsistency rather than an implausibility"** -- which is [[which_assertion_catches_it]] applied to
+a table's column choice rather than to a test, and which is portable to tables where no column
+happens to look odd. Peer reviewer's correction, made against their own first version of it as well
+as mine.
 The deeper rule, which is the peer's and which they state against themselves: when the artefact is
 reachable, compute from the artefact, never from a message about it -- a quoted value is evidence
 about what someone read, not about what the file says, and here the same sealed census had been
