@@ -105,6 +105,13 @@ is defined against MKL — and the ~1.1% x86 cost per environment variable an ar
 
 ## The four refutation conditions, registered before the run
 
+> **CONDITIONS 1, 3 AND 4 BELOW ARE SUPERSEDED — DO NOT SCORE THEM.** Condition 1 is replaced by
+> amendment 1(c) (it certified a width where one macro under test is provably inert). Condition 3
+> is replaced by amendment 1(b) and then again by **amendment 2**, which withdraws amendment 1's
+> floor-gated primary as structurally unreachable. Condition 4 is replaced by amendment 1(e).
+> **Only condition 2 below stands as written.** This marker is here because a reader greps for
+> "refutation conditions" and starts at this heading.
+
 1. **Reachability.** If k=8 does not move outside the floor, the arm never fired and **nothing else
    in the run is readable** — not a null result. This is the condition that makes the rest
    interpretable and it is scored first.
@@ -317,3 +324,97 @@ is at least the measured one. `layout_artefact_by_width.md` records up to −2.6
 parity on identical-decision objects. That bites conditions 2 and 4, not 3 — a ≤2.6% artefact cannot
 touch a 14.75% target — and condition 2's consequence is the largest, since its failure declares the
 whole run confounded.
+
+---
+
+# Amendment 2 — amendment 1's floor-gated primary is withdrawn: it can only return zero
+
+Still before any timing. Amendment 1 replaced condition 3 because its pass line exceeded the
+mechanism's measured range. **The replacement is worse: its primary can only return zero, and that
+follows from the gate's definition rather than from which cells the gate picks.**
+
+## The structural argument
+
+The ratio gate admits a cell only if `S − 1 > 0.2783` (amendment 1(g): the DLMC k=4 floor is the
+two-sided spread at 27.83%). **So every cell the gate admits needs a gain above 27.8% to reach
+parity, by definition of the gate.** The mechanism is 7.7–12.4%. The gate's own floor is **2.2×**
+the mechanism's maximum.
+
+Membership, estimator choice and replication accuracy are all irrelevant to that conclusion. My
+own reconstruction of the gated set at k=4 returns **2** cells, needing 56.5% and 62.7%:
+
+| S pooled | S aa | S bb | gain needed | deg | key |
+|---|---|---|---|---|---|
+| 1.6274 | 1.3813 | 1.3637 | **62.7%** | 323.3 | `transformer/l0_regularization/0.5/body_decoder_la…` |
+| 1.5652 | 1.5603 | 1.3195 | **56.5%** | 256.0 | `transformer/random_pruning/0.5/body_decoder_layer…` |
+
+A second reader's reconstruction returns 8, needing 38.1–56.3%; this run's sealed analysis headlines
+8. **Three reconstructions, three populations, one conclusion** — at 9.2%, 12.4%, 14.75% or even
+27.83%, the count is **0 of 2** and **0 of 8**.
+
+**And the criterion's null is also zero**, since an A/A moves nothing. Observed = null = 0. Zero
+discriminating power, and a reported 0 would read as *"the arm does not work"* when it means *"the
+gate and the mechanism are mutually exclusive."*
+
+**The reconstruction gap is recorded, not papered over**: my 2 against the sealed 8 at k=4 means my
+floor replication is not byte-exact, and the per-width vector a second reader gets (`1/8/3/0/0`)
+differs from the sealed `1/8/1/0/0` at k=8. Whoever scores this must use the sealed definition, and
+the discrepancy is itself worth resolving separately.
+
+## The design fact, stated as a fact rather than a bug
+
+**Floor-clearance demands a large deficit; reachability by a bounded mechanism demands a small one.**
+At a 27.8% floor those two sets are disjoint, so no threshold on their intersection can carry
+information. That is a property of this corpus's floor at this width, not a flaw in either
+requirement — scoring only where the deficit clears the replication pair remains the right instinct.
+
+## The lesson, which is cleaner than the original defect
+
+**Narrowing the population to escape a floor problem RAISED the bar, because the gate selects on
+deficit size and the bar IS deficit size.** The narrowing and the threshold moved in the same
+direction. **When a criterion is unreachable, check whether the proposed narrowing moves the bar in
+the same direction as the narrowing itself.**
+
+## Condition 3, replaced a second time — change the question, not the population
+
+**3-PRIMARY (promoted from amendment 1's 3c).** Report the measured gain at float32 k=4 and the
+implied parity count **as a curve, with no threshold**. This is measurable, it is what the data can
+answer, and it reports a real improvement that does not reach parity as exactly that.
+
+**3-SECONDARY (the answerable displacement question, in condition 4's shape).** Does the arm move
+the k=4 geomean by more than **the geomean's own floor at that n**, computed from the `mr0`/`mr0b`
+pair? Floor-scaled, answerable, and it does not require the deficit to close.
+
+**3-DESCRIPTIVE.** The parity counts over the 8 gated cells and the 51 sign-only cells, reported
+beside their two-build flip counts, as **descriptive counts and not as a pass/fail test**.
+
+**"Does the arm CLOSE the deficit" is unaskable for a 10% mechanism against a 38–63% gap, and is
+withdrawn as a question.** A 7.7–12.4% gain on the 51 would be a real improvement; the curve says so
+and no threshold needs to.
+
+## Two further items
+
+**The row-dispersion stratifier is not computable from the ledger.** Amendment 1(e) moved condition
+4's stratification to row-length coefficient of variation, which is the right covariate — but the
+sealed CSVs carry only `build,slice,key,k,rows,nnz,deg,arm,ms,batch`, and `deg` is `nnz/rows`. There
+is no row-length distribution in the ledger, so the CV requires re-reading the source `.smtx`
+matrices. **A correct stratifier and an available stratifier are different questions, and amending
+the condition answered only the first.** Noticed now rather than when the scoring script runs; the
+reader is to be written before scoring, against `~/dlmc` on this host and `/scratch/bobbyy/dlmc` on
+redwood, and its row counts must be checked against the ledger's `rows` column per key so a
+mismatched corpus cannot read as a dispersion result.
+
+**The firing check's one blind direction, registered rather than fixed.** If `mrhv` and `mrhv4` do
+not differ at k=4, that conflates *non-firing* with *ROWS=2 and ROWS=4 performing identically*. The
+`.text` assertion proves the objects' code differs, not that execution differed. It **fails closed**
+— discarding a readable run rather than accepting a confounded one — so it is conservative in the
+right direction. Also recorded: `mrhv` against `mr0` could **not** serve as the firing check even
+though `mr0` never admits multi-row, because that contrast *is* the effect, so a null would be
+indistinguishable from "fired and did not help". A firing check has to vary a parameter the effect
+does not depend on, and `multirow_ok` is ROWS-independent beyond `multirow > 1`, so admission is
+identical between `mrhv` and `mrhv4`. That is what makes the check valid.
+
+## Build complete, all assertions passed
+
+Four objects at one fixed absolute path: `mr0` and `mr0b` **`.text`-identical** (the floor), `mrhv`
+differing from ship by **+4385** instruction lines, `mrhv4` differing from `mrhv` by **−75**.
