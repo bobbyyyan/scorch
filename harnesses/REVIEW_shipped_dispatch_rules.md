@@ -2020,3 +2020,84 @@ Worth separating because they sit in the same file family and give opposite answ
 
 So the half-vector mechanism is live on MKT and the W1-unroll mechanism is inert there by
 construction. Cite the line, not "the AVX2 gate".
+
+### Correction: `comm` under a different collation than the `sort` fabricated three numbers
+
+The "916 common of ~4590" above was wrong, and so was every figure derived from it. The lists were
+written with `LC_ALL=C sort`, but `comm` ran under the shell's `en_US.UTF-8`, whose collation
+reorders punctuation -- so the merge desynchronised and reported keys as one-sided that `grep`
+finds in both files.
+
+| comparison | UTF-8 `comm` | `LC_ALL=C comm` |
+|---|---|---|
+| full-list common | 916 | **1226** |
+| redwood 3-component vs MKT | 931 common, 295 rw-only | **1226 common, 0 rw-only** |
+| basenames: common / rw-only / MKT-only | 4578 / 6 / 0 | **4578 / 6 / 0, unchanged** |
+
+**All 1226 of redwood's group-qualified keys exact-match MKT's**, 1:1 with nothing left over. So
+the two caches agree perfectly on group labelling wherever redwood records a group, and the
+"295-310 group-name disagreements" that the wrong number implied **do not exist**. The remaining
+differences are only the two already recorded: 6 basenames and 16 duplicate paths.
+
+**The basename comparison -- which the finding above rests on -- is unchanged.** It was correct,
+and is now correct for a checkable reason rather than by luck.
+
+**The tell was an internal contradiction, not a suspicious value.** Redwood's 3-component keys are
+a *subset* of its full list, yet reported 931 matches against the full list's 916. A subset cannot
+match more than its superset, and that is visible without knowing which number is right. Both
+numbers were individually plausible: 916 of ~4590 reads like a layout mismatch, 931 like the same
+thing measured slightly differently.
+
+**The rule: `comm`, `join` and `uniq` are merge algorithms whose correctness depends on the input
+order matching their own comparison.** Setting the locale on `sort` and not on the consumer is
+silently wrong in both directions. Set it on both, or verify with a membership test -- `grep -c
+'^key$'` on each file -- which is order-independent and is what exposed this.
+
+### Redwood's cache has three key forms, so "redwood stores `<name>/<name>`" described 39% of it
+
+From the sealed dims census (`chain209-dlmc-dims/ss_dims.csv`, 4584 rows), counting path components:
+
+| form | example | n | share |
+|---|---|---|---|
+| group-qualified | `ss/AG-Monien/3elt/3elt` | 1226 | 26.75% |
+| flat | `ss/barth4/barth4` | 1772 | 38.66% |
+| group dir + suffixed name | `ss/bone010/bone010_M` | 1586 | 34.60% |
+
+So the earlier sentence covered 1772 of 4584. Only the 1226 qualified keys can exact-match a
+uniformly-qualified list, and all 1226 do.
+
+### The 6 redwood-only matrices: 4 are not SpMM operands, so the loss is 2
+
+From the same census:
+
+    ss/bone010/bone010_B,986703,1,1          ss/boneS10/boneS10_B,914898,1,1
+    ss/bone010/bone010_C,3,986703,3          ss/boneS10/boneS10_C,3,914898,3
+    ss/bone010/bone010_M,986703,986703,23888775
+    ss/boneS10/boneS10_M,914898,914898,18489474
+
+The `_B` pair are single-column right-hand sides and the `_C` pair are 3-row blocks. Only the `_M`
+pair are operators, so a cross-host comparable set loses **2** real matrices, not 6.
+
+### Non-operands distort the board but are provably inert on the k=4 finding
+
+150 of the 4584 census keys have `min(rows, cols) == 1` -- 127 with `cols == 1`, 23 with
+`rows == 1`. Excluding them from the SuiteSparse dip, measured on this project's own board:
+
+| band | all keys | operands only | shift |
+|---|---|---|---|
+| 0-32 | n=4167, -2.82% | n=4018, **-3.34%** | **-0.52 pp** |
+| 32-100 | n=308, -6.13% | n=307, -6.16% | -0.03 pp |
+| 100-256 | n=58, -11.23% | n=58, **-11.23%** | **0.00 pp** |
+| 256+ | n=51, -9.66% | n=51, **-9.66%** | **0.00 pp** |
+
+Pooled geomeans move k=2 1.7351 -> 1.7113, k=4 1.9346 -> 1.8979, k=8 2.3038 -> 2.2707, deepening
+the pooled dip -3.24% -> -3.72%.
+
+**The distortion is real, runs against the dip, and cannot touch the finding** -- because a matrix
+with `min(rows, cols) == 1` has mean degree at most 1 and therefore lands in band 0-32 by
+construction. 149 of the 150 are in that band and one is in 32-100. The two high-degree bands that
+carry the entire k=4 result contain **none** of them and move by exactly 0.00 pp. That is
+disjointness by construction rather than a caveat.
+
+What does change: SuiteSparse's low-degree dip is **-3.34%**, not -2.82%, which widens rather than
+narrows its separation from DLMC's +0.95% at the same band.
