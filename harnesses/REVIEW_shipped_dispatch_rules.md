@@ -279,10 +279,18 @@ routes to the arm it would measure as 1.5–1.9× slower, and nothing in its pat
 
 ## Concerns #1 and #2 — both predicates are REACHABLE on x86; the inertness argument is a statement about one host's core count
 
-Measured 2026-10-02 on mkt1 (AMD EPYC 9334 Zen4, 128 CPUs), inside a 64-CPU Slurm
+Measured 2026-10-02 on mkt1 (AMD EPYC 9334 Zen4, 128 CPUs on the machine; this run saw
+64 via its cpuset, and `omp_get_num_procs()` in-process read 64), inside a 64-CPU Slurm
 allocation, against `/scr/bobbyy/adg/adg0` — verified to carry the shipped constants
 (`SCORCH_SPMM_PARTITION_GATE_MAXTHREADS 16`, `SCORCH_SPMM_NT_CAP -2`,
 `SCORCH_SPMM_RECRUIT_MIN_WORK 1e7`). Probe: `harnesses/pfstream/pool_reach.py`.
+
+Line numbers: the review named `:2277` and `:1583`; the predicates are at `:2313` and
+`:2612` in the tree as measured. Both were read at both sites to confirm they are the same
+two predicates, so this is traceability drift and not a wrong target. The inertness claim
+for #1 appears **twice** -- `:333` (the constant's doc comment, which carries the word
+"provably") and `:2298` (which does not) -- plus `:2283` asserting the same of the cap, so
+a comment fix has three sites.
 
 **This is a reachability result and not a performance result.** No runtime was measured.
 What follows says the predicates can fire on x86, not that firing helps or hurts.
@@ -306,8 +314,32 @@ there."* Sweeping the caller's pool over a 175-cell grid of rows x nnz x k:
 
 **At pool 24 -- the exact pool the comment names -- the gate is reachable on 85 of 175
 cells.** The comment's premise is that the resolved count is "at most 32". That bound is
-`omp_get_num_procs()`, which is 32 on redwood (i9-14900K) and 128 on mkt1. So the
-inertness is real and the reasoning is sound, but what it depends on is the ratio
+`omp_get_num_procs()`, read at `scorch_policy.h:2118` and `:2167` and nowhere else.
+
+**Corrected**: the first version of this section said that bound "is 32 on redwood and 128
+on mkt1". 128 is `os.cpu_count()`. libgomp honours the cpuset, so inside the 64-CPU
+allocation the run actually used, `omp_get_num_procs()` returned **64** -- which the
+`max resolved` column was already showing by reading 64 at pool 8, 16, 24 and 32 alike, a
+hard ceiling rather than four coincidences. Three quantities were going by one name:
+
+| quantity | mkt1, this run | what it is |
+|---|---|---|
+| `os.cpu_count()` | 128 | the machine; what the sentence quoted |
+| `len(sched_getaffinity(0))` | 64 | what the process may use |
+| `omp_get_num_procs()` in-process | **64** | the predicate's actual bound |
+
+The conclusion was stated in the one quantity the probe did not read, and it named a value
+no process in the run ever saw. The probe now prints all three. This **strengthens** the
+result rather than weakening it: the predicate fires at an effective processor count of 64,
+so an unrestricted node is not needed for it, and 85 of 175 cells at pool 24 against a
+ceiling of 64 is a stronger statement than the same count attributed to 128.
+
+It also removes a contradiction between the rule and the probe's own guard: at pool 40,
+`128 >= 80` says reachable while `64 >= 80` says not, and `pool_reach.py` already warns
+that a pool whose gate exceeds the allocation reports the allocation. With the right
+variable the two agree.
+
+So the inertness is real and the reasoning is sound, but what it depends on is the ratio
 `omp_get_num_procs() / pool`, not the instruction set:
 
 > the predicate is reachable exactly when `omp_get_num_procs() >= 2 * pool`.
@@ -327,11 +359,28 @@ x86**, and its sign was established on ARM.
 | pool | cells with mode != 0 at the reference pool | of those, forced to mode 0 | share |
 |---|---|---|---|
 | 1 .. 16 | 165 | 29 | 17.6% |
-| 20 .. 32 | 165 | 0 | 0.0% |
+| 17, 20, 24 | 165 | 0 | 0.0% |
+| 32 | 165 | 0 | 0.0% -- IDENTITY, the negative control |
 
-A clean step at the documented constant. The `cells with mode != 0` column is the
-non-vacuity check: it is 165 at every pool, so the zero rows are genuine zeros and not an
-empty population.
+Two corrections to the first version of this table.
+
+**The boundary is located at 16, not merely bracketed.** The original sweep stepped
+16 -> 20, which produces an identical table for a ceiling of 16, 17, 18 or 19. A
+geometric pool sweep is right for reachability and wrong for localization, and one grid
+cannot do both. Pool 17 was added and reads 0 forced, so the transition is between 16 and
+17 and matches the shipped constant exactly.
+
+**The pool-32 row is an identity and is now labelled as such.** The reference pool is 32
+and 32 was in the sweep, so at that row the two calls being compared are the same call and
+`forced` could only ever be 0. The first version banded it with two genuine zeros,
+inflating the count of real zeros by one. It is kept rather than deleted, because it is the
+only row whose answer is known in advance: a nonzero there would mean the detection is
+broken rather than that the gate is inert. The general check is to intersect the sweep list
+with every constant the comparison holds fixed, which finds both the vacuous row and the
+free negative control in one pass.
+
+The `cells with mode != 0` column is the non-vacuity check: it is 165 at every pool, so the
+remaining zero rows are genuine.
 
 Reachable by ordinary means. `torch.set_num_threads(16)` or less is a normal thing for a
 caller to do -- it is what a process sharing a node, or running inside a dataloader

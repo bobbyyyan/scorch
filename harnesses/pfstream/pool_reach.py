@@ -51,7 +51,10 @@ GRAIN = None
 # Capped at 32 so the largest gate (2x32 = 64) is reachable inside a 64-CPU
 # allocation. mkt1 would not grant 128, and a pool whose gate exceeds the
 # allocation reports the allocation rather than the policy.
-POOLS = [1, 2, 4, 6, 8, 12, 16, 20, 24, 32]
+# 17 is here to LOCATE predicate 2's boundary rather than bracket it. A geometric sweep
+# stepping 16 -> 20 produces an identical table for a ceiling of 16, 17, 18 or 19, so the
+# same grid cannot do reachability and localization at once.
+POOLS = [1, 2, 4, 6, 8, 12, 16, 17, 20, 24, 32]
 # rows x nnz x k, spanning short kernels to large ones in both axes
 ROWS = [64, 512, 4096, 65536, 1000000]
 NNZ = [3_000, 50_000, 1_000_000, 20_000_000, 200_000_000]
@@ -66,8 +69,28 @@ def main():
     # exactly that: it reported predicate 1 "reachable at pool 1" because the allocation
     # had 2 CPUs, which made 2 >= 2*1 true for reasons having nothing to do with x86.
     avail = len(os.sched_getaffinity(0)) if hasattr(os, "sched_getaffinity") else os.cpu_count()
-    print("host %s  nproc %d  CPUs this process may use %d  torch default pool %d"
-          % (os.uname().nodename, os.cpu_count(), avail, torch.get_num_threads()))
+    # Three different numbers go by "the core count", and the predicate's bound is the
+    # third one. Printing all three is the whole point: libgomp honours the cpuset, so
+    # inside a partial allocation omp_get_num_procs() is the allocation and NOT
+    # os.cpu_count(), and a conclusion written in terms of omp_get_num_procs() while
+    # quoting os.cpu_count() names a value no process in the run ever saw.
+    procs = None
+    for lib in ("libgomp.so.1", "libgomp.so", "libomp.so"):
+        try:
+            import ctypes
+            procs = ctypes.CDLL(lib).omp_get_num_procs()
+            break
+        except Exception:                                          # noqa: BLE001
+            continue
+    print("host %s" % os.uname().nodename)
+    print("  os.cpu_count()                  %s   the machine" % os.cpu_count())
+    print("  len(sched_getaffinity(0))       %s   what this process may use" % avail)
+    print("  omp_get_num_procs() in-process  %s   <- THE BOUND THE PREDICATE USES"
+          % (procs if procs is not None else "UNAVAILABLE"))
+    print("  torch.get_num_threads()         %s   the default pool" % torch.get_num_threads())
+    if procs is None:
+        print("  !! omp_get_num_procs() could not be read, so the conclusion's own variable")
+        print("  !! is unmeasured here and any statement about reachability bounds is a guess.")
     need = 2 * max(POOLS)
     print("PREMISE: predicate 1's largest gate is 2 x %d = %d, so a verdict of 'never"
           " reached'" % (max(POOLS), need))
@@ -124,6 +147,12 @@ def main():
     print("  pool and 0 at a small one is a cell the ARM-derived work gate forced to 0.")
     print("=" * 78)
     REF = 32
+    print("  pool %d is the REFERENCE itself, so its row is an IDENTITY -- m_s and m_r are"
+          % REF)
+    print("  the same call and `forced` can only be 0. It is kept as the negative control:")
+    print("  it is the one row whose answer is known in advance, so a nonzero there would")
+    print("  mean the detection is broken rather than that the gate is inert. It must not")
+    print("  be pooled with the genuine zeros.")
     print("  %-6s %-10s %-10s %-10s %s"
           % ("pool", "cells n>0", "forced to 0", "share", "example rows/nnz/k"))
     for pool in POOLS:
@@ -140,10 +169,11 @@ def main():
                     forced += 1
                     if ex is None:
                         ex = (r, n, k)
-        print("  %-6d %-10d %-10d %-10s %s"
+        print("  %-6d %-10d %-10d %-10s %s%s"
               % (pool, live, forced,
                  ("%.1f%%" % (100.0 * forced / live)) if live else "n/a",
-                 ("%d/%d/%d" % ex) if ex else "-"))
+                 ("%d/%d/%d" % ex) if ex else "-",
+                 "   <- IDENTITY, the negative control" if pool == REF else ""))
     print("\n  the 'cells n>0' column is the non-vacuity check: a zero there would make the")
     print("  'forced to 0' column unable to report anything, and the two must be read together.")
     return 0
