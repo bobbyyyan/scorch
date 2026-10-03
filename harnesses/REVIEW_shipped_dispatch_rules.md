@@ -2925,8 +2925,53 @@ cannot bear on it. What would settle (b) is **redwood's own grid completeness**,
 is on record for the other corpus: chain207's DLMC board is 19100 cells with 229200 observations
 against an expected 229200, fully balanced. If the SuiteSparse board is likewise complete then (b)
 holds within redwood and rounding is the only live branch -- but that is an argument from
-completeness, not from between-host identity, and the SuiteSparse board's own completeness figure
-has not been read here.
+completeness, not from between-host identity.
+
+**That route is now closed, by a peer who found the board where I said it was not.** Redwood's
+per-key five-width SuiteSparse board is in the sealed ledgers on this machine --
+`chain196-fullcollection-redwood/sh_{c0,c0b,pfd0}_float32_p{1..6}.csv` plus the chain205 and
+chain206 recount/drift objects, 42 files over 7 objects x 6 passes -- and **every one is exactly
+balanced**: 4584 keys x 5 widths x 3 arms = 68760 rows, distinct `(key,k,arm)` equal to the row
+count, zero duplicates. Balance at cell level makes the per-width populations coincide inside every
+band including the 51-key top one, so premise (b) holds on redwood too and **the pairing route is
+dead on both hosts**. The 0.022 pp has only the rounding branch left, which is the conclusion I had
+declined to draw from the wrong evidence and which now follows from the right evidence. "I could
+not find it locally" was a statement about my search, not about the ledger.
+
+**And the published band table is now independently identified, not merely consistent.** A sweep of
+7 objects x {median, geomean, min} x {ours, oursb} = 42 combinations matches all four published
+values at all four counts in exactly one place: `chain196.../sh_c0_float32_p{1..6}.csv`, with
+`r_k = mkl_ms/ours_ms`, **min over the six passes**, exact `nnz/rows` bands, and the estimator
+`exp(mean_keys[log r_4 - (log r_2 + log r_8)/2]) - 1`. So artefact, arm, pass aggregation, binning
+and estimator are all pinned.
+
+### The estimator mismatch in the 2x2, stated and bounded
+
+**The registered comparison is not estimator-matched: redwood's published cell is best-of-6 passes
+and MKT's is single-pass.** The ss phase is 41346 rows = 4594 keys x 3 widths x 3 arms, which
+leaves no room for a second pass. (75726 is this job's *total*, 41346 ss + 34380 dlmc.) On redwood's
+own data the choice is not free -- holding the object fixed, aggregation x arm moves the top band by
+1.30 pp on c196/c0 and 2.37 pp on c205/c0, which is 23-42% of that band's published CI width of
+5.65 pp.
+
+**Bounded on the MKT side with the two our-side objects as a pseudo-replicate pair**, which is the
+only replication a single pass admits:
+
+| aggregation | pooled | deg 0-32 | 32-100 | 100-256 | 256+ |
+|---|---|---|---|---|---|
+| `ours` only (as published) | +2.56% | +1.86 | +10.95 | +9.30 | +3.27 |
+| `oursb` only | +2.54% | +1.85 | +10.95 | +9.02 | +3.22 |
+| max ratio (= min of our ms) | +2.50% | +1.82 | +10.73 | +8.94 | +2.90 |
+| min ratio (pessimistic) | +2.60% | +1.89 | +11.17 | +9.39 | +3.59 |
+
+Spreads: 0.105 pp pooled, 0.071 / 0.432 / 0.452 / **0.697** pp by band, and **every aggregation
+gives the same sign in every band**. So the mismatch is real and must be declared -- it is -- but it
+cannot reach the registered branches: the between-host separation the 2x2 turns on is about
+**18.5 pp** (MKT's most pessimistic top-band +2.90 against redwood DLMC's -15.60), which is **26x**
+the MKT aggregation spread and **8x** redwood's own 2.37 pp. A two-object spread is not a six-pass
+spread, so this bounds rather than reproduces the house convention; the useful fact is the ratio
+between the sensitivity and the effect, not the sensitivity alone. Peer reviewer's finding; the MKT
+bound is measured here.
 
 **And the 0.12 pp appears twice but is one quantity.** The additive residual against the top band is
 `r = -c_0 (1+c_top)/(1+c_0)`, which gives **+2.62 pp** for SuiteSparse against an observed +2.60 and
