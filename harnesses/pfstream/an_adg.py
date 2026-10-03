@@ -22,7 +22,29 @@ cells = collections.defaultdict(dict)   # (build,key,k) -> {arm: ms}
 meta = {}
 nt = {}
 backends = set()
-for p in sorted(glob.glob(os.path.join(A.csvdir, "*.csv"))):
+# SELECTED BY SCHEMA, NOT BY GLOB, AND NOT BY FILENAME EITHER. `$ADG_OUT` holds two producers:
+# the ADOPT_GRAIN screen writes `build,key,k,...` and the thread-count oracle sweep writes
+# `key,k,...,resolved,...` with NO `build` column. A `*.csv` glob fed the sweep's 38016 rows into
+# this analysis and it died on KeyError: 'build' -- so a one-hour job produced no ADOPT_GRAIN
+# verdict. Two producers writing different schemas into one directory is the defect; the glob was
+# only the mechanism. Filtering on a filename pattern would restate the producer's naming
+# convention, which is the harness-restates-production failure; the columns this script actually
+# reads are the honest predicate.
+NEED = {"build", "key", "k", "arm", "ms", "nthreads", "rows", "nnz", "deg"}
+_found = sorted(glob.glob(os.path.join(A.csvdir, "*.csv")))
+_use, _skip = [], []
+for _p in _found:
+    with open(_p) as _fh:
+        _hdr = set((csv.reader(_fh).__next__() or []))
+    (_use if NEED <= _hdr else _skip).append((_p, sorted(NEED - _hdr)))
+print("csv files present %d   usable %d   skipped %d" % (len(_found), len(_use), len(_skip)))
+for _p, _miss in _skip:
+    print("  SKIPPED %s: lacks %s" % (os.path.basename(_p), ",".join(_miss)))
+if not _use:
+    raise SystemExit("REFUSE: no CSV in %s carries the ADOPT_GRAIN schema (%s). Every verdict "
+                     "below would be computed over zero rows and would print as a clean pass."
+                     % (A.csvdir, ",".join(sorted(NEED))))
+for p, _ in _use:
     for r in csv.DictReader(open(p)):
         key, k, b = r["key"], int(r["k"]), r["build"]
         cells[(b, key, k)][r["arm"]] = float(r["ms"])

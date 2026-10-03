@@ -1119,3 +1119,86 @@ The guard was written while looking at a CSV that had the column; the literals w
 from the run that produced them; the column name was accurate to an earlier version of the
 table. None of the three could be caught by re-reading the code, and all three fell out of
 running the tool on a *second* input -- which in two cases was the same host, one sweep older.
+
+---
+
+## Amendment 18 — ALL FOUR registered predictions are now scored, on three hosts with one tool digest. The sqrt model is refuted.
+
+MKT job 17696556 completed, so the last two unscored predictions can be read. Every figure below
+comes from `an_ntoracle.py` at digest **`222543063d02c9c1`** run on all three hosts' sweeps — the
+same object, because a prediction about an ordering across hosts cannot be scored from statistics
+that were redefined between them, and this one nearly was (see below).
+
+### Prediction 4 — FAILS. The registered ordering is violated and the statistic is not monotone in `c`.
+
+Amendment 1 registered: *"The ordering of how much the rule bites is registered as M5 > redwood >
+MKT"*, on the reasoning that `n* = sqrt(T1/c)` reaches the whole pool as soon as `T1 >= c·pool²`,
+which is 61 µs on MKT against 150 µs on redwood and far more on the M5.
+
+| host | pool | `c` (µs) | LIVE cells | optimum at or above the clamp | strictly above |
+|---|---|---|---|---|---|
+| M5 | 6 | 4.75 | 345 of 576 | 82 (**23.8%**) | 0 |
+| redwood | 24 | 0.26 | 435 of 576 | 150 (**34.5%**) | 68 |
+| MKT | 32 | 0.06 | 435 of 576 | 98 (**22.5%**) | 2 |
+
+**Observed ordering: redwood > M5 > MKT.** The registered one puts redwood in the middle; it is
+the largest. And the two *extreme* hosts — 4.75 µs and 0.06 µs per worker, a **79× range**, with
+pools of 6 and 32 — sit **1.3 points apart**, which is the opposite of a quantity governed by `c`.
+
+The model's premise had already failed its own check: `a` in `T1 = a·nnz + b·nnz·k` spreads **58×
+across nnz decades** on the fit half, and since `n* = sqrt(T1/c)` a factor `f` in `T1` is `sqrt(f)`
+in the count, so up to 7.6× in `n*`. A model with no constant `a` cannot order hosts by `c`.
+
+### The full scorecard
+
+| prediction | verdict | the figure that decides it |
+|---|---|---|
+| 1 — per cell within ±1, no single G suffices | **PASSES, UNINFORMATIVE** | 15–22 of 26–29 cells per width are `no-G-can` (50–79%) |
+| 2 — within ±1 at every width in {4,12,16,20,24} | **FAILS** | lowest width 17.4%, fails at 50/80/100% |
+| 3 — ≥80% within ±1 **and** no cell off by >2 | **FAILS both clauses** | clause A 20.0% of n=160; clause B 127 cells off by >2 |
+| 4 — biting order M5 > redwood > MKT | **FAILS** | redwood 34.5% > M5 23.8% > MKT 22.5% |
+
+**Prediction 1's pass carries no information and I am not claiming the registered conditional
+fired.** The conditional was: *if prediction 1 passes on MKT while amendment 8's table holds, the
+excess statistic is wrong rather than the thread rule right.* But prediction 1 passes when no
+single `G` clears the threshold at every width, and on 50–79% of cells **no tested `G` reaches
+within 1 of the measured optimum at all**. A width where most cells are unreachable by the whole
+family makes "no single G clears it" true for a reason unrelated to linear-versus-sqrt. The
+instrument says exactly this in its own text; taking the pass at face value would be reading the
+null as the result.
+
+So **the registered prediction set for the sqrt thread-sizing model has failed or is
+uninformative in every one of its four parts**, measured on three hosts spanning 6 to 32 workers
+and 0.06 to 4.75 µs per worker. Together with amendment 8's construction argument — the resolved
+count is identical on 392 of 392 keys at k=2..16 while the deficit falls 4.4× — **thread sizing is
+closed as a mechanism for the narrow-k deficit.**
+
+### A near-miss worth recording: the statistic that scores prediction 4 was redefined mid-flight
+
+The REPLACEMENT CONTROL used to read *"LIVE cells whose largest reachable count already equals the
+clamp"* and now reads *"whose measured OPTIMUM sits at or above the clamp"*. The M5 figure under
+the old definition was **345 of 345, 100.0%**; under the current one it is **82 of 345, 23.8%**.
+Had prediction 4 been scored by comparing the M5's archived 100% against MKT's 22.5%, the ordering
+would have read as a spectacular confirmation.
+
+**Two numbers from the same named control, differing by a factor of four, because the control was
+improved between hosts.** This is why all three were re-run under one digest. A cross-host ordering
+is the one claim where a redefinition is indistinguishable from an effect — both appear as a
+difference between hosts — and nothing in either output would have flagged it.
+
+### Separately: ADOPT_GRAIN does not ship on MKT
+
+The three-object screen (`adg0`/`adgb`/`adgG`, three passes, 1296 cells) prices
+`SCORCH_SPMM_ADOPT_GRAIN`:
+
+- **Placement floor** (`adgb/adg0`, one configuration built twice): median 0.9918–1.0019, p95
+  deviation 2.58–5.28%.
+- **The arm's pooled CI overlaps the floor's pooled CI at all six widths** (k=2,4,8,12,16,32).
+- The gate is **not inert**: it changes the resolved count on **30–31 of 72 cells, 41.7–43.1%**, at
+  every width.
+- **58 harmed cells**, up to **1.44×**, and **all 58 changed the worker count** — so none of the
+  harm is the floor's tail showing through the gate. By row count `{64: 10, 128: 22, 256: 20,
+  1024: 3, 2048: 3}`, by nnz decade `{3: 4, 4: 54}`.
+
+A lever that fires on 42% of cells, produces no pooled effect beyond the placement floor, and
+harms 58 cells by up to 1.44× is a no-ship. Recorded as a bounded negative, not as noise.
