@@ -1805,3 +1805,57 @@ So "the dip grows with degree on both corpora" is true and is weaker support for
 than it reads. The general form: **when a contrast agrees across populations while its components
 disagree, the statistic's construction is a candidate for what is doing the agreeing** -- check the
 components before reading the contrast as replication.
+
+### The band CIs recomputed on exact binning, so the two tables share one partition
+
+Rather than caveat the n mismatch, both bins were run. The dip CIs are unchanged to within
+0.04 pp, so nothing in the finding depended on the convention -- but the exact column is now the
+published one and the agreement is a measurement rather than an assumption:
+
+| band | rounded column | exact `nnz/rows` |
+|---|---|---|
+| 0-32 | n=1051, +0.95% [+0.61, +1.31] | n=1051, +0.95% [+0.61, +1.31] |
+| 32-100 | n=781, -2.39% [-3.01, -1.74] | n=781, -2.39% [-3.01, -1.74] |
+| 100-256 | n=1275, -11.72% [-12.55, -10.85] | n=1276, -11.72% [-12.59, -10.85] |
+| 256+ | n=713, -15.59% [-17.25, -13.91] | n=712, **-15.60%** [-17.24, -13.90] |
+
+**The flipping key has a checkable fingerprint**, which is what makes the single flip a near-miss
+rather than a suspicious coincidence: `rows = 512`, `nnz = 131071 = 2^17 - 1`, so
+`nnz/rows = 255.998046875 = 256 - 1/512` exactly, and `nnz == 256*rows - rows/512` holds. For that
+ratio to arise with integer `nnz`, `rows` must be a multiple of 512 -- so the value is a real
+structural ratio from a pruned power-of-two layer one nonzero short of dense-256, not a formatting
+artefact.
+
+### The k-set discriminator is enforced by the driver, not merely true of one run
+
+A sealed ledger states the float32/float64 discriminator as a property of the concurrent run. It is
+structural: `arm_screen.sh:92` sets `LANES=4` for float64, `:120` computes `hi = 4 * lanes` = 16,
+and `:123` collects `over = [k for k in ks if k > hi]` and **refuses**. So no float64 grid on this
+driver can contain 20, 24 or 32 at all, and "presence of {20,24,32} implies float32" fails closed
+rather than holding by coincidence. The sets are not disjoint -- intersection {2,8,12,16}, float32
+only {20,24,32}, float64 only {4,6,10} -- so the implication runs one way only.
+
+## State of the k=4 question, with the shared feature and the disagreement on separate lines
+
+Written out separately because a reader who takes the step as shared evidence will otherwise take
+the sign as shared too.
+
+**Established on both collections, absolute:** k=4 at high degree is the weakest cell --
+SuiteSparse 1.1894 (deg 100-256) and 1.0853 (256+); DLMC 1.0198 and 0.9823, the last below parity.
+
+**Established on both collections, shape:** an anomalous step at the k=2 -> k=4 boundary, which is
+where the narrow-k exact kernel hands off to the half-vector kernel. On SuiteSparse it is a step
+2.7x the next one in an otherwise monotone decline; on DLMC it is a sign reversal.
+
+**A DISAGREEMENT, not a shared feature:** the width-versus-robustness trend *above* k=4 runs
+opposite directions -- SuiteSparse declining (-0.0870, -0.0391, -0.0451), DLMC rising (+0.2339,
++0.0548, +0.1232). k=4 ranks 2nd most robust of five widths on SuiteSparse and least robust of five
+on DLMC.
+
+**Established on DLMC only:** that k=4 is the responsible width.
+
+**What SuiteSparse contributes:** that every width degrades with degree, k=4 included and not
+worst. That is a fact about the kernel family, not evidence for k=4.
+
+**Established nowhere:** the mechanism. And `mr0 -> mrhv` cannot supply it, since the conjunction
+moves as a package with the `(rows 2, halfvec 0)` arm missing.
