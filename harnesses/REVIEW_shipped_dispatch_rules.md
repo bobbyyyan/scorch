@@ -618,9 +618,27 @@ The flat share across k <= 16 is the `max(k,16)` in the work proxy, not a coinci
 The collection's nnz runs min 6, median 52428, max 8.5M, so the region is the lower third
 rather than an edge case.
 
+And over the 4594 SuiteSparse matrices cached on mkt1, by the same predicate:
+
+| k | matrices in the gate region | of 4594 | share |
+|---|---|---|---|
+| 1, 2, 4, 8, 16 | 2181 | 4594 | **47.5%** |
+
 **So at any caller pool of 16 or fewer, an ARM-derived gate decides the row-handout mode
-for about a third of this collection on an x86 host.** That is the reason the runtime
-question is worth measuring rather than leaving at reachability.
+for about a third of DLMC and nearly half of SuiteSparse on an x86 host.** That is the
+reason the runtime question is worth measuring rather than leaving at reachability.
+
+Instrument for the SuiteSparse figure: `harnesses/pfstream/npz_gate_region.py`. It reads
+nnz from each `.npz`'s ZIP directory -- the uncompressed size of the `indices` member is
+four bytes per nonzero -- rather than decompressing 26 GB. That is an inference about a
+file format, so it is cross-checked against the actual arrays on a sample and the check is
+printed: 12 of 12 agree exactly, including a 1-nonzero matrix and a 4.4-million-nonzero
+one. A size-derived nnz that disagreed with the array it claims to describe would have
+selected a different set of matrices with no outward sign.
+
+One design note for the runtime work: the region's smallest members have nnz = 1, some with
+hundreds of thousands of rows. Those are not meaningful SpMM subjects and must be excluded
+by a stated floor rather than left to dominate a geometric mean.
 
 Provenance: **three** independent records of rows and nnz agree on all 3820 common keys
 with zero disagreements -- the sealed `verifier-dlmc-dims` ledger (digest verified),
