@@ -211,3 +211,68 @@ probed, is the failure mode that mislabel conceals. **Not yet a verdict**: two c
 I have not checked whether these shapes are inside the model's training distribution. What would
 settle it: the grouped-CV figure that `group_split` already computes at `:215` and never exports,
 plus the model's predicted-versus-measured ratio on these two cells.
+
+### #5 — confirmed at source, and the learned level's prediction is wrong by 3–4× in scale and inverted in rank on the two cells probed
+
+**The mislabel, verified.** `bench/train_autotune_model.py:298` reads
+`# in-sample cell agreement (sanity, optimistic)`; `:299` computes `lreg` with
+`eval_cells(rows, …)` over **all** training rows; `:305` writes exactly that into the shipped spec
+as `heldout_geomean`. Two things the concern did not say, both from a peer and both confirmed:
+
+- `heldout_geomean=round(geomean([r for r in lreg]), 4)` — `[r for r in lreg]` is an **identity
+  comprehension**, a filter shape with no predicate. That is the construction that lets an unsplit
+  list read as a selected one at a glance.
+- **The honest figure is not missing. It is computed, printed, and discarded.** `group_split`
+  (`:215`) splits by matrix so a matrix's rows never straddle train/test, and `:252-266` runs it
+  over multiple seeds and prints `learned held-out geomean = …` under the correct name. The script
+  holds both numbers and persists the wrong one. The fix is to write down the figure already
+  running, not to add a computation.
+
+**Scope, which bounds it.** `tiling.py`'s loader reads only `version`, `machine_id` and
+`feature_names` (`:1233-1235`), so `heldout_geomean` is not consumed by dispatch and the mislabel
+cannot misroute anything. It misleads a reader. The shipped value is **0.9896**.
+
+**There is no domain check anywhere on the learned path.** `_eligible_learned` (`:1269-1276`) has a
+one-line body: `return _operand_over_cache(J, N, C)`. Its docstring states the delegation —
+*"Relax the degree floor + locality pre-exclusion; the model + v2 floor route the newly-admitted
+products/arxiv/FEM/banded shapes"* — so the two gates that would have bounded `f_log_degree` and
+`f_locality` are the two the widening removed **by name**. The feature vector is **17** wide; one
+derived combination of three of them is all that is constrained.
+
+**And the shipped artefact could not support a domain check even if the code wanted one.** The spec
+carries `feature_names`, `trees`, `init`, `learning_rate`, `machine_id`, `platform`,
+`n_train_rows` (1572) and `heldout_geomean` — and **no feature ranges, quantiles or bounds**. A
+consumer cannot tell whether an input is inside the training domain from what ships.
+
+**The measurement that discriminates, run because a structure is not a rate.** Capturing the
+model's own predictions and timing the same candidates, M5 at nt=6:
+
+| cell | model's predicted times | measured | |
+|---|---|---|---|
+| N=1024 | all six candidates in **3.04–3.95 ms** | v2 17.772 ms, best tilej(1024) 11.734 ms | v2 **+51.5%** slower |
+| N=2048 | all six in **7.8–10.8 ms** | v2 43.567 ms, best tilej(512) 22.814 ms | v2 **+91.0%** slower |
+
+Two distinct failures:
+
+- **Scale.** Predictions are compressed into a narrow band roughly **3–4× below** the measured
+  times. A gradient-boosted tree is piecewise constant and cannot extrapolate: an out-of-domain
+  input is clamped into the outermost leaf region and returns whatever the nearest training region
+  said, with **no signal in the output** that the input was outside. Compression far from the truth
+  is that signature.
+- **Rank, and the margin cannot catch it.** At N=1024 the predicted spread between the best
+  candidate and v2 is `exp(−5.824 + 5.794) = 0.970` — a **3.0%** predicted improvement, which
+  `_LEARNED_MARGIN` correctly rejects, against a **51.5%** measured one. At N=2048 the model's own
+  argmin **is v2**, where v2 is measured 91.0% slower: the predicted ranking is inverted.
+
+**This is the structural point made concrete.** At the probed levels the floor is a *measurement* —
+two identical baseline arms bracketing the candidates. At the learned level the "v2 floor" is
+`_LEARNED_MARGIN` comparing `pred[best]` against `v2_pred` (`:1303-1305`): **two predictions from
+the same model.** When the model is wrong it is wrong in both terms, and the margin between two
+wrong numbers carries no information about either. The floor cited to justify removing the input
+gates is the model grading its own homework — and that is specific to the path the widening opened.
+
+**What is still not established.** Whether these two cells' features lie outside the training rows'
+ranges. The shipped spec carries no ranges and the 1572 training rows are not in the repo, so
+saturation remains a candidate structure rather than the demonstrated mechanism. Two cells, one
+host. **But the consequence does not depend on the mechanism**: on these cells the learned level
+routes to the arm it would measure as 1.5–1.9× slower, and nothing in its path can detect that.
