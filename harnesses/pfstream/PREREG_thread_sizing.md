@@ -2204,6 +2204,12 @@ statistic had already been published on three hosts and eight widths.
 
 ## Amendment 29 — the all-392 sweep reports: reach is bounded at 23.8%, and where it reaches the HEADROOM is monotone in the worker count
 
+> **THIS HEADING'S SECOND CLAUSE IS WITHDRAWN BY AMENDMENT 30 AND RESTATED BY AMENDMENT 31.**
+> The nulls are in headroom units, so only the `<=2` group exceeds its own; the gradient is not
+> "monotone headroom" as the heading says. Amendment 31 gives the gradient intervals and
+> re-establishes it in a form that holds. Also: the reach figure's base is the 328 KEYS; as a
+> share of the deficit it is 28.4%, and `b66954b`'s commit message states it with the wrong base.
+
 Job 17698209, COMPLETED rc=0 in 1:08:44 on mkt1, pool 32, one object `4c11296ce2a68c3d`,
 206,976 rows = 392 keys × 8 widths × 33 counts × 2 readings. Transported from `/scr` through a
 single-task `srun` and verified by digest on both ends
@@ -2350,3 +2356,80 @@ minimum is.** Measured on the CSVs:
 - per `(key, width)`: **min 66, max 66, zero short**
 
 That line belongs in the readout and was missing from amendment 29.
+
+---
+
+## Amendment 31 — the 78-key effect has an interval and EXCLUDES zero; the three groups separate; and conditions 2 and 3 are one finding about one set
+
+Amendment 30 left the result resting on a single number with no interval: `+13.00 pp` as a
+difference of medians. A peer named the matched measurement — a paired bootstrap over the 78 keys on
+per-key `(raw − null)` — and said plainly that if its lower bound did not exclude zero, the honest
+verdict would be "no effect established on this host" rather than "minority effect". It was the
+right test to demand. It ran, reusing `perm_null` (`nt_k2curve.py:209-225`) and the `gain` body
+(`:459-463`) **from the harness source** rather than retyped, and with a replication gate that
+refused twice before passing:
+
+- grouping by `nthreads` instead of the **resolved** count gave 328 and 55 → refused;
+- grouping by resolved but without the live filter gave 328 and 108 → refused;
+- grouping by resolved with `len(counts) >= 2` gave **298 and 78**, and reproduced amendment 29's
+  medians exactly (raw 1.3565, null 1.2265).
+
+| group | n | median per-key (raw − null) | paired bootstrap 95% CI | |
+|---|---|---|---|---|
+| `<=2` | 78 | **+14.39 pp** | **[+11.92, +17.27]** | **excludes zero, positive** |
+| `3-7` | 68 | −7.64 pp | [−9.71, −0.50] | excludes zero, negative |
+| `>=8` | 152 | −16.72 pp | [−21.87, −5.96] | excludes zero, negative |
+| ALL | 298 | −2.51 pp | [−4.59, −1.06] | excludes zero, negative |
+
+**The effect is established on the 78-key set.** 70 of 78 keys (89.7%) have raw above null
+individually. The `<=2` interval is disjoint from both other groups' intervals, so the gradient is
+real *with intervals* and not merely as an ordering of point estimates. `3-7` and `>=8` overlap each
+other ([−9.71, −0.50] against [−21.87, −5.96]), so the gradient is **two-level and not three**.
+
+Note `+14.39 pp` is the median of the per-key differences where amendment 30's `+13.00 pp` was the
+difference of the medians. Both are correct statements of different functionals; the paired one is
+the one with an interval, and it is the one to quote.
+
+**Said out loud, as the peer asked: the pooled row is BELOW its own null** (−2.51 pp, CI excluding
+zero). The only above-null quantity anywhere in this readout is the 78-key group. That retires
+condition 1 more cleanly than amendment 29's "recorded, not read as closure" did — even on the
+invalidated instrument, the deficit set's figure is itself sub-null, so there is nothing there to
+read either way.
+
+### Conditions 2 and 3 are the same 78 keys, so they are one finding and not two
+
+`78/328 = 0.237805`, which **is** s328 to every digit published. Amendment 26's registered
+numerator — keys among the 328 that resolve to ≤2 **and** are live — is the same predicate the `<=2`
+subgroup is defined by. So condition 2's reach bound and condition 3's one above-null group are two
+framings of one set.
+
+Amendment 29 presented them as independent survivals, which double-counts. Stated together they are
+**stronger** than either alone: the reach bound stops being an upper bound on an unlocated subset
+and becomes a bound on a **located** one — these 78 keys, named, with a measured effect that excludes
+zero, and 220 live deficit keys where the effect is measurably absent.
+
+### Condition 2's threshold sits inside its own interval, which is harmless here and bad practice
+
+The reading rule is three-way: ≥0.50 causal, 0.25–0.50 a share with no causal claim, **<0.25 a bound
+on reach**. The verdict was read off the point estimate 0.2378. But condition 4 publishes
+`+0.2378 [+0.1921, +0.2835]` on `s328 − s64`, and because `s64` is structurally zero **that is the
+interval on s328**. So `0.1921 < 0.25 < 0.2835`: the classification is decided by a point estimate
+whose own interval spans the boundary between two of its categories — and the interval was already
+printed two rows below, computed because a *different* condition needed it.
+
+**The shape, which is the transferable part: an interval computed for one condition and not applied
+to another decided by the same number.** A reading rule stated as thresholds invites a point
+estimate. The matched form is to classify the interval and say so when it straddles.
+
+**The verdict does not change** — "bound on reach" at 0.2378 and "no causal claim" at 0.2835 are both
+non-passes, so condition 2 is not a pass anywhere in its interval. What changes is the summary
+sentence: not "bounded at a quarter" but **up to 28.35% of the 328 keys, which is 33.9% of the
+deficit** at the upper endpoint, against 28.4% at the point estimate.
+
+### A base error in the record that the prose does not contain
+
+`b66954b`'s commit message says "at most 23.8% of the deficit". The document does not: `:2281` reads
+"bounded at ≤23.8% of the **328 keys**", base named and correct, and 23.8% of the keys is **28.4%**
+of the deficit. The wrong base is in the commit message and in the relays, which is the copy a
+`git log` reader sees and the one that cannot be edited. Recorded here because that is the only place
+it can be.
