@@ -1859,3 +1859,51 @@ worst. That is a fact about the kernel family, not evidence for k=4.
 
 **Established nowhere:** the mechanism. And `mr0 -> mrhv` cannot supply it, since the conjunction
 moves as a package with the `(rows 2, halfvec 0)` arm missing.
+
+### Correction: "max movement 0.04 pp" compared two separate bootstrap runs
+
+The two CI columns above were produced by two bootstrap calls. Both used seed 11, but the bands
+differ in n (1275/1276 and 713/712), so `randrange(n)` consumes different streams and the draws are
+**not matched** -- the difference between the columns is the key's effect *plus* resampling jitter,
+and the table did not separate them. The tell was inside the table: band 100-256 **gained** a key
+while its lower bound moved *down* 0.04 pp and its point estimate did not move at all, which is
+the signature of resampling variation rather than of one added observation.
+
+**Both quantities measured separately.** The key's effect needs no bootstrap at all, because the
+dip is a **mean** of per-key log contrasts, so adding or removing one observation moves it exactly:
+
+| band | without the key | with it | exact shift |
+|---|---|---|---|
+| 256+ | n=712, -15.599% | n=713, -15.594% | **+0.0052 pp** |
+| 100-256 | n=1275, -11.723% | n=1276, -11.723% | **-0.0001 pp** |
+
+And the jitter, measured on **identical** data (exact binning, band 256+, five seeds, nboot=4000):
+
+    seed 11  [-17.241, -13.896]      seed 14  [-17.253, -13.959]
+    seed 12  [-17.334, -13.885]      seed 15  [-17.236, -13.885]
+    seed 13  [-17.211, -13.900]
+    spread:  lower 0.123 pp   upper 0.074 pp
+
+**The jitter exceeds the 0.04 pp difference I published**, so that figure is withdrawn as a
+statement about the key. The key's actual effect is 0.005 pp, roughly a twentieth of the method's
+own run-to-run spread. The conclusion is unchanged and better stated as a bound: one key in ~1000
+moves these intervals by less than the bootstrap's own reproducibility, and the point estimates
+moving 0.00 and 0.01 pp is exactly what one observation of ~1000 must produce.
+
+**The moved key's own contrast, which is what the band tables cannot show:**
+
+    r_2 1.0236   r_4 0.9753   r_8 1.1954      contrast -11.833%
+
+So this matrix is itself a clean instance of the effect -- ahead of MKL at k=2 and k=8, **behind at
+k=4** -- and its contrast nearly equals the 100-256 band's average of -11.723%, which is why
+adding it there moves the mean by 0.0001 pp.
+
+### A reporting defect this exposes in every CI above
+
+Endpoints that move 0.123 pp across seeds cannot be reported to two decimals. The published
+intervals print figures like `[-17.24, -13.90]` whose last digit is not reproducible, and bootstrap
+jitter falls as 1/sqrt(nboot), so recovering that digit would need roughly 100x the 4000 draws
+rather than a different seed. **The intervals should be read to 0.1 pp**, at which precision every
+one of them is stable and every conclusion drawn from them holds. The per-band dips and their signs
+are unaffected; only the printed precision of the endpoints overstates what the method supports.
+See the note on an index matrix being what pins a bootstrap bound -- a seed plus nboot does not.
