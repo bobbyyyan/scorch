@@ -206,12 +206,19 @@ always a multiple of 4, so step 4 *is* the finest granularity, **and the equalit
 when `C` is divisible by 4**. It holds for both C values on record (16777216 and the Linux fallback
 37748736, both `% 4 == 0`), so the pair is valid as published; on a C not divisible by 4 there is no
 equality row and the straddling pair is a different one. One thing `C = 16777216` does **not**
-certify, so that no later entry quotes it that way: `query_llc()` has three macOS routes and two of
-them return that exact value -- `hw.perflevel0.l2cachesize` succeeding, and the Darwin fallback
-`16 * 1024 * 1024` at `:402-404` after a subprocess failure. Only the middle route is
-distinguishable (`hw.l2cachesize` = 8388608 on this host). Benign here precisely *because* they
-agree; the value is right either way, and it is quoted here as a value and not as evidence the
-query ran. Peer reviewer's observation, verified by reading both sysctl keys.
+certify, so that no later entry quotes it that way: `query_llc()` has **four** macOS routes and
+**three** of them return that exact value -- `hw.perflevel0.l2cachesize` succeeding; the Darwin
+fallback `16 * 1024 * 1024` at `:402` after a raise or two empty reads; and a first non-empty key
+returning `"0"`, which the inner `if out:` accepts as truthy bytes and the outer `val or` then
+discards as a falsy int. Only `hw.l2cachesize` is distinguishable, at 8388608 -- which is also
+`hw.perflevel1.l2cachesize`, the E-cluster L2, not the P-cluster cache the docstring calls binding.
+Benign here precisely *because* three agree; the value is right either way, and it is quoted here
+as a value and not as evidence the query ran. Worth one further clause, because it is the reason
+neither reviewer predicted it from the `SCORCH_LLC_BYTES=0` case: **this function treats zero as
+significant at `:368` (the string `"0"` is truthy, so C = 0 is accepted and crashes downstream) and
+as absent at `:402` (the int `0` is falsy, so a measured zero is discarded)** -- same literal,
+opposite handling, 34 lines apart. Peer reviewer's findings; both sysctl keys and both falsy tests
+read here.
 
 **So an all-zero operand does become a learned candidate once `J * 4 * N > C`, and that is the
 DEFAULT, not an opt-in.** `_LEARNED_WIDEN = os.environ.get("SCORCH_AUTOTUNE_WIDEN", "1") == "1"`
