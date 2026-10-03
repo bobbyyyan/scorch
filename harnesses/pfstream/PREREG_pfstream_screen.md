@@ -3491,3 +3491,88 @@ Host, dtype and corpus all change between the two columns above, so amendment 38
 property of that host, dtype or corpus" — was the only supportable form. **MKT float64 on
 SuiteSparse holds dtype and corpus fixed and isolates host**, and the same run settles the 192's
 provenance through the `Pothen/barth4` nnz row. Two blocking questions, one measurement.
+
+---
+
+## Amendment 42 — the withdrawn median-magnitude comparison survived in a second code path for two amendments
+
+Prompted by a reviewing session's rule — *a verdict line should carry the comparison it performed,
+with both operands and the signed distance* — I scanned every verdict-emitting print in these
+tools for the operands it reports. One came back bad, and it is the comparison this document
+already withdrew.
+
+`an_f64_arms.py:405`, in the DEFICIT-SET block:
+
+```python
+"INSIDE the floor" if abs(m) <= abs(fl_med) else ...
+```
+
+That is an arm's **location** against the **magnitude of the floor's location** — exactly the
+comparison amendment 30 withdrew after it called an arm of −0.973% "outside" a floor of +1.381%.
+Amendment 30 withdrew it in prose; amendment 31 replaced it in the per-width table; **this block
+was never touched**, so the withdrawn method kept emitting verdicts for two amendments. It is the
+block that produced amendment 29's "nopf −0.073% vs floor median +0.692% → INSIDE the floor".
+
+A withdrawal that fixes one call site is not a withdrawal. **The method has to be removed from
+every path that emits it, and the way to find them is to grep for the verdict strings, not for the
+reasoning.**
+
+Now reports the band with both operands and the margin, plus the paired CI for the same
+population, so existence and actionability print side by side and neither can stand in for the
+other.
+
+**Not yet exercised on real data.** Redwood f64 has an empty deficit set — 0 cells behind MKL — so
+the block correctly returns `REFUSE: the floor pair has no cells on the deficit set`. The refusal
+path is verified; the non-empty path is verified only for parse and self-test until `/scr` frees.
+Stated because an unexercised fix is not a verified one.
+
+### Two findings pointed opposite ways on the same verdicts, and the resolution is a comparator
+
+A reader could reasonably have hit a contradiction between two corrections in this document:
+
+- **Amendment 31:** the band is ~`0.67·√n` too wide for the quantity it bounds, so an OUTSIDE
+  verdict is **conservative and understated**.
+- **Amendment 41:** MKT's bands are narrower than redwood's, so MKT's marginal OUTSIDE verdicts
+  cleared a **lower bar and are flattered**.
+
+Both are true, and they compare the band to **two different reference quantities**. Amendment 31's
+comparator is the sampling spread of the arm's own median on the same host — a question about
+**existence**. Amendment 41's is redwood's measured same-config artefact — a question about
+**actionability**.
+
+**The operative one is whichever the registered rule asks, and the rule is actionability**, so 41
+governs what may ship: "actionable on MKT" is a weaker claim than "actionable on redwood", roughly
+by the band ratio. Amendment 31 governs any statement about whether an effect exists, where
+OUTSIDE remains understated.
+
+Stated as the discipline: **a bound is lenient or strict only relative to a named comparator.**
+That is the same rule as naming what a floor is a spread over, applied to the comparison instead
+of the statistic.
+
+### And the reviewing session's bound is corrected for the record
+
+Amendment 41 credited a per-width bound on redwood's floor p05 derived from the *paired* median.
+The band compares `mn = pct(vn, 0.5)` — the median of (arm vs ship) — not the paired
+`(arm − floor)/ship`. Two different contrasts, so the correct bound from "inside" is `p05 <= mn`.
+Recovering `mn` from the margins shows the substitution was **overstated at three widths and
+understated at four, with no systematic direction** — the signature of substituting an unrelated
+quantity rather than a biased one, which is worse than a bias because it cannot be corrected for.
+All seven held against the true p05 only because the true values are far beyond either bound.
+
+The headline ratio also came out lucky: the quoted 1.48× was 2.789/1.888, the justified input gives
+1.335, and the truth is 2.736/1.888 = **1.449**. The conclusion is unaffected and amendment 41's
+own column is what settles it — ranges non-overlapping, 1.45× at the narrowest and
+4.757/1.888 = **2.52×** at k=16.
+
+### The transcription boundary does have an instrument, and it was miscalibrated
+
+Amendment 41 observed that two consecutive defects lived at the step from tool output to amendment
+claim, with no instrument on that boundary. That was half right. **The old verdict line was the
+instrument** — it printed a figure pair in the right slot — and it printed the wrong operand. That
+is why the block could be read and audited without the defect being seen: **a present-but-wrong
+number in the right slot suppresses the question that an absent number would raise.**
+
+So the fix is not only external review. It is requiring every verdict to print its own two
+operands and their distance, which is now true of the per-width table, the deficit-set block and
+the paired test. A reader who reads past it is then still covered by the next reader who does the
+subtraction.

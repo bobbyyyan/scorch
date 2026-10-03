@@ -391,24 +391,47 @@ def main(argv):
     fl = rel("shpb", "ship", pop)
     if not fl:
         return "REFUSE: the floor pair has no cells on the deficit set"
-    fl_med, fl_p05 = pct(fl, 0.5), pct(fl, 0.05)
-    print("  floor median %.3f%%, floor p05 %.3f%% (the floor's own best-case tail)"
-          % (100 * fl_med, 100 * fl_p05))
+    # THIS BLOCK STILL USED THE WITHDRAWN COMPARISON. It read `abs(m) <= abs(fl_med)` -- an arm's
+    # LOCATION against the magnitude of the floor's LOCATION -- which amendment 30 withdrew after
+    # it called an arm of -0.973% "outside" a floor of +1.381%. Amendment 31 fixed the per-width
+    # table and left this one, so the withdrawn method survived in a second code path for two
+    # amendments. The floor's median is where the object-swap artefact SITS; its p05/p95 is how
+    # wide it is, and only the width can say whether an effect is resolvable.
+    fl_med, fl_p05, fl_p95 = pct(fl, 0.5), pct(fl, 0.05), pct(fl, 0.95)
+    print("  floor median %+.3f%%, band p05 %+.3f%% to p95 %+.3f%% (width %.3f pp)"
+          % (100 * fl_med, 100 * fl_p05, 100 * fl_p95, 100 * (fl_p95 - fl_p05)))
+    print("  The BAND decides actionability, not the median: a median is a location and cannot")
+    print("  bound an effect. Read the paired CI below for whether the effect EXISTS.")
     for a in arms:
         v = rel(a, "ship", pop)
         if not v:
             continue
         m = pct(v, 0.5)
         beats = sum(1 for x in v if x < fl_p05)
-        print("  %-5s median %+.3f%%  vs floor median %+.3f%%  ->  %s"
-              % (a, 100 * m, 100 * fl_med,
-                 "INSIDE the floor" if abs(m) <= abs(fl_med) else
-                 ("faster beyond the floor median" if m < fl_med else "slower beyond the floor median")))
+        if m < fl_p05:
+            vd, edge = "FASTER, outside the band", fl_p05
+        elif m > fl_p95:
+            vd, edge = "SLOWER, outside the band", fl_p95
+        else:
+            vd, edge = "inside the band, not actionable", (fl_p05 if m < 0 else fl_p95)
+        print("  %-5s median %+.3f%% vs band edge %+.3f%% (margin %.3f pp)  ->  %s"
+              % (a, 100 * m, 100 * edge, abs(100 * (m - edge)), vd))
         print("        cells beyond the floor's p05 tail: %d of %d (%.1f%%)"
               % (beats, len(v), 100.0 * beats / len(v)))
+        d = paired_d(med, pop, a, "shpb", "ship") if a == "nopf" else []
+        if d:
+            lo_, hi_, vdg, idg, nn_ = boot_median_ci(d)
+            if lo_ is not None:
+                print("        PAIRED vs floor, n=%d: median %+.3f%% CI [%+.3f%%, %+.3f%%] -> %s"
+                      "  v:%s i:%s"
+                      % (nn_, 100 * pct(d, 0.5), 100 * lo_, 100 * hi_,
+                         "EXISTS, faster" if hi_ < 0 else
+                         ("EXISTS, slower" if lo_ > 0 else "CI spans 0"), vdg, idg))
     print()
-    print("  A median inside the floor is not evidence of nothing -- it is evidence that this")
-    print("  screen cannot resolve the arm on this population, which is a different statement.")
+    print("  An effect inside the band is not evidence of nothing -- it is evidence that it is")
+    print("  smaller than the artefact between two same-config objects, so it is not worth")
+    print("  shipping even where the paired CI says it is real. Those are different statements")
+    print("  and both lines above are printed so neither can stand in for the other.")
     return 0
 
 
