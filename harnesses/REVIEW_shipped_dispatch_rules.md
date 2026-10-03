@@ -2772,3 +2772,25 @@ every reading" over 12-16 readings. A geomean of 0.9480 over 4570 matrices is no
 individual cell at 0.98 may be. One host for this board: the matching redwood screen at these three
 widths does not exist yet, and the redwood figures quoted above come from a different screen
 (`chain207`, five widths), so the cross-host comparison is of statistics, not of a shared design.
+
+### Pre-registration for the dlmc phase of 17701502 (started 04:41:07, no rows read)
+
+The sign reversal above has two candidate explanations and the dlmc phase discriminates them,
+because it is the one missing cell of a 2x2:
+
+| | redwood | MKT |
+|---|---|---|
+| SuiteSparse | dip -3.24% | **bump +2.56%** |
+| DLMC | dip (k=4 least robust of 5) | **pending** |
+
+**Registered predictions, before any dlmc row is read.** If the cause is the host -- AVX2 against
+Zen4 AVX-512 changing what the 128-bit `scorch_simd_half<float>` path compiles to -- MKT DLMC
+should read a **bump**, pooled CI above zero. If the cause is an interaction with the corpus, MKT
+DLMC should read a **dip**, matching redwood's sign on the same collection. A pooled CI spanning
+zero supports neither and would mean the effect is smaller than this design resolves.
+
+**Registered as a separation, not a rank**, per the lesson above: the quantity is the pooled paired
+`log r_4 - mean(log r_2, log r_8)` with a bootstrap CI, and the comparison is to MKT SuiteSparse's
+`+2.56% [+2.07, +3.06]` and to redwood DLMC's negative sign -- not an ordering of three widths.
+Secondary and also registered: whether k=2's behind-MKL share on DLMC exceeds its 61.9% on
+SuiteSparse, since k=2 is the live deficit and DLMC's matrices are smaller and lower-degree.
