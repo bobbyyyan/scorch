@@ -25,25 +25,45 @@ WANTKEYS=3820   # and 9 rows each: 3 widths x 3 arms
 echo "backstop for 17701502's dlmc phase  $(date '+%F %T')  job ${SLURM_JOB_ID:-none}"
 if [ -f "$OUT" ]; then
   HAVE=$(( $(wc -l < "$OUT") - 1 ))
-  CENSUS=$(awk -F, 'NR>1{c[$3]++}END{e=0;s=0;o=0;for(k in c){if(c[k]==9)e++;else if(c[k]<9)s++;else o++};
-           printf "%d %d %d %d", e, s, o, length(c)}' "$OUT")
+  # SET IDENTITY, not cardinality. Counting keys-with-9-rows is corpus-INDEPENDENT (9 = 3 widths
+  # x 3 arms), so a file holding 4594 SuiteSparse keys plus 1000 DLMC keys gives 5594 exactly-9,
+  # 0 short, 0 over and passes any count-based gate. This harness measures both corpora in one
+  # job and this project has already recorded "a float32 DLMC screen wrote files named for a
+  # float64 SuiteSparse one", so a dlmc-named file carrying ss keys is the documented failure.
+  # Comparing the CSV's key SET against $KEYS catches it by identity. awk membership is used
+  # rather than sort+comm because a merge is order-sensitive and a locale mismatch between the
+  # sort and the merge silently fabricates set differences.
+  CENSUS=$(awk -F, 'NR==FNR{want[$0]=1; nw++; next}
+    FNR>1{c[$3]++}
+    END{e=0;s=0;o=0;unk=0;miss=0
+        for(k in c){ if(!(k in want)) unk++; if(c[k]==9) e++; else if(c[k]<9) s++; else o++ }
+        for(k in want) if(!(k in c)) miss++
+        printf "%d %d %d %d %d %d %d", e, s, o, length(c), unk, miss, nw}' "$KEYS" "$OUT")
   set -- $CENSUS
-  echo "per-key census: $1 keys with exactly 9 rows, $2 short, $3 over, $4 keys present"
-  echo "  (total rows $HAVE; a total is NOT the check -- 9 rows per key is)"
-  if [ "$1" -ge "$WANTKEYS" ] && [ "$2" = "0" ] && [ "$3" = "0" ]; then
-    echo "SKIP: $1 of $WANTKEYS keys complete at exactly 9 rows, none short or over."
+  echo "per-key census: exactly9=$1 short=$2 over=$3 keys=$4 unknown=$5 missing=$6 wanted=$7"
+  echo "  (total rows $HAVE is NOT the check: identity of the key set is)"
+  if [ "$1" = "$7" ] && [ "$2" = "0" ] && [ "$3" = "0" ] && [ "$4" = "$7" ] \
+     && [ "$5" = "0" ] && [ "$6" = "0" ]; then
+    echo "SKIP: all $7 wanted keys present at exactly 9 rows, none short, over, unknown or missing."
     echo "      Leaving the existing file untouched."
     exit 0
   fi
-  echo "NOT COMPLETE by the per-key gate, so re-measuring."
+  echo "NOT COMPLETE by the key-set gate, so re-measuring."
   echo "incomplete -- re-measuring to a SEPARATE path so the partial file is preserved as evidence"
   OUT=$ROOT/dlmc_float32_ship_p1_backstop.csv
 fi
-echo "object sha256 $(sha256sum "$BUILD"/src/scorch_ops*.so | cut -c1-16)   (expect 4c11296ce2a68c3d)"
+# COMPARE, do not print beside. A line reading "expect X" next to a measured value reads as
+# provenance to anyone auditing the log afterwards, which is worse than no check.
+OBJSHA=$(sha256sum "$BUILD"/src/scorch_ops*.so | cut -c1-16)
+echo "object sha256 $OBJSHA"
+[ "$OBJSHA" = "4c11296ce2a68c3d" ] || { echo "REFUSE: object is $OBJSHA, expected 4c11296ce2a68c3d"; exit 1; }
 echo "HOOKS: SCORCH_SPMM_* strings = $(strings -n 6 "$BUILD"/src/scorch_ops*.so | grep -c '^SCORCH_SPMM_')"
 env | grep '^SCORCH_' || echo "ambient SCORCH_*: none"
 [ -f "$KEYS" ] || { echo "REFUSE: $KEYS absent"; exit 1; }
-echo "keys $(wc -l < "$KEYS")  sha $(sha256sum "$KEYS" | cut -c1-16)   (expect 3820, a8132f50d2c44fe4)"
+KN=$(wc -l < "$KEYS" | tr -d ' '); KSHA=$(sha256sum "$KEYS" | cut -c1-16)
+echo "keys $KN  sha $KSHA"
+[ "$KN" = "3820" ] || { echo "REFUSE: key list has $KN lines, expected 3820"; exit 1; }
+[ "$KSHA" = "a8132f50d2c44fe4" ] || { echo "REFUSE: key list sha $KSHA, expected a8132f50d2c44fe4"; exit 1; }
 . /scr/bobbyy/venv/bin/activate || exit 1
 POOL=$(OMP_NUM_THREADS=${SLURM_CPUS_PER_TASK:-32} python -c 'import torch;print(torch.get_num_threads())')
 echo "torch pool $POOL"

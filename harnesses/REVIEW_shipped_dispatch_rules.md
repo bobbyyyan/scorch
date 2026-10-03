@@ -2222,3 +2222,61 @@ verdicts were reached by `[` erroring rather than by the comparison -- reporting
 "wrongly refuses" for the same wrong reason. The sbatch script is `#!/bin/bash`, where splitting
 works, so the script was never affected; the *test* was. Re-run under `bash`, which is what the job
 uses, it gives the table above. **Run a verification under the interpreter the artefact declares.**
+
+### The per-key gate counted the right property over the wrong population
+
+The per-key census fixed the total-row defect and left a hole the per-key form does not close: it
+counted keys **with** 9 rows and never checked **which** keys. "9 rows per key" is
+corpus-independent -- 3 widths x 3 arms -- so any corpus satisfies it, and a file holding all 4594
+SuiteSparse keys plus 1000 of the 3820 DLMC keys gives 5594 exactly-9, 0 short, 0 over, and
+**skips**.
+
+**Not hypothetical for this family.** Job 17701502 measures both corpora in one job, and
+`arm_screen.sh:49-56` records that this project already had "a float32 DLMC screen wrote files
+named for a float64 SuiteSparse one". A dlmc-named file carrying ss keys is the documented failure
+mode, and it was the one case where the skip was silent.
+
+**The census computed four values, printed four, and the gate tested three.** `length(c)`, the
+distinct-key count, was the only one bounding the *population* rather than the per-key property,
+and it was printed and not tested.
+
+**Fixed by set identity rather than another count.** The gate now compares the CSV's key set
+against `$KEYS` by `awk` membership -- not `sort` + `comm`, because a merge is order-sensitive and a
+locale mismatch between the sort and the merge silently fabricates set differences, which this
+document records happening earlier in the same session. It reports and requires `exactly9 == nw`,
+`short == 0`, `over == 0`, `keys == nw`, `unknown == 0`, `missing == 0`.
+
+**Driven through one case per failure mode, under `bash` as the artefact declares:**
+
+| case | rows | e9 | short | over | keys | unknown | missing | identity gate | count gate |
+|---|---|---|---|---|---|---|---|---|---|
+| zero-byte | -1 | 0 | 0 | 0 | 0 | 0 | 3820 | REMEASURE | REMEASURE |
+| header-only | 0 | 0 | 0 | 0 | 0 | 0 | 3820 | REMEASURE | REMEASURE |
+| complete | 34380 | 3820 | 0 | 0 | 3820 | 0 | 0 | **SKIP** | SKIP |
+| one key over | 34381 | 3819 | 0 | **1** | 3820 | 0 | 0 | REMEASURE | **SKIP** |
+| one key short | 34377 | 3819 | **1** | 0 | 3820 | 0 | 0 | REMEASURE | REMEASURE |
+| one key missing | 34371 | 3819 | 0 | 0 | 3819 | 0 | **1** | REMEASURE | REMEASURE |
+| extra unknown key | 34389 | 3821 | 0 | 0 | 3821 | **1** | 0 | REMEASURE | **SKIP** |
+| 4594 ss + 1000 dlmc | 50346 | 5594 | 0 | 0 | 5594 | **4594** | **2820** | REMEASURE | **SKIP** |
+
+**The count-based gate wrongly skips 3 of 8**, and `complete` is the only SKIP under the identity
+gate. Stated honestly: the six clauses are **coupled** -- `e9`, `keys`, `unknown` and `missing` are
+all functions of the same two sets -- so a single-clause isolation is not always constructible. What
+the table demonstrates is that each failure *mode* is caught and which field catches it, which is
+the useful form.
+
+**Two printed expectations became comparisons.** The script carried
+`(expect 4c11296ce2a68c3d)` and `(expect 3820, a8132f50d2c44fe4)` beside measured values and never
+compared them. For audit purposes that is **worse than no check** -- a reader scanning the log sees
+"expect X" next to a measured value and takes it for provenance. Both now `REFUSE` on mismatch, and
+the key-list digest is the second, independent route to catching the wrong-corpus case above.
+
+**Job 17701584 cancelled while PENDING; job 17701598 submitted**, spooled digest
+`f14b7b86c77af257`, identical to `harnesses/pfstream/k4dip_dlmc.sbatch` as committed.
+
+**And the zsh trap recurred on the reviewer's side one message after the rule was published**, with
+a tell worth recording: every branch returned the **same** verdict for the same wrong reason --
+REMEASURE for all cases including the complete one that must SKIP -- so a broken sweep reads as a
+conservative gate. **Uniform output across a branch sweep is the tell.** `bash -n` passes and proves
+nothing, since it parses without running the comparisons. The table above is varied, which is the
+minimum evidence that the sweep itself works.
