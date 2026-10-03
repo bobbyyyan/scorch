@@ -188,7 +188,7 @@ no floor term, and it is the one that decides the arm.**
   parity" separately per build: at g = 1.1475, build `aa` says **27** and build `bb` says **20**,
   with **25 of 51 verdicts flipping** — and the registered line is 26. **The verdict would be
   decided by which replication build was measured.**
-- **43 of the 51 sit inside the floor.** This run's own sealed analysis headlines "both builds
+- **[CORRECTED BY AMENDMENT 3(a): it is 50 of 51, and the two sets are NOT nested — they share one cell.]** This run's own sealed analysis headlines "both builds
   beyond the ratio floor" at per-width `1/8/1/0/0` — **8 at k=4**, not 51. "Behind in all 12
   readings" is a consistent *sign* with no magnitude term. Both predicates are defensible and the
   original named its own, but condition 3 asked the arm to fix cells where the deficit is not
@@ -418,3 +418,110 @@ identical between `mrhv` and `mrhv4`. That is what makes the check valid.
 
 Four objects at one fixed absolute path: `mr0` and `mr0b` **`.text`-identical** (the floor), `mrhv`
 differing from ship by **+4385** instruction lines, `mrhv4` differing from `mrhv` by **−75**.
+
+---
+
+# Amendment 3 — the two criteria select nearly DISJOINT populations, and my gate and my report used different reductions
+
+Still before any timing.
+
+## (a) "50 of 51 sit inside the floor (corrected, amendment 3(a))" is wrong — it is 50 of 51, and the sets are not nested
+
+That figure came from a second reader as `51 − 8`, which is arithmetic rather than set algebra, and
+I repeated it in amendment 1(b) and amendment 2. **Both sets measured directly, per width:**
+
+| k | sign-only (all 12 behind) | floor-gated (both builds) | intersection |
+|---|---|---|---|
+| 2 | 0 | 0 | 0 |
+| **4** | **51** | **2** | **1** |
+| 8 | 2 | 0 | 0 |
+| 16 | 0 | 0 | 0 |
+| 32 | 0 | 0 | 0 |
+
+**The two criteria share one cell on the whole board.** So **50 of the 51** sign-only cells sit
+inside the floor, and half of my gated set is not in the 51 at all. **Corrected in all three places
+it appeared.**
+
+The consequence for amendment 1 is bigger than the arithmetic: **its narrowing was a population
+SWAP, not a subsetting.** This document's entire motivation section is built on the 51, and
+amendment 1's condition 3a then scored a set almost disjoint from it. Amendment 2 withdrew 3a for
+unreachability, which stands; **the better reason is that it was a different deficit.**
+
+## (b) The floor gate selects on VARIANCE, not on slowness
+
+| population | n | median CV of the 12 per-pass ratios | median S |
+|---|---|---|---|
+| floor-gated | 2 | **26.8%** | 1.5652 |
+| sign-only | 51 | **16.0%** | 1.1510 |
+| all k=4 (1200-key sample) | 1200 | **15.9%** | — |
+
+**The sign-only 51 sit at the corpus's own CV; the gated cells sit well above it.** A magnitude
+threshold applied to a per-cell median, in a corpus whose per-cell CV is already ~16%,
+preferentially admits unstable cells — requiring consistency and requiring magnitude pull in
+opposite directions once the floor is comparable to the effect.
+
+Two corrections to how strongly this can be stated. On **my** reconstruction the gated set is n=2, so
+26.8% is two cells and the second reader's 37.5% over n=8 is the better-powered figure; and their
+"every gated cell above 2.4× per-pass spread" is **not** distinguishing — the sign-only 51 also reach
+3.27×, 2.81×, 2.71×. The **CV contrast** is the finding; the spread list is not. Their own flag that
+the "0 of 51 ever ahead of MKL" column is true by construction is correct and I am not citing it as
+evidence.
+
+**This cuts in favour of the original target.** The 51 — at the corpus CV, median S 1.1510, never
+once ahead of MKL across 12 readings — look far more like a genuine width-specific kernel deficit
+than the gated cells do. **At this noise level the intersection of "large deficit" and "stable" is
+one cell in 3820, which is itself the answer**: the board contains no population that is both, so
+the honest target is the stable modest-deficit set with the gain reported as a curve. That is what
+amendment 2 already arrived at, and it is better supported than amendment 2 argued.
+
+## (c) A real defect in my own table, which is NOT the one it was reported as
+
+A second reader read the deg-323.3 row as "S_aa 1.6274, S_bb 1.3813, pooled 1.3637" and concluded
+all three were single-pass readings with two of them both from `aa`. **The column order was
+transposed in the reading.** That cell's readings:
+
+```
+aa 6 passes: 4.5076 1.9379 0.7385 1.0066 1.3813 1.6274
+bb 6 passes: 2.4504 1.1270 1.3637 2.6324 1.2019 1.8642
+pooled(12) = 1.6274    aa(6) = 1.3813    bb(6) = 1.3637
+```
+
+The header is `S pooled | S aa | S bb` and the row is `1.6274 | 1.3813 | 1.3637`. **The labels are
+correct.** And the general rule offered — "a reduction of twelve values should not BE one of the
+twelve" — does not hold here: `pct(·, 0.5)` is a **lower-median order statistic**, copied verbatim
+across these harnesses precisely so the convention cannot drift, and an order-statistic median of an
+even-sized sample **is** by construction one of the sample values.
+
+**But there is a real defect underneath, and it is mine.** The gate was applied to the **per-build**
+medians (1.3813 and 1.3637, both clearing 0.2783) while the "gain needed" column reported the
+**pooled** median (1.6274 → 62.7%). **Gate and report must use the same reduction.** Per build the
+cell needs **38.1%** and **36.4%**, not 62.7%.
+
+So **"a 38–63% gap" is withdrawn**: its upper endpoint came from a pooled reduction where the gate
+used per-build ones. Corrected, the gated cells need **36–57%** against a 7.7–12.4% mechanism — which
+changes no conclusion in amendment 2, since its argument is definitional (the gate admits only cells
+needing more than 27.8%), but the quoted range was wrong.
+
+**Registered for the scoring path**: every per-cell figure in the run must state which reduction
+produced it, and any gate and the number reported beside it must use the **same** one. That is the
+defect's transferable form, and it is a different one from what was reported.
+
+## (d) My reconstruction still differs from the sealed analyser, and the sealed definition governs
+
+My gated count at k=4 is **2**; the sealed analysis headlines **8**; a second reader reconstructs
+**8**. At k=8 I get 0, they get 3, the sealed says 1. **Three reconstructions, three answers.**
+Scoring uses the sealed definition, and the discrepancy is logged as unresolved — it is not
+explained by the reduction mismatch in (c), which affects the reported gain and not gate membership.
+
+## (e) Three notes for the driver, all pre-run
+
+- **The gain curve's x-axis anchor is now measured.** The 51's S distribution: min 1.0550, p25
+  1.1161, median 1.1475–1.1510, p75 1.2048, max 1.5627. **If the measured gain lands at 9–12% the
+  curve reads 4–13 of 51, and that is the expected result rather than a disappointment.**
+- **Two different n, therefore two different floors.** The displacement question uses **n=51**; the
+  no-regression pool uses **n≈3769**. Using one floor for both would be the pooled-against-per-cell
+  error in a new place.
+- **Condition 2 is now the only original condition still standing, so it carries more weight** — and
+  k=2 is the width where `layout_artefact_by_width.md` records that the artefact's width ordering
+  does **not** generalise across host/dtype/corpus. **A condition-2 trip must have the layout
+  artefact ruled out before it is read as non-neutrality.**
