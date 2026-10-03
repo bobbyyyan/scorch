@@ -3662,3 +3662,70 @@ adggate CSVs are intact and the oracle sweep is intact — 38016 rows, one objec
 pool 32, overrides 0..32, widths 2,4,8,12,16,20,24,32 — only the analysis of the former is
 missing. **Two producers writing different schemas into one directory is the defect**, and a glob
 is the mechanism that turns it into a crash.
+
+---
+
+## Amendment 44 — the floor decomposes: its LOCATION is a dtype/corpus property, its DISPERSION is a host property
+
+Amendments 38 and 41 could only state the floor's anomaly disjunctively — "a property of that host,
+dtype or corpus" — because all three changed between the two measurements available. MKT float64
+on SuiteSparse holds dtype and corpus fixed against redwood and holds host fixed against MKT
+float32/DLMC, so the three-way confound resolves. **It resolves into two different answers for two
+different functionals.**
+
+| measurement | floor median range | band width range |
+|---|---|---|
+| MKT, f32, DLMC | **+0.237% to +1.735%**, all seven positive | 3.30 – 4.89 pp |
+| MKT, f64, SuiteSparse | −0.134% to +0.334%, mixed sign | 3.20 – 4.72 pp |
+| redwood, f64, SuiteSparse | −0.057% to +0.332%, mixed sign | **6.11 – 9.03 pp** |
+
+- **LOCATION is not a host property.** Same host, different dtype and corpus: MKT's f32/DLMC
+  offset is uniformly positive up to +1.735%, while its f64/SuiteSparse medians straddle zero
+  (−0.001, −0.073, +0.112, −0.023, −0.091, −0.134, +0.334 %). MKT f64 looks like redwood f64, not
+  like MKT f32. **So the positive offset tracks dtype or corpus, and f32/DLMC is where it lives.**
+- **DISPERSION is a host property.** Same host, different dtype and corpus: 3.30–4.89 against
+  3.20–4.72 — nearly identical. Different host, dtype and corpus **held fixed**: redwood's
+  6.11–9.03 is about **1.9× wider**. So the per-cell spread between two same-config objects is a
+  property of the machine, not of the workload.
+
+This matters because the two functionals carry different verdicts. Amendment 41 established that
+the dispersion sets the actionability bar; it is now attributable to the host, so **the bar differs
+by host and not by what is being measured on it.** And the location offset — the thing that made
+MKT's f32/DLMC floor read as pathological — does not follow MKT around.
+
+### And `nopf` goes the WRONG WAY at the width carrying the deficit
+
+MKT f64, paired against the floor, n=418 per width:
+
+| k | median d | CI95 | verdict | deficit cells at this width |
+|---|---|---|---|---|
+| **2** | **+0.429%** | **[+0.274, +0.611]** | **SLOWER than floor** | **129 of 192** |
+| 4 | −2.933% | [−3.349, −2.592] | FASTER | 35 |
+| 6 | −1.743% | [−2.051, −1.395] | FASTER | 18 |
+| 8 | −1.515% | [−1.923, −1.246] | FASTER | 9 |
+| 10 | −1.210% | [−1.408, −0.941] | FASTER | 1 |
+| 12 | −1.195% | [−1.488, −1.005] | FASTER | 0 |
+| 16 | −2.202% | [−2.569, −1.976] | FASTER | 0 |
+
+**At k=2 — the width holding 129 of the 192 deficit cells, 67% of them — deleting the register-block
+prefetch is SLOWER, with a CI well clear of zero.** It is faster at every other width. So the
+arm's sign is opposite to the deficit's distribution, and `nopf` cannot be the fix for the float64
+deficit even though it is a real effect at six of seven widths.
+
+On the 192-cell deficit set itself, the same conclusion by a second route: floor median −0.176%,
+band −1.817% to +1.138%; `nopf` median −0.618% is **inside** the band (margin 1.199 pp), and its
+paired CI is **[−0.471%, +0.306%], spanning zero** — so on that population the effect does not
+exist, let alone qualify. This is the first population where existence and actionability agree on
+"no", which is a stronger negative than the band alone could give. `strm` reads +1.168%, slower.
+
+This confirms amendment 26's premise — "neither prefetch arm touches them" — with a paired CI
+rather than a pooled comparison, and it was that premise, not the deficit, that the 192's
+provenance question had put in doubt.
+
+### Three boundary verdicts that must not be read
+
+`k=8` clears the band by **0.070 pp**, `k=16` by **0.028 pp**, and `strm` on the deficit set misses
+by **0.031 pp**. Those are measurements that landed on the boundary, and the same rule applies as
+to the 0.009 pp case in amendment 30: a verdict is not to be read from which side of a line a value
+fell when the distance is this far below the band's own width. The paired CIs are the usable
+statement at those widths, and they say FASTER at both — but by existence, not by actionability.
