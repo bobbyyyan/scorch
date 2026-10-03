@@ -1359,3 +1359,104 @@ than a timing one. Worth knowing before any future screen spends rotation budget
 kernel, k=4 to the half-vector kernel, k>=8 to the register-blocked kernel. Three kernels, so
 "one width out of eight" is really "one of three kernels", and the correct comparison for k=4
 is the 5% null above rather than the other widths' rates.
+
+## Correction: the "3.5x over its own null" framing is withdrawn, and the repair strengthens the result
+
+A peer showed the 5% null is the at-parity rate for a distribution **centred at the floor's
+median**, and none of the scored distributions have that location. The floor is median 1.0000
+with log-symmetric tails (-0.06251 / +0.06354), so sigma = 0.03801; k=4's arm is centred at
+1.2508, which puts the 0.9394 threshold **-7.53 sigma** below that centre, where the expected
+share is ~1e-13 rather than 5%. So the sub-floor count is a statement about the arm's
+**dispersion**, not a rate excess over 5%.
+
+**The pooled row showed this and I read past it:** 3.3% observed against a stated 5% null,
+while every width sits well above parity. A criterion firing *below* its own null in aggregate,
+on data centred at 1.4455, is the signature of a null whose location does not match what it
+scores. Withdrawn: "3.5x over its own null", "676 observed against 191 expected", and "exactly
+one of eight widths exceeds the rate its own floor produces at parity".
+
+**What never needed a floor, and is the result:** k=4 has the **lowest geomean of the eight
+widths**. No threshold, no null, no floor enters that.
+
+### The repair: per-width floor on matched batch divergence
+
+`mrgate.py:55-77` records that the 5-95 spread rises 13.6% -> 19.9% -> 36.6% -> 78.2% as the two
+arms' calibrated batch counts diverge, and `:128-129` calibrates MKL separately because "it can
+be twenty times a different speed". The floor pair's divergence is zero by construction, so an
+unrestricted floor understates the scored arm's noise. Restricting both to
+`batch_mkl/batch_ours` within 1.2x scores each width against its own noise:
+
+| k | n | floor p05 | geomean | median | behind parity | below floor p05 |
+|---|---|---|---|---|---|---|
+| 2 | 1990 | 0.8617 | 1.1036 | 1.1102 | 9.6% | 3.1% |
+| **4** | 2139 | 0.8135 | **0.9987** | 1.0382 | **43.7%** | 7.3% |
+| 8 | 1628 | 0.9140 | 1.1240 | 1.1336 | 6.4% | 2.5% |
+| 12 | 1572 | 0.9226 | 1.1204 | 1.1314 | 7.3% | 3.2% |
+| 16 | 462 | 0.9484 | 1.2540 | 1.2532 | 1.5% | 1.1% |
+| 20 | 698 | 0.9218 | 1.2138 | 1.2265 | 2.7% | 1.9% |
+| 24 | 255 | 0.9112 | 1.2684 | 1.2943 | 2.7% | 2.4% |
+| 32 | 175 | 0.8980 | 1.2993 | 1.3080 | 1.7% | 1.1% |
+
+**On the low-noise subset, k=4 is at 0.9987 -- scorch is at parity-or-behind MKL**, with 43.7%
+of 2139 cells behind. The gap to the next-worst width *widens* under restriction, 7.7% to 10.5%.
+
+**The restriction is not the population, and the direction is known.** Requiring similar batch
+counts selects cells where the two arms run at similar speed, so every geomean falls (k=32
+1.6052 -> 1.2993). The restricted figure is therefore **not** an estimate of DLMC k=4
+performance; it is the cleanest available contrast, and it is biased toward parity by
+construction. Both tables agree on the ordering, which is what the restriction was for.
+
+The `below floor p05` column keeps no 5% interpretation at either restriction, for the location
+reason above. It is reported as a tail measure; the ordering is what compares.
+
+## The mechanism, read from the correct tree -- and a 128-bit form DOES exist
+
+An earlier note here recorded that `scorch_simd<T>` has no 128-bit form. **That described the
+state before one was added, and the addition is what the screen is testing.** In
+`src/scorch/csrc/spmm.h`:
+
+    :2153  template <typename T> struct scorch_simd;        // <float> wraps __m256
+    :2200  template <typename T> struct scorch_simd_half;   // <float> uses __m128
+    :2196  "...load and throwing away half the FMA width. That is a per-nonzero cost"
+
+So the half-width path exists and is gated behind `SCORCH_SPMM_MULTIROW_HALFVEC`
+(`scorch_policy.h:661-662`, default 0), with a `getenv` override at `spmm.h:4333-4334`. The
+comment names the same cost the degree scaling in the board shows.
+
+**Two readings in this file's earlier draft came from the wrong tree.** They were run from
+`/Users/bobby/scorch`, which is on `refactor/compiler-ir-phase3-std-move-call`, not from the
+`scorch-beat-mkl` worktree. Both are corrected above: `scorch_simd` does exist, and the
+"`__AVX2__ && __FMA__` with no `!__AVX512F__`" gating claim is withdrawn as read from the wrong
+source. Checking the branch is part of reading a path.
+
+## What the four arms are, decoded from the objects rather than from a build log
+
+The `pfs/` trees are byte-identical in every file except the `.so`, and hold no build log, so the
+arms are distinguished only by `-D` flags. Decoded statically, with no process started next to
+the live screen:
+
+| arm | `.text` | `scorch_spmm_*` symbols | multirow symbols |
+|---|---|---|---|
+| mr0 | 715033 | 29 | **0** |
+| mr0b | 715033 | 29 | 0 |
+| mrhv | 735417 | 36 | present |
+| mrhv4 | 734921 | 36 | present |
+
+So the baseline has multirow **entirely absent**, not merely configured off -- `mr0` -> `mrhv`
+therefore moves multirow and half-vector together and does not isolate either. And **mrhv and
+mrhv4 have identical symbol sets**, differing by 496 bytes of `.text`, so they differ by a
+compile-time constant rather than by which templates are instantiated; the instantiated set in
+both is `<float, {2,3,4}, false, {2,4}, scorch_simd<float>>`.
+
+**One input remains unbound: which constants separate mrhv from mrhv4.** It is resolvable by
+importing each object and reading the policy, and that is **deferred until the screen completes**
+rather than run now, because four torch imports on the host running a 32-thread timing screen is
+a perturbation of a live measurement. Recorded as a gap with a scheduled resolution, not left
+implicit.
+
+## Per-unit row counts, the quantity the sentinel drops
+
+| unit | arm | rows | rc | window |
+|---|---|---|---|---|
+| p1.1 | mr0 | 91680 | 0 | 20:50:29 - 00:08:43 |
+
