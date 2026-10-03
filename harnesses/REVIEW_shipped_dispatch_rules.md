@@ -205,7 +205,13 @@ rather than something coarser. One premise under that pair: `J * 4 * N` over int
 always a multiple of 4, so step 4 *is* the finest granularity, **and the equality row exists only
 when `C` is divisible by 4**. It holds for both C values on record (16777216 and the Linux fallback
 37748736, both `% 4 == 0`), so the pair is valid as published; on a C not divisible by 4 there is no
-equality row and the straddling pair is a different one.
+equality row and the straddling pair is a different one. One thing `C = 16777216` does **not**
+certify, so that no later entry quotes it that way: `query_llc()` has three macOS routes and two of
+them return that exact value -- `hw.perflevel0.l2cachesize` succeeding, and the Darwin fallback
+`16 * 1024 * 1024` at `:402-404` after a subprocess failure. Only the middle route is
+distinguishable (`hw.l2cachesize` = 8388608 on this host). Benign here precisely *because* they
+agree; the value is right either way, and it is quoted here as a value and not as evidence the
+query ran. Peer reviewer's observation, verified by reading both sysctl keys.
 
 **So an all-zero operand does become a learned candidate once `J * 4 * N > C`, and that is the
 DEFAULT, not an opt-in.** `_LEARNED_WIDEN = os.environ.get("SCORCH_AUTOTUNE_WIDEN", "1") == "1"`
