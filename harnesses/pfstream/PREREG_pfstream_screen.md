@@ -3576,3 +3576,89 @@ So the fix is not only external review. It is requiring every verdict to print i
 operands and their distance, which is now true of the per-width table, the deficit-set block and
 the paired test. A reader who reads past it is then still covered by the next reader who does the
 subtraction.
+
+---
+
+## Amendment 43 — RESOLVED: the 192 is MKT float64 at N=16, so float64 IS a two-host difference
+
+Settled by the direct host test rather than by the denominator inference amendment 39 got wrong.
+
+### The one-row host discriminator
+
+On MKT, the two `barth4` keys resolve to **different matrices**:
+
+```
+Nasa/barth4/barth4,   k, 6019, 23492
+Pothen/barth4/barth4, k, 6019, 40965
+```
+
+40965 ≠ 23492, so MKT distinguished them, where redwood's flat cache collapses both to Nasa's
+23492. **The host test returns MKT.** `/scr/bobbyy/pfs/csv64` exists, its CSVs carry
+`Pothen/barth4` rows, and `/scr/bobbyy/pfs/screen_f64.log` opens:
+
+```
+host mkt1.stanford.edu  pool 32  12:19:08
+corpus 418 matrices, dtype float64, widths 2,4,6,8,10,12,16
+  --- p1 ship done  12:38:49  rc=0  (8778 rows)
+```
+
+That is job 17681665 exactly as recorded at `:1472` — 8778 rows = 418 × 7 × 3 arms, one pass of
+sixteen.
+
+### And the deficit reproduces exactly, at the full reading count
+
+16 CSVs, a complete four-pass screen. Expected 418 × 7 × 16 = 46816 readings, observed 46816;
+2926 of 2926 cells carry all 16.
+
+| | cells | share |
+|---|---|---|
+| ahead in every reading | 2504 | 85.58% |
+| **behind in every reading** | **192** | **6.56%** |
+| mixed sign | 230 | 7.86% |
+
+Per-width: `{2: 129, 4: 35, 6: 18, 8: 9, 10: 1, 12: 0, 16: 0}` — **exactly amendment 26's table**,
+width for width.
+
+### What this settles, and one thing it vindicates from the other side
+
+- **Float64 is a two-host difference**: MKT **192 of 2926 behind** (6.56%), redwood **0 of 2919**.
+  Both at 16 readings, both complete four-pass screens.
+- **Reading count was never the explanation** — the 192 is measured at N=16, not at low N. So
+  amendment 37's exclusion is confirmed from the opposite direction: it ruled the mechanism out by
+  measuring redwood's slope, and the 192 turns out to sit at the strictest bar there is.
+- **Amendment 26's predictor is scoreable, with its negative control intact.** The 9 cells at k=8
+  — where the mechanism predicts no signal because `S % 64 == 0` — are real and present. The
+  vanished-control problem is closed in the good direction.
+- Amendment 36's first branch is confirmed; amendment 40's restored ambiguity is resolved. **The
+  conclusion amendment 39 reached is correct; its argument was not, and the correct argument is a
+  different one.** Worth keeping separate: a right answer from a wrong inference is not evidence
+  the inference was sound, and the replacement test the reviewing session specified is what
+  actually settled it.
+
+### A caveat on how this was read, stated because the tool stated it
+
+MKT's `csv64` has no sentinel carrying a `ks` line, so the width set was passed as argument 2 from
+the producer's own log. The tool flagged **DEGRADED** and named precisely what that costs: the key
+count and pass-file count then come from the data, so it can no longer catch a key the cache never
+resolved or a pass-file that never arrived — "exactly the two the declaration exists for".
+
+One of the two is recovered from an external source: the log independently declares `corpus 418
+matrices`, and the rows yield 418. The pass-file check is not recovered — 16 files are present and
+16 is what the count reports. So the reading is sound on the key axis and assumes completeness on
+the pass axis.
+
+### Separately: the ADOPT_GRAIN screen is unanalysed because the analysis globbed the oracle sweep
+
+`an_adg.py` died with `KeyError: 'build'`. The cause is a column-set collision, not a bad CSV:
+
+```
+adg0_p1.csv   build,key,k,rows,cols,nnz,deg,arm,ms,batch,nthreads,refbackend,so_sha
+oracle.csv    key,k,rows,cols,nnz,deg,nthreads,resolved,res_ovr0,...,so_sha
+```
+
+`oracle.csv` has **no `build` column**, and both files live in `$ADG_OUT`, so a `*.csv` glob over
+the output directory feeds the thread-sweep's rows into the ADOPT_GRAIN analysis. The nine
+adggate CSVs are intact and the oracle sweep is intact — 38016 rows, one object `09b7b24cbceec93c`,
+pool 32, overrides 0..32, widths 2,4,8,12,16,20,24,32 — only the analysis of the former is
+missing. **Two producers writing different schemas into one directory is the defect**, and a glob
+is the mechanism that turns it into a crash.
