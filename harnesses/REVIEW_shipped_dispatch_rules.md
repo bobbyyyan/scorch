@@ -1956,3 +1956,67 @@ dozens a `SCORCH_TUNE_HOOKS` build carries, and ambient `SCORCH_*` is empty unde
 The key lists are generated from each cache by `find`, so the group-qualified `ss` layout cannot
 silently drop keys -- and `mrgate.py`'s `resolve_all` refuses on any unresolved key rather than
 proceeding short.
+
+## The two hosts' SuiteSparse corpora are NOT the same corpus
+
+Checked **before** reading job 17701502's SuiteSparse result rather than after, because the DLMC
+half had a byte-identical key-list digest across hosts and the SuiteSparse half had no counterpart
+-- so "different corpus" was not excluded as an explanation for any cross-host disagreement.
+
+**Key path structure differs, so comparing key strings across hosts is meaningless.** Redwood's
+cache stores `<name>/<name>`; MKT's is group-qualified, `<GROUP>/<name>/<name>`. A naive set
+comparison of the generated lists reports 916 common of ~4590, which is an artefact of the layout
+and not a corpus statement. The identity is the matrix **basename**:
+
+| | redwood | MKT |
+|---|---|---|
+| keys | 4584 | 4594 |
+| distinct basenames | 4584 | **4578** |
+| common basenames | **4578** | |
+| redwood-only | **6** | 0 MKT-only |
+
+**Redwood has 6 matrices MKT lacks:** `bone010_B`, `bone010_C`, `bone010_M`, `boneS10_B`,
+`boneS10_C`, `boneS10_M`. The published SuiteSparse board covers 4584 and therefore includes
+these; MKT cannot measure them.
+
+**MKT has 16 extra PATHS over 15 basenames**, matrices mirrored under two collection groups:
+
+    Nasa/barth + Pothen/barth          Boeing/nasa1824 + Nasa/nasa1824
+    Nasa/barth4 + Pothen/barth4        Boeing/nasa2910 + Nasa/nasa2910
+    Nasa/barth5 + Pothen/barth5        Boeing/nasa4704 + Nasa/nasa4704
+    GHS_indef/copter2 + GHS_psdef/copter2    Andrianov/{ex3sta1,fxm3_6,fxm4_6,pf2177}
+    Newman/football + Pajek/football          + Meszaros/{same four}
+    Nasa/shuttle_eddy + Pothen/shuttle_eddy   Nasa/skirt + Pothen/skirt
+    pwt: GHS_psdef/pwt + Nasa/pwt + Pothen/pwt   (three paths)
+
+14 pairs plus one triple = 31 paths for 15 basenames = the 16 surplus.
+
+### Three consequences for reading the MKT result
+
+1. **The cross-host comparison must be restricted to the 4578 common basenames.** Comparing a
+   4584-matrix board against a 4594-path one would differ by 22 keys for reasons that have nothing
+   to do with the kernel or the ISA.
+2. **MKT's 16 duplicate paths must be deduplicated before any per-matrix statistic**, or 14
+   matrices carry double weight and `pwt` triple. The dip is a mean over matrices, so duplicates
+   bias it toward whatever those 15 do. Whether the mirrored pairs are byte-identical is checkable
+   from the emitted `rows`/`nnz` columns at no cost and is deferred to the analysis.
+3. **This is the exact case `csrresolve.py` refuses on.** Its resolution is exact-path then
+   *unique* basename, and on MKT 15 basenames are not unique -- so a flat corpus list would be
+   ambiguous for them. The job passes exact paths generated from the cache, so it resolves; the
+   refusal would have fired on a hand-written flat list.
+
+**The completeness check when it lands is 9 rows per key, not the 75,726 total.** A total is
+satisfied by one key with 6 rows and another with 12, which is the defect already on record in
+this project's own sentinel.
+
+### And the ISA guards are not interchangeable
+
+Worth separating because they sit in the same file family and give opposite answers on Zen4:
+
+| guard | condition | Zen4 |
+|---|---|---|
+| `spmm.h:2139` (half-vector kernel) | `__AVX2__ && __FMA__` | **true** |
+| `scorch_policy.h:1451` (narrow-k W1 unroll mindeg) | `__AVX2__ && __FMA__ && !__AVX512F__` | **false** |
+
+So the half-vector mechanism is live on MKT and the W1-unroll mechanism is inert there by
+construction. Cite the line, not "the AVX2 gate".
