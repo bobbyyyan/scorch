@@ -2280,3 +2280,70 @@ REMEASURE for all cases including the complete one that must SKIP -- so a broken
 conservative gate. **Uniform output across a branch sweep is the tell.** `bash -n` passes and proves
 nothing, since it parses without running the comparisons. The table above is varied, which is the
 minimum evidence that the sweep itself works.
+
+### The same defect recurs one level down, where no census field registers it
+
+A key whose nine rows are nine copies of a single `(k, arm)` cell has **no k=4 and no k=8 data**,
+and reads identically to a complete key on every field above: present, exactly 9 rows, not short,
+not over, not unknown, not missing -- and the row total is exactly 34380. This is not a coupling
+limitation. **All six fields and the total read the same as `complete`, so there is no clause to
+isolate: the census was blind.**
+
+"9 rows per key" counted the right property over the wrong population **inside** a key, exactly as
+"keys with 9 rows" did across the corpus one revision earlier.
+
+**The general form, now twice in two revisions: a completeness gate must name the population at
+every level of the key it aggregates over -- corpus, key, cell -- because a count at one level is
+invariant to a permutation at the next.**
+
+Fixed with one clause: distinct `(key, k, arm)` triples per key must equal 9, via
+`t[$3 SUBSEP $4 SUBSEP $8]`. It subsumes the short case, which also reads `cells!=9 = 1`.
+
+| case | rows | e9 | sh | ov | keys | unk | miss | **c!=9** | identity+cell | total-row gate | per-key-count gate |
+|---|---|---|---|---|---|---|---|---|---|---|---|
+| zero-byte | -1 | 0 | 0 | 0 | 0 | 0 | 3820 | 0 | REMEASURE | REMEASURE | REMEASURE |
+| header-only | 0 | 0 | 0 | 0 | 0 | 0 | 3820 | 0 | REMEASURE | REMEASURE | REMEASURE |
+| complete | 34380 | 3820 | 0 | 0 | 3820 | 0 | 0 | 0 | **SKIP** | SKIP | SKIP |
+| one key over | 34381 | 3819 | 0 | 1 | 3820 | 0 | 0 | 0 | REMEASURE | **SKIP** | REMEASURE |
+| one key short | 34377 | 3819 | 1 | 0 | 3820 | 0 | 0 | 1 | REMEASURE | REMEASURE | REMEASURE |
+| one key missing | 34371 | 3819 | 0 | 0 | 3819 | 0 | 1 | 0 | REMEASURE | REMEASURE | REMEASURE |
+| extra unknown key | 34389 | 3821 | 0 | 0 | 3821 | 1 | 0 | 0 | REMEASURE | **SKIP** | **SKIP** |
+| 4594 ss + 1000 dlmc | 50346 | 5594 | 0 | 0 | 5594 | 4594 | 2820 | 0 | REMEASURE | **SKIP** | **SKIP** |
+| **repeated cell** | **34380** | **3820** | **0** | **0** | **3820** | **0** | **0** | **1** | REMEASURE | **SKIP** | **SKIP** |
+| | | | | | | | | | 1 SKIP | **4 of 9 wrong** | **3 of 9 wrong** |
+
+**Reachability, stated rather than assumed:** the repeated-cell case needs duplicate
+`(key, k, arm)` rows, which means an appending or retried write by the *producing* job. The
+backstop writes to a separate path and cannot do this to itself; the file it judges is written by
+17701502, whose write behaviour this gate cannot see. So it is not claimed to be likely -- the
+point is that the gate's reach stopped one level above where its own data lives, and the fix is one
+clause.
+
+### Correcting my own scorecard: "wrongly skips 3 of 8" named the wrong gate
+
+The two figures disagreed because the column was mislabelled, not because either count was wrong.
+My table's column headed "count gate" computed `total rows >= 34380` -- the **total-row** gate,
+which is the original defect -- and against that, 3 of 8 is right. Against the **per-key-count**
+gate (`exactly9 >= wanted && short == 0 && over == 0`), which is what "count gate" reads as, it is
+2 of 8: `one key over` has `e9 = 3819`, so `3819 >= 3820` is false and that gate refuses. Both
+columns are now computed and labelled separately above.
+
+**The overstatement ran in favour of the change I was making**, which is the direction to be
+suspicious of in one's own scorecard, and it is the reason to recompute a comparison rather than
+read it off the version you are replacing.
+
+### Two smaller repairs
+
+`nw` was incremented per **line** of `$KEYS` while the set was built as `want[$0]`, so a duplicated
+or blank line would make `wanted` disagree with the set actually used -- failing closed, but with a
+log reading "3820 of 3821 wanted" and nothing pointing at the key list. Now `length(want)`, with
+blank lines skipped.
+
+And `awk` membership over `sort` + `comm` was chosen because a merge is order-sensitive; it is also
+why this gate is immune to the locale defect recorded earlier in this document, so the two fixes
+compose rather than merely coexist.
+
+Job 17701598 cancelled while PENDING; job **17701612** submitted, spooled digest
+`b99b6bc5c4a5379e`, identical to `harnesses/pfstream/k4dip_dlmc.sbatch` as committed. Superseded
+spools on record: `b825da8309043311` (total gate), `0e154a9b737704fd` (per-key count),
+`f14b7b86c77af257` (key-set identity, no cell clause).

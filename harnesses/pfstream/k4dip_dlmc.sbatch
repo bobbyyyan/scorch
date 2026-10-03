@@ -33,18 +33,30 @@ if [ -f "$OUT" ]; then
   # Comparing the CSV's key SET against $KEYS catches it by identity. awk membership is used
   # rather than sort+comm because a merge is order-sensitive and a locale mismatch between the
   # sort and the merge silently fabricates set differences.
-  CENSUS=$(awk -F, 'NR==FNR{want[$0]=1; nw++; next}
-    FNR>1{c[$3]++}
-    END{e=0;s=0;o=0;unk=0;miss=0
-        for(k in c){ if(!(k in want)) unk++; if(c[k]==9) e++; else if(c[k]<9) s++; else o++ }
+  # AND THE SAME DEFECT RECURS ONE LEVEL DOWN. A key whose nine rows are nine copies of a single
+  # (k, arm) cell has no k=4 and no k=8 data, yet reads identically to a complete key on every
+  # count above: present, exactly 9 rows, not short, not over, not unknown, not missing. A count
+  # at one level is invariant to a permutation at the next, so the gate must name the population
+  # at EVERY level of the key it aggregates over -- corpus, key, cell. `trip` counts distinct
+  # (key, k, arm) triples per key and requires 9, which subsumes the short case too.
+  # `nw` is length(want), not a line count: a duplicated or blank line in $KEYS would otherwise
+  # make `wanted` disagree with the set actually built.
+  CENSUS=$(awk -F, 'NR==FNR{if($0!="") want[$0]=1; next}
+    FNR>1{c[$3]++; t[$3 SUBSEP $4 SUBSEP $8]=1}
+    END{e=0;s=0;o=0;unk=0;miss=0;bad=0
+        for(x in t){ split(x, p, SUBSEP); nt[p[1]]++ }
+        for(k in c){ if(!(k in want)) unk++; if(c[k]==9) e++; else if(c[k]<9) s++; else o++
+                     if(nt[k]!=9) bad++ }
         for(k in want) if(!(k in c)) miss++
-        printf "%d %d %d %d %d %d %d", e, s, o, length(c), unk, miss, nw}' "$KEYS" "$OUT")
+        printf "%d %d %d %d %d %d %d %d", e, s, o, length(c), unk, miss, length(want), bad}' \
+    "$KEYS" "$OUT")
   set -- $CENSUS
-  echo "per-key census: exactly9=$1 short=$2 over=$3 keys=$4 unknown=$5 missing=$6 wanted=$7"
+  echo "per-key census: exactly9=$1 short=$2 over=$3 keys=$4 unknown=$5 missing=$6 wanted=$7 cells!=9=$8"
   echo "  (total rows $HAVE is NOT the check: identity of the key set is)"
   if [ "$1" = "$7" ] && [ "$2" = "0" ] && [ "$3" = "0" ] && [ "$4" = "$7" ] \
-     && [ "$5" = "0" ] && [ "$6" = "0" ]; then
-    echo "SKIP: all $7 wanted keys present at exactly 9 rows, none short, over, unknown or missing."
+     && [ "$5" = "0" ] && [ "$6" = "0" ] && [ "$8" = "0" ]; then
+    echo "SKIP: all $7 wanted keys present with 9 DISTINCT (k,arm) cells each; none short, over,"
+    echo "      unknown, missing, or holding a repeated cell."
     echo "      Leaving the existing file untouched."
     exit 0
   fi
