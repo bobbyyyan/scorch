@@ -2811,10 +2811,14 @@ SuiteSparse, since k=2 is the live deficit and DLMC's matrices are smaller and l
 
 Written while the dlmc phase runs. **Stated as a bound rather than an assurance**, which is the
 checkable form: this section committed at 04:58:44 against a dlmc start of 04:41:07, so 1057 s had
-elapsed, and at the ss phase's logged 4.52 rows/s **at most ~4.8k of 34380 rows (~14%) existed** --
-about 531 of 3846 keys, and since the driver walks the key list in order that is a **specific
-non-random prefix**, more informative about whatever the list ordering correlates with than about
-the corpus. The dlmc rate may differ from ss's, so 14% is an estimate with its rate named. The
+elapsed, and at the dlmc phase's **measured** 4.556 rows/s **at most ~4.82k of 34380 rows (14.01%)
+existed** -- about **535** of 3846 keys, and since the driver walks the key list in order that is a
+**specific non-random prefix**, more informative about whatever the list ordering correlates with
+than about the corpus. The caveat this paragraph carried -- that the rate was the *ss* phase's 4.52
+and the dlmc rate might differ -- is retired: the dlmc rate is now measured from the phase this
+bound describes, at +0.8% over ss, which moves the key figure 531 -> 535. That is the direction an
+upper bound on exposure should move, so the published figure was slightly too small rather than too
+large. Peer reviewer's update. The
 access record, separately: no dlmc CSV has been opened this session; the only dlmc-related read was
 `tail -3` of the job's stdout, which printed the phase's start line. Peer reviewer's framing, and it
 is better than "no rows informed it" because a bound can be checked and a negative cannot.
