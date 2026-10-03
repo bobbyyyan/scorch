@@ -424,6 +424,12 @@ count. On the grid used, the resolved count at pool 8 is **<= 1 on 36 of 216 cel
 on those mode 0 is forced by the single-worker gate with the ceiling unreadable. So "29 of
 165 forced at pool <= 16" conflated the ceiling with the worker count.
 
+Instrument: `harnesses/pfstream/gate_isolate.py`, grid 6 rows x 6 nnz x 6 k = 216 cells,
+committed so every figure below is regenerable. The first version of this entry quoted
+figures from a script that existed only in a scratchpad, in a commit that touched no code,
+so its "grid used" was not the committed probe's 175-cell grid and no number in it could be
+reproduced from the repository. That is the defect `scratchpad is not storage` names.
+
 **Isolated, by holding the resolved count fixed and varying only the pool:**
 
 | held nthreads | gate-attributable | live cells | share |
@@ -440,6 +446,32 @@ and neither side contains a thread term. The conclusion of the earlier entry is 
 -- the gate is active on x86 at pool <= 16 and its sign was established on ARM -- but the
 share is now attributable where before it was not.
 
+**A third leg: the closed form, which the two env routes cannot supply.** `work_proxy`
+contains no thread term and no row term, so the fired set is fixed by `(nnz, k)` and the
+two committed constants -- `SCORCH_SPMM_PARTITION_MINGRAINS 2L` at `:1581` and
+`SCORCH_GRAIN_SPMM 150000L` at `:82`, giving a threshold of 300000. The prediction is 36
+cells, from 6 `(nnz,k)` pairs (all at nnz=3000) times 6 row values.
+
+Production attributes **35 of the 36**, and the single difference is named:
+`(rows=1000000, nnz=3000, k=32)` returns mode 0 at the small pool *and* at the large one,
+so it is not live at either and cannot be attributed to the ceiling -- a matrix with 0.003
+nonzeros per row is excluded by something else first. Both env routes differ from the
+prediction by exactly that one cell and by nothing else.
+
+This leg matters because the two env routes only establish that two readings of the source
+agree with each other; both go through the same exported function, so neither can tell
+whether that function reads the constants the header declares. A linked object whose
+`MINGRAINS` or `GRAIN_SPMM` differs from the header -- which is what a defines-only rebuild
+relinking stale objects produces -- would leave the two routes agreeing and both
+disagreeing with the closed form.
+
+**Two invariances the predicate's own form demands, both run.** Over the held thread count:
+identical sets, as required. Over rows: the harness reports **DIFFERS**, and correctly --
+6 `(nnz,k)` cells at each of rows 64, 256, 512, 4096, 65536 and only 5 at rows=1000000.
+That is the same single cell as above, so the check fired on a real asymmetry and the
+asymmetry has an explanation outside the gate. A check that passed silently here would have
+been the weaker outcome.
+
 **A defect in my own toggle, which read as a missing feature.** To test whether the build
 could switch the gate off I set `SCORCH_SPMM_PARTITION_GATE_MAXTHREADS=0`. That is
 backwards. The source is
@@ -455,7 +487,8 @@ discloses neither. The probe reported "hooks are NOT live" on a build where they
 **The gate is toggleable on MKT, so no build is needed.** Ten hooks builds already exist
 there; `adg/*` are not among them (0 of 4 knob strings present in any, which is why the
 first probe read nothing). `/scr/bobbyy/raisefloor/tree` carries 49 `SCORCH_SPMM_*`
-environment strings. With the resolved count held at 8 and the pool at 8:
+environment strings. With the resolved count held at 8 and the pool at 8 (control row first, because it is the
+one that separates a live hook from a live hook whose object carries a stale default):
 
 | arm | cells with mode != 0 | moved vs shipped |
 |---|---|---|
