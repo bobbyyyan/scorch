@@ -1404,3 +1404,100 @@ this dtype ... excluded from the tail census", which is correct for the prefetch
 backwards here: k=4 is the only width under test, so the driver's coverage requirement
 describes the seven widths that are *not* the subject. The k=4 data is collected regardless,
 because the width is in `$KS` and reaches `mrgate.py` the same as any other.
+
+---
+
+## Amendment 13: the invocation is the environment, read rather than inferred
+
+Amendment 12 recorded argv. A peer then pointed out that argv is **four of this driver's
+thirteen inputs**, and that two of the other nine default to a different experiment:
+
+    CACHE=${F64_CACHE:-$ROOT/mklsweep/csrcache/ss}      <- SuiteSparse
+    KEYS=${F64_KEYS:-$ROOT/f64_keys_screen.txt}         <- a float64 key list
+
+So `mrhv_screen.sh /scratch/bobbyy/mrhv float32 2,4,8,12,16,20,24,32 9` is literally
+consistent with a **SuiteSparse** float32 run. The corpus is not in argv, and the corpus is
+the one input the driver's own comment block at lines 54-59 argues cannot be recovered
+afterwards.
+
+**The repair is to read the environment, not to quote more log lines.** The driver is still
+running as pid 2904667, so `/proc/2904667/environ` is the invocation itself rather than a
+reconstruction of it:
+
+    F64_CACHE=/scratch/bobbyy/mklsweep/csrcache/dlmc
+    F64_KEYS=/scratch/bobbyy/mrhv/dlmc_keys_nopfx.txt
+    F64_HARNESS=/scratch/bobbyy
+    F64_PFS=/scratch/bobbyy/mrhv/pfs
+    F64_OUT=/scratch/bobbyy/mrhv/csv
+    F64_ACTIVATE=/scratch/bobbyy/pfs-activate.sh
+    F64_THREADS=32
+    F64_TREE   unset
+    F64_MINPOOL unset
+
+That is a reading of the corpus path, where recovering it from the output filename
+(`CORPUS=$(basename "$CACHE")`, `PREFIX=${CORPUS}_${DTYPE}`, so `dlmc_float32_*.csv` implies
+basename `dlmc`) is an inference from the naming rule. Both agree; only one is evidence.
+
+### Three inputs that no record binds, now measured
+
+Reading the environment exposes which inputs have no home in any record the driver writes.
+They are not incidental -- they are the three that determine **what was measured**: which
+matrices, with what code, on which objects.
+
+| input | where the driver records it | identity |
+|---|---|---|
+| `F64_KEYS` path | **nowhere** | `dlmc_keys_nopfx.txt`, 3820 lines, sha256 `a8132f50d2c44fe4`, mtime 20:49:32 (57s before start) |
+| `F64_HARNESS` / `mrgate.py` | **nowhere** | `/scratch/bobbyy/mrgate.py`, sha256 `a55e07bf03e1fb34`, mtime 2026-09-08 19:31:54, `ARMS = ["ours","oursb","mkl"]` at `:43` |
+| the four builds' objects | names only, at `builds` | see the floor-pair check below |
+
+The key list's mtime precedes the run start by 57 seconds, so the corpus definition is bound
+the same way the driver is. Its first entries are `rn50/extended_magnitude_pruning/0.8/...`,
+which is DLMC by content and not only by cardinality.
+
+**The sentinel does not close this, though its field name suggests it does.** Line 226 is
+
+    printf "...\nks %s\nkeys %s\n..."  "$KS" "$NK" ...
+
+where `NK=$(wc -l < "$KEYS")`. The field named `keys` holds a **count**, so the completion
+record identifies the corpus by cardinality exactly as the log header does. 3820 is the DLMC
+key count, but a count is not a path: any 3820-key list satisfies it.
+
+### The A/A floor pair is byte-identical at the object level, not merely by construction
+
+This was an intention of the design and is now a measurement:
+
+| arm | object sha256 |
+|---|---|
+| mr0 | `25a5f0c4425671aa` |
+| mr0b | `25a5f0c4425671aa` |
+| mrhv | `713b9353f62f55c0` |
+| mrhv4 | `f2ecbf401439f742` |
+
+mr0 and mr0b are the same bytes, so the floor pair measures process-to-process and
+position-in-rotation variation with **zero** code difference -- three distinct objects across
+four arms, which is the designed structure. "Built from the same source" would have permitted
+the layout artefact that moves narrow-k SpMM 1-2.6% between objects with identical decisions;
+identical digests exclude it. Had these two differed, every floor number in this screen would
+have been an A/B mislabelled as an A/A, and nothing in the logs would have said so.
+
+### The pool guard was not relaxed, and one latent defect did not fire
+
+`F64_MINPOOL` is unset, so the guard at `:180-186` ran on its default floor `THREADS/2` = 16
+and admitted the recorded `pool 24`. That matters because `F64_MINPOOL` can relax the guard
+silently, and only the realized POOL shows what was actually admitted.
+
+`F64_TREE` is also unset, so `TREE` resolves to `/scratch/bobbyy/mrhv/scorch-beat-mkl`, which
+**does not exist**. It is harmless here only because `TREE` has exactly one use -- line 64,
+`HARNESS=${F64_HARNESS:-$TREE/harnesses/pfstream}` -- and `F64_HARNESS` is set. The
+resolve-or-refuse loop at `:69` checks `KEYS` and `ACTIVATE` and not `HARNESS`, so with
+`F64_HARNESS` unset this driver would have passed its own premise check and failed 130 lines
+later at the first `python "$H/mrgate.py"`. Recorded as a gap in the refuse loop's coverage,
+not as a defect in this run.
+
+### The general rule
+
+Argv is the invocation only for a script that takes all its inputs there. **Ask which inputs
+come from the environment, and bind those too** -- preferring `/proc/<pid>/environ` while the
+process lives, because it is the only form that is a reading rather than a reconstruction. A
+default that points at a *different experiment* makes the gap worse than a missing record: it
+supplies a plausible wrong answer instead of no answer.
