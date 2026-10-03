@@ -340,6 +340,10 @@ whole run confounded.
 ---
 
 # Amendment 2 — amendment 1's floor-gated primary is withdrawn: it can only return zero
+> **Implementation corrected by amendment 10:** condition 3 secondary as first coded
+> used a two-sided p95 where this amendment registers the geomean, which read "inside
+> the floor" across the whole 7.7-12.4% mechanism range.
+
 > **Superseded by amendments 6(a) and 8:** the gated-cell range quoted in this
 > amendment is withdrawn, and replaced by 34.6-54.6% of S-1 (median 45.6% of S-1) over
 > the sealed population of 8 at k=4. The membership counts 2/8/34 stay withdrawn; the
@@ -1116,3 +1120,101 @@ computed on the same readings it is applied to. It is not: the floor comes from 
 mr0/mr0b A/A pair and the count comes from the arm contrast, so under no effect the 5% is
 a genuine prediction about a different sample. The plant's seven null widths read
 2.50-5.83%, straddling it -- a calibration, not a restatement.
+
+# Amendment 10 — condition 3 secondary was two-sided where the effect is one-sided, and read "inside the floor" across the entire registered mechanism range
+
+Written 2026-10-02, screen still on pass 1, nothing from it scored. Found by a peer
+session reading `score_mrhv.py`; reproduced here with my own code before changing anything.
+
+### The defect
+
+Amendment 2 registers condition 3 secondary as the k=4 **geomean** against the geomean's
+own floor from the mr0/mr0b pair. The implementation instead built the per-cell
+`|log(arm/control)|`, took its p95, and compared that against the same functional on the
+A/A pair.
+
+A two-sided tail statistic is not a conservative choice for a one-sided effect. It is
+**non-monotone in the effect size**, because a uniform speedup divides every cell's ratio
+by the effect, which pulls the cells sitting above 1 down through 1 and *out* of the
+two-sided tail before the far side regrows. Planting a uniform speedup onto chain207's own
+A/A noise over the 51 cells, floor p95 19.14% of S-1:
+
+| plant | x1.00 | x1.02 | x1.05 | x1.10 | x1.15 | x1.25 |
+|---|---|---|---|---|---|---|
+| implemented p95, of S-1 | 19.14 | 16.81 | **16.58** | 22.13 | 27.69 | 38.79 |
+| implemented verdict | inside | inside | inside | inside | DISPL | DISPL |
+| registered geomean CI | contains 1 | **excludes** | excludes | excludes | excludes | excludes |
+
+The statistic falls *below* its own no-effect value at x1.02 and x1.05 and does not
+produce a displaced verdict until x1.15. The registered functional separates from x1.02.
+**The registered mechanism range is 7.7-12.4%, which is x1.077 to x1.124 -- entirely
+inside the dead zone.** A working mechanism would have fired this test less than no
+mechanism at all.
+
+I had predicted the opposite sign before measuring, reasoning that `|log r - c|` must
+have a growing upper tail. That holds for an `r` symmetric in log, and the A/A
+distribution is not: over the 51 its per-cell range is 0.656 to 1.193, so the tail is
+dominated by the left side and the ordering of the top three values changes as the plant
+shifts the distribution.
+
+### The fix, and what is NOT changed
+
+`boot_sep` now takes the functional as an argument. Condition 3 secondary uses
+`stat="center"` -- the geometric middle, compared on the log scale, which is the
+registered functional. Conditions 1 and 2 keep `stat="tail"`, where two-sided is
+**correct**: a firing difference between ROWS=2 and ROWS=4 has no preferred sign, and
+condition 2 is an equivalence test. Sidedness has to match the question, not be chosen
+once for the file.
+
+The corrected functional on the same sweep is monotone and recovers the plant exactly:
++2.00 / +5.00 / +10.00 / +15.00 / +25.00 / +50.00 pp of S-1 at the six plants, displaced
+from x1.02 on.
+
+### Four further defects in the same file, all fixed
+
+**Condition 4's null was asserted and roughly twice the truth.** The floor is a p95 of
+`|log|`, so 5% of cells exceed it on *either* side, while the count tests only the upper
+side -- about half. The printed "(null 5.00% by the floor's own definition)" was therefore
+too high by a factor of about 1.9, in the direction that makes a clean run look like a
+regression. It is now **measured** instead of asserted: the A/A pair's own one-sided
+exceedance at the same floor is computed per width and printed beside the arm's. On the
+full-corpus plant that reads 2.33-2.76% across widths, and the arm reads 2.15-2.65% at
+the seven null widths and 0.00% at k=4 where the effect is. Amendment 9(5)'s *reasoning*
+stands untouched -- the floor comes from the A/A pair and the count from the arm, so it
+is a prediction about a different sample and not an identity -- only its value was wrong.
+
+**Condition 3 primary set a pooled centre against a per-cell tail over a different
+population.** `g - 1.0` is a geometric middle over the 51; the floor column beside it was
+a per-cell p95 over all 3820 keys. Two mismatches at once, and it printed a
+"beyond/inside" verdict inside a block whose own header says no threshold is applied. The
+column is now the A/A **geomean** on the same cells -- the matched functional -- with no
+verdict word.
+
+**A dead identity presented as a control.** The line computed
+`paired(..., FLOOR_BUILDS[0], FLOOR_BUILDS[0], ...)`, the same build as both arguments,
+so every ratio was exactly 1.0; it was never read, and it hardcoded one arm inside a loop
+over arms. Deleted. A 1.0000 column labelled "control" is the most convincing artefact a
+reader can be handed. It survived because `pre-commit.sh` lints `src` only and never
+`harnesses/`, so flake8's unused-variable check could not reach it.
+
+**The key set was derived from the data it certifies.** `keys` came out of the observation
+dictionary, so a key missing from every object in every pass is not "short" -- it is
+absent, and no per-cell completeness check can see it. The ledger already opened for the
+behind set is an independent record of which matrices the corpus holds, so the scorer now
+compares its key set against the ledger's and exits if any ledger key is wholly absent.
+This fired immediately on the old 171-key plant, which is why the plant is now generated
+over all 3820 keys -- so it exercises the tables at the real n, with the real p95 indices.
+
+One further item: the two chain207 figures condition 4's header cites (the 2.7x tercile
+spread, rho -0.62) now carry amendment 9(4)'s transferability mark in the output. They
+are grounds for a withdrawal, not thresholds, and nothing compares against either.
+
+### The unifying statement, which is the part worth carrying
+
+**There is no such thing as "the floor" for a run.** A floor is a functional over a
+population, and this file had one floor object with three different statistics set against
+it: condition 4 matched (per-cell against per-cell p95), condition 3 primary mismatched
+twice (functional and population), condition 3 secondary building its own and diverging
+from the registered word. Every site where a number meets a floor needs checking against
+what sits on the other side of the comparison -- the sidedness, the functional, and the
+population, each separately.

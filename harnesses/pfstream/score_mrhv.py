@@ -43,8 +43,34 @@ def geo(v):
     return math.exp(statistics.median([math.log(x) for x in v]))
 
 
-def boot_sep(arm, flo, seed, B=2000):
-    """CI for p95(arm) - p95(floor) by resampling CELLS, which are paired in both.
+def boot_sep(arm, flo, seed, B=2000, stat="tail"):
+    """CI for functional(arm) - functional(floor) by resampling CELLS, paired in both.
+
+    `stat` picks the functional, and the choice is not cosmetic -- it has to match the
+    SIDEDNESS of the effect:
+
+      "tail"    p95 of the per-cell |log| displacement. Two-sided. Correct for a
+                difference that may go either way: condition 1 (a firing difference has
+                no preferred sign) and condition 2 (an equivalence test).
+
+      "center"  the geometric middle of the per-cell ratio, compared on the log scale.
+                One-sided and monotone in a uniform speedup. This is what amendment 2
+                registers for condition 3 secondary.
+
+    Using "tail" for a one-sided effect is a real defect and not a conservative choice.
+    A uniform speedup divides every cell's ratio by the effect, which pulls the cells
+    sitting above 1 DOWN through 1 and out of the two-sided tail before the far side
+    regrows, so p95(|log|) is NON-MONOTONE in the effect with its minimum near the
+    effect sizes this screen exists to detect. Measured on chain207's own A/A noise over
+    the 51 cells, floor p95 19.14% of S-1:
+
+        plant   x1.00   x1.02   x1.05   x1.10   x1.15   x1.25
+        p95     19.14   16.81   16.58   22.13   27.69   38.79
+        verdict inside  inside  inside  inside  DISPL   DISPL
+
+    The statistic FALLS below its own no-effect value at x1.02 and x1.05 and does not
+    fire until x1.15, while the registered geometric middle separates from x1.02 onward.
+    The whole registered 7.7-12.4% mechanism range lands in the dead zone.
 
     A bare comparison of two p95 point estimates is a coin flip when nothing is
     happening: two p95s of the same noise distribution differ by a fraction of a
@@ -66,9 +92,16 @@ def boot_sep(arm, flo, seed, B=2000):
     h = hashlib.sha256(repr(idx).encode()).hexdigest()[:16]
     seps = []
     for row in idx:
-        a = p95_upper([arm[i] for i in row])[0]
-        f = p95_upper([flo[i] for i in row])[0]
-        seps.append((math.exp(a) - 1.0) - (math.exp(f) - 1.0))
+        if stat == "center":
+            # log of the floor's middle minus log of the arm's middle: positive when the
+            # arm is FASTER than an A/A contrast is, which is the one-sided question.
+            a = math.log(geo([arm[i] for i in row]))
+            f = math.log(geo([flo[i] for i in row]))
+            seps.append(math.expm1(f - a))
+        else:
+            a = p95_upper([arm[i] for i in row])[0]
+            f = p95_upper([flo[i] for i in row])[0]
+            seps.append((math.exp(a) - 1.0) - (math.exp(f) - 1.0))
     seps.sort()
     lo = seps[int(0.025 * (B - 1))]
     hi = seps[int(0.975 * (B - 1))]
@@ -98,7 +131,16 @@ def load(csv_dir, dtype, prefix):
 
 
 def behind_set(ledger_dir):
-    """The sign-only 51: every one of 12 readings at k=4 above 1.0. No median anywhere."""
+    """The sign-only 51, and the ledger's FULL key set at k=4.
+
+    The full set is returned because the scorer's own key list is derived from the CSVs
+    it is certifying: a key missing from every object in every pass is not "short", it is
+    simply absent from `keys` and from `dims`, and no per-cell completeness check can see
+    it. The ledger is an independent record of which matrices the corpus holds, so the
+    comparison costs nothing and closes the one direction the completeness guard cannot.
+
+    Returns (the 51, every distinct key at k=4).
+    """
     R = collections.defaultdict(lambda: collections.defaultdict(dict))
     for p in sorted(glob.glob(os.path.join(ledger_dir, "dl_*_float32_p*.csv"))):
         b = "aa" if "_aa_" in p else "bb"
@@ -113,7 +155,7 @@ def behind_set(ledger_dir):
             v += [d[p]["ours"] / d[p]["mkl"] for p in d if "ours" in d[p] and "mkl" in d[p]]
         if len(v) == 12 and all(x > 1.0 for x in v):
             out.append(key)
-    return out
+    return out, sorted({k for k, _ in R})
 
 
 def paired(obs, keys, k, arm, lo, hi, passes):
@@ -175,9 +217,23 @@ def main(argv):
     print("   GUARD: every cell carries all 4 objects in all %d passes" % len(passes))
 
     # --- the behind set, matched into this corpus by an explicit, reported prefix strip
-    led = behind_set(ledger)
+    led, led_all = behind_set(ledger)
     strip = lambda s: s.split("/", 1)[1] if s.startswith("dlmc/") else s
     b51 = [strip(k) for k in led]
+    led_keys = {strip(k) for k in led_all}
+    absent = sorted(led_keys - set(keys))
+    extra = sorted(set(keys) - led_keys)
+    print("   ledger corpus at k=4: %d distinct keys; this run carries %d"
+          % (len(led_keys), len(keys)))
+    print("   in the ledger but ABSENT from every object in every pass: %d" % len(absent))
+    for k in absent[:5]:
+        print("      %s" % k)
+    print("   in this run but not in the ledger: %d" % len(extra))
+    if absent:
+        print("EXIT: a key absent from the whole run is invisible to the per-cell")
+        print("      completeness check -- it is not short, it is missing -- so the")
+        print("      populations below would silently be narrower than they claim.")
+        return 1
     hit = [k for k in b51 if k in set(keys)]
     print("== populations")
     print("   sign-only behind set from the ledger: %d keys (every one of 12 readings > 1.0)" % len(led))
@@ -259,38 +315,42 @@ def main(argv):
         print("   reports the curve and lets its shape answer. Both units are printed, because")
         print("   the mechanism's reachability was verified as FACTORS (x1.1008 and so on) and")
         print("   a factor may only be set against the S-1 column.")
+        print("   The last column is the A/A GEOMEAN on the same cells -- the functional")
+        print("   matched to the one beside it. The per-cell p95 floor that used to sit here")
+        print("   was a pooled centre set against a per-cell tail over a different")
+        print("   population, and it printed a verdict in a block that decides nothing.")
         print("   %-5s %5s  %-14s  %-14s  %-16s %s"
-              % ("k", "n", "speedup factor", "pct of S-1", "pct of 1-1/S", "floor, of S-1"))
+              % ("k", "n", "speedup factor", "pct of S-1", "pct of 1-1/S", "A/A geomean"))
         for k in widths:
             d = paired(obs, hit, k, arm, FLOOR_BUILDS[0], ARM, passes)
             if not d:
                 continue
             r = geo(list(d.values()))            # arm / control
             g = 1.0 / r                          # the speedup as a factor
-            f = floor.get(k, float("nan"))
-            print("   k=%-3d %5d  x%-13.4f  %+13.2f%%  %+15.2f%%  %7.2f%%   %s"
-                  % (k, len(d), g, 100 * (g - 1.0), 100 * (1.0 - r), 100 * f,
-                     "beyond" if (g - 1.0) > f else "inside"))
+            aa = paired(obs, hit, k, arm, FLOOR_BUILDS[0], FLOOR_BUILDS[1], passes)
+            print("   k=%-3d %5d  x%-13.4f  %+13.2f%%  %+15.2f%%  %.4f"
+                  % (k, len(d), g, 100 * (g - 1.0), 100 * (1.0 - r),
+                     geo(list(aa.values())) if aa else float("nan")))
 
         # ---------------- condition 3 secondary, displacement against its own floor
-        print("\n-- CONDITION 3 SECONDARY  k=4 displacement vs the floor at the same n")
+        print("\n-- CONDITION 3 SECONDARY  k=4 geomean displacement vs the geomean's own floor")
+        print("   amendment 2 registers this as the k=4 GEOMEAN against the geomean's own")
+        print("   floor from the mr0/mr0b pair, and amendment 10 corrects the implementation:")
+        print("   it had used the two-sided p95 of per-cell |log|, which is non-monotone in a")
+        print("   one-sided effect and reads 'inside the floor' across the whole registered")
+        print("   mechanism range. The functional below is the registered one.")
         if 4 in widths:
             d = paired(obs, hit, 4, arm, FLOOR_BUILDS[0], ARM, passes)
             fd = paired(obs, hit, 4, arm, FLOOR_BUILDS[0], FLOOR_BUILDS[1], passes)
             cells = sorted(set(d) & set(fd))
-            dv = [abs(math.log(d[c])) for c in cells]
-            fv = [abs(math.log(fd[c])) for c in cells]
-            a, ai, an = p95_upper(dv)
-            b, bi, bn = p95_upper(fv)
-            print("   arm   n=%3d  p95 = %6.2f%% of S-1  (upper order statistic, index %d of %d)"
-                  % (an, 100 * (math.exp(a) - 1), ai, an))
-            print("   floor n=%3d  p95 = %6.2f%% of S-1  (upper order statistic, index %d of %d)"
-                  % (bn, 100 * (math.exp(b) - 1), bi, bn))
-            lo, hi, h, n = boot_sep(dv, fv, seed=409)
-            print("   separation = [%+.2f, %+.2f] pp of S-1   index matrix sha %s, B=2000"
-                  % (100 * lo, 100 * hi, h))
-            print("   -> %s" % ("DISPLACED beyond the floor" if lo > 0 else
-                                "inside the floor"))
+            dv = [d[c] for c in cells]
+            fv = [fd[c] for c in cells]
+            lo, hi, h, n = boot_sep(dv, fv, seed=409, stat="center")
+            print("   n=%3d  arm geomean %.4f   A/A geomean %.4f" % (n, geo(dv), geo(fv)))
+            print("   the arm's speedup over the A/A contrast = [%+.2f, %+.2f] pp of S-1"
+                  % (100 * lo, 100 * hi))
+            print("          index matrix sha %s, B=2000, resampled on the cell, stat=center" % h)
+            print("   -> %s" % ("DISPLACED beyond the floor" if lo > 0 else "inside the floor"))
 
         # ---------------- condition 3 descriptive
         print("\n-- CONDITION 3 DESCRIPTIVE  parity counts beside flip counts")
@@ -298,7 +358,6 @@ def main(argv):
         print("   only and decide nothing. The flip count is printed beside them because two")
         print("   byte-identical builds disagreed on 25 of 51 verdicts at the old pass line.")
         if 4 in widths:
-            ctl = paired(obs, hit, 4, "ours", FLOOR_BUILDS[0], FLOOR_BUILDS[0], passes)
             d = paired(obs, hit, 4, arm, FLOOR_BUILDS[0], ARM, passes)
             fd = paired(obs, hit, 4, arm, FLOOR_BUILDS[0], FLOOR_BUILDS[1], passes)
             better = sum(1 for v in d.values() if v < 1.0)
@@ -309,17 +368,30 @@ def main(argv):
         # ---------------- condition 4, no stratification
         print("\n-- CONDITION 4  no regression off the behind set, UNSTRATIFIED (amendment 7)")
         print("   the row-dispersion stratifier is withdrawn: it sorts cells by their own A/A")
-        print("   floor (2.7x across terciles) and predicts the outcome (rho -0.62).")
+        print("   floor (2.7x across terciles) and predicts the outcome (rho -0.62). Both of")
+        print("   those are chain207 6-pass figures, cited as the GROUNDS for a withdrawal and")
+        print("   not as thresholds -- per amendment 9(4) no chain207 floor transfers to a")
+        print("   4-pass run, and nothing here compares against either number.")
+        print("   The null is MEASURED, not asserted. The floor is a p95 of |log|, so 5% of")
+        print("   cells exceed it on EITHER side and only about half of those on the upper")
+        print("   side the count tests -- the printed 5.00%% was roughly twice the right")
+        print("   number, in the direction that makes a clean run look like a regression.")
+        print("   So the A/A pair's own one-sided exceedance is computed per width and")
+        print("   printed beside the arm's, which needs no distributional assumption.")
         for k in widths:
             d = paired(obs, rest, k, arm, FLOOR_BUILDS[0], ARM, passes)
             if not d:
                 continue
             f = floor.get(k, float("nan"))
+            aa = paired(obs, rest, k, arm, FLOOR_BUILDS[0], FLOOR_BUILDS[1], passes)
+            null = (100.0 * sum(1 for v in aa.values() if math.log(v) > math.log(1.0 + f))
+                    / len(aa)) if aa else float("nan")
             worse = [(key, v) for key, v in d.items() if math.log(v) > math.log(1.0 + f)]
             wk, wv = max(d.items(), key=lambda kv: kv[1])
-            print("   k=%-3d n=%4d  geomean arm/control %.4f  cells beyond the floor %4d = %5.2f%%"
-                  " (null 5.00%% by the floor's own definition)"
-                  % (k, len(d), geo(list(d.values())), len(worse), 100 * len(worse) / len(d)))
+            print("   k=%-3d n=%4d  geomean arm/control %.4f  cells beyond the floor %4d ="
+                  " %5.2f%%  vs the A/A pair's own %5.2f%% at the same floor"
+                  % (k, len(d), geo(list(d.values())), len(worse),
+                     100 * len(worse) / len(d), null))
             print("          worst cell %s  %.4f  rows=%d nnz=%d deg=%.1f"
                   % (wk, wv, dims[wk][0], dims[wk][1], dims[wk][2]))
     return 0
