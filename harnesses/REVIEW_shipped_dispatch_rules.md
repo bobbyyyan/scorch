@@ -1901,9 +1901,58 @@ adding it there moves the mean by 0.0001 pp.
 ### A reporting defect this exposes in every CI above
 
 Endpoints that move 0.123 pp across seeds cannot be reported to two decimals. The published
-intervals print figures like `[-17.24, -13.90]` whose last digit is not reproducible, and bootstrap
-jitter falls as 1/sqrt(nboot), so recovering that digit would need roughly 100x the 4000 draws
-rather than a different seed. **The intervals should be read to 0.1 pp**, at which precision every
-one of them is stable and every conclusion drawn from them holds. The per-band dips and their signs
-are unaffected; only the printed precision of the endpoints overstates what the method supports.
-See the note on an index matrix being what pins a bootstrap bound -- a seed plus nboot does not.
+intervals print figures like `[-17.24, -13.90]` whose last digit is not reproducible.
+
+**My first repair -- "read them to 0.1 pp" -- is wrong, and the five seeds above refute it:**
+
+    lower  -17.241 -17.334 -17.211 -17.253 -17.236  ->  -17.2 -17.3 -17.2 -17.3 -17.2
+    upper  -13.896 -13.885 -13.900 -13.959 -13.885  ->  -13.9 -13.9 -13.9 -14.0 -13.9
+
+Two distinct values at **each** endpoint, and the upper one crosses a whole unit in the first
+decimal at `-13.959`. **A rounding quantum equal to the spread leaves the last digit flipping; the
+quantum has to EXCEED it**, conventionally by 2-3x -- here 0.5 pp.
+
+**The better form carries the jitter instead of hiding it:** `-17.24 +- 0.12 across seeds`, which
+is strictly more informative than any rounding because it reports the method's reproducibility
+rather than concealing it. Otherwise pin the resampling with an index matrix.
+
+**Resampling harder is not the escape, and the arithmetic is worse than I implied.** Jitter falls
+as 1/sqrt(nboot), so 100x the draws (400k) buys 0.0123 pp -- which still exceeds the 0.01 pp
+printing quantum. A *reproducible* second decimal needs the spread under half a unit in the last
+place, 0.005 pp, which is about **605x = 2.4M draws**. So "~100x" was the right factor for
+0.0123 pp and badly understates the cost if read as "then two decimals would be fine". Report
+coarser; do not resample harder.
+
+The per-band dips, their signs, the band ordering and the rank reversal are all unaffected. At
+0.5 pp granularity every interval in this finding is stable and every conclusion drawn from one
+still holds. What was wrong is printed precision the method never had to offer. See the note on an
+index matrix being what pins a bootstrap bound -- a seed plus nboot does not.
+
+### The degenerate back-derivation, which is sharper than calling one branch lucky
+
+Recovering the moved key's own contrast from the published 2-decimal band figures was tried two
+ways: removing it from band 256+ implied -8.16%, adding it to 100-256 implied -11.72%, against the
+truth of -11.833%. I attributed the near-agreement of the second to the key's contrast nearly
+equalling that band's mean.
+
+**It is stronger than luck: that branch had no content at all.** When the published before and
+after values are *equal* -- as they are at -11.72% either side, the band moving by -0.0001 pp --
+the back-derivation returns the reported mean **identically**. It is an algebraic identity, not an
+estimate, so its 0.11 pp accuracy measures only how near the key sits to the band mean, which is
+the same fact as the band not moving. **Check whether a derivation degenerates on the inputs
+available before reading its output as an estimate.**
+
+## Pending: the two-host confirmation for the width attribution
+
+The width attribution is DLMC-only and single-host. MKT can test it -- the half-vector block is
+`__AVX2__ && __FMA__`, which Zen4 satisfies, so the kernel is live there on a different ISA
+(AVX-512 vs redwood's AVX2). Job **17701493** submitted 2026-10-03, measuring k in {2,4,8} at 9
+reps over **both** collections from MKT's own caches (ss 4594, dlmc 3820), using the existing
+release build `ship` (`4c11296ce2a68c3d`).
+
+Checked before submitting, because a hooks build would make the MKL columns unreadable rather than
+merely noisy: the object carries **one** `SCORCH_SPMM_*` string (`SCORCH_SPMM_ATPARALLEL`), not the
+dozens a `SCORCH_TUNE_HOOKS` build carries, and ambient `SCORCH_*` is empty under the allocation.
+The key lists are generated from each cache by `find`, so the group-qualified `ss` layout cannot
+silently drop keys -- and `mrgate.py`'s `resolve_all` refuses on any unresolved key rather than
+proceeding short.
