@@ -2880,7 +2880,10 @@ publication rounding or a population mismatch, nothing else.** The one partition
 already quantifies is closed by a number measured earlier in it -- rounded-versus-exact degree
 binning moves DLMC 256+ from n=713 to n=712 and the figure by **+0.0052 pp**, 25x too small to be
 0.128. The pairing route is untestable from what is held locally, since redwood's per-key five-width
-board is not on this host.
+board is not on this host. **[SUPERSEDED, in place: it IS on this host, in the sealed ledgers --
+`chain196-fullcollection-redwood` and the chain205/206 objects. That sentence described my search,
+not the ledger, and the route is closed below. Do not read past this clause with the claim above
+it.]**
 
 **And the high bands are the same KEYS on both hosts, which removes a population difference from the
 registered test.** Band censuses over exact `nnz/rows`:
@@ -3086,13 +3089,27 @@ shapes of which two are `rows 33288, nnz 8521728` where the row count is not a p
 reviewer's). The internal check that the two conventions describe one population: 712 - 185 =
 713 - 186 = 527 strictly above 256, which is the `:1959` table's own figure.
 
-**The single flip is selected by the format's resolution, not produced by one key's coincidence.**
-**Six** keys sit strictly between 255 and 256 -- 255.998046875 (`rows 512, nnz 131071`),
-255.954589844, 255.908203125, 255.740234375, 255.320312500, 255.257812500 -- and only the first is
-within the 0.005 that `"%.2f"` can move, so it alone renders as `256.00`. That is why the count is
-1 rather than 6, and it is a fact about the format's resolution meeting the collection's
-distance-to-edge distribution. A peer put the candidate set at three; it is six, and the conclusion
-is the same but less accidental for it. SuiteSparse's closest approach to any edge is **0.033**, which is why
+**The single flip is selected by the format's resolution with a wide margin, and the right
+statement of that is a margin rather than a count.** "One candidate out of three" and "one out of
+six" are both **window-bound** -- three keys lie in (255.9, 256) and six in (255, 256), neither
+window is canonical, and the N can be made to read almost anything by choosing one. The window-free
+form is each key's distance to the edge in units of the `"%.2f"` resolution, 0.005:
+
+| deg | gap to 256 | x of the 0.005 resolution | shape | |
+|---|---|---|---|---|
+| 255.998046875 | 0.001953125 | **0.39** | rows 512, nnz 131071 | **flips to 256.00** |
+| 255.954589844 | 0.045410156 | 9.08 | rows 2048, nnz 524195 | |
+| 255.908203125 | 0.091796875 | 18.36 | rows 512, nnz 131025 | |
+| 255.740234375 | 0.259765625 | 51.95 | rows 512, nnz 130939 | |
+| 255.320312500 | 0.679687500 | 135.94 | rows 512, nnz 130724 | |
+| 255.257812500 | 0.742187500 | 148.44 | rows 512, nnz 130692 | |
+
+The flipping key sits at **39% of the format's resolution and the runner-up is 9.1x outside it**, so
+the selection is not marginal -- and no choice of window can inflate or deflate that. Peer
+reviewer's correction, of a framing they had themselves supplied and I had carried in their name.
+**State a margin, not a count, when the count depends on a window you chose.** The same caution
+applies to my own "eight hits" in the sweep above: that number is grep-pattern-relative, a different
+pattern returns a different eight, and only the per-item classification transfers. SuiteSparse's closest approach to any edge is **0.033**, which is why
 2-decimal and exact agree there in every band. **Convention-invariance is a property of a
 collection's distance-to-edge distribution, so it has to be re-derived per corpus and never carried
 across one.** Peer reviewer's scoping; both censuses recomputed here.
