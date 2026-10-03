@@ -62,15 +62,31 @@ def boot_sep(arm, flo, seed, B=2000, stat="tail"):
     sitting above 1 DOWN through 1 and out of the two-sided tail before the far side
     regrows, so p95(|log|) is NON-MONOTONE in the effect with its minimum near the
     effect sizes this screen exists to detect. Measured on chain207's own A/A noise over
-    the 51 cells, floor p95 19.14% of S-1:
+    the 51 cells, on the SAME construction paired() builds here -- the object pair on
+    the `ours` column, whose floor p95 is 39.77% of S-1:
 
-        plant   x1.00   x1.02   x1.05   x1.10   x1.15   x1.25
-        p95     19.14   16.81   16.58   22.13   27.69   38.79
-        verdict inside  inside  inside  inside  DISPL   DISPL
+        plant   x1.00   x1.02   x1.05   x1.10   x1.15   x1.25   x1.50
+        p95     39.77   37.84   33.90   30.10   36.02   47.85   77.41
+        verdict inside  inside  inside  inside  inside  inside  DISPL
 
-    The statistic FALLS below its own no-effect value at x1.02 and x1.05 and does not
-    fire until x1.15, while the registered geometric middle separates from x1.02 onward.
-    The whole registered 7.7-12.4% mechanism range lands in the dead zone.
+    The statistic falls below its own no-effect value from x1.02 through x1.10 and does
+    not fire until a x1.50 speedup. The registered mechanism is 7.7-12.4%, so detecting
+    it would have needed an effect four to six times larger than the one sought.
+
+    Which A/A construction this is measured on matters, and four of them share the name.
+    Over the same 51 cells at k=4, p95 of the per-cell |log|: the object pair on `ours`
+    is 39.77% of S-1, on `oursb` 33.29%, an arm pair inside one build 21.34%, and the
+    object pair on S = ours/mkl 19.14% -- the last being the sealed analyser's form,
+    which divides MKL out of both sides so common-mode noise cancels. paired() builds
+    the first. An earlier version of this table was computed on the last and understated
+    the defect threefold.
+
+    And the plant above is a UNIFORM rescale, which is degenerate for the corrected
+    statistic: arm = floor/g makes every bootstrap replicate exactly g-1 and the interval
+    collapses to a point. It is a valid probe of the BROKEN statistic precisely because
+    that one is not invariant to a uniform shift -- that invariance failure is the defect.
+    For the corrected statistic, power has to be measured with independent numerators;
+    amendment 11 does that and finds the registered range detected at +6.86 pp or better.
 
     A bare comparison of two p95 point estimates is a coin flip when nothing is
     happening: two p95s of the same noise distribution differ by a fraction of a
