@@ -3782,3 +3782,74 @@ original indentation.
 same exact-kernel instantiation set as the pre-edit object, and no pre-edit source line was
 modified. That is what inert means operationally. **They do not support "byte-identical object",
 and it is not claimed.**
+
+### 6. The selection script's own metric was broken, and fixing it exposed a second error in how I read it
+
+Four defects, all in `rvlf_select.sh`, none touching job 17704079. Peer reviewer's findings; the
+numbers below are measured here on the existing ROWVEC objects, which needed no rebuild.
+
+**The displacement metric was a cross product, and the verdict it exists to produce could not
+fire.** The join keyed on field 2 of a whitespace-split line, which for a function template is the
+**return type** -- `void` for nearly every kernel here -- so `join` emitted the cross product and
+`awk '$1 != $2'` counted address pairs between *different* symbols. Distinct symbols always have
+distinct addresses, so with n symbols sharing `void` the count was bounded below by n(n-1) and
+`[ "$D" = 0 ]` was unreachable. Measured on `ship` vs `shpb`, whose `.text` digests are **identical**
+so the true displacement is exactly 0:
+
+| pair | old metric | fixed metric | truth |
+|---|---|---|---|
+| `ship` vs `shpb` | **514** (frac 18.36) | **0** | 0, identical `.text` |
+| `ship` vs `rvec` | 404 | 21 of 21 joined | nonzero, `.text` differs by 90272 |
+| `ship` vs `hi01` | 514 | **0** of 28 joined | `.text` differs by 208 |
+
+The failure direction was the harmful one: a pair that moved nothing read as usable and would have
+cost job time. Fixed by keying the join on the whole name, splitting address from name on `nm`'s
+type column rather than by whitespace count -- which also removes a `$9` truncation that cut
+signatures at seven tokens.
+
+**A tool failure could arrive wearing a measurement verdict.** The non-vacuity guard covered the
+base side only. A failing `nm` on a *tag* left an empty symbol file, the join yielded nothing,
+`D=0`, and the row printed "UNUSABLE -- float32 code did not move". Each tag now reports its own
+tracked and joined counts and a zero in either is a refusal. `objcopy` failures were silently
+absorbed into `$((T - BT))` as a large negative delta; `textsize` now returns nonzero and the row
+refuses.
+
+**The concurrency guard failed open.** `squeue ... 2>/dev/null | grep -q` produces no match when
+`squeue` is absent, errors, or changes format, so a broken query was indistinguishable from "no
+such job" -- and the script would have built beside a live measurement, the one thing it exists to
+prevent. The status is now captured and a nonzero rc is a refusal, and it matches **any** state
+rather than only `RUNNING`, since a `PENDING` job of this family can start mid-build. Verified
+firing on a present job (rc=1 naming 17704079); the missing half was that it could not tell "no
+such job" from "could not ask".
+
+**The unit question, settled by measurement rather than by reading.** `TARGET_DELTA` is compared
+against `objcopy --only-section=.text` sizes, and 1073586 had appeared in two roles in my own
+notes. `size -A` and `objcopy` agree: `ship` `.text` 1073586, `rvec` 983314, `hi01` 1073378, while
+the **file** sizes are 21287312 / 21225008 / 21285816. So 90272 is a `.text` delta compared against
+`.text` sizes and the units are consistent. The ambiguity was in my phrasing, not the script.
+
+**And the fix exposed an error of mine the peer had not raised: `displaced` does not mean the same
+thing on both axes.** For a `_F64` knob the float32 content is *provably* identical, so
+displacement is the whole of the difference the float32 side can see -- zero displacement means
+the float32 execution is bit-identical and the pair is an A/A. For a float32 knob like `hv00` the
+emitted code changes as well as its placement, so zero displacement does **not** mean nothing
+changed and the pair is still informative. A single `UNUSABLE` label would have misread one of
+them. The script now declares an axis per arm and interprets accordingly.
+
+That also means the two axes bound different things, which is more useful than one number:
+the `_F64` arms give a **pure-placement** floor, a lower bound on what a content-changing arm
+incurs; `hv00` is closer in kind to ROWVEC, which itself changes float32 content substantially.
+
+`ship` vs `hi01` is the concrete case: a 208-byte `.text` delta that displaces **zero** of 28
+tracked float32 symbols, against `ship` vs `rvec` displacing 21 of 21 joined. Delta and
+displacement are close to independent, so selecting on delta alone would have been wrong -- which
+is the peer's point, now measured rather than argued.
+
+**One check of mine that was necessary but not sufficient.** I proposed verifying the pairing by
+equal row counts across the four builds. That does not establish it: if one key fails in `ship` and
+a *different* key fails in `rvec`, both files land on the same reduced count while the paired key
+sets differ, and a partial loss of one width of one key moves the count by less than 9 against an
+expectation of 11035. What settles it is **set identity** -- the distinct `(key, k, arm)` set equal
+to the row count within each file, and that set identical across the four files, with `LC_ALL=C`
+fixed on both the sort and the consumer. `ss_float32_ship_s0.csv` is 11035 rows (1226 x 3 x 3 plus
+header), which is necessary and is not the check.

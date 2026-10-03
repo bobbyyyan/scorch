@@ -74,10 +74,22 @@ python -c "import torch,sys; sys.stderr.write('torch %s at %s\n'%(torch.__versio
 
 # A CONCURRENT BUILD PERTURBS A LIVE MEASUREMENT, and this script exists to measure a floor, so
 # running it beside a timing job would put the contention inside the number it produces.
-if squeue -u "$(whoami)" -h -o '%i %T %j' 2>/dev/null | grep -qE 'RUNNING.*(rvec_screen|rvlf)'; then
-  echo "REFUSE: a screen job of this family is RUNNING. Building now contends for the cores and"
-  echo "        the memory bandwidth it is timing on. Wait for it, then re-run."
-  squeue -u "$(whoami)" -h -o '  %i %T %M %j' | sed 's/^/  /'
+# FAILS CLOSED, which the first version did not. `squeue | grep -q` produces no match when
+# squeue is absent, errors, or changes format, so a broken query was indistinguishable from "no
+# such job" and the script would have built next to a live measurement -- the one thing it exists
+# to prevent. The status is captured and a nonzero rc is a REFUSAL. It also matches any state, not
+# just RUNNING: a PENDING job of this family can start mid-build, and a build that began legally
+# does not become harmless when the measurement starts underneath it.
+if ! q=$(squeue -u "$(whoami)" -h -o '%i %T %M %j' 2>&1); then
+  echo "REFUSE: squeue failed, so this cannot tell 'no such job' from 'could not ask':"
+  echo "$q" | sed 's/^/        /'
+  exit 1
+fi
+if printf '%s\n' "$q" | grep -qE '(rvec_screen|rvlf)'; then
+  echo "REFUSE: a job of this family is queued or running. Building now contends for the cores and"
+  echo "        the memory bandwidth it is timing on, which would put this script's own"
+  echo "        contention inside the floor it exists to measure."
+  printf '%s\n' "$q" | grep -E '(rvec_screen|rvlf)' | sed 's/^/        /'
   exit 1
 fi
 
@@ -93,6 +105,27 @@ DEFS[mr64]="-DSCORCH_SPMM_MULTIROW_ROWS_F64=2"
 DEFS[both]="-DSCORCH_SPMM_HALFVEC_F64=1 -DSCORCH_SPMM_MULTIROW_ROWS_F64=2"
 DEFS[hv00]="-DSCORCH_SPMM_HALFVEC_F32=0"
 TAGS="base hv64 mr64 both hv00"
+
+# THE AXIS PER ARM, because `displaced` does NOT mean the same thing on both and a single verdict
+# label would misread one of them.
+#   placement  a _F64 knob leaves the float32 code's CONTENT provably identical (every per-dtype
+#              constant is a std::is_same<scalar_t,float> ternary, constexpr off the hooks path).
+#              So displacement is the WHOLE of the difference the float32 side can see: zero
+#              displacement means the float32 execution is bit-identical and the pair measures
+#              nothing. This isolates a pure-placement floor, which is a LOWER bound on the
+#              artefact a content-changing arm like ROWVEC incurs.
+#   content    a float32 knob changes the emitted code as well as where it sits, so zero
+#              displacement does NOT mean nothing changed and the pair is still informative.
+#              Closer in kind to ROWVEC, which is why it is kept despite the weaker inertness
+#              argument.
+# Measured on the existing ROWVEC objects: ship vs hi01 has a 208-byte .text delta and displaces
+# ZERO of 28 tracked float32 symbols, while ship vs rvec displaces 21 of 22 joined. So delta and
+# displacement are close to independent, and selecting on delta alone would have been wrong.
+declare -A AXIS
+AXIS[hv64]="placement"
+AXIS[mr64]="placement"
+AXIS[both]="placement"
+AXIS[hv00]="content"
 
 for tag in $TAGS; do
   d="$ROOT/$tag"
@@ -152,34 +185,77 @@ echo "  .text delta   -- the size of the object perturbation"
 echo "  f32 displaced -- how many float32 SpMM symbols changed ADDRESS. A _F64 knob leaves the"
 echo "                   float32 code's CONTENT identical, so if the linker does not move it the"
 echo "                   pair measures nothing and the .text delta is irrelevant."
+# THE SYMBOL TABLE, KEYED ON THE WHOLE NAME. The first version keyed the join on field 2 of a
+# whitespace-split line, which for a function template is the RETURN TYPE -- `void` for nearly
+# every kernel here -- so `join` emitted the cross product and counted address pairs between
+# DIFFERENT symbols. With n symbols sharing `void` the count was bounded below by n*(n-1), so
+# `[ "$D" = 0 ]` was unreachable and the UNUSABLE verdict this script exists to produce could
+# never fire. The failure direction was the harmful one: a pair that moved nothing read as usable
+# and would have cost job time. Splitting address from name on nm's TYPE column also removes the
+# $9 truncation, which cut signatures at seven tokens and dropped the type field.
+PAT='scorch_spmm_row_(narrow_exact|narrow_rowvec|regblock|gather)<(float|scalar_t)|spmm_csr_v2_core<float'
+symtab() {  # $1 = .so, $2 = output path
+  nm -C --defined-only "$1" 2>/dev/null \
+    | grep -E "$PAT" \
+    | sed 's/^\([0-9a-f]*\) \([A-Za-z]\) /\1\t\2\t/' \
+    | awk -F'\t' 'NF>=3 { print $3 "\t" $1 }' \
+    | LC_ALL=C sort -t'\t' -k1,1 > "$2"
+}
+textsize() { # $1 = .so, $2 = output bin path; echoes the size or returns nonzero
+  objcopy -O binary --only-section=.text "$1" "$2" 2>/dev/null || return 1
+  [ -s "$2" ] || return 1
+  stat -c %s "$2"
+}
+
 BSO=$(ls "$ROOT/base"/src/scorch_ops*.so | head -1)
-objcopy -O binary --only-section=.text "$BSO" "$ROOT/base/text.bin" 2>/dev/null
-BT=$(stat -c %s "$ROOT/base/text.bin")
-nm -C --defined-only "$BSO" 2>/dev/null | grep -E "scorch_spmm_row_(narrow_exact|narrow_rowvec|regblock|gather)<(float|scalar_t)|spmm_csr_v2_core<float" \
-  | awk '{print $1, $3, $4, $5, $6, $7, $8, $9}' | sort -k2 > "$ROOT/base/f32syms.txt"
+BT=$(textsize "$BSO" "$ROOT/base/text.bin") || {
+  echo "REFUSE: objcopy could not extract .text from the base object, so every delta below"
+  echo "        would be computed against nothing"; exit 1; }
+symtab "$BSO" "$ROOT/base/f32syms.txt"
 NB=$(wc -l < "$ROOT/base/f32syms.txt")
 echo "  base: .text $BT bytes, $NB float32 SpMM symbols tracked"
 [ "$NB" -gt 0 ] || { echo "REFUSE: zero float32 symbols tracked, so 'displaced' could only read 0"; exit 1; }
 echo
-printf "  %-5s %12s %12s %10s %8s  %s\n" tag text_bytes delta f32_displ frac verdict
+printf "  %-5s %-9s %12s %12s %7s %7s %10s  %s\n" tag axis text_bytes delta tracked joined displaced verdict
 for tag in $TAGS; do
   [ "$tag" = "base" ] && continue
-  so=$(ls "$ROOT/$tag"/src/scorch_ops*.so 2>/dev/null | head -1); [ -n "$so" ] || { printf "  %-5s %12s\n" "$tag" "NO OBJECT"; continue; }
-  objcopy -O binary --only-section=.text "$so" "$ROOT/$tag/text.bin" 2>/dev/null
-  T=$(stat -c %s "$ROOT/$tag/text.bin")
-  nm -C --defined-only "$so" 2>/dev/null | grep -E "scorch_spmm_row_(narrow_exact|narrow_rowvec|regblock|gather)<(float|scalar_t)|spmm_csr_v2_core<float" \
-    | awk '{print $1, $3, $4, $5, $6, $7, $8, $9}' | sort -k2 > "$ROOT/$tag/f32syms.txt"
-  # A symbol is displaced if its name is present in both and its address differs.
-  D=$(join -j 2 -o 1.1,2.1 \
-        <(awk '{a=$1; $1=""; sub(/^ /,""); print a, $0}' "$ROOT/base/f32syms.txt" | sort -k2) \
-        <(awk '{a=$1; $1=""; sub(/^ /,""); print a, $0}' "$ROOT/$tag/f32syms.txt" | sort -k2) \
-        2>/dev/null | awk '$1 != $2' | wc -l)
+  so=$(ls "$ROOT/$tag"/src/scorch_ops*.so 2>/dev/null | head -1)
+  [ -n "$so" ] || { printf "  %-5s %12s\n" "$tag" "NO OBJECT -- build failed, see build.log"; continue; }
+  # A TOOL FAILURE MUST NOT ARRIVE WEARING A MEASUREMENT VERDICT. The base side was guarded and
+  # the tag side was not: a failing nm left an empty symbol file, the join yielded nothing, and
+  # the row printed "UNUSABLE -- float32 code did not move". Each tag now reports its own tracked
+  # and joined counts, and a zero in either is a REFUSAL rather than a reading.
+  T=$(textsize "$so" "$ROOT/$tag/text.bin") || {
+    printf "  %-5s %12s\n" "$tag" "REFUSE: objcopy failed on this object"; fail=1; continue; }
+  symtab "$so" "$ROOT/$tag/f32syms.txt"
+  NT=$(wc -l < "$ROOT/$tag/f32syms.txt")
+  if [ "$NT" -eq 0 ]; then
+    printf "  %-5s %12s %12s %7s  %s\n" "$tag" "$T" "$((T-BT))" "0" \
+      "REFUSE: nm tracked 0 symbols here -- a tool failure, not a null displacement"
+    fail=1; continue
+  fi
+  # Join coverage reported beside the displacement: a name present in one object and not the other
+  # drops out of the join silently, which is the same shape of loss as a dropped manifest line.
+  J=$(LC_ALL=C join -t"$(printf '\t')" -j 1 "$ROOT/base/f32syms.txt" "$ROOT/$tag/f32syms.txt" | wc -l)
+  D=$(LC_ALL=C join -t"$(printf '\t')" -j 1 -o 1.2,2.2 \
+        "$ROOT/base/f32syms.txt" "$ROOT/$tag/f32syms.txt" \
+      | awk -F'\t' '$1 != $2' | wc -l)
   AD=$((T - BT)); [ "$AD" -lt 0 ] && AD=$((-AD))
-  FR=$(awk -v d="$D" -v n="$NB" 'BEGIN{printf "%.2f", n?d/n:0}')
-  if [ "$D" = "0" ]; then V="UNUSABLE -- float32 code did not move"
-  elif [ "$AD" -ge "$TARGET_DELTA" ]; then V="BRACKETS FROM ABOVE"
-  else V="brackets from below"; fi
-  printf "  %-5s %12s %12s %10s %8s  %s\n" "$tag" "$T" "$((T-BT))" "$D" "$FR" "$V"
+  AX=${AXIS[$tag]:-content}
+  if [ "$J" -eq 0 ]; then
+    V="REFUSE: join matched 0 names -- not a null displacement"
+    fail=1
+  elif [ "$D" -eq 0 ] && [ "$AX" = "placement" ]; then
+    # Content is provably identical on this axis, so nothing moving means nothing differs.
+    V="UNUSABLE -- float32 content identical AND unmoved, so this pair is an A/A"
+  elif [ "$D" -eq 0 ]; then
+    V="usable (content axis) -- unmoved, but the emitted float32 code differs"
+  elif [ "$AD" -ge "$TARGET_DELTA" ]; then
+    V="BRACKETS FROM ABOVE"
+  else
+    V="brackets from below"
+  fi
+  printf "  %-5s %-9s %12s %12s %7s %7s %10s  %s\n" "$tag" "$AX" "$T" "$((T-BT))" "$NT" "$J" "$D" "$V"
 done
 echo
 echo "Keep the candidates whose verdict is not UNUSABLE and whose deltas STRADDLE $TARGET_DELTA."
