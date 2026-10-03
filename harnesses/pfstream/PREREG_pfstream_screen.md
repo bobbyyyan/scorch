@@ -3920,6 +3920,12 @@ withdrawn.
 
 ### DISPERSION: this cell cannot test the host claim, and the reason is measurable
 
+> **EVERY NUMBER IN THIS SECTION IS SUPERSEDED BY AMENDMENT 47.** The window factor cited
+> `mrgate.py`'s DEFAULT of 25 ms where the screens pass `--target-ms 15`; the observed
+> ratio range mixed widths and understated its upper end; and the comparator named in the
+> prose is not the one the arithmetic used. Corrected, the decomposition **does not close**
+> — which strengthens the section's own verdict rather than weakening it.
+
 31.3 to 51.3 pp here against 3.2 to 9.0 pp in the three screens. **Before reading that as a
 refutation of the host claim, two differences in measurement design, both measured rather than
 asserted:**
@@ -3955,3 +3961,75 @@ near 38% at 1e4–1e6 nnz against these 3–9 pp bands, with a strong inverted-U
 floor depends heavily on the corpus's size mix; a cross-corpus substitution would manufacture a host
 effect in whichever direction the mixes differ. DLMC-to-DLMC on a matched key list is what makes
 this cell clean, and it is the only reason it was worth computing.
+
+---
+
+## Amendment 47 — amendment 46's dispersion decomposition had three defects; corrected, it does not close, and its verdict is stronger for it
+
+Three figure-level defects, all raised by a peer session from the published numbers alone. **None
+of them touches amendment 46's verdict** — "consistency, not identification" — and the corrections
+all push in the direction of making that verdict firmer, which is the only reason they are safe to
+report together.
+
+### (a) The window factor cited a default the screens override
+
+Amendment 46: *"`mrgate.py:29` targets 25 ms."* That is the **argparse default**. The screens pass
+`--target-ms 15` — `arm_screen.sh:204`, and `pfs_screen_dlmc.sbatch:133` invokes
+`arm_screen.sh … float32`, so the MKT float32 DLMC screen ran at 15 ms. `pfs_screen_f64.sbatch:64`
+passes 15 too.
+
+**A default read out of a parser is not a run's parameter.** The window factor is
+`sqrt(15 / 5.694) = 1.623×`, not `sqrt(25 / 5.694) = 2.096×`.
+
+### (b) The observed ratio mixed widths and understated its upper end
+
+Amendment 46 published *"an observed 6.4× to 9.5×"*. The lower end is `31.27/4.89 = 6.39` — the
+narrowest redwood band over the widest MKT band. The upper end, 9.5, is `31.27/3.30`: **k=2's
+numerator against the smallest MKT denominator, which is not width-matched either.** Amendment 44
+published MKT float32's bands only as a range, so the tightest statable width-matched bounds are
+
+`min 31.27/4.89 = 6.39×` and `max 51.31/3.30 = 15.55×`.
+
+### (c) The comparator named in the prose is not the one the arithmetic used
+
+Amendment 46's prose says *"against 3.2 to 9.0 pp in the three screens"* while its arithmetic
+divides by 4.89 and 3.30 — MKT float32's range. The pooled three-screen range is the wrong
+comparator for a second reason: **its 9.0 endpoint is redwood float64's 9.03, the same host as the
+numerator**, and a ratio meant to isolate host cannot take its denominator from a cell of that host.
+**The matched comparator is MKT float32/DLMC alone** — the only cell differing from the fourth in
+exactly one factor. That the lower endpoint 6.39 was right is a coincidence: it happens to come
+from the matched cell.
+
+### Corrected, and the conclusion moves
+
+| | amendment 46 | corrected |
+|---|---|---|
+| readings 6 → 16 at `n^-0.668` | 1.90× | 1.93× |
+| measurement window | 2.10× (25 ms) | **1.62× (15 ms)** |
+| product | 4.0× | **3.13×** |
+| observed ratio | 6.4× to 9.5× | **6.39× to 15.55×** |
+| residual | 1.6× to 2.4× | **2.05× to 4.98×** |
+| measured host ratio | 1.9× — **inside** | 1.9× — **BELOW the window** |
+
+**The decomposition no longer closes.** Two measured measurement-design differences plus the
+independently measured redwood/MKT host ratio **under-explain** the gap, by a factor of at least
+1.08× and at most 2.62×. So there is an unidentified factor, and amendment 46's verdict — *"the
+dispersion row of the 2×2 stays identified from the three screens alone; the fourth cell neither
+confirms nor refutes it"* — is **better supported after the correction than before it.** An
+after-the-fact product of three factors landing inside a window was weak evidence; a product that
+misses the window is not evidence at all.
+
+### And the transferable caution does NOT bite the three screens, which is now checkable rather than open
+
+Amendment 46 warned that *"a band is not comparable across runs whose readings-per-cell and
+measurement window differ"* and left it open whether that applies to the three screens themselves.
+Both axes are now closed from the artefacts:
+
+- **Readings per cell: equal at 16.** MKT float32/DLMC `{16: 2744}`, MKT float64 `{16: 2926}`,
+  redwood float64 2919 cells × 16, each from its own published census.
+- **Measurement window: equal at 15 ms.** `arm_screen.sh:204` for the arms screens and
+  `pfs_screen_f64.sbatch:64` for float64, both passing `--target-ms 15` explicitly.
+
+**So the dispersion row is safe on both axes, and the 1.9× host ratio is not an artefact of unequal
+measurement design.** That is worth stating plainly: the caution was raised against my own
+comparison and it is the fourth cell, not the three screens, that it disqualifies.
