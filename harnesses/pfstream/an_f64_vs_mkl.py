@@ -49,7 +49,24 @@ def pct(v, q):
     return v[i]
 
 
+# THE COMPARISON ARM. Default "mkl" -- the claim. Set to another arm to get the CRITERIA's OWN
+# NULLS: "behind in every reading" is an intersection over N and a median-above-1.0 test is a
+# point-estimate threshold, and the two have nulls differing by orders of magnitude, so a ratio
+# between their counts says nothing until both nulls are measured. chain207's own analyser prints
+# `oursb/ours` as its "arm-identity" floor, so --vs oursb is the structural twin of the real run:
+# same files, same pairing, same 12 readings, true ratio 1.0 at every cell.
+VS = "mkl"
+
+
 def main(argv):
+    global VS
+    for _i, _a in enumerate(argv):
+        if _a == "--vs" and _i + 1 < len(argv):
+            VS = argv[_i + 1]
+    if VS != "mkl":
+        print("COMPARISON ARM: ours vs %r -- this is a NULL RUN, not a claim. Every count below is"
+              % VS)
+        print("the number that criterion returns when the true ratio is 1.0 at every cell.")
     if len(argv) < 2:
         return "usage: an_f64_vs_mkl.py <csv-dir> [declared-ks e.g. 2,4,6,8,10,12,16]"
     d = argv[1]
@@ -105,6 +122,7 @@ def main(argv):
     degree_of = {}
     skipped = collections.Counter()
     passes, builds = set(), set()
+    _arms_seen = set()
     for n in names:
         with open(os.path.join(d, n)) as fh:
             rows = list(csv.DictReader(fh))
@@ -112,6 +130,7 @@ def main(argv):
         for r in rows:
             try:
                 by[(r["key"], int(r["k"]), r["arm"])] = float(r["ms"])
+                _arms_seen.add(r["arm"])
                 nnz[r["key"]] = int(r["nnz"])
                 rows_of[r["key"]] = int(r["rows"])
                 degree_of[r["key"]] = float(r["deg"])
@@ -127,15 +146,16 @@ def main(argv):
         for (key, k, a), t in by.items():
             if a != "ours":
                 continue
-            m = by.get((key, k, "mkl"))
+            m = by.get((key, k, VS))
             if m and t > 0 and m > 0:
                 cell[(key, k)].append((b, tag, t, m))
             else:
-                skipped["no mkl partner or non-positive"] += 1
+                skipped["no %s partner or non-positive" % VS] += 1
     print("files %d   builds %s   pass-files %d" % (len(names), sorted(builds), len(passes)))
     print("cells %d   skipped %s" % (len(cell), dict(skipped) or "{}"))
     if not cell:
-        return "REFUSE: no cells with both arms present"
+        return ("REFUSE: no cell carries both 'ours' and %r, so every count below would be zero "
+                "by construction. Arms present: %s" % (VS, sorted({a for a in _arms_seen})))
 
     nread = collections.Counter(len(v) for v in cell.values())
     print("readings per cell: %s" % dict(nread))

@@ -4176,6 +4176,13 @@ corpus-specific and the numerator fix has a different size at each width.
 
 ## Amendment 49 — amendment 48 miscounted its own table and understated its own finding by 25×. The redwood board is not 0.28% behind; it is 11.2% slower by the criterion the goal is stated in.
 
+> **THE HEADING AND SECTION (c)'s CONCLUSION ARE RETRACTED BY AMENDMENT 50.** "11.2%" is a
+> SHARE OF CELLS, not a magnitude — the board's pooled geomean is 0.7584, i.e. 31.9%
+> **faster**. And the 11.2% is **5.4× BELOW its own measured null**: on the arm-identity
+> pair, where the true ratio is 1.0 at every cell, the same criterion returns **61.0%**. The
+> 40× ratio is the two criteria's nulls, which differ by 2329×, and not something the
+> intersection criterion hid. The k=4 finding survives and is strengthened.
+
 Three corrections to amendment 48, all raised by a reviewing session, **all in the direction of
 making the finding larger**. Two are mine; one is the review's and it is wrong in a way worth
 recording.
@@ -4253,3 +4260,96 @@ construction, so it is the right headline for *"here is a cell we must fix"* and
 *"here is how much is left to fix."* Report both, with the ratio between them, because the ratio is
 a property of the screen's resolution and not of the kernel — 40× here at 12 readings, and it would
 shrink at 16.
+
+---
+
+## Amendment 50 — both criteria's nulls, measured on the arm-identity pair. Amendment 49's scoreboard claim is RETRACTED; the k=4 finding is the only thing above its own null, on all three criteria.
+
+Amendment 49 published a 40× ratio between two criteria and read it as what the conservative one
+hid. **Neither criterion had reported its null.** chain207 carries `ours`, `oursb` and `mkl`, and
+the ledger's own analyser (`an_c207.py:140,160`) computes `oursb/ours` as its **"arm-identity"**
+floor — so pairing `ours` against `oursb` gives the structural twin of the real run: same files,
+same pairing, same 12 readings, **true ratio 1.0 at every cell**. `an_f64_vs_mkl.py` now takes
+`--vs ARM` so both criteria get their nulls from **the same code path**, and REFUSES on an arm no
+row carries, naming the arms present.
+
+### The two nulls, and they differ by 2329×
+
+| criterion | observed (vs `mkl`) | **null** (vs `oursb`) | observed / null |
+|---|---|---|---|
+| behind in every one of 12 readings | 53 (0.28%) | **5 (0.03%)** | **10.6× ABOVE** |
+| cell median above 1.0 | 2144 (11.2%) | **11644 (61.0%)** | **5.4× BELOW** |
+| ratio between the two counts | 40.5× | **2329×** | — |
+
+The intersection null of 5 is almost exactly the `19100 × (1/2)^12 = 4.66` that
+reading-to-reading noise predicts, so the first of the two candidate structures holds.
+
+### What this retracts
+
+**Amendment 49's section (c) conclusion is wrong.** *"2144 of 19100 cells are slower by median, and
+the intersection criterion hid every one of them"* — the 2144 is **5.4× below** what a true null
+produces on this ledger. It is not a hidden deficit; it is **fewer** above-1.0 cells than noise
+alone would give, because the real distribution is centred at 0.7584 while the null is centred at
+1.0. **The 40× is the criteria's nulls, exactly as the review argued.**
+
+**And the heading converted a share into a magnitude.** *"The board is 11.2% slower by median"* —
+the board's pooled geomean is 0.7584, **31.9% faster**. 11.2% is the **share of cells** whose median
+exceeds 1.0. The body said it correctly; the heading, which is the most-quoted line, contradicted
+the board's own headline. Recorded rather than quietly reworded because it is the same failure class
+as several real findings in this sequence: **a quantity whose unit is a share, read as a
+magnitude.**
+
+**One thing the null also reveals: the arm-identity pair is not symmetric.** A count-above-1.0
+criterion on a symmetric null would read 50%; it reads **61.0%**, and the null's per-band median
+ratios run **1.0005 to 1.0064** — `oursb` is systematically a few tenths of a percent slower than
+`ours` within one process. So the count criterion is biased upward by ~11 points **before any kernel
+difference**, and its null is not 50% and cannot be assumed.
+
+### What survives, and is stronger for having a null
+
+**The median-RATIO table is informative, because its null is tight.** The null's degree-banded
+medians span 1.0005–1.0064 against an observed range of 0.2379–1.0987. At degree ≥256:
+
+| | k=2 | k=4 | k=8 | k=16 | k=32 |
+|---|---|---|---|---|---|
+| observed | 0.9574 | **1.0987** | 0.9381 | 0.8179 | 0.7699 |
+| null | 1.0016 | 1.0050 | 1.0064 | 1.0046 | 1.0048 |
+| **observed / null** | 0.9558 | **1.0932** | 0.9321 | 0.8141 | 0.7662 |
+
+**k=4 is 9.3% above its own null; every other width is 4.4% to 23.4% below it.**
+
+**The intersection criterion agrees, and sharpens the width claim.** Per-width behind counts are
+`{2:0, 4:51, 8:2, 16:0, 32:0}` against a per-width null of `{2:0, 4:1, 8:2, 16:1, 32:1}`. So
+**k=4 is the only width above its own null — 51 against 1 — and k=8's 2 is EXACTLY its null of 2.**
+Amendment 48 reported those 2 cells as part of the deficit; they are the null.
+
+**The count criterion agrees in one cell and nowhere else.** At degree ≥256, observed 110/**506**/
+200/41/19 against nulls 421/**462**/442/438/438: **k=4's 506 is the single cell of thirty above its
+own null (1.10×)**, and every other cell is below. So the count form is uninformative board-wide and
+still points at the same place.
+
+**Three criteria, three nulls, one width above all three.** That is a stronger statement than
+amendment 48's and it needed no new measurement — only the arm the ledger already carried.
+
+### The reusable form, amended
+
+Amendment 49 wrote: *"an intersection over N readings is conservative by construction… report both
+counts and the ratio between them, because the ratio is a property of the screen's resolution."*
+**That is true and insufficient.** The amended version:
+
+> An intersection over N readings is conservative by construction, **and a point-estimate threshold
+> is biased by the density of cells near the threshold.** Report both counts, their ratio, **and
+> each criterion's null on an A/A pair** — the third item is the only one that makes the first two
+> comparable. A criterion's null is a measurable property of the screen, not an arguable one,
+> whenever the ledger carries a pair whose true ratio is 1.0.
+
+**And the review's own withdrawal is worth keeping beside it**, because it is the same failure one
+level up: having enumerated every cell of the table with a script — which is how the "exactly one
+cell" slip was caught — it then asserted column monotonicity by reading the columns, in the next
+sentence, with the script still open. The two dips are in the third decimal of the last step.
+**Once you are computing over an artefact, compute every claim you make about it: an unchecked
+claim arriving in the same message as checked ones is read as checked.**
+
+**One cross-check I am recording because two independently computed tables constraining each other
+is worth more than either alone:** over all 30 cells, *(count share > 50%)* agrees exactly with
+*(band median > 1.0)* — zero disagreements.
