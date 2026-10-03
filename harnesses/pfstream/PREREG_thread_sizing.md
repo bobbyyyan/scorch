@@ -1500,10 +1500,124 @@ k=2 in the `<=2`-worker group.
 
 The question is whether the `<=2`-worker group intersects the deficit sets. **Registered: compute
 the overlap between MKT's 9 `<=2`-worker k=2 cells and (i) the 328 float32 DLMC k=2 deficit cells
-and (ii) the 129 float64 MKT k=2 deficit cells, by key.** `cand = min(override, rows/16)`, so a cell
+and (ii) the 129 float64 MKT k=2 deficit cells, by key.** ~~`cand = min(override, rows/16)`, so a cell
 resolving to `<=2` has `rows < 48`; every one of the 20 worst float32 DLMC cells reads `rows=512`,
-which clamps at 32. **Refutation condition: if the overlap is zero at both, the `<=2`-worker
+which clamps at 32.~~ **WRONG, corrected in amendment 21: the clamp is a CEILING on the count, not
+the count. The nine members read rows 64 to 2048, one of them exactly the 512 this sentence claims
+is excluded.** **Refutation condition: if the overlap is zero at both, the `<=2`-worker
 headroom is real, registered, and irrelevant to this project's goal, and thread sizing closes for
 the deficit on that basis rather than on the pooled number.** If the overlap is non-zero, the group
 is named and a fixed-count arm on exactly those keys is the next arm. No mechanism is proposed for
 either outcome in advance.
+
+---
+
+## Amendment 21 — amendment 20's row-count argument is wrong, and its registered overlap measurement has almost no power on the existing corpora
+
+Amendment 20 registered a measurement and gave a reason to expect its answer. The reason was wrong
+and the measurement is now done.
+
+### (a) The clamp is a ceiling on the worker count, not the count
+
+Amendment 20 wrote: *"`cand = min(override, rows/16)`, so a cell resolving to `<=2` has
+`rows < 48`; every one of the 20 worst float32 DLMC cells reads `rows=512`, which clamps at 32."*
+
+The nine members of the `<=2`-worker group at k=2 on MKT, named by `nt_k2curve.py` at
+`977c9d0d59f8e7f0`:
+
+| resolved | cur/best | null | rows | nnz | deg | key |
+|---|---|---|---|---|---|---|
+| 1 | 1.5396 | 1.2775 | **512** | 15612 | 30.49 | `transformer/l0_regularization/0.95/…encdec_attention…output_transform` |
+| 2 | 1.5168 | 1.2965 | **2048** | 20971 | 10.24 | `transformer/random_pruning/0.98/…decoder_layer_3_ffn_conv1…` |
+| 2 | 1.4197 | 1.3220 | 1024 | 23655 | 23.10 | `rn50/extended_magnitude_pruning/0.91/bottleneck_3_block_group3_5_1` |
+| 1 | 1.3986 | 1.0192 | 128 | 15187 | 118.65 | `rn50/variational_dropout/0.95/…projection_block_group2` |
+| 1 | 1.3859 | 1.1886 | 1024 | 13107 | 12.80 | `rn50/magnitude_pruning/0.95/…projection_block_group3` |
+| 2 | 1.3761 | 1.0201 | 256 | 23655 | 92.40 | `rn50/extended_magnitude_pruning/0.91/bottleneck_1_block_group3_3_1` |
+| 1 | 1.3348 | 1.0139 | 128 | 13107 | 102.40 | `rn50/random_pruning/0.8/bottleneck_1_block_group2_3_1` |
+| 1 | 1.3122 | 1.0301 | 256 | 11796 | 46.08 | `rn50/magnitude_pruning/0.98/bottleneck_2_block_group3_1_1` |
+| 1 | 1.2436 | 1.0087 | 64 | 11059 | 172.80 | `rn50/random_pruning/0.7/bottleneck_2_block_group1_1_1` |
+
+Rows run 64 to 2048, and the **first row reads exactly the 512 that amendment 20 named as the
+counter-example.** `min(override, rows/16)` bounds the count from above; production's rule then
+chooses below it on total work, so a 2048-row matrix resolves to 2 workers because `nnz` is 20971.
+**The group is a small-WORK group — nnz 11059 to 23655, every one of the nine — not a small-rows
+group.** Mean degree spans 10.24 to 172.80, so degree does not separate it either.
+
+The line that caught this is the one printed beside the table: *"a cell resolving to `<=2` workers
+is a claim about its row count that the shape columns can confirm or contradict."* It contradicted
+it on the first row. **A claim stated next to the columns that test it does not survive being
+wrong, which is the only reason to put it there.**
+
+### (b) The registered overlap, measured — and nearly powerless
+
+Amendment 20 registered: *"compute the overlap between MKT's 9 `<=2`-worker k=2 cells and (i) the
+328 float32 DLMC k=2 deficit cells and (ii) the 129 float64 MKT k=2 deficit cells, by key"*, with
+the refutation condition *"if the overlap is zero at both, the `<=2`-worker headroom is real,
+registered, and irrelevant to this project's goal."*
+
+**(ii) is zero without a measurement, by corpus disjointness.** The nine keys are DLMC
+(`<model>/<method>/<sparsity>/<layer>`); the float64 MKT deficit is SuiteSparse (`ss/<group>/<name>`).
+No join is needed and none was run.
+
+**(i) answered by the committed instrument.** `an_f64_vs_mkl.py` at `9c82ae31191662bc` now takes
+`--probe-keys` and answers the join itself, because a join answered by an uncommitted script is
+exactly how two of amendment 13's three figures became unreproducible. On
+`/scr/bobbyy/pfs/csvdlmc` — the MKT float32 DLMC screen, identified by its `k` set
+`{2,8,12,16,20,24,32}` and DLMC key shape rather than by its filename, which `POOL_PROVENANCE.txt`
+records as colliding with redwood's float64 files — it reproduces the published board exactly:
+`readings per cell {16: 2744}`, 662 behind in every reading, per-width `{2:328, 8:149, 12:102,
+16:71, 20:6, 24:4, 32:2}`.
+
+```
+9 keys requested, 1 present in this screen's corpus
+rn50/magnitude_pruning/0.98/bottleneck_2_block_group3_1_1
+    k=2 behind   k=8 mixed   k=12 mixed   k=16 ahead   k=20 ahead   k=24 ahead   k=32 ahead
+BEHIND-IN-ALL among the probed keys, per width: {2: 1, 8: 0, 12: 0, 16: 0, 20: 0, 24: 0, 32: 0}
+```
+
+**The overlap is 1, and the refutation condition does not fire. But the honest verdict is that the
+question is not answerable at useful power on the existing corpora.** Eight of the nine keys are
+**absent** from the screen corpus — the thread-count oracle ran on `adg_keys.txt` (72 keys) and the
+float32 screen on `dlmc_keys.txt` (392 keys), and these two lists share **one** of the nine. So the
+measured intersection is 1 of a possible 1, not 1 of a possible 9. "Zero overlap" and "nine of nine"
+are both consistent with this measurement, and the instrument prints the denominator for that
+reason: *"the denominator is 1 probed key present, NOT the 9 requested; a key absent from this
+corpus is unmeasured here, not ahead."*
+
+**The single testable case points the same way as the hypothesis**, which is worth one sentence and
+no more at n=1: that key is behind MKL in all 16 readings at k=2 and **only** at k=2 (mixed at 8 and
+12, ahead at 16 through 32), and it carries `cur/best 1.3122` against a null of 1.0301 — excess
+1.274, so 27% of its apparent headroom survives the winner's curse. A cell that is behind MKL
+exactly where it has recoverable thread-sizing headroom, and ahead everywhere else, is the shape the
+hypothesis predicts. It is also one cell.
+
+### (c) The registered next measurement, and why this one is not overfitting
+
+The defect is that the oracle and the screen were run on **different corpora**, so the one
+population that matters — the 328 — has never had its thread-count curve measured at all. The fix is
+to measure the registered statistic on that population instead of inferring it from a 72-key list
+that barely intersects it.
+
+**Registered, before it runs:** run `ntoracle.py` on the **328 float32 DLMC k=2 deficit keys**, same
+widths, same `--reps 2 --target-ms 10`, and compute `nt_k2curve.py`'s excess and its `<=2` / `3-7` /
+`>=8` subgroup split on exactly that set.
+
+**Refutation conditions, all three written now.**
+
+1. **If the pooled k=2 excess on the 328 is at or below 1.00**, thread sizing is closed for the
+   deficit on its own population, and amendment 20's `<=2` result is a property of the 72-key
+   corpus's small-work tail rather than of the cells this project must fix.
+2. **If the `<=2` group on the 328 is smaller than 5% of the set**, the mechanism cannot account for
+   the deficit however large its per-cell excess, and the result is reported as a bound on reach
+   rather than a candidate.
+3. **If the `<=2` group's excess on the 328 does not exceed the `>=8` group's**, the element-2
+   direction does not transfer from the 72-key corpus to the deficit population, and the MKT result
+   stands as corpus-specific.
+
+**This is the generalizable form of the question and not a tuning step.** The statistic, its null,
+the subgroup boundaries and the three refutation conditions are all carried over unchanged from a
+registration written before any of this was measured; the only thing that changes is the population,
+and it changes to the one the project's goal is stated over. No rule, threshold or gate is proposed
+by this measurement under any outcome — a kernel change would need a runtime-testable separating
+property, and "resolves to `<=2` workers" is a property of the policy being tested, not an
+independent one.

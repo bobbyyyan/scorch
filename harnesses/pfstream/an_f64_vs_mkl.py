@@ -202,6 +202,46 @@ def main(argv):
     # as covering.
     if tot != len(cell):
         return "REFUSE: internal inconsistency, verdicts %d vs cells %d" % (tot, len(cell))
+    # ---- MEMBERSHIP OF A NAMED KEY SET IN THE BEHIND SET.
+    # Registered in PREREG_thread_sizing amendment 21: the question "does the <=2-worker headroom
+    # group intersect the deficit set" is a JOIN, and a join answered by an uncommitted script is
+    # how two of amendment 13's three figures came to be unreproducible. So it is answered here,
+    # by the instrument that defines the behind set, with the join's own census printed -- because
+    # a key list that matches nothing produces an empty intersection that reads exactly like a
+    # measured absence.
+    probe = None
+    for i, a in enumerate(argv):
+        if a == "--probe-keys" and i + 1 < len(argv):
+            probe = argv[i + 1]
+    if probe:
+        want = [l.strip() for l in open(probe) if l.strip()]
+        present = sorted({k for (k, _w) in cell if k in set(want)})
+        print()
+        print("PROBED KEY SET  %s" % probe)
+        print("  %d keys requested, %d present in this screen's corpus" % (len(want), len(present)))
+        if not present:
+            return ("REFUSE: none of the %d probed keys is in this corpus, so an empty "
+                    "intersection below would be a JOIN failure and not a measured absence. "
+                    "Compare a sample key from each side before concluding." % len(want))
+        _V = {}
+        for ck, obs in cell.items():
+            rs = [t / m for (_b, _p, t, m) in obs]
+            _V[ck] = ("behind" if all(r > 1.0 for r in rs)
+                      else ("ahead" if all(r < 1.0 for r in rs) else "mixed"))
+        pw = sorted({w for (_k, w) in cell})
+        print("  %-62s %s" % ("key", "  ".join("k=%d" % w for w in pw)))
+        nb = collections.Counter()
+        for k in present:
+            cells = ["%-5s" % (_V.get((k, w), "-")[:5]) for w in pw]
+            for w in pw:
+                if _V.get((k, w)) == "behind":
+                    nb[w] += 1
+            print("  %-62s %s" % (k[-62:], " ".join(cells)))
+        print("  BEHIND-IN-ALL count among the probed keys, per width: %s"
+              % ({w: nb[w] for w in pw}))
+        print("  The denominator is %d probed keys present, NOT the %d requested; a key absent "
+              "from this corpus is unmeasured here, not ahead." % (len(present), len(want)))
+
     print()
     print("CELL VERDICTS over %d readings each (sign must agree in ALL readings)" % full)
     print("  ahead in every reading  %5d  (%.2f%%)" % (counts[AHEAD], 100.0 * counts[AHEAD] / tot))
