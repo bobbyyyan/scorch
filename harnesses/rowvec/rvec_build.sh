@@ -1,7 +1,7 @@
 #!/bin/bash
 # Build the three objects the row-as-vector measurement needs, at EQUAL-LENGTH paths.
 #
-# WHY THREE AND NOT TWO. ship and shpb are the SAME configuration built twice at paths of equal
+# WHY FOUR AND NOT TWO. ship and shpb are the SAME configuration built twice at paths of equal
 # length. That pair is the build floor, and it has to be a separate build rather than two runs of
 # one object: the build floor's whole increment over the arm floor is reproduced by two
 # byte-identical objects, so a floor taken from one binary understates what an arm must clear.
@@ -13,6 +13,14 @@
 #   rvec  SCORCH_NARROWK_EXACT_ROWVEC=1: the same widths run the row-as-vector kernel, which
 #         loads a whole B row as one 128-bit register and does one FMA per nonzero instead of
 #         K loads and K FMAs that GCC then turns into a per-lane gather emulation
+#   hi01  SCORCH_NARROWK_EXACT_HI=1: the exact-width kernel keeps only k=1, so k=2 and k=3 fall
+#         through to the 256-bit register block with a mask of 2 or 3 lanes of 8. THIS IS THE ARM
+#         THAT MUST BE HERE. scorch_policy.h's retired mr2h arm already measured it at nnz>=1e6
+#         and found the SCALAR kernel 1.6-46.6% slower than the vector one at exactly k=2 and k=3
+#         (float32 MKT 1.1588/1.4657, redwood 1.0157/1.1581, floors 1.015-1.026 and 1.001-1.009),
+#         with an isolating arm recorded as queued and never run. Without it, rvec would be
+#         compared only against the arm already suspected of being the worst of the three, and a
+#         rvec win over ship would not establish that rvec is the right kernel.
 #
 # The prediction, from the kernel-isolation grid recorded at scorch_policy.h's
 # SCORCH_NARROWK_EXACT_ROWVEC: rvec at or above ship at float k=2 and k=3, which are the only
@@ -77,8 +85,9 @@ declare -A DEFS
 DEFS[ship]=""
 DEFS[shpb]=""
 DEFS[rvec]="-DSCORCH_NARROWK_EXACT_ROWVEC=1"
+DEFS[hi01]="-DSCORCH_NARROWK_EXACT_HI=1"
 
-for tag in ship shpb rvec; do
+for tag in ship shpb rvec hi01; do
   d="$ROOT/$tag"
   rm -rf "$d"; mkdir -p "$d"
   cp -r "$STAGE"/src "$STAGE"/pyproject.toml "$STAGE"/scorch_build.py "$d"/ || exit 1
@@ -102,7 +111,7 @@ fi
 echo "ambient-environment probe: sees a set variable (count $probe), so an empty section is a fact"
 
 # Build all four concurrently; each is one translation unit, so they do not contend on make jobs.
-for tag in ship shpb rvec; do
+for tag in ship shpb rvec hi01; do
   (
     cd "$ROOT/$tag" || exit 1
     # Record the AMBIENT SCORCH_* environment before building. scorch_build.py:103 keys
@@ -140,7 +149,7 @@ wait
 
 echo
 echo "BUILD RESULTS"
-for tag in ship shpb rvec; do
+for tag in ship shpb rvec hi01; do
   d="$ROOT/$tag"
   rc=$(cut -d' ' -f1 "$d/rc.txt" 2>/dev/null)
   so=$(ls "$d"/src/scorch_ops*.so 2>/dev/null | head -1)
@@ -163,7 +172,7 @@ echo
 echo "EMISSION CHECK (.text digests; the floor pair must AGREE, the arms must DIFFER)"
 fail=0
 declare -A TSHA
-for tag in ship shpb rvec; do
+for tag in ship shpb rvec hi01; do
   so=$(ls "$ROOT/$tag"/src/scorch_ops*.so 2>/dev/null | head -1)
   if [ -z "$so" ]; then
     echo "  $tag  REFUSE: no object, so its digest cannot be compared"; fail=1; continue
@@ -183,7 +192,7 @@ if [ "${TSHA[ship]}" != "${TSHA[shpb]}" ]; then
 fi
 # The arms: each must differ from the floor pair AND from each other. An arm matching ship is a
 # dropped define, which no timing can distinguish from a true null result.
-for tag in rvec; do
+for tag in rvec hi01; do
   if [ "${TSHA[$tag]}" = "${TSHA[ship]}" ]; then
     echo "REFUSE: $tag has ship's .text, so its define did not take. Every number it produces"
     echo "        would look like a plausible null result."
@@ -191,7 +200,12 @@ for tag in rvec; do
   fi
 done
 [ "$fail" = "0" ] || exit 1
-echo "  ASSERTED: ship == shpb, and rvec differs from ship."
+if [ "${TSHA[rvec]}" = "${TSHA[hi01]}" ]; then
+  echo "REFUSE: rvec and hi01 have identical .text; they are different configurations"
+  fail=1
+fi
+[ "$fail" = "0" ] || exit 1
+echo "  ASSERTED: ship == shpb, and rvec, hi01 each differ from ship and from each other."
 
 # THE HOOKS AXIS, WHICH THE DIGESTS ABOVE CANNOT SEE. Every .text assertion above passes whether
 # or not SCORCH_TUNE_HOOKS was compiled in, because it is orthogonal to the PFSTREAM/PFD defines
@@ -199,8 +213,8 @@ echo "  ASSERTED: ship == shpb, and rvec differs from ship."
 # instead of reporting a null it manufactured (ops.cpp:595-600) -- and until now no screen in this
 # directory had ever queried it. Asked of each object, not of the headers or the environment.
 echo
-echo "HOOKS CHECK (spmm_tune_hooks must be False on all three; a hooks build taxes every call)"
-for tag in ship shpb rvec; do
+echo "HOOKS CHECK (spmm_tune_hooks must be False on all four; a hooks build taxes every call)"
+for tag in ship shpb rvec hi01; do
   # Bind the answer to the object under $ROOT/$tag. The emission check above already refuses on
   # a missing object and line 36 rm -rf's the directory before staging, so an installed copy
   # winning is mostly closed by construction -- but "mostly" is not a check, and the sibling

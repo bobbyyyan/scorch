@@ -1,5 +1,12 @@
 #!/bin/bash
-# The row-as-vector screen: three builds, both full collections, ours-vs-MKL per cell.
+# The row-as-vector screen: four builds, both full collections, ours-vs-MKL per cell.
+#
+# THE FOURTH ARM IS THE ONE THAT MAKES THIS A CHOICE RATHER THAN A CONFIRMATION. hi01
+# (SCORCH_NARROWK_EXACT_HI=1) hands k=2 and k=3 to the 256-bit register block instead of the
+# scalar exact kernel. scorch_policy.h's retired mr2h arm already measured that swap at nnz>=1e6
+# and found the scalar kernel 1.6-46.6% slower than the vector one at exactly these widths, with
+# an isolating arm recorded as queued and never run. Comparing rvec only against ship would
+# compare it against the arm already suspected of being the worst of the three.
 #
 # THE WIDTH ROLES ARE THE INVERSE OF THE PREFETCH SCREENS'. arm_screen.sh uses k<=3 as its
 # NEGATIVE CONTROL, because that span is owned by scorch_spmm_row_narrow_exact and the
@@ -9,9 +16,9 @@
 # tables: it was their control.
 #
 # WHAT THE CONTROL BUYS. The define replaces template instantiations, so the whole object moves:
-# rvec's .text is 983314 bytes against ship's 1073586. A width the define cannot reach therefore
-# measures this object's layout offset for free, and an effect at k=2 is only an effect if it
-# exceeds what k=8 shows.
+# rvec's .text is 983314 bytes against ship's 1073586. A width neither define can reach therefore
+# measures each object's layout offset for free, and an effect at k=2 is only an effect if it
+# exceeds what k=8 shows for the same object.
 #
 # KEYS ARE DERIVED FROM THE CACHE, not from a corpus list. csrresolve.py exists because a flat
 # corpus list silently dropped 50 of 298 keys against MKT's group-qualified cache; keys taken as
@@ -94,17 +101,23 @@ for corpus in ss dlmc; do
   echo "corpus $corpus: $n keys derived from the cache"
   [ "$n" -gt 0 ] || { echo "REFUSE: $corpus produced 0 keys, so every number below would be vacuous"; exit 1; }
 
-  # THREE SLICES, build order rotated by one each slice. Each build leads exactly once and
-  # occupies each position exactly once, so pass position is balanced across builds -- an
-  # unbalanced rotation loads the later arms with whatever drifts during the run.
-  split -n l/3 -d "$K" "$OUT/sl_${corpus}_"
-  for s in 0 1 2; do
+  # FOUR SLICES, build order rotated by one each slice: a Latin square, so each build leads
+  # exactly once and occupies each position exactly once. An unbalanced rotation loads the later
+  # arms with whatever drifts during the run.
+  #
+  # `split -n l/4` divides by BYTES at line boundaries, so the slices differ in key count by a
+  # few percent (key strings differ in length). Each build still occupies each position once, and
+  # the primary comparison is ours/MKL timed in the same process per cell, which is immune to
+  # drift between builds -- so the residual imbalance affects only ours-here/ours-there.
+  split -n l/4 -d "$K" "$OUT/sl_${corpus}_"
+  for s in 0 1 2 3; do
     SK="$OUT/sl_${corpus}_0$s"
     [ -s "$SK" ] || { echo "REFUSE: slice $s of $corpus is empty"; exit 1; }
     case $s in
-      0) ORDER="ship shpb rvec" ;;
-      1) ORDER="shpb rvec ship" ;;
-      2) ORDER="rvec ship shpb" ;;
+      0) ORDER="ship shpb rvec hi01" ;;
+      1) ORDER="shpb rvec hi01 ship" ;;
+      2) ORDER="rvec hi01 ship shpb" ;;
+      3) ORDER="hi01 ship shpb rvec" ;;
     esac
     echo "  slice $s ($(wc -l < "$SK") keys) order: $ORDER"
     for b in $ORDER; do
