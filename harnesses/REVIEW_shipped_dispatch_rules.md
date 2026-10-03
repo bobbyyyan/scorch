@@ -510,3 +510,31 @@ never against MKL.
 ARM-derived gate help or hurt on x86 at pool <= 16 -- is now a single-binary A/B on 35
 identified cells, with no second build and so no layout artefact between the arms. Still
 unmeasured: any runtime at all, for either concern.
+
+### Concern #2, prevalence on a real collection — 30.2% of DLMC, and it needed no host
+
+Measured 2026-10-02 locally. The grid figures above are on synthetic `(rows, nnz, k)`
+tuples, and a share of a synthetic grid is a property of the grid. The decisive question is
+how much of a real collection the gate governs, and the closed form answers it from
+dimensions alone: the gate forces `partition_mode = 0` when
+`nnz * max(k,16) < 300000`, so it needs `nnz < 18750` at k <= 16 and `nnz < 9375` at k=32.
+
+Over all 3820 DLMC matrices:
+
+| k | matrices in the gate region | of 3820 | share |
+|---|---|---|---|
+| 1, 2, 4, 8, 16 | 1154 | 3820 | **30.2%** |
+| 32 | 724 | 3820 | 19.0% |
+
+The flat share across k <= 16 is the `max(k,16)` in the work proxy, not a coincidence.
+The collection's nnz runs min 6, median 52428, max 8.5M, so the region is the lower third
+rather than an edge case.
+
+**So at any caller pool of 16 or fewer, an ARM-derived gate decides the row-handout mode
+for about a third of this collection on an x86 host.** That is the reason the runtime
+question is worth measuring rather than leaving at reachability.
+
+Provenance: two independent records of rows and nnz -- the sealed `verifier-dlmc-dims`
+ledger (digest verified) and `dlmc_rowdisp.py`'s own read of the `.smtx` row pointers --
+agree on all 3820 keys with zero disagreements. A prevalence figure computed from one
+record of the corpus would be a claim about that record.
