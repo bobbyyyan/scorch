@@ -1148,16 +1148,39 @@ The gate fires only at pool <= 16, so the question is what pool a caller actuall
 | `-c 128` | 128 | 64 | 64 | inert |
 
 So the gate fires **with nothing set by the caller** under any allocation of 16 or fewer
-CPUs, which on a shared cluster is an ordinary way to run rather than a special
-configuration. An earlier version of this section measured one allocation size, reported
+CPUs. And the live case is wider than that: this repo's own job scripts record that a
+submission with no CPU request at all lands at **pool 2** on this node.
+`adg_screen_mkt.sbatch:7-10` says "without a cpus-per-task request Slurm gives the default
+allocation and torch.get_num_threads() reads 2 on this node, so OMP_NUM_THREADS cannot help
+because the cgroup caps it", and names the artefact left behind when this project made that
+mistake -- `/scr/bobbyy/pfs/csvdlmc_pool2_abandoned`, which still exists. So the absence of
+a flag is sufficient; no deliberately constrained pool is needed.
+
+Against that, the balancing fact from this file's own materiality clause: **pool 2 is the
+weakest cell in the table.** Its four ratios are 1.068, 1.099, 1.077 and 1.086, all below
+the 10% bar `dcf2e1f` sets. So the configuration that needs no flag is also the one where
+the gate is harmful by a measurement excluding zero and *not* by the standard it was fit
+to. Both halves, and only together. An earlier version of this section measured one allocation size, reported
 `torch.get_num_threads()` as 64, called that "the default", and concluded the predicate was
 unreachable except under a deliberately constrained pool. That under-stated the finding: no
 deliberation is required.
 
-What remains true is the narrower claim: at a **full-node** allocation both x86 hosts are
-above the ceiling -- 64 on mkt1, and the header gives redwood's pool as 24 -- so the runs
-that produce this project's headline MKL comparisons do not exercise the gate, and this
-finding does not move those numbers.
+What remains true is the narrower claim, and it is checkable from the repo rather than from
+a live reading: **every** `#SBATCH` script in the tree requests `-c 32` --
+`adg_screen_mkt`, `pfs_screen_fused`, `nt_all392_mkt`, `pfs_screen_dlmc`, `pfs_screen_f64`
+and `pfs_screen` -- and the complement, files carrying `#SBATCH` without that directive, is
+empty. So those runs sit at pool `min(32, 64) = 32`, above the ceiling, and the gate is
+inert in all six. The header gives redwood's pool as 24, likewise above. The runs producing
+this project's headline MKL comparisons do not exercise the gate, and this finding does not
+move those numbers.
+
+**The two quantities agree by common cause, not by construction.** A reasonable objection to
+the table is that importing torch might call `omp_set_num_threads` with ATen's own computed
+value, in which case the two columns would be one measurement reported twice. Tested by
+loading `libgomp.so.1` directly and reading `omp_get_max_threads()` before and after the
+import in one process: 8 before and 8 after under `-c 8`, 32 and 32 under `-c 32`, with
+`omp_get_num_procs()` also equal to the allocation before the import. So all three track the
+cgroup independently and the columns are two observations.
 
 Combined with the prevalence figures above, the exposed population wherever the gate does
 fire is 2069 of 4446 SuiteSparse operands at k <= 16 and 1154 of 3820 DLMC matrices, at
