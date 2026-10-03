@@ -103,6 +103,18 @@ try:
     SHIM = _c
 except Exception:                                                      # noqa: BLE001
     pass
+# The shim's digest, for the same reason the object's is recorded: a run that mutates a
+# shared .so while other runs read it leaves no trace in the output. One grid was discarded
+# for exactly that -- the library and the harness were overwritten mid-flight, so early
+# widths used one version and later widths another, with nothing in the data saying which.
+SHIM_SHA = "none"
+if SHIM:
+    import glob as _g
+    for _c in (os.environ.get("LD_PRELOAD", "").split(":") + ["libfastenv.so"]):
+        if _c and os.path.exists(_c):
+            SHIM_SHA = hashlib.sha256(open(_c, "rb").read()).hexdigest()[:16]
+            break
+    print("shim object sha %s" % SHIM_SHA)
 print("getenv shim: %s" % ("LIVE, so readings are tax-free and the cell scale is "
       "comparable to the comment's bands" if SHIM else "ABSENT, so every reading carries "
       "~20 us of getenv; A-B is still valid, the cell SCALE is not"), flush=True)
@@ -313,7 +325,8 @@ SYM = so.spmm_csr_float_v2
 out = open(A.csv, "w", newline="")
 w = csv.DictWriter(out, fieldnames=["route", "pop", "key", "k", "kt", "rows", "cols",
                                     "nnz", "arm", "us", "batch", "mode", "nthreads",
-                                    "pool", "nproc", "adoption", "shim", "so_sha"])
+                                    "pool", "nproc", "adoption", "shim", "shim_sha",
+                                    "so_sha"])
 w.writeheader()
 
 
@@ -415,7 +428,7 @@ for route, ea, eb, popname, pop, k in CELLS:
             w.writerow(dict(route=route, pop=popname, key=key, k=k, kt=KT, rows=rows,
                             cols=J, nnz=nnz, arm=arm, us="%.4f" % us, batch=batch,
                             nproc=NPROC, adoption=int(ADOPTION),
-                            shim=int(SHIM is not None), mode=decide(s, k, ea if arm == "A" else eb), nthreads=nt,
+                            shim=int(SHIM is not None), shim_sha=SHIM_SHA, mode=decide(s, k, ea if arm == "A" else eb), nthreads=nt,
                             pool=POOL, so_sha=SO_SHA))
         per.append((key, nnz, rows, ua, ub, ma, mb, sa, sb))
         if i % 50 == 0:
