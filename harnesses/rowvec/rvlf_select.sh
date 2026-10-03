@@ -208,61 +208,17 @@ echo "                   pair measures nothing and the .text delta is irrelevant
 # identified by naming double/f64. Forgetting a float32 function name now leaves it in `rest` by
 # default rather than dropping it silently, which is the fail-closed direction.
 KPAT='scorch_spmm_row_(narrow_exact|narrow_rowvec|regblock|gather)<(float|scalar_t)|spmm_csr_v2_core<float'
-# The exclusion: symbols the _F64 arms are entitled to move. Deliberately broad -- over-excluding
-# shrinks `rest` and can only make UNUSABLE easier to reach, which is the conservative direction
-# for a verdict that sends an arm away.
-#
-# IT MATCHES A STRING, AND TWO SYMBOLS IN THIS OBJECT DO NOT CARRY IT. `nm -C` fails to demangle
-# the OpenMP outlined bodies of the SpMM dispatch -- GCC's demangler rejects the
-# lambda-inside-a-template-argument form, and stripping the `._omp_fn.N` suffix does not help --
-# so they keep their mangled names, where a `double` template parameter is encoded as `d`:
-#
-#   _ZN2at8internal15invoke_parallelIZNS_12parallel_forIZ16spmm_csr_v2_coreIdLb0EE..._omp_fn.0
-#   _ZN2at8internal15invoke_parallelIZNS_12parallel_forIZ16spmm_csr_v2_coreIfLb0EE..._omp_fn.0
-#
-# The first is spmm_csr_v2_core<double, false>'s parallel-region body -- the place the float64
-# loop actually runs. XPAT cannot see it, so it would stay in `rest`, move legitimately for a
-# _F64 arm, inflate rest_displ and KEEP an arm that should have been sent away. That is the
-# direction the exclusion exists to prevent, so the mangled forms get their own rule and anything
-# still unclassified is a REFUSAL rather than a default into `rest`.
-XPAT='double|_f64|F64|<double'
-# Mangled-form exclusion: in a mangled template-id, `coreId` is a double instantiation.
-XPAT_MANGLED='coreId'
-# Mangled forms known to be float32 and therefore to BELONG in `rest`.
-KEEP_MANGLED='coreIf'
-# ONE ROW PER NAME, CARRYING ITS SORTED ADDRESS LIST. A name<TAB>addr table is NOT join-safe:
-# `nm -C` emits 1190 lines for 1093 distinct names in this object -- 83 names appear more than
-# once (weak/local aliases, COMDAT folding, pybind holder templates at up to 3 addresses each) --
-# and `join` on a key present k and m times emits k*m rows. That is the same cross product as the
-# return-type bug in a different guise, and it was caught by the ship/shpb negative control:
-# those two have byte-identical .text so their displacement MUST be 0, and the name<TAB>addr
-# version read 56 with `joined` (1412) exceeding the table size (1190). A join emitting more rows
-# than its input is the tell.
-#
-# Collapsing to one row per name makes `joined <= min(table sizes)` an invariant the output can be
-# checked against, and makes a name whose address SET differs the definition of displaced -- which
-# is the right definition when a name legitimately has several addresses.
-symtab() {  # $1 = .so, $2 = prefix; writes <prefix>.all, .rest, .kern as name<TAB>addr,addr,...
-  nm -C --defined-only "$1" 2>/dev/null \
-    | sed 's/^\([0-9a-f]*\) \([A-Za-z]\) /\1\t\2\t/' \
-    | awk -F'\t' 'NF>=3 { print $3 "\t" $1 }' \
-    | LC_ALL=C sort -u \
-    | awk -F'\t' '{ if ($1==p) a=a","$2; else { if(p!="") print p"\t"a; p=$1; a=$2 } }
-                   END { if(p!="") print p"\t"a }' \
-    | LC_ALL=C sort -t'\t' -k1,1 > "$2.all"
-  # rest = everything the define may not change. Demangled names are classified by XPAT; a
-  # still-mangled name is classified by XPAT_MANGLED/KEEP_MANGLED, and anything left over is
-  # written to .unres so the caller can refuse on it instead of silently keeping it.
-  grep -Ev "$XPAT" "$2.all" | grep -Ev "$XPAT_MANGLED" > "$2.rest" || true
-  grep -E  "$KPAT" "$2.all" > "$2.kern" || true
-  grep '^_Z' "$2.all" | grep -Ev "$XPAT_MANGLED|$KEEP_MANGLED" > "$2.unres" || true
-}
-disp() {    # $1 = base table, $2 = tag table; echoes "joined displaced"
-  local j d
-  j=$(LC_ALL=C join -t"$(printf '\t')" -j 1 "$1" "$2" | wc -l)
-  d=$(LC_ALL=C join -t"$(printf '\t')" -j 1 -o 1.2,2.2 "$1" "$2" | awk -F'\t' '$1 != $2' | wc -l)
-  echo "$j $d"
-}
+# The symbol-table metric, the demangler choice and the two refusals live in rvlf_lib.sh, which
+# the self-test also sources. They were duplicated here once and the copies drifted on the next
+# change -- the script moved to a chained demangler, the self-test did not, and its CONTROL case
+# then refused on clean input. A harness that restates the thing it checks is wrong silently; this
+# one was wrong loudly, which was luck.
+. "$(dirname "$0")/rvlf_lib.sh"
+rvlf_pick_demangler || exit 1
+echo "demangler: $RVLF_DEMANGLER"
+KPAT=$RVLF_KPAT
+XPAT=$RVLF_XPAT
+
 textsize() { # $1 = .so, $2 = output bin path; echoes the size or returns nonzero
   objcopy -O binary --only-section=.text "$1" "$2" 2>/dev/null || return 1
   [ -s "$2" ] || return 1
@@ -273,7 +229,7 @@ BSO=$(ls "$ROOT/base"/src/scorch_ops*.so | head -1)
 BT=$(textsize "$BSO" "$ROOT/base/text.bin") || {
   echo "REFUSE: objcopy could not extract .text from the base object, so every delta below"
   echo "        would be computed against nothing"; exit 1; }
-symtab "$BSO" "$ROOT/base/sym"
+rvlf_symtab "$BSO" "$ROOT/base/sym"
 NA=$(wc -l < "$ROOT/base/sym.all"); NR=$(wc -l < "$ROOT/base/sym.rest"); NK=$(wc -l < "$ROOT/base/sym.kern")
 # THE EXCLUSION'S OWN NON-VACUITY NUMBER. XPAT matches the STRING "double", but a symbol nm failed
 # to demangle keeps its mangled form, where a double template parameter is encoded as `d`. Such a
@@ -281,25 +237,13 @@ NA=$(wc -l < "$ROOT/base/sym.all"); NR=$(wc -l < "$ROOT/base/sym.rest"); NK=$(wc
 # legitimately -- inflating rest_displ and KEEPING an arm that should have been sent away, which is
 # the direction the exclusion exists to prevent. Expected zero, printed rather than expected: the
 # symbols that fail to demangle here are C-linkage ones and those are not double instantiations.
-NM=$(grep -c '^_Z' "$ROOT/base/sym.all" || true)
-NU=$(wc -l < "$ROOT/base/sym.unres")
-echo "  base: .text $BT bytes;  symbols all $NA, rest $NR, kernels $NK"
-echo "  still-mangled: $NM, of which unclassified: $NU"
-if [ "${NU:-0}" -gt 0 ]; then
-  echo "REFUSE: $NU mangled symbol(s) match neither the double nor the float rule, so they would"
-  echo "        default into 'rest'. If any is a float64 instantiation it moves legitimately for a"
-  echo "        _F64 arm, inflates rest_displ, and KEEPS an arm that measures nothing. Classify"
-  echo "        them in XPAT_MANGLED or KEEP_MANGLED first:"
-  cut -c1-110 "$ROOT/base/sym.unres" | sed 's/^/        /'
-  exit 1
-fi
-echo "  (the two known mangled forms are the SpMM OpenMP outlined bodies; coreId is excluded as"
-echo "   float64, coreIf is kept as float32 -- see XPAT_MANGLED above)"
-for pair in "all:$NA" "rest:$NR" "kernels:$NK"; do
-  n=${pair#*:}
-  [ "$n" -gt 0 ] || { echo "REFUSE: zero symbols in the '${pair%%:*}' population, so its"
-                      echo "        displacement count could only read 0"; exit 1; }
-done
+# THE ASSERTION, RUN PER OBJECT RATHER THAN ONLY ON BASE. A first version checked this on `base`
+# alone, which is the one object that by construction CANNOT carry the symbols it was written to
+# catch: new unresolvable names come from new float64 template code, and that is exactly what
+# `mr64` and `both` introduce. The guard was on the side that cannot fail. Checked here for base
+# and again inside the per-tag loop, naming the tag.
+rvlf_unres_check "base" "$ROOT/base/sym" >/dev/null || { rvlf_unres_check "base" "$ROOT/base/sym"; exit 1; }
+echo "  base: .text $BT bytes;  symbols all $NA, rest $NR, kernels $NK, unresolved 0"
 echo
 echo "  rest_displ is the verdict number: all symbols EXCEPT those the define may change."
 echo "  kern_displ is the same question asked of the SpMM kernels only, reported as a detail."
@@ -315,15 +259,16 @@ for tag in $TAGS; do
   # printed "UNUSABLE -- float32 code did not move".
   T=$(textsize "$so" "$ROOT/$tag/text.bin") || {
     printf "  %-5s %s\n" "$tag" "REFUSE: objcopy failed on this object"; fail=1; continue; }
-  symtab "$so" "$ROOT/$tag/sym"
+  rvlf_symtab "$so" "$ROOT/$tag/sym"
+  if ! rvlf_unres_check "$tag" "$ROOT/$tag/sym" >/dev/null; then rvlf_unres_check "$tag" "$ROOT/$tag/sym"; fail=1; continue; fi
   TR=$(wc -l < "$ROOT/$tag/sym.rest"); TK=$(wc -l < "$ROOT/$tag/sym.kern")
   if [ "$TR" -eq 0 ] || [ "$TK" -eq 0 ]; then
     printf "  %-5s %-9s %12s %11s %6s %6s  %s\n" "$tag" "${AXIS[$tag]:-content}" "$T" "$((T-BT))" \
       "$TR" "$TK" "REFUSE: nm tracked 0 in a population here -- a tool failure, not a null"
     fail=1; continue
   fi
-  read -r JR DR <<<"$(disp "$ROOT/base/sym.rest" "$ROOT/$tag/sym.rest")"
-  read -r JK DK <<<"$(disp "$ROOT/base/sym.kern" "$ROOT/$tag/sym.kern")"
+  read -r JR DR <<<"$(rvlf_disp "$ROOT/base/sym.rest" "$ROOT/$tag/sym.rest")"
+  read -r JK DK <<<"$(rvlf_disp "$ROOT/base/sym.kern" "$ROOT/$tag/sym.kern")"
   # THE INVARIANT THAT CATCHES A CROSS PRODUCT. With one row per name the join cannot exceed the
   # smaller table. Checked rather than assumed, because this exact failure has now occurred twice
   # in this script from two different causes and both times produced a plausible number.

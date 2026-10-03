@@ -26,32 +26,10 @@ echo "  ship and shpb are the SAME configuration, so their .text is identical an
 echo "  displacement is exactly 0. Every plant below perturbs the INSTRUMENT, not the objects."
 echo
 
-# The two table forms. `collapsed` is what ships; `uncollapsed` is the ea78f6b form.
-uncollapsed() {
-  nm -C --defined-only "$1" 2>/dev/null \
-    | sed 's/^\([0-9a-f]*\) \([A-Za-z]\) /\1\t\2\t/' \
-    | awk -F'\t' 'NF>=3 { print $3 "\t" $1 }' | LC_ALL=C sort -t'	' -k1,1
-}
-collapsed() {
-  uncollapsed "$1" | LC_ALL=C sort -u \
-    | awk -F'\t' '{ if ($1==p) a=a","$2; else { if(p!="") print p"\t"a; p=$1; a=$2 } }
-                  END { if(p!="") print p"\t"a }' | LC_ALL=C sort -t'	' -k1,1
-}
-disp() {  # echoes "joined displaced"
-  echo "$(LC_ALL=C join -t'	' -j 1 "$1" "$2" | wc -l) \
-$(LC_ALL=C join -t'	' -j 1 -o 1.2,2.2 "$1" "$2" | awk -F'\t' '$1 != $2' | wc -l)"
-}
-# The guard under test, lifted verbatim in behaviour from rvlf_select.sh.
-verdict() { # $1 base table  $2 tag table -> prints REFUSE... or OK <j> <d>
-  local nb nt mr j d
-  nb=$(wc -l < "$1"); nt=$(wc -l < "$2")
-  read -r j d <<<"$(disp "$1" "$2")"
-  mr=$(( nb < nt ? nb : nt ))
-  if [ "$nt" -eq 0 ]; then echo "REFUSE: tag table empty -- tool failure, not a null"; return; fi
-  if [ "$j" -gt "$mr" ]; then echo "REFUSE: join returned $j rows against a smaller table of $mr -- a cross product"; return; fi
-  if [ "$j" -eq 0 ]; then echo "REFUSE: join matched 0 names -- not a null displacement"; return; fi
-  echo "OK joined=$j displaced=$d"
-}
+. "$(dirname "$0")/rvlf_lib.sh"
+rvlf_pick_demangler || exit 1
+echo "  demangler: $RVLF_DEMANGLER"
+echo
 
 pass=0; faildemo=0
 check() { # $1 label  $2 expectation: MUST_REFUSE|MUST_PASS  $3 output
@@ -65,28 +43,42 @@ check() { # $1 label  $2 expectation: MUST_REFUSE|MUST_PASS  $3 output
 
 # CONTROL FIRST. Without it a refusal on every plant is indistinguishable from a metric that
 # refuses unconditionally, which would pass every plant below while measuring nothing.
-collapsed "$SHIP" > "$W/c_ship"; collapsed "$SHPB" > "$W/c_shpb"
+rvlf_symtab "$SHIP" "$W/ship"; rvlf_symtab "$SHPB" "$W/shpb"
+cp "$W/ship.all" "$W/c_ship"; cp "$W/shpb.all" "$W/c_shpb"
 check "control: collapsed tables on the identical pair must PASS and read 0" MUST_PASS \
-  "$(verdict "$W/c_ship" "$W/c_shpb")"
-d=$(verdict "$W/c_ship" "$W/c_shpb" | sed 's/.*displaced=//')
+  "$(rvlf_join_check "$W/c_ship" "$W/c_shpb")"
+d=$(rvlf_join_check "$W/c_ship" "$W/c_shpb" | sed 's/.*displaced=//')
 if [ "$d" = "0" ]; then echo "  PASS  control reads displaced=0, as a byte-identical pair must"; pass=$((pass+1));
 else echo "  FAIL  control read displaced=$d on a byte-identical pair"; faildemo=1; fi
 
 # PLANT 1: the ea78f6b uncollapsed form. Duplicate names make join emit k*m rows.
-uncollapsed "$SHIP" > "$W/u_ship"; uncollapsed "$SHPB" > "$W/u_shpb"
+rvlf_symtab_uncollapsed "$SHIP" "$W/u_ship"; rvlf_symtab_uncollapsed "$SHPB" "$W/u_shpb"
 echo "  plant 1 input: uncollapsed tables, $(wc -l < "$W/u_ship") rows for $(wc -l < "$W/c_ship") distinct names"
 check "plant 1: uncollapsed table (the shipped-at-ea78f6b form) must REFUSE" MUST_REFUSE \
-  "$(verdict "$W/u_ship" "$W/u_shpb")"
+  "$(rvlf_join_check "$W/u_ship" "$W/u_shpb")"
 
 # PLANT 2: an empty tag table, i.e. nm failed on one side.
 : > "$W/empty"
 check "plant 2: empty tag table must REFUSE, not read displaced=0" MUST_REFUSE \
-  "$(verdict "$W/c_ship" "$W/empty")"
+  "$(rvlf_join_check "$W/c_ship" "$W/empty")"
 
 # PLANT 3: disjoint names, so the join matches nothing without either table being empty.
-sed 's/^/ZZZ_/' "$W/c_shpb" | LC_ALL=C sort -t'	' -k1,1 > "$W/disjoint"
+sed 's/^/ZZZ_/' "$W/c_shpb" | LC_ALL=C sort -t"$RVLF_TAB" -k1,1 > "$W/disjoint"
 check "plant 3: non-empty tag table sharing no names must REFUSE" MUST_REFUSE \
-  "$(verdict "$W/c_ship" "$W/disjoint")"
+  "$(rvlf_join_check "$W/c_ship" "$W/disjoint")"
+
+# PLANT 4: an unresolvable mangled symbol. This is the guard that protects the EXCLUSION rather
+# than the join: XPAT matches the string "double", so a name the demangler could not resolve keeps
+# its mangled form where double is encoded as `d`, stays in `rest`, and for a _F64 arm moves
+# legitimately -- keeping an arm that measures nothing. It cannot fire on real input now that both
+# demanglers are chained (0 of 1135 left mangled), which is exactly why it needs planting.
+cp "$W/ship.all" "$W/planted.all"; cp "$W/ship.unres" "$W/planted.unres"
+printf '_ZN2at8internal15invoke_parallelIZ16spmm_csr_v2_coreIdLb0EEE._omp_fn.9\t00000000deadbeef\n' \
+  | tee -a "$W/planted.all" >> "$W/planted.unres"
+check "control: the real table must have NO unresolved symbols" MUST_PASS \
+  "$(rvlf_unres_check ship "$W/ship")"
+check "plant 4: one unresolvable mangled line must REFUSE" MUST_REFUSE \
+  "$(rvlf_unres_check planted "$W/planted")"
 
 echo
 echo "$pass checks passed"
