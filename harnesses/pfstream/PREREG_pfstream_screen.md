@@ -4771,3 +4771,42 @@ denominator is diagnostic of the key list, not the host. The 418→417 step is o
 established is where 192 came from, and I am not going to guess." Quoting the +0.429% with the host
 unstated is therefore the **registered** position rather than a new finding, and needs no further
 work. Amendment 53(b)'s "unresolved" framing is corrected to a citation.
+
+---
+
+## Amendment 55 — the published floor column is signed too, and its SIGN is not stable under reduction order
+
+Finding 154 is right that amendment 54's metamorphic swap tested the **corrected** (pass-paired)
+floor column, not the **published** (cell-paired) one it was offered as a defence of. The two are
+different computations rather than two orientations of one statistic, so their product of 1.0184
+proved nothing in either direction — as the message itself said. Ran the swap on the column that
+was actually flagged:
+
+| pair | published floor `aa/bb` | swapped `bb/aa` | product | |
+|---|---|---|---|---|
+| 4 vs 2 | +0.924% | −0.815% | 1.001016 | reciprocal |
+| 4 vs 8 | +0.909% | −0.824% | 1.000774 | reciprocal |
+| 4 vs 16 | +1.220% | −1.205% | 1.000003 | reciprocal |
+| 4 vs 32 | +0.965% | −0.884% | 1.000731 | reciprocal |
+
+**The published column is signed as well.** Both floor columns are locations; neither is a
+magnitude, and the provenance question is closed.
+
+**But my explanation of its sign was wrong, exactly as finding 154 says.** "Object `aa` is
+systematically slower on that contrast" cannot be it, because the pass-paired version of the same
+orientation on the same cells is **negative** at the two narrowest widths (−0.573%, −0.205%) where
+the cell-paired version is positive (+0.924%, +0.909%).
+
+**And that is the strongest available statement that the floor's location is zero.** Two reductions
+of one quantity, over the same objects and the same 712 cells, disagree on its *sign* at two of four
+widths. A location whose sign is decided by reduction order is a location with no sign, which is
+the same conclusion the bootstrap reached by a different route — the CI straddles zero at all four
+widths — and reached independently of it. Both floor columns stand as computed; the withdrawal of
+every "N× the floor" figure in amendment 54 stands, and the containment statement is unaffected:
+
+| pair | contrast CI lower bound | floor CI upper bound | separation |
+|---|---|---|---|
+| 4 vs 2 | +14.54% | +0.69% | 13.9 pp |
+| 4 vs 8 | +11.72% | +2.07% | 9.7 pp |
+| 4 vs 16 | +27.62% | +1.66% | 26.0 pp |
+| 4 vs 32 | +37.95% | +3.35% | 34.6 pp |
