@@ -1787,3 +1787,55 @@ is true of an empty table and describes a measurement. It now reads `res_ovr0` f
 the cell and REFUSES if a key carries more than one value, so the grouping cannot depend on row
 order. The Fisher implementation is validated against two published tables before use: the
 tea-tasting `[[3,1],[1,3]]` at 0.4857142857 and `[[1,9],[11,3]]` at 0.0027594.
+
+---
+
+## Amendment 24 — condition 2's units were fixed but not its BASE, and condition 4's difference carries a composition effect. Both pinned before job 17698209 reports.
+
+Amendment 22(b) put condition 2 in units of the explained quantity. It did not say which
+**denominator** the numerator sits on, and amendment 22(a) names two without choosing: `9/53` live
+cells **= 17.0%** and `9/72` keys **= 12.5%**, differing by the live fraction `53/72 = 0.7361`.
+
+**The 83.7% is 328 of 392 KEYS.** So a share computed over the live subset while its thresholds
+were calibrated against an all-keys prevalence is **inflated by 1.359×**. Against the registered
+boundaries that is decisive, not cosmetic:
+
+| registered boundary (all-keys) | the same number read live-only |
+|---|---|
+| 0.250 | **0.340** |
+| 0.500 | **0.679** |
+
+and inversely, a live-only reading of **0.368** would be an all-keys 0.500. **The base choice alone
+moves a reading from "bound on reach" to "share with no causal claim", and from that to "licenses a
+causal claim."** The threshold was in the right units and the numerator was not pinned.
+
+### CONDITION 2, BASE FIXED
+
+**`s328` is computed over all 328 deficit keys, with non-live keys in the denominator** — the same
+base as the 83.7%. A non-live key — one reaching a single worker count, so its curve is undefined —
+can still be behind MKL, so excluding it from the subgroup denominator while the deficit's
+denominator includes it is the mismatch. The live count is printed beside the share so the two bases
+are both recoverable from the output, and the all-keys one is the one the bands are read against.
+
+### CONDITION 4, COMPOSITION EFFECT NAMED
+
+`s328 - s64` is a difference of prevalences **only if the live fraction is equal in both groups**,
+and there is no reason it should be: behind cells may be systematically smaller and less live, which
+is the **same small-work axis amendment 21(a) identified** as the one shape column separating the
+`<=2` group. **Registered: the live fraction is reported per group beside the difference, and if the
+two fractions differ by more than 5 percentage points the difference is reported as carrying a
+composition effect shaped like the association under test, not as a difference of prevalences.** In
+that case the all-keys form is the primary statistic and the live-only form is reported beside it.
+
+### And the headline shortfall picked the conservative base by accident
+
+Amendment 22(a) quoted **4.9×** from `83.7/17.0`. The base-matched figure is `83.7/12.5` = **6.7×**.
+Understating a bound in the mechanism's favour is the safe error, but **a prevalence ratio has to
+name its base**, and both of amendment 22(a)'s numbers now do: the shortfall is **6.7× on matched
+keys**, 4.9× if the subgroup is read on live cells against an all-keys deficit.
+
+**Timing, stated because it is what makes this an amendment and not a revision.** Job 17698209 was
+submitted at the amended design and is running; `sbatch` spools the script at submit, so the four
+conditions in its header are fixed as of submission. This amendment pins a **denominator for reading
+them**, written before the job has produced an analysable CSV and before any share has been computed
+on either base.
