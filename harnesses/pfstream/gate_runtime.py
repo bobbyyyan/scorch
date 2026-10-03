@@ -540,17 +540,49 @@ for route, ea, eb, want in ROUTES:
                   "on n but NOT on population; z = %+.2f against the theoretical %d"
                   % (zscore(npos, len(d)), len(d) // 2))
         else:
-            bits = ["theoretical %d, z = %+.2f" % (len(d) // 2, zscore(npos, len(d)))]
+            zt = zscore(npos, len(d))
+            bits = [("theoretical", len(d) // 2, len(d), zt)]
             for pn, (fp, fn_) in sorted(emp.items()):
-                # The floor's own rate as the null, rather than a fair coin: the same
-                # binomial spread, recentred on what a non-moving arm pair actually did.
-                mu = fn_ and len(d) * fp / float(fn_)
-                sd = math.sqrt(len(d) * (fp / float(fn_)) * (1 - fp / float(fn_))) if fn_ else 0.0
-                bits.append("vs %s's rate %d/%d, z = %+.2f"
-                            % (pn, fp, fn_, (npos - mu) / sd if sd > 1e-9 else float("inf")))
-            print("         nulls: %s" % ";  ".join(bits))
-            print("         the two disagree, so the claim is that the count clears the "
-                  "WORSE of them, not that they coincide")
+                # TWO-PROPORTION test, not one. The floor's rate is itself estimated on the
+                # floor's own n, so treating it as a known p understates the spread by
+                # sqrt(2) and the understatement is always in the treatment's favour.
+                n1, n2 = len(d), fn_
+                pp = (npos + fp) / float(n1 + n2)
+                se = math.sqrt(pp * (1 - pp) * (1.0 / n1 + 1.0 / n2))
+                z = ((npos / float(n1)) - (fp / float(n2))) / se if se > 1e-12 else float("inf")
+                bits.append(("%s's rate" % pn, fp, fn_, z))
+            print("         nulls, %d of them:" % len(bits))
+            for nm, cnt, nn, z in bits:
+                # A UNANIMOUS count needs no normal approximation and the approximation is
+                # worst exactly there: at npos == n the treatment arm has zero sample
+                # variance, so a z built on it is the least trustworthy form of the most
+                # clear-cut case. The exact tail under that null's rate is one power.
+                extra = "  (two-proportion, both rates estimated)" if nm != "theoretical" else ""
+                if npos == len(d) and nn:
+                    rate = cnt / float(nn)
+                    lg = len(d) * math.log10(rate) if rate > 0 else float("-inf")
+                    print("           %-16s %3d of %3d   exact P(all %d positive) = 10^%.1f"
+                          "   (z = %+.2f, strained at npos = n)"
+                          % (nm, cnt, nn, len(d), lg, z))
+                else:
+                    print("           %-16s %3d of %3d   z = %+6.2f%s" % (nm, cnt, nn, z, extra))
+            # The RELATION between the nulls is computed, not asserted. Earlier versions of
+            # this line said unconditionally that they coincide, then unconditionally that
+            # they disagree; both were falsified by the run that printed them, and R2
+            # declares every population a treatment so it has one null and no relation at
+            # all. The sentence now reports what is there.
+            rates = sorted(set(round(c / float(n), 6) for _, c, n, _ in bits))
+            if len(bits) == 1:
+                print("         one null only, so there is nothing to reconcile: this route "
+                      "moves every population and has no A/A row to supply an empirical rate")
+            elif len(rates) == 1:
+                print("         all %d nulls coincide at the same rate, so the choice "
+                      "between them does not matter here" % len(bits))
+            else:
+                worst = min(b[3] for b in bits)
+                print("         the %d nulls differ (rates %s), so the claim is that the "
+                      "count clears the WORST of them, z = %+.2f"
+                      % (len(bits), ", ".join("%.3f" % r for r in rates), worst))
         glo, ghi = boot_med([x - y for x, y in zip(dmed, d)])
         print("       median-of-reps A-B %+8.3f us  vs min-of-reps %+8.3f  gap %+.3f "
               "CI [%+.3f, %+.3f] %s"

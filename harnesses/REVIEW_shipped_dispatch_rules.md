@@ -847,3 +847,103 @@ reports DIFFER and `diff` reports every line changed. The causes are a `dlmc/` k
 on one side and a two-line `#` preamble on the other. Normalized, they are identical. **A
 digest mismatch between two records of the same quantity is evidence of nothing until the
 comparison is normalized** -- this nearly read as a provenance alarm.
+
+## Concern #2, runtime: the work gate's threshold was calibrated against a different mode
+
+Every earlier probe on this predicate measured which cells it selects. This section is
+about time, and about where the gate's original evidence does and does not reach.
+
+### The measurement
+
+One object, arms are env vars read per call at `:2532` and `:2599`, interleaved inside one
+process. Pool 8, width 16, float32, mkt1, 120 cells, isolated at `omp_get_num_procs()` = 14
+so concern #1's adoption path cannot fire. Readings are tax-free: a caching `getenv`
+returns the same pointers and flushes on every write to the environment, so decisions are
+unchanged while the hooks build's measured 20.13 us per-call `getenv` cost stops being
+per-call.
+
+| route | population | median A-B | sign count | scale | ratio A/B |
+|---|---|---|---|---|---|
+| R1 gate as shipped | T in-region | **+14.224 us** | **120 of 120** | 29.86 us | **1.6175** |
+| R1 | C1 floor, same matrices at k=32 | +0.008 us | 79 of 120 | 26.03 us | 1.0003 |
+| R1 | C2 floor, same width, larger nnz | -0.000 us | 60 of 120 | 23.35 us | 1.0000 |
+
+Arm A sets `MINGRAINS=2`, the shipped value, which forces mode 0. So **the gate selects the
+slower mode on its entire treatment population**, by 61.75%, on every cell. Under the
+theoretical null P(all 120 positive) is 10^-36.1; under C1's own observed rate, 10^-21.8.
+Min-of-reps and median-of-reps agree to 0.005 us with comparable arm spreads, so the
+estimator choice is not carrying it.
+
+### Why, and it is in the git history rather than in the measurement
+
+`dcf2e1f` calibrated the threshold and states its separator as "the cells where the
+partition falls more than 10% behind **the shared counter**". At that commit
+`SCORCH_SPMM_PARTITION_DEFAULT` was **0** -- the shared counter was what shipped, and the
+partition was an opt-in. `dcf2e1f` also shipped the gate at `MINGRAINS` default **0**, off.
+
+`8ccd104` then flipped four defaults in one commit, two of which interact:
+`PARTITION_DEFAULT` 0 -> **3** (back-stealing) and `MINGRAINS` 0 -> **2** (gate on). So the
+threshold calibrated when the alternative to mode 0 was the then-current partition was
+carried over unchanged to gate **back-stealing**, which that same commit introduced as the
+default. The gate's constant was never re-fit against the mode it now gates.
+
+### And x86 at pool <= 16 was never measured, by that commit's own account
+
+`8ccd104` says, of the pool ceiling: "ungated the work gate costs 7.0% and 8.5% across the
+whole x86 corpus, uniformly at every k. Capped at 16 it is **unreachable on a 24-thread
+pool**". Its x86 grid is redwood's, at a 24-thread pool -- so the ceiling made the gate
+inert for that entire grid, and the headline 1.3242x never exercised it. The gate's only
+positive evidence is the next sentence: "On the **6-thread host** the gate recovers a third
+of the row partition's only regression", and that host is the ARM one (the same commit
+reports "1099 passed, 48 skipped on the ARM host").
+
+So the evidence partitions cleanly:
+
+| configuration | gate fires? | evidence |
+|---|---|---|
+| x86, pool > 16 | no, ceiling blocks | 1.3242x grid, gate inert |
+| x86, pool > 16, ceiling removed | yes | **costs 7.0% / 8.5%** |
+| ARM, 6 threads | yes | recovers a third of one regression |
+| **x86, pool <= 16** | **yes** | **none** |
+
+The last row is the gate's active range on x86 and it is empty. The 7.0%/8.5% cost figure
+already has the sign I measure; the measurement above is the same sign, larger, inside the
+range the ceiling deliberately leaves open.
+
+### What this does NOT establish
+
+**The duration band is not evidence either way, and I withdraw leaning on it.** The header
+reads "the cells where it falls more than 10% behind the shared counter sit at 19-30
+microseconds where the cells it wins sit at 31-110". `dcf2e1f` gives the quartiles those
+came from: losing cells at **19 / 27 / 28 / 30** and winning cells at **16 / 31 / 62 / 110**
+at min / q1 / median / q3. So "19-30" is min-to-q3 of one population and "31-110" is
+q1-to-q3 of the other -- different functionals in one sentence -- and the winning cells'
+minimum of 16 is *below* the losing cells' minimum. The two distributions overlap across
+the whole of 19-30 and at least a quarter of winning cells sit under 31. A cell measuring
+29.86 us is therefore in a region both populations occupy. What survives is only that 29.86
+is inside the losing cells' IQR (27-30) and below the winning cells' q1 (31).
+
+**And those microseconds carry their own object.** `dcf2e1f` swept the LLC-divisor ladder
+through a hook and closes by noting "a hook that is measured and rejected still costs a
+getenv on every call in every instrumented build" -- so its durations were very likely
+taken on an instrumented build and carry that build's `getenv` tax, as this concern's own
+readings did before the shim. The comparison would need both sides on the same footing.
+Not reading, inference: `dcf2e1f` does not name its object, and if the ladder was built
+per-value with `-D` rather than swept by env var its durations are tax-free and the bands
+stand as written.
+
+**The band is not the criterion in the first place.** `dcf2e1f` scores the shipped
+predicate as "catching 74% and 77% of the regressed cells against 14.5% and 13.7% of the
+winning ones" -- those are P(in region | outcome). The 120-of-120 above is
+P(slower | in region). Converting between them needs the base rates, how many regressed and
+how many winning cells that grid held, which the commit never states. So 14.5% is not a
+false-positive rate for the gate without those counts, and the right comparison is against
+P(outcome | region) measured on the original grid.
+
+### Scope
+
+One pool, one width, one host, 120 cells, isolated allocation. The pool axis is the one that
+can reverse the sign and the header reserves it explicitly at `:1595-1603`, anchoring the
+counter winning at pool 6 and the partition winning at pool 24; pool 8 reads with the pool
+24 end. A sweep over pools 2/4/8/16/20/24 x widths 2/4/8/16 is running. Above pool 16 the
+ceiling makes R1 a declined argument, which supplies a floor on the treatment's own cells.
