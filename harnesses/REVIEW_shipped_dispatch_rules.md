@@ -2794,3 +2794,60 @@ zero supports neither and would mean the effect is smaller than this design reso
 `+2.56% [+2.07, +3.06]` and to redwood DLMC's negative sign -- not an ordering of three widths.
 Secondary and also registered: whether k=2's behind-MKL share on DLMC exceeds its 61.9% on
 SuiteSparse, since k=2 is the live deficit and DLMC's matrices are smaller and lower-degree.
+
+### Amendment to that pre-registration, made before reading any dlmc row
+
+Written while the dlmc phase runs and **before any dlmc row has been read** — rows exist on disk,
+which is weaker than writing this before the phase started, so the claim is the one that can be
+checked: nothing below is informed by a dlmc reading, and the only dlmc file access this session has
+been `wc -l` on the ss CSV and the phase's start line.
+
+**First, the redwood SuiteSparse anchor is not inconsistent — the two figures are different
+populations.** A peer computed `-7.06%` from the co-registered summaries `{0.682, 0.540, 0.495}`
+and read it against the doc's `-3.24%`, a 2.2x gap. But those three numbers are **top-degree-band
+values normalised to each width's own deg 0-32 band**, so a contrast over them is a deg-256+
+quantity. The registered redwood band figures are -2.82 / -6.13 / -11.23 / **-9.66**, and -7.06 sits
+beside the top band's -9.66, not beside the pooled -3.24. The pooled figure is dominated by band 0,
+which holds 4153 of 4570 SuiteSparse matrices. Two populations, not two estimators, so there is
+nothing to reconcile and no 3.8 pp estimator spread to carry. (The same arithmetic on redwood DLMC's
+`{0.587, 0.520, 0.657}` gives -16.27%, beside that corpus's top band -15.60 — the same agreement,
+which is the check that the explanation is right rather than convenient.)
+
+**Second, and this is a defect in my own registration: the pooled branch is not well posed.**
+Redwood DLMC's paired dip by band is **+0.95** / -2.39 / -11.72 / -15.60 — the lowest band is a
+**bump**. So "MKT DLMC reads a dip -> the cause interacts with the corpus" has no clean comparand,
+because redwood DLMC is itself a bump at low degree and only a deep dip at high degree. Worse,
+pooling across corpora compares different band *mixtures*: band 0 holds 91% of SuiteSparse but a far
+smaller share of DLMC, whose degree distribution is much higher. **The comparison is therefore
+registered band by band, and the discriminating feature is the high-degree bands**, where redwood
+DLMC reads -11.72 and -15.60 against MKT SuiteSparse's +9.30 and +3.27:
+
+| registered read, MKT DLMC deg 100-256 and 256+ | conclusion it supports |
+|---|---|
+| both bumps, CIs above zero | the inversion is **host**-caused (AVX2 vs Zen4 AVX-512 on the 128-bit path) |
+| both deep dips near -12 and -16, CIs below zero | it tracks the **corpus**, matching redwood DLMC |
+| dips, but an order of magnitude shallower | the **sign** tracks the corpus and the magnitude does not — which is the reading a sign-only branch would have hidden |
+| CIs spanning zero | below this design's resolution; report as such |
+
+The third row is the one this amendment exists to make sayable. A sign-only branch inherits exactly
+the defect the rank did: it cannot express that a dip of -0.5% and a dip of -15.6% are different
+findings.
+
+**Third, the three registered ss reads are all applied, and none moves the verdict.** The `+2.56%`
+already carried the common-basename restriction and the shape check; recomputing across all three
+populations:
+
+| population | n | pooled paired k=4 | 95% CI |
+|---|---|---|---|
+| one path per basename, no shape check | 4578 | +2.54% | [+2.06, +3.02] |
+| 4578 common basenames, shape check applied | 4570 | **+2.56%** | [+2.07, +3.06] |
+| same, 148 non-operands dropped | 4422 | +2.33% | [+1.83, +2.83] |
+
+The non-operand correction is **-0.23 pp** here, and the worst case across all three is **+1.83%** —
+a bump in every population, with the margin named.
+
+**Fourth, the secondary's base.** k=2's **61.9%** behind-MKL share is over the **4570**
+common-basename set *including* the 148 non-operands; operands only it is **63.1%** (2790/4422), so
+dropping the degenerate keys raises it rather than lowering it. The DLMC side must use the same
+predicate — one path per basename, shape-checked where a census exists, and the share reported on
+both bases — or the two shares are differently defined and not comparable.
