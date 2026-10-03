@@ -942,8 +942,19 @@ The sealed criterion is recorded, at `an_c207.py:181-189`:
 Transcribing it reproduces, from the sealed CSVs and nothing else: 19100 complete cells
 (the file's own `EXPECT_CELLS`), the per-width ratio floors
 0.2607 / 0.2783 / 0.2858 / 0.3010 / 0.2960, the headline count 1/8/1/0/0 = 10 cells over
-10 matrices, and the board medians 0.885 / 0.925 / 0.885 / 0.793 / 0.741. Eleven
-independent values to the digit. The procedure is identified, not conjectural.
+10 matrices, and the board medians, as `median aa`,
+0.8864 / 0.9231 / 0.8849 / 0.7907 / 0.7409. Sixteen independent values to the digit. The
+procedure is identified, not conjectural.
+
+The medians took a second attempt, and the reason is worth recording because it is the
+third instance of one error. `an_c207.py:169-173` prints `red(ra)` and `red(rb)` -- the
+two builds in **separate columns** -- and never forms a median across them. My first
+reconstruction pooled the two builds into one list, which is a third statistic, and read
+0.8854 / 0.9248 / 0.8854 / 0.7926 / 0.7412: wrong in the third digit, plausible in every
+digit. Amendment 3(c) recorded the same error in the other direction, where the gate used
+per-build medians while "gain needed" reported the pooled one. A reduction across builds
+is not a reduction within one, and nothing about either number's appearance says which it
+is.
 
 My amendment-6 table differed in two ways, both of which I had stated and neither of
 which I accounted for: it restricted to the sign-only 51, and it admitted on
