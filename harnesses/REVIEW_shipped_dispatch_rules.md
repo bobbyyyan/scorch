@@ -1134,6 +1134,25 @@ The one non-literal caller in 1.7 billion lookups is why the cache owns its keys
 than borrowing them: with a borrowed pointer that single case could have left a dangling
 key, and the diagnostic that found it costs nothing.
 
+### How much this matters, measured rather than implied
+
+The gate fires only at pool <= 16, and **neither x86 benchmark host runs a pool that low by
+default**: `torch.get_num_threads()` reads **64** on mkt1 (128 CPUs, so half) and the
+header gives redwood's as 24. At those pools `:2614` zeroes `mingrains` and the predicate
+is unreachable. So the configuration measured above is not the one that produces this
+project's MKL comparisons, and this finding does **not** move the MKL scoreboard on either
+host at default settings.
+
+Where it does bite is x86 with a deliberately constrained pool -- `torch.set_num_threads(8)`,
+a container CPU limit, a narrow Slurm allocation -- which is a real pattern and not the
+default one. Combined with the prevalence figures above, the exposed population at pool <= 16
+is 2069 of 4446 SuiteSparse operands at k <= 16 and 1154 of 3820 DLMC matrices, at a cost of
+6.8% to 62.3% depending on pool.
+
+Stating this prominently because the alternative is a finding that reads as a 62% regression
+in shipped code without the clause that makes it a non-default configuration. Both halves
+are true and only together.
+
 ### Scope
 
 One host, float32, 120 cells per configuration, isolated allocations where concern #1
