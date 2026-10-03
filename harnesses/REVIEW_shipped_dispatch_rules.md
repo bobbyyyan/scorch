@@ -1716,3 +1716,92 @@ rather than a predicate difference. It is left as a one-key gap, not reconciled.
 degree 256, so `>=` against `>` moves this population by **26%**. Any claim stated as "deg >= 256"
 on this corpus must name the side the boundary belongs to; the n summing to the corpus total
 proves the bands partition but not which convention they use.
+
+## The 712/713 gap is RESOLVED: a rounded covariate, not a dropped key
+
+`mrgate.py:143` writes `deg="%.2f" % (nnz / max(M, 1))`, so a band computed from the CSV column
+bins a **rounded** degree while one recomputing `nnz/rows` bins the exact ratio. With keys sitting
+on the boundary value, that is enough. Binned both ways on the same file:
+
+| reading | >= 256 | > 256 | == 256.0 |
+|---|---|---|---|
+| CSV `deg` column (rounded to 2dp) | **713** | 527 | 186 |
+| recomputed `nnz/rows` (exact) | **712** | 527 | 185 |
+
+Exactly one key flips, and it is the expected shape:
+
+    transformer/magnitude_pruning/0.5/body_decoder_layer_2_encdec_attention_
+      multihead_attention_k_fully_connected
+        column 256.00      exact 255.9980468750
+
+So the earlier study's n=712 computed degree exactly and this section's 713 binned the rounded
+column. **No key was lost**, and "the earlier filter dropped one key" is withdrawn. Band n under
+the exact reading: 1051 / 781 / 1276 / 712.
+
+The 26% convention exposure is unchanged and is the larger point: **185 keys have `nnz/rows`
+exactly 256** -- integer `nnz` being an exact multiple of `rows`, which pruned power-of-two layers
+produce in quantity -- so `>=` against `>` still moves this population from 712 to 527. A
+covariate written through `%.2f` and a boundary landing on a value 185 matrices hit exactly are
+two independent reasons to state the predicate precisely.
+
+## Correction to the normalised table: the `k=4/nbr` column is not the dip
+
+Every width in that table is normalised to **its own** deg 0-32 value, so a ratio taken inside it
+inherits the normalisation. `k=4/nbr` is therefore the dip **relative to the deg 0-32 band's own
+dip**, not the dip. Read as the dip it understates by up to 2.7 pp:
+
+| SuiteSparse band | `k=4/nbr` read directly | the actual dip |
+|---|---|---|
+| 32-100 | -3.40% | -6.13% |
+| 100-256 | -8.67% | -11.23% |
+| 256+ | -7.06% | -9.66% |
+
+The relation is `(1 + dip_band) = (1 + dip_{0-32}) x (k=4/nbr)`, which recovers the published
+figures to 0.01 pp. The column is kept because the normalised view is what separates the widths'
+trends, but its base is now named beside it.
+
+## The disagreement as a rank reversal, which is sharper than "what is special"
+
+Ranking k=4's degree-robustness among the five widths in the top band:
+
+| | normalised values, k=2..k=32 | k=4's rank |
+|---|---|---|
+| SuiteSparse | 0.682 0.540 0.495 0.476 0.455 | **2nd most robust of 5** |
+| DLMC | 0.587 0.520 0.657 0.694 0.785 | **least robust of 5** |
+
+And the log-step sequence across widths at deg 256+:
+
+    SuiteSparse  -0.2335  -0.0870  -0.0391  -0.0451   monotone decline, no local minimum
+    DLMC         -0.1212  +0.2339  +0.0548  +0.1232   local minimum at k=4, trend REVERSES
+
+**The width-versus-robustness trend above k=4 has opposite sign on the two collections.** That is
+a larger disagreement than which width is responsible, and it bounds what SuiteSparse contributes:
+"every width degrades with degree, k=4 included and not worst" is a fact about the kernel family,
+not evidence for k=4.
+
+### One feature of the SuiteSparse sequence a width-specific account does predict
+
+The monotone decline is **not uniform**: the k=2 -> k=4 step is -0.2335 against the next step's
+-0.0870, a factor of **2.7**. So SuiteSparse does carry a discontinuity at exactly the boundary
+where the narrow-k exact kernel hands off to the half-vector one, and DLMC's reversal is at the
+same boundary. That is the one cross-corpus feature located at a kernel transition rather than at
+an arbitrary width.
+
+It does **not** restore the attribution, because it reads equally as "the exact kernel is
+unusually robust to degree" -- and on SuiteSparse that is the better description, since k=4 is
+second-most robust there. But the previous section's withdrawal was slightly harsher than the data
+requires, and this is the part of the cross-corpus content that survives: an anomalous step at the
+exact-to-half-vector boundary on both collections, with opposite sign of everything above it.
+
+### Why the surviving agreement is partly built into the statistic
+
+The paired contrast is constructed from k=2 and k=8 -- the two widths whose behaviour differs most
+between the collections. On SuiteSparse k=8 degrades **more** than k=4 (0.495 against 0.540), which
+produces a negative dip with k=4 behaving normally; on DLMC k=8 degrades **less** (0.657 against
+0.520), which produces a negative dip because k=4 collapses. **Same dip sign, opposite cause**, and
+the sign agreement is what the construction guarantees once both neighbours move.
+
+So "the dip grows with degree on both corpora" is true and is weaker support for a shared mechanism
+than it reads. The general form: **when a contrast agrees across populations while its components
+disagree, the statistic's construction is a candidate for what is doing the agreeing** -- check the
+components before reading the contrast as replication.
