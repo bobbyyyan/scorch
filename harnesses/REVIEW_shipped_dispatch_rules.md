@@ -40,49 +40,74 @@ on the first run rather than printing six reassuring "STABLE" rows):
 
 2 of 5 eligible cells moved, and the **kind** never moved — only the panel width.
 
-**The null, which overturns that reading.** A pick that moves across thread counts is evidence of
-thread dependence only if it is stable at a *fixed* thread count. Repeating the probe 8 times at
-each of nt=2 and nt=6:
+**The null, which overturns that reading — and a second run that overturns my reading of the
+null.** A pick that moves across thread counts is evidence of thread dependence only if it is
+stable at a *fixed* thread count. Repeating the probe 8 times at each of nt=2 and nt=6:
 
-| cell | nt=2, 8 reps | nt=6, 8 reps | within-nt switch (null) | across-nt switch | majority |
-|---|---|---|---|---|---|
-| N=1024 | tilej/1024 ×8 | tilej/1024 ×6, tilej/2048 ×2 | 2/14 = 0.14 | 2/8 = 0.25 | **same** |
-| N=2048 | tilej/512 ×8 | tilej/512 ×7, tilej/256 ×1 | 2/14 = 0.14 | 1/8 = 0.12 | **same** |
+| run | cell | nt=2 | nt=6 | majority agrees? |
+|---|---|---|---|---|
+| first | N=1024 | tilej/1024 ×8 — **0/7 transitions** | 1024 ×6, 2048 ×2 — 2/7 | yes (1024) |
+| first | N=2048 | tilej/512 ×8 — **0/7 transitions** | 512 ×7, 256 ×1 — 2/7 | yes (512) |
+| second | N=1024 | 1024,1024,512,512,1024,512,1024,512 — **5/7 = 0.71** | 3/7 = 0.43 | yes (1024) |
+| second | N=2048 | 256,512,256,256,256,512,512,256 — **4/7 = 0.57** | 4/7 = 0.57 | yes (**256**) |
 
-The across-thread variation does not exceed the within-thread variation, and the majority pick is
-identical at both thread counts on both cells. **The concern's stated consequence does not
-reproduce here.** The key's omission of `nthreads` is real, but on these cells it is not what makes
-the plan wrong.
+**Three corrections to what the first run let me write, two of them structural.**
 
-**What the null exposed instead, with a size.** The pick is irreproducible at fixed configuration —
-three distinct widths appeared at nt=6 alone — and the memo freezes whichever width won the first
-call for the whole process. Timing each pick by seeding the memo and calling the production entry,
-so production builds its own kernel arguments, two interleaved passes per pick, M5 at nt=6:
+- The first version of this entry compared raw **counts** (`within >= across`) across different
+  denominators — 14 adjacent pairs against 8 matched-index pairs — and printed "does not exceed"
+  for the N=1024 cell where the *rates* are 0.25 against 0.14. The claim was false on that cell and
+  the published range "0.12–0.25" hid it at the top end.
+- **The two rates were never the same statistic.** Within-condition counts adjacent transitions;
+  across-condition counts matched-index disagreements. For a minority set of size *m* in *r*
+  contiguous interior runs the numerators are 2*r* and *m*, so when both describe the same events
+  their ratio is the denominator ratio and nothing else — on N=1024, 0.25/0.14 is exactly 14/8.
+  **The ratio is withdrawn**; it could not have carried information either way.
+- **The first run's pooled null averaged a perfectly stable condition with the condition under
+  test.** nt=2 was 0/7 on both cells and every switch was at nt=6, so the pooled 0.14 was the mean
+  of 0.00 and 0.29 — half its mass was the quantity being explained away, which makes the
+  comparison against nt=6 circular and leaves the comparison against nt=2 with no null at all.
+  A within-condition null is reported **per condition** when the conditions are the arms of the
+  contrast.
 
-| cell | widths the probe flips between | runtime span | worst same-pick pass spread | ratio | v2 baseline |
-|---|---|---|---|---|---|
-| N=1024 | 512 / 1024 / 2048 | **4.66%** | 1.15% | 4.1× | **+54.87%** |
-| N=2048 | 256 / 512 / 1024 | **6.12%** | 2.74% | 2.2× | **+94.99%** |
+**And the second run kills the explanation I had built on the first.** nt=2 is not stable: it is
+*more* unstable than nt=6 on the N=1024 cell (0.71 against 0.43) and equal on N=2048. So the
+"instability appears at nt=6, which is the M5's fast-core count" reading — the hybrid-core
+alternative I had flagged as live — **is dead**, because the first run's nt=2 stability was a draw
+and not a property. The N=2048 majority pick also moved between runs, 512 to 256, so even the
+surviving leg agrees *within* a run without the majority itself being reproducible *across* runs.
 
-**So the "never slower by construction" guarantee is not what this breaks.** v2 is 54.9% and 95.0%
-slower than the best tiled width in these two cells, so every width the coin flip chooses between
-is far above the baseline the guarantee is about. What the irreproducibility costs is **4.7–6.1% of
-the available tiling gain**, not a regression. The reviewer pointed at the right code and the wrong
-consequence; the defect is smaller in kind and larger in frequency than stated.
+**What is left is simpler than the concern and more actionable.** The pick is substantially
+irreproducible at fixed configuration — 0.43 to 0.71 adjacent-transition rate over 8 repeats, two
+distinct widths in every condition of every run — and the memo freezes whichever width won the
+first call for the process. **Thread count is not the variable.** Adding `nthreads` to the memo key
+would partition the cache without changing a decision, because there is no thread-dependent
+decision to protect; the defect is the probe's width resolution.
 
-**Not yet generalized, and this bounds what the finding is worth.** One host. The instability
-appeared at nt=6 and not at nt=2, and 6 is the M5's fast-core count — the cliff already recorded
-for OpenMP team width on this machine — so a hybrid-core artefact is a live alternative to a
-general property of the probe. Two-host confirmation is the standing requirement for anything
-quoting a percentage, and neither x86 host is available: redwood is down and mkt1 is mid-run on
-job 17698209. **No code change is proposed on one host.**
+**The cost, with the base named, because the base inverts the ranking.** Timing each pick by
+seeding the memo and calling the production entry, two interleaved passes per pick, M5 at nt=6:
 
-**What would settle it**, in the order a second host should run it: (a) the same within-nt
-repetition at 2, 8, 16 and 32 workers, where 6 has no special status; (b) whether the probe's
-candidate list is dense enough that adjacent widths are inside its floor by construction, which
-would make the flip a property of the search rather than of the machine; (c) only then, whether
-adding `nt` to the memo key changes any decision — because on this evidence it would partition the
-cache without changing a pick.
+| cell | widths in play | span of runtime between them | same-pick pass spread | v2 over best tiled | span as share of runtime | span as share of the gain over v2 |
+|---|---|---|---|---|---|---|
+| N=1024 | 512 / 1024 / 2048 | 4.66% | 1.15% | +54.87% | **4.66%** | **8.5%** |
+| N=2048 | 256 / 512 / 1024 | 6.12% | 2.74% | +94.99% | **6.12%** | **6.4%** |
+
+The span is relative to the **best tiled width**. The first version of this entry called it
+"4.7–6.1% of the available tiling gain", which is the span wearing the gain's label: the gain over
+v2 is 0.5487 and 0.9499 of the best width's time, so the span is 0.0466/0.5487 = 8.5% and
+0.0612/0.9499 = 6.4% of it. Both bases are defensible and the pairing was not. **The choice inverts
+which cell is worse** — by share of runtime the second (6.12 > 4.66), by share of the gain the
+first (8.5 > 6.4) — so neither number travels without its base.
+
+**The never-slower-than-baseline guarantee is untouched.** v2 is 54.9% and 95.0% slower than the
+best tiled width in these cells, so every width the draw chooses between is far above the baseline
+the guarantee is about. This costs headroom, not correctness.
+
+**Still one host, and no code change proposed.** The hybrid-core alternative is dead but the
+single-host limit is not: everything above is the M5. What a second host should run, in order:
+(a) the same per-condition repetition at 2, 8, 16 and 32 workers; (b) whether adjacent candidate
+widths are inside the probe's floor **by construction**, which would make the draw a property of
+the search rather than of the machine, and is now the leading hypothesis; (c) whether increasing
+the probe's repetition count resolves the width, which is the fix if (b) holds.
 
 **Harnesses** (scratchpad; to be filed with the measurement if a second host confirms):
 `tile_thread_dep.py` (refuses when no cell is eligible), `tile_thread_null.py` (reports its own
