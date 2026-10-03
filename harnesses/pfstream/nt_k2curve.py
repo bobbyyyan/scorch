@@ -120,6 +120,16 @@ for r in rows:
 # reproducible across processes: `nt_cap = override > 0 ? override : omp_get_max_threads()`, so
 # override 0 reads ambient OpenMP state. Within this sweep it is the right label because the
 # object that answered and the kernel that was timed were in the same process.
+# Shape per key, for naming the registered subgroup's members. Taken from the first row that
+# carries the columns, because the shape is a property of the matrix and does not vary by width.
+shape_of = {}
+for r in rows:
+    if r["key"] not in shape_of:
+        try:
+            shape_of[r["key"]] = (int(r["rows"]), int(r["nnz"]), float(r["deg"]))
+        except (KeyError, TypeError, ValueError):
+            pass
+
 prod_count = {}
 for r in rows:
     try:
@@ -411,8 +421,10 @@ print("null is the winner's curse itself, measured on this cell's own noise, and
 print("over it is the part a thread rule could actually recover.")
 print("  %4s %7s %9s %9s %9s %9s %9s" % ("k", "cells", "median", "null", "excess", "p75", "p95"))
 excess_by_k = {}
+rows_by_k = {}
 for k in ks:
     gains, nulls = [], []
+    trip = []
     for ck, c in cell.items():
         if ck[1] != k or len(c) < 2:
             continue
@@ -431,7 +443,10 @@ for k in ks:
         if g is None:
             continue
         gains.append(g)
-        nulls.append(perm_null(c, gain))
+        _nl = perm_null(c, gain)
+        nulls.append(_nl)
+        trip.append((prod, g, _nl, ck[0]))
+    rows_by_k[k] = trip
     if not gains:
         print("  %4d       0   no cell has a reading at the count production resolves to" % k)
         continue
@@ -442,6 +457,99 @@ for k in ks:
     print("  %4d %7d %9.4f %9.4f %9.4f %9.4f %9.4f"
           % (k, len(gs), med, nul, exc,
              gs[int(0.75 * (len(gs) - 1))], gs[int(0.95 * (len(gs) - 1))]))
+print()
+print("SUBGROUP CENSUS BY THE COUNT PRODUCTION RESOLVES TO. This is prereg amendment 5's")
+print("element 2 scored as registered -- 'the excess for cells resolving to <= 2 workers will")
+print("exceed that for cells resolving to >= 8 workers' -- computed from the SAME per-cell")
+print("triples as the pooled row above, so the two cannot disagree by construction.")
+print("THE MIDDLE GROUP IS NAMED EVEN THOUGH THE REGISTRATION DOES NOT NAME IT, because a")
+print("pooled value outside the range of the named groups is explicable only by an unnamed")
+print("one, and omitting it is how a transcription error reads as a plausible number.")
+print("A MEDIAN OVER A UNION LIES BETWEEN THE SMALLEST AND LARGEST SUBGROUP MEDIAN: if it did")
+print("not, more than half of every subgroup would sit on one side of it, hence more than half")
+print("of the union, which contradicts it being the union's median. That bound is CHECKED")
+print("below on the median and on the null SEPARATELY, because the excess is a RATIO of two")
+print("medians and is not itself a median, so the bound does not transfer to it.")
+print("  %4s %-8s %6s %9s %9s %9s" % ("k", "group", "n", "median", "null", "excess"))
+GRP = (("<=2", lambda n: n <= 2), ("3-7", lambda n: 3 <= n <= 7), (">=8", lambda n: n >= 8))
+_dom_fail = []
+for k in ks:
+    trip = rows_by_k.get(k) or []
+    if not trip:
+        print("  %4d %-8s %6d   no cell has a reading at the count production resolves to" % (k, "ALL", 0))
+        continue
+    gall = sorted(t[1] for t in trip)
+    nall = sorted(t[2] for t in trip if t[2] == t[2])
+    pm = st.median(gall)
+    pn = st.median(nall) if nall else float("nan")
+    print("  %4d %-8s %6d %9.4f %9.4f %9.4f"
+          % (k, "ALL", len(gall), pm, pn, (pm / pn) if pn == pn and pn > 0 else float("nan")))
+    gm_, nm_ = [], []
+    for name, pred in GRP:
+        sub = [t for t in trip if pred(t[0])]
+        if not sub:
+            print("  %4s %-8s %6d   empty -- printed so an absent group cannot read as a pass" % ("", name, 0))
+            continue
+        sg = sorted(t[1] for t in sub)
+        sn = sorted(t[2] for t in sub if t[2] == t[2])
+        m = st.median(sg)
+        nn = st.median(sn) if sn else float("nan")
+        gm_.append(m)
+        if nn == nn:
+            nm_.append(nn)
+        tag = "" if len(sg) >= 4 else "   n<4, not interpreted"
+        print("  %4s %-8s %6d %9.4f %9.4f %9.4f%s"
+              % ("", name, len(sg), m, nn, (m / nn) if nn == nn and nn > 0 else float("nan"), tag))
+    # the bound, checked rather than asserted in prose
+    if len(gm_) >= 2:
+        lo, hi = min(gm_), max(gm_)
+        if not (lo - 1e-12 <= pm <= hi + 1e-12):
+            _dom_fail.append("k=%d median %.4f outside subgroup range [%.4f, %.4f]" % (k, pm, lo, hi))
+    if len(nm_) >= 2 and pn == pn:
+        lo, hi = min(nm_), max(nm_)
+        if not (lo - 1e-12 <= pn <= hi + 1e-12):
+            _dom_fail.append("k=%d null %.4f outside subgroup range [%.4f, %.4f]" % (k, pn, lo, hi))
+print("  DOMINANCE CHECK on the union median and the union null: %s"
+      % ("PASS at every width" if not _dom_fail else "FAILED"))
+for _m in _dom_fail:
+    print("    FAIL: " + _m)
+if _dom_fail:
+    print("  A union median outside the range of its subgroup medians is ARITHMETICALLY")
+    print("  IMPOSSIBLE, so a FAIL here is a defect in this script's own routing, not a")
+    print("  finding about the kernel. It is printed rather than raised so the rest of the")
+    print("  output stays readable, and the exit code below carries it.")
+print("  THE REGISTERED SUBGROUP'S MEMBERS at the narrowest width, named because a 9-cell")
+print("  group carrying a large effect is only actionable if one can say WHICH cells, and")
+print("  because `rows/16` is the clamp -- so a cell resolving to <=2 workers is a claim about")
+print("  its row count that the shape columns can confirm or contradict.")
+_narrow = ks[0] if ks else None
+_sub = [t for t in (rows_by_k.get(_narrow) or []) if t[0] <= 2]
+if not _sub:
+    print("    none at k=%s" % _narrow)
+for _t in sorted(_sub, key=lambda z: -z[1])[:16]:
+    _sh = shape_of.get(_t[3], (0, 0, 0.0))
+    print("    k=%-3s resolved %d  cur/best %.4f  null %.4f  rows %7d  nnz %9d  deg %7.2f  %s"
+          % (_narrow, _t[0], _t[1], _t[2], _sh[0], _sh[1], _sh[2], _t[3]))
+if len(_sub) > 16:
+    print("    ... %d more; 16 shown, and the count above is the group's full n" % (len(_sub) - 16))
+print()
+print("  ELEMENT 2's REGISTERED COMPARISON, read off the rows above per width, with its own")
+print("  direction stated so a reversal cannot be reported as a pass:")
+for k in ks:
+    trip = rows_by_k.get(k) or []
+    a = sorted(t[1] for t in trip if t[0] <= 2)
+    b = sorted(t[1] for t in trip if t[0] >= 8)
+    na = sorted(t[2] for t in trip if t[0] <= 2 and t[2] == t[2])
+    nb = sorted(t[2] for t in trip if t[0] >= 8 and t[2] == t[2])
+    if len(a) < 4 or len(b) < 4:
+        print("    k=%-3d NOT SCOREABLE: n(<=2)=%d n(>=8)=%d, one side under 4 cells" % (k, len(a), len(b)))
+        continue
+    ea = st.median(a) / st.median(na) if na and st.median(na) > 0 else float("nan")
+    eb = st.median(b) / st.median(nb) if nb and st.median(nb) > 0 else float("nan")
+    print("    k=%-3d <=2 excess %.4f (n=%d) vs >=8 excess %.4f (n=%d) -> %s"
+          % (k, ea, len(a), eb, len(b),
+             "AS REGISTERED" if ea > eb else "REVERSED -- the registration predicted <=2 LARGER"))
+print()
 print("  'excess' is median/null. At 1.00 the apparent headroom is entirely the winner's curse")
 print("  and a thread rule has nothing to recover; above 1.00 it is the recoverable part.")
 print()
@@ -555,3 +663,14 @@ else:
     print("     count and the best reachable one. If that median is at the floor, the rule has")
     print("     nothing to recover here whatever the curve's shape, and if it is well above the")
     print("     floor the rule has headroom even on a curve that reads flat end to end.")
+
+# The dominance check's exit code, which the census block's prose promises. Last statement in
+# the file so every table still prints: an internal routing defect must not suppress the run's
+# own output, and a reader who only checks `rc` must still see it.
+if _dom_fail:
+    print()
+    print("EXIT 1: %d dominance check(s) failed above. The tables printed are NOT trustworthy"
+          % len(_dom_fail))
+    print("at the widths named, because a union statistic outside its subgroups' range means a")
+    print("cell reached the wrong bucket.")
+    raise SystemExit(1)

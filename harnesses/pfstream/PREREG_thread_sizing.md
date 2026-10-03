@@ -1212,6 +1212,11 @@ harms 58 cells by up to 1.44× is a no-ship. Recorded as a bounded negative, not
 
 ## Amendment 19 — amendment 18 scored the wrong set and two rows on the wrong host; amendment 5's prediction 1 is now scored and FAILS
 
+> **PARTLY CORRECTED BY AMENDMENT 20.** This amendment's own scorecard lists three of
+> amendment 5's four elements and marks two of those three unscored, when the ledger had
+> already scored both and its own table held the fourth element's verdict. Element 2 HOLDS
+> on its registered host. Read amendment 20.
+
 Three defects in amendment 18, all found by a reviewing session from inconsistencies between my own
 published numbers, and one registered prediction scored for the first time.
 
@@ -1311,3 +1316,194 @@ both; the measured clamp shares read M5 and redwood **10.7 points apart** and M5
 points apart**. The model's near-tie reads far apart and its far-apart pair reads nearly equal.
 That is a stronger refutation than the one amendment 18 wrote, and the refutation is robust to the
 sign convention: redwood is the middle term under either direction of "bites" and it reads largest.
+
+---
+
+## Amendment 20 — element 2 HOLDS on its registered host at all eight widths, element 4's control FIRES, and amendment 19 reproduced at n=3 the defect it diagnosed at n=4
+
+Amendment 19 named amendment 5's set as the unscored domain, scored element 1, and gave every
+scorecard row its host. It then listed **three** of the four elements and marked **two of those
+three unscored** — when the ledger had already scored both, and when its own table one row up held
+the fourth element's verdict. Scoring only the element that prompted the finding reproduces the
+defect with a smaller n.
+
+All numbers below come from `nt_k2curve.py` at `977c9d0d59f8e7f0`, which now computes the subgroup
+split from the **same per-cell triples as the pooled row**, so the two cannot disagree by
+construction. MKT: `/scr/bobbyy/adg/csv/oracle.csv`, object `09b7b24cbceec93c`, 38016 of 38016 rows
+carrying an `so_sha`. redwood: `oracle_redwood.csv`, object `8192715070225fd3`, 28800 of 28800.
+
+### (a) Element 2 HOLDS on MKT at every width, and the pooled statistics hid it
+
+Element 2, `:292-294`: *"The headroom concentrates where the resolved count is small. **Among MKT
+k=2 live cells**, the excess for cells resolving to `<=2` workers will exceed that for cells
+resolving to `>=8` workers."*
+
+MKT, the registered host:
+
+| k | ALL n | ALL excess | `<=2` n | `<=2` excess | `3-7` n | `3-7` excess | `>=8` n | `>=8` excess | direction |
+|---|---|---|---|---|---|---|---|---|---|
+| **2** | 53 | 0.9996 | 9 | **1.3454** | 11 | 0.9243 | 33 | **0.9358** | **AS REGISTERED** |
+| 4 | 53 | 0.9852 | 9 | 1.1573 | 11 | 0.8923 | 33 | 0.9292 | as registered |
+| 8 | 53 | 1.0226 | 9 | 1.3401 | 11 | 0.9844 | 33 | 0.9431 | as registered |
+| 12 | 53 | 1.0409 | 9 | 1.4255 | 11 | 0.9780 | 33 | 0.9462 | as registered |
+| 16 | 53 | 1.0409 | 9 | 1.3585 | 11 | 0.9839 | 33 | 0.9362 | as registered |
+| 20 | 54 | 1.0593 | 8 | 1.3414 | 12 | 1.0199 | 34 | 0.9964 | as registered |
+| 24 | 57 | 1.0181 | 10 | 1.2324 | 10 | 1.0510 | 37 | 0.9670 | as registered |
+| 32 | 59 | 1.0146 | 10 | 1.2242 | 9 | 0.8878 | 40 | 0.9977 | as registered |
+
+**Eight of eight, in the registered direction, by margins of 0.23 to 0.48 on a statistic whose
+pooled value never leaves 0.9996–1.0593.** At the registered width the small-count cells carry
+**34.5% recoverable headroom** against the large-count cells' 0.9358 — production already beating
+an arbitrary count by 6.4% there.
+
+**This changes what the closure can claim.** Element 1's pooled 0.9996 is not in conflict with it:
+33 of the 53 k=2 cells resolve to `>=8` workers and read 0.9358, so the union median is dominated
+by the group with no headroom. (The dominance check confirms the routing: 1.1430 lies inside
+[1.0701, 1.3859].) So thread sizing is **closed for the `>=8`-worker majority and OPEN for the
+`<=2`-worker minority**, and the prediction that said so was registered in advance, on this host,
+at this width, before either sweep ran. That is the opposite of a shape tuned around after the
+fact — but it is also **9 cells of 53**, and whether those 9 intersect the deficit sets this
+project is trying to close is a separate question that no measurement here answers.
+
+### (b) Element 4 is the registered negative control and it fires
+
+`:297-301`: *"At k=32 the work measure `nnz*max(k,16)` is `nnz*32` ... Prediction 1's statistic at
+k=32 will be below its k=2 value on MKT. **If k=32 shows equal or greater excess, the account
+above is wrong and the deficit is not a thread-count story at all.**"*
+
+Amendment 19's own table, same row block: **k=2 0.9996, k=32 1.0146.** Greater, not below. The
+control fires on the statistic it names — element 1's, which is the pooled one. Amendment 13 had
+recorded the same direction on redwood and flagged it *"not its host, but contrary"* (1.0330
+against 0.9584), so the control is contrary on **both x86 hosts**, one of them the host it names.
+
+**The direction is favourable, which is why it went unnoticed.** A control that fires unreported
+costs the conclusion its pre-registration: the closure then rests on an argument assembled after
+the data, and nothing in the write-up shows the difference.
+
+**And one thing the pooled reading does not see.** Inside the `<=2` group — the subpopulation
+element 2 identifies — k=32 reads **1.2242 against k=2's 1.3454**, which is *below*, as element 4
+registered. So the control fires on the pooled statistic and holds within the small-count group.
+Element 4 names "prediction 1's statistic", which is pooled, so **the firing is the verdict**; the
+subgroup reading is recorded because element 4's purpose was to test the thread-count account, and
+the account survives its own control exactly where element 2 says the headroom is.
+
+### (c) Two of amendment 13's three element-2 figures were wrong, and the verdict they supported was on the wrong host
+
+Amendment 13's row read: *"k=2: `<=2` workers 0.9584 (n=9) vs `>=8` workers **1.0319**. k=32:
+1.0523 vs 1.0550. Direction REVERSED at both widths"*, concluding the prediction *"should be
+considered settled."*
+
+`0.9584` is redwood's **pooled** k=2 excess — cited as such twenty lines earlier with its own null
+(1.2176) beside it, and `1 - 0.9584 = 4.2%` matching the sentence that uses it. A union statistic
+landing on a 9-cell minority subgroup's value to four decimals is a transcription. A peer session
+derived that from the published table alone, with no access to the run.
+
+Recomputed on redwood under the committed instrument:
+
+| k | ALL excess | `<=2` n / excess | `3-7` n / excess | `>=8` n / excess | direction |
+|---|---|---|---|---|---|
+| **2** | 0.9584 | 9 / **0.9383** | 11 / 1.0070 | 33 / **0.9771** | **REVERSED** |
+| 4 | 0.9547 | 9 / 0.9726 | 11 / 1.0155 | 33 / 0.9337 | as registered |
+| 8 | 0.9781 | 9 / 0.9883 | 11 / 0.9285 | 33 / 0.9617 | as registered |
+| 12 | 0.9928 | 9 / 1.0261 | 11 / 1.0198 | 33 / 0.9849 | as registered |
+| 16 | 1.0037 | 9 / 1.1057 | 11 / 1.0355 | 33 / 0.9602 | as registered |
+| 20 | 1.0143 | 8 / 1.0531 | 12 / 1.0122 | 34 / 0.9974 | as registered |
+| 24 | 1.0029 | 10 / 1.0780 | 10 / 0.9510 | 37 / 0.9662 | as registered |
+| **32** | 1.0330 | 10 / **1.0174** | 9 / 0.9953 | 40 / **1.0727** | **REVERSED** |
+
+`<=2` reads **0.9383**, not 0.9584. `>=8` reads **0.9771**, not 1.0319. At k=32 it is 1.0174 vs
+1.0727 — a 0.055 gap where amendment 13 published 0.0027, twenty times narrower. **`1.0319` matches
+no value this instrument produces at any width under either subgroup, so its origin is
+unrecoverable.** The script that produced all three was never committed; that is the whole reason
+they could not be checked.
+
+**Three things follow, and they are different claims.** The redwood k=2 direction is REVERSED, as
+amendment 13 said — so on redwood the figures were wrong and the sign was right. The word
+*"settled"* is refuted: six of the eight widths go the registered way on redwood, and the two
+widths amendment 13 published are the only two that reverse. Those six are outside the
+registration, so this is not scoring on the outcome — but a verdict generalized past its registered
+width, resting on the only two contrary widths, is contradicted at three quarters of what was
+measured. And the verdict itself was **on the wrong host**: element 2 names MKT, where it holds at
+all eight.
+
+### (d) Element 3, re-scored on measurements instead of against a prediction
+
+Amendment 13 scored it as *"redwood 0.9584 is BELOW the M5's 1.0032, not between it and a predicted
+`>1.05`"* — a measurement against the *prediction* element 1 made, because MKT had no sweep then.
+With MKT measured it re-scores on measurements only, three hosts under one tool digest:
+
+| host | `c` (µs/worker) | pool | k=2 pooled excess |
+|---|---|---|---|
+| M5 | 4.75 | 6 | 1.0032 |
+| MKT | 0.06 | 32 | 0.9996 |
+| redwood | 0.26 | 24 | **0.9584** |
+
+redwood is below **both**, so element 3 still **FAILS** — and the shape is the finding. The two
+hosts **79× apart in `c`** sit **0.0036 apart** while the middle host sits **0.0412 below both,
+11× the entire span of the pair it was predicted to fall between.** Non-monotone in `c`, from a
+statistic independent of the clamp-share measurement that refuted the original set's prediction 4
+in the same shape — an unplanned second corroboration.
+
+The registered failure mode was the opposite one: *"the pool clamp may absorb [it] entirely on
+redwood's pool of 24"*, which would pull redwood toward inertness. It went the other way; redwood
+is where production's count beats an arbitrary one by the widest margin. **The prediction failed,
+and not by the mechanism its registration named.**
+
+### (e) The structural check: what it catches, and the two things it does not
+
+The census prints the union row beside the subgroups and checks the bound that makes a misrouted
+pooled figure visible: **a median over a union lies between the smallest and largest subgroup
+median** — if it did not, more than half of every subgroup would sit on one side of it, hence more
+than half of the union. Checked on the median and on the null **separately**, because the excess is
+a ratio of two medians and is not itself a median, so the bound does not transfer. The middle group
+`3-7` is printed although the registration does not name it, because a pooled value outside the
+range of the *named* groups is explicable only by an unnamed one.
+
+**It fires on its own input.** A planted routing defect — the union drawn from the widest width's
+population while the subgroups keep the current width's — gives `rc=1` and six flagged widths.
+
+**Limit one, from the plant itself.** All six failures were on the **null**, none on the median: the
+pooled median moves only from 1.1611 to 1.1934 across widths on redwood, so substituting another
+width's median usually lands inside the subgroup range. The null bound carried the detection. The
+two checks are not redundant and the median's is the weaker.
+
+**Limit two, which is the defect that actually occurred.** Amendment 13's error was a number
+transcribed into prose from another row. No check inside the producing script sees that, and
+inclusive range-containment admits a pooled value *equal* to a subgroup's. Only recomputation found
+it. The sharper reading — that a union statistic *cannot* land on a minority subgroup's value — is
+a plausibility argument, not a theorem: with 53 cells split 9/11/33, a union median as low as the
+9-cell group's is arithmetically reachable. **The four-decimal coincidence was the tell, not an
+impossibility, and the weaker claim is the one that holds.**
+
+### The scorecard, replacing amendment 19's three rows
+
+| set | prediction | registered host | verdict |
+|---|---|---|---|
+| amd 5 | 1 — pooled excess > 1.05 at k=2 | MKT | **FAILS** (0.9996, below 1.00) |
+| amd 5 | 2 — `<=2` workers exceed `>=8` at k=2 | MKT | **HOLDS**, 1.3454 vs 0.9358, and at all 8 widths |
+| amd 5 | 3 — redwood between the hosts | redwood | **FAILS** (0.9584, below both; 11× the pair's span) |
+| amd 5 | 4 — k=32 pooled excess below k=2's | MKT | **CONTROL FIRES** (1.0146 > 0.9996); contrary on redwood too |
+
+### What the closure may now say, and what it may not
+
+**May:** the pooled thread-sizing headroom on MKT at k=2 is 0.9996 — production already at least as
+good as an arbitrary count — the registered negative control fired on its own host, and the one host
+constant the model depends on is non-monotone across three hosts on two independent statistics. For
+the 33 of 53 k=2 cells resolving to `>=8` workers, thread sizing is closed on measurement, not on
+argument.
+
+**May not:** that thread sizing is closed everywhere. A prediction registered before either sweep,
+naming where to look, holds at all eight widths on its own host with 34.5% recoverable headroom at
+k=2 in the `<=2`-worker group.
+
+### The registered next measurement, and its refutation condition, written before it runs
+
+The question is whether the `<=2`-worker group intersects the deficit sets. **Registered: compute
+the overlap between MKT's 9 `<=2`-worker k=2 cells and (i) the 328 float32 DLMC k=2 deficit cells
+and (ii) the 129 float64 MKT k=2 deficit cells, by key.** `cand = min(override, rows/16)`, so a cell
+resolving to `<=2` has `rows < 48`; every one of the 20 worst float32 DLMC cells reads `rows=512`,
+which clamps at 32. **Refutation condition: if the overlap is zero at both, the `<=2`-worker
+headroom is real, registered, and irrelevant to this project's goal, and thread sizing closes for
+the deficit on that basis rather than on the pooled number.** If the overlap is non-zero, the group
+is named and a fixed-count arm on exactly those keys is the next arm. No mechanism is proposed for
+either outcome in advance.
