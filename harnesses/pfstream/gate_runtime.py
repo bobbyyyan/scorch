@@ -475,8 +475,26 @@ print("treatment cells (mode 0) and arm B has it ON (mode 3), so a NEGATIVE diff
 print("means the gate's choice is the faster one and the shipped gate is earning its")
 print("constant. An additive per-call tax cancels here, so this column is tax-free.")
 print("=" * 78)
+def zscore(npos, n):
+    """Standard deviations from the exchangeability null, where a sign is a fair coin."""
+    return (npos - n / 2.0) / math.sqrt(n / 4.0) if n else 0.0
+
+
 for route, ea, eb, want in ROUTES:
     print("\n%s" % route)
+    # Two passes. The treatment row's null can be stated two ways -- the theoretical n/2
+    # of exchangeable arms, and the EMPIRICAL rate the floor populations actually show --
+    # and an earlier version of this block printed "null is n/2, i.e. the floor rows' own
+    # sign counts", asserting with "i.e." that they coincide. The same run falsified it:
+    # C1 read 79 of 120 where n/2 is 60, which is 3.47 sd away. They are different
+    # quantities and both are reported, because the honest scope statement is that the
+    # treatment survives the WORSE of the two.
+    emp = {}
+    for popname in ("T", "C1", "C2"):
+        per = res.get((route, popname)) or []
+        if per and want[popname] != "all":
+            d0 = [c[3] - c[4] for c in per]
+            emp[popname] = (sum(1 for x in d0 if x > 0), len(d0))
     for popname in ("T", "C1", "C2"):
         per = res.get((route, popname)) or []
         if not per:
@@ -499,12 +517,24 @@ for route, ea, eb, want in ROUTES:
         print("   %-3s %-9s n %3d   median A-B %+8.3f us  CI [%+7.3f, %+7.3f]  %s"
               % (popname, tag, len(d), statistics.median(d), lo, hi,
                  "spans 0" if lo <= 0 <= hi else "excludes 0"))
-        print("       SIGN COUNT %3d of %3d positive, %3d negative%s  (no reduction step, "
-              "invariant to min-vs-median and to the tax)"
-              % (npos, len(d), nneg,
-                 "  <- the NULL for the treatment row above, matched on n but NOT on "
-                 "population" if tag == "A/A FLOOR" else "  null is %d, i.e. the floor "
-                 "rows' own sign counts below" % (len(d) // 2)))
+        print("       SIGN COUNT %3d of %3d positive, %3d negative   (no reduction step, "
+              "invariant to min-vs-median and to the tax)" % (npos, len(d), nneg))
+        if tag == "A/A FLOOR":
+            print("         this row is an EMPIRICAL null for the treatment above, matched "
+                  "on n but NOT on population; z = %+.2f against the theoretical %d"
+                  % (zscore(npos, len(d)), len(d) // 2))
+        else:
+            bits = ["theoretical %d, z = %+.2f" % (len(d) // 2, zscore(npos, len(d)))]
+            for pn, (fp, fn_) in sorted(emp.items()):
+                # The floor's own rate as the null, rather than a fair coin: the same
+                # binomial spread, recentred on what a non-moving arm pair actually did.
+                mu = fn_ and len(d) * fp / float(fn_)
+                sd = math.sqrt(len(d) * (fp / float(fn_)) * (1 - fp / float(fn_))) if fn_ else 0.0
+                bits.append("vs %s's rate %d/%d, z = %+.2f"
+                            % (pn, fp, fn_, (npos - mu) / sd if sd > 1e-9 else float("inf")))
+            print("         nulls: %s" % ";  ".join(bits))
+            print("         the two disagree, so the claim is that the count clears the "
+                  "WORSE of them, not that they coincide")
         glo, ghi = boot_med([x - y for x, y in zip(dmed, d)])
         print("       median-of-reps A-B %+8.3f us  vs min-of-reps %+8.3f  gap %+.3f "
               "CI [%+.3f, %+.3f] %s"
@@ -520,12 +550,25 @@ for route, ea, eb, want in ROUTES:
 if SHIM:
     print("\nTHE `scale` COLUMN IS COMPARABLE TO THE SHIPPED COMMENT'S BANDS, AND READING IT")
     print("DIRECTLY IS WHY THE SHIM EXISTS. That comment puts the cells where the partition")
-    print("loses at 19-30 us and the ones it wins at 31-110. Under the shim the getenv tax is")
-    print("amortised to a per-batch rather than a per-call cost, so `scale` is the kernel's")
-    print("own level and lands in one of those bands without a subtracted constant. The ratio")
-    print("column is likewise unattenuated, which matters because the comment's criterion is")
-    print("itself a ratio -- 'falls more than 10% behind' -- so an additive tax would shrink")
-    print("the very quantity the threshold is stated in.")
+    print("loses at 19-30 us and the ones it wins at 31-110.")
+    print("")
+    print("WHAT THE SHIM REMOVES IS THE MISS COST, NOT ALL OF IT. The counters above show a")
+    print("few hundred real getenv calls across the whole run -- tens of microseconds in")
+    print("total, which really is amortised to nothing per call. The HIT cost is not: the")
+    print("kernel still performs 99 lookups every call and each costs a hash and a strcmp.")
+    print("So a residual of order 99 x (a few ns) remains inside `scale`.")
+    print("")
+    print("WHICH MAKES `scale` AN UPPER BOUND ON THE TAX-FREE LEVEL, AND A BOUND IS STRONGER")
+    print("THAN AN ESTIMATE HERE. The shim only ever ADDS work along the getenv path, so the")
+    print("true release level K satisfies K < scale. A scale below 30 therefore places the")
+    print("cell inside the 19-30 band with no subtracted constant and no calibration, and the")
+    print("residual's size cannot overturn it because the residual has a known sign. The one")
+    print("premise is that the shim perturbs nothing but the getenv path; if it also moved")
+    print("cache or branch behaviour the bound would be premised rather than proven.")
+    print("")
+    print("AND THE RATIO COLUMN IS LIKEWISE UNATTENUATED, which matters because the")
+    print("comment's criterion is itself a ratio -- 'falls more than 10% behind' -- so an")
+    print("additive tax shrinks the very quantity the threshold is stated in.")
 else:
     print("\nTHE DIFFERENCE IS TAX-FREE AND THE SCALE IS NOT, SO THE `scale` COLUMN ABOVE MUST")
     print("NOT BE COMPARED WITH THE MICROSECOND BANDS IN THE SHIPPED COMMENT. That comment")
