@@ -1261,3 +1261,101 @@ Not established: a cause. The explanation attempted above is withdrawn, and the 
 candidate questions are about `dcf2e1f`'s grid -- its arm labels, and the regressed and
 winning cell counts needed to convert its P(region | outcome) scores into the
 P(slower | region) measured here. That grid is not in this tree.
+
+---
+
+# The DLMC float32 deficit is ONE WIDTH, and it is the half-vector width
+
+Measured 2026-10-03 from the completed first unit of the live multi-row screen
+(`mrhv_screen.sh`, provenance bound in `PREREG_multirow_halfvec.md` amendments 12-13: driver
+sha `32c9b0f077040980`, corpus `/scratch/bobbyy/mklsweep/csrcache/dlmc` read from
+`/proc/2904667/environ`, key list sha `a8132f50d2c44fe4` at 3820 keys, object
+`25a5f0c4425671aa`). Baseline build `mr0`, pass p1 of 4, 30560 cells complete in all three
+arms, redwood pool 24.
+
+This is not a new experiment -- it is the **baseline arm** of a screen that was already
+running, read for the standing MKL question instead of only for the arm contrast it was built
+for. The treatment arms are still being collected.
+
+## The floor comes from the same pass, same process, same object bytes
+
+`ours` and `oursb` are the same object (`25a5f0c4425671aa` for both `mr0` and `mr0b`, checked
+by digest, not inferred from the build recipe) timed interleaved in one process. Their ratio
+over all 30560 cells: **median 1.0000, p05 0.9394, p95 1.0656**.
+
+So the per-cell floor for a single-pass reading is about -6%/+6.6%. Pooled, it is 1.0000.
+
+## The board
+
+MKL time over scorch time, so above 1 means scorch is faster.
+
+| k | n | geomean | median | p05 | p95 | behind parity | below the floor's p05 |
+|---|---|---|---|---|---|---|---|
+| 2 | 3820 | 1.3506 | 1.1387 | 0.9791 | 3.1074 | 236 | 147 = 3.8% |
+| **4** | 3820 | **1.2508** | 1.0979 | **0.8188** | 3.1106 | **1102** | **676 = 17.7%** |
+| 8 | 3820 | 1.3474 | 1.1641 | 1.0187 | 2.9358 | 128 | 60 = 1.6% |
+| 12 | 3820 | 1.3465 | 1.1757 | 1.0207 | 2.9002 | 141 | 67 = 1.8% |
+| 16 | 3820 | 1.5231 | 1.3398 | 1.1944 | 3.0043 | 11 | 8 = 0.2% |
+| 20 | 3820 | 1.5380 | 1.3103 | 1.1265 | 3.0113 | 39 | 29 = 0.8% |
+| 24 | 3820 | 1.6543 | 1.4347 | 1.2293 | 3.1121 | 12 | 11 = 0.3% |
+| 32 | 3820 | 1.6052 | 1.4363 | 1.2393 | 2.9666 | 18 | 10 = 0.3% |
+
+Overall geomean **1.4455**, behind parity 1687/30560 = 5.5%, below the floor's p05
+1008/30560 = 3.3%.
+
+## The null for that last column is 5%, not zero -- and it changes which widths count
+
+A criterion "below the A/A distribution's 5th percentile" flags **5% of cells by
+construction** when scorch and MKL are genuinely equal and the only variation is the
+variation the A/A measures. Reading the column against zero would have made every width look
+like a deficit. Against its own 5%:
+
+| k | below p05 | vs the 5% the floor's tail gives at parity |
+|---|---|---|
+| 4 | 17.7% | **3.5x over**, 676 observed against 191 expected |
+| 2 | 3.8% | under |
+| 8, 12, 16, 20, 24, 32 | 0.2-1.8% | all well under |
+
+**Of eight widths, exactly one exceeds the rate its own floor produces at parity, and it is
+k=4.** 676 of the 1008 sub-floor cells -- 67% -- are at that single width, which carries 12.5%
+of the cells. k=2, the other narrow width and the one whose dispatch rule was closed earlier,
+is *under* its null at 3.8%.
+
+## The sub-floor cells are high-degree, which matches the proposed mechanism
+
+| | p05 | median | p95 |
+|---|---|---|---|
+| deg over the 1008 sub-floor cells | 101.5 | **217.6** | 589.1 |
+| deg over the whole corpus | 6.7 | **102.4** | 614.4 |
+
+The deficit lives at roughly **twice the corpus median degree**, and the worst cells are
+extreme: 0.2629 at k=4 deg 1024, 0.2896 at k=4 deg 512, 0.3360 at k=4 deg 256 -- 2.7-3.8x
+slower than MKL, all `transformer/` and `rn50/` layers at 0.5 pruning, i.e. the *densest* rows
+in the collection.
+
+That is the population `SPMM_BEAT_MKL_RESULTS.md` names for the k=4 float32 mechanism:
+`scorch_simd<T>` has no 128-bit form, so k=4 issues `_mm256_maskload_ps` per nonzero and uses
+**4 lanes of 8**. Cost per nonzero is halved in useful work, and a long row pays it once per
+nonzero -- so the penalty should scale with degree, which is what the table shows. It also
+matches the independently measured direction in the half-vector study at deg>=256.
+
+**This is a located deficit, not a fixed one.** The mechanism is a hypothesis that the
+screen's own treatment arms (`mrhv`, `mrhv4`, distinct objects `713b9353f62f55c0` and
+`f2ecbf401439f742`) are collected to test; `mr0b` is 41% through the second of four units.
+Nothing here licenses a dispatch change, and the one-pass per-cell reading carries the
++-6% floor above.
+
+## Two cautions that bound what this pass can say
+
+**One pass, and it was the pass that led the rotation.** `mr0` ran first and paid a cold page
+cache over 3820 `.npz` files: its wall rate was 7.71 rows/s against `mr0b`'s 8.34, an 8.2%
+gap. That gap is **entirely outside the kernel** -- summed kernel time over the 37559 matched
+cells is 1477.0 s for `mr0` against 1477.5 s for `mr0b`, 0.03% apart -- because each matrix is
+loaded once and both arms are then timed inside that load. So the leading position costs wall
+clock and not measurements, and the Latin-square rotation is guarding an I/O effect rather
+than a timing one. Worth knowing before any future screen spends rotation budget on it.
+
+**The widths are not independent reads of one quantity.** k=2 routes to the narrow-k exact
+kernel, k=4 to the half-vector kernel, k>=8 to the register-blocked kernel. Three kernels, so
+"one width out of eight" is really "one of three kernels", and the correct comparison for k=4
+is the 5% null above rather than the other widths' rates.
