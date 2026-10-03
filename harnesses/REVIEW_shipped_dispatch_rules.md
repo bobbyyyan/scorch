@@ -1794,6 +1794,28 @@ a larger disagreement than which width is responsible, and it bounds what SuiteS
 "every width degrades with degree, k=4 included and not worst" is a fact about the kernel family,
 not evidence for k=4.
 
+## The same ranks on the {2,4,8} subset, computed before MKT's result lands
+
+MKT's screen measures three widths, {2, 4, 8}. Restricting the two rows above to those three
+columns, so that a three-width rank from MKT is never cross-quoted against a five-width one:
+
+| | normalised values, k=2 / k=4 / k=8 | k=4's rank |
+|---|---|---|
+| SuiteSparse | 0.682 / 0.540 / 0.495 | **2nd most robust of 3** |
+| DLMC | 0.587 / 0.520 / 0.657 | **least robust of 3** |
+
+The rank reversal survives the restriction, so **the registered prediction for MKT's SuiteSparse
+phase is k=4 ranking 2nd of 3, not last of 3.** If MKT reads k=4 last of three on SuiteSparse that
+is a between-host disagreement on the same collection -- a new finding, not a confirmation of the
+DLMC one.
+
+**What is base-robust here and what is not.** These values are normalised to each width's own deg
+0-32 band. Recomputing DLMC's ordering from a different base *and* the opposite convention -- the
+`chain207-dlmc-redwood` degree-band table, median ours/mkl where lower is better, deg>=256 over
+deg 16-64 -- gives k=8 1.0743, k=2 1.0755, k=4 1.2154. Same ordering, so **k=4 last on DLMC is
+base-robust**. The k=2-versus-k=8 ordering is **not**: 7.0 pp apart under this base, 0.11% apart
+under that one. Only k=4's position should be carried across bases.
+
 ### One feature of the SuiteSparse sequence a width-specific account does predict
 
 The monotone decline is **not uniform**: the k=2 -> k=4 step is -0.2335 against the next step's
