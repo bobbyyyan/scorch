@@ -2290,3 +2290,63 @@ per-call overhead share from thread sizing proper. The `<=2` group's 35.7% is th
 worth that run.
 
 **Still one host.** mkt1 only. The equivalent redwood sweep has not run.
+
+---
+
+## Amendment 30 — correcting amendment 29: the nulls are in HEADROOM units, so only the `<=2` group exceeds its own
+
+> **Amendment 29's "clean monotone headroom gradient" is withdrawn as stated.** The ordering is
+> real; the levels are not recoverable headroom, and two of three groups sit BELOW their own null.
+
+A peer asked which functional the nulls carry, because amendment 29 put bare ratios on the other
+side of "against" from percentages. Settled at source: `perm_null` (`nt_k2curve.py:209-225`) returns
+the median of **the same statistic** over permutations, so the null is in the same units as the
+`median` column. `1.2265` is **22.65% in headroom units**, and the comparison amendment 29 implied
+is the right one to make — it just does not say what that amendment claimed:
+
+| group | n | raw headroom | its own null | observed − null |
+|---|---|---|---|---|
+| `<=2` | 78 | **35.65%** | 22.65% | **+13.00 pp** |
+| `3-7` | 68 | 13.74% | 23.38% | **−9.64 pp** |
+| `>=8` | 152 | 2.92% | 22.82% | **−19.90 pp** |
+| ALL | 298 | 13.55% | 23.06% | −9.51 pp |
+
+**Only the `<=2` group exceeds its own null.** The ordering 35.65 > 13.74 > 2.92 is, for two of the
+three groups, an ordering in how far *under* the null they sit. "A clean monotone headroom gradient
+inside the reach" claimed more than this: the gradient is carried by one group of the three.
+
+**What does survive, and why the constancy of the nulls still matters.** The three nulls span
+0.73 pp (22.65 / 23.38 / 22.82). So whatever the null measures, it measures the same amount in each
+group, and the ordering in the raw column is therefore **not** produced by the groups having
+different null levels. The ordering is a real property of the raw statistic.
+
+**And the recoverable amount is bracketed, not point-estimated.** Amendment 28 established that the
+null absorbs real between-configuration differences as well as the winner's curse, so `observed −
+null` **under**-states; and the raw column is inflated by the winner's curse, so it **over**-states.
+For `<=2` the recoverable headroom lies between **+13.00 pp and +35.65 pp**. For `3-7` and `>=8` the
+lower end is negative, so **nothing is established** — in rank terms production there already beats
+a typical reachable count.
+
+### Three further corrections to amendment 29, all from the same message
+
+**(a) Condition 2 in the units of the thing it must explain.** `0.2378 / 0.837 = 0.2841`. So the
+mechanism accounts for **at most 28.4% of the deficit**, which is the sentence the registration is
+about; "a quarter of the population" is a different and weaker one. Both are now stated.
+
+**(b) Condition 4 carries no information beyond condition 2, provably.** `s328 − s64 = 0.2378 − 0 =
+0.2378` is **numerically identical to s328**. Because `s64` is structurally zero, condition 4's
+statistic *is* condition 2's. Amendment 29 reached VOID from the control's empty `<=2` subgroup; the
+identity reaches it without needing the subgroup argument, and is the stronger route because it does
+not depend on reading a live fraction.
+
+**(c) The design is complete, and the total could not have shown it.** The peer's arithmetic —
+206,976 = 392 × 528, and 528 is not divisible by 7 — was right, against a stale premise of seven
+widths; this sweep used **eight** (`2,4,8,12,16,20,24,32`), and the factor of 11 is the 33 worker
+counts (0..32). The point stands regardless: **a total is not a completeness check, a per-cell
+minimum is.** Measured on the CSVs:
+
+- cells `(key, width, nthreads)`: **103,488 of 103,488 expected**
+- readings per cell: **min 2, max 2, zero cells short**
+- per `(key, width)`: **min 66, max 66, zero short**
+
+That line belongs in the readout and was missing from amendment 29.

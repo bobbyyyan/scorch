@@ -4469,6 +4469,13 @@ the floor's p05–p95 band on absolute ratios.
 ---
 
 ## Amendment 52 — the float64 k=2 prefetch reading is this screen's own registered negative control, it MOVED, and the paired test's artefact-removal claim is withdrawn
+> **PARTLY SUPERSEDED BY AMENDMENT 54(a).** This amendment's justification for the control's
+> inertness — that `narrow_exact` owns double k=1..3 with the `narrowk_exact_mindeg` gate
+> shipping at 0 — is NOT the reason it is inert. `halfvec_exact` carries no `!exact_width`
+> and the half-vector block sits ahead of the exact kernel, so `SCORCH_SPMM_HALFVEC_F64 == 0`
+> is the only mechanism, and under `SCORCH_TUNE_HOOKS` that is a runtime read. The
+> conclusion survives for a different reason than the one given here.
+
 
 A reviewing agent read amendment 44 against this document's own registration. Both points hold and
 both are verified at source.
@@ -4551,6 +4558,13 @@ is a difference of two independent object offsets rather than one.
 ---
 
 ## Amendment 53 — the width contrast was a ratio of two band medians, not a paired statistic; and the one local arm-screen ledger is not the one that can carry the three-contrast bound
+> **SUPERSEDED IN PART BY AMENDMENT 54(b) AND 55.** Section (a)'s contrast figures
+> (14.62 / 11.83 / 28.50 / 38.72%) and floors (0.92 / 0.91 / 1.22 / 0.97%) are superseded:
+> they pair within a cell but not within a PASS, and each pass file holds exactly one
+> reading per cell-arm. The pass-paired figures are 15.48 / 12.95 / 29.36 / 39.28%.
+> Section (b)'s "unresolved" framing of the 418/host question is corrected to a citation of
+> amendment 40 by 54(d).
+
 
 Two things, both arising from checks against a peer's findings 149 and 150. The first corrects a
 number I published. The second corrects a claim I was about to publish.
@@ -4671,6 +4685,11 @@ width and k=2 is the narrowest.
 ---
 
 ## Amendment 54 — the f64 k=2 control has ONE mechanism, not two; and the contrast's floor is signed but indistinguishable from zero
+> **CORRECTED IN PART BY AMENDMENT 55.** Section (c)'s metamorphic-swap evidence cites the
+> CORRECTED pass-paired floor column, not the PUBLISHED cell-paired one it was offered to
+> defend. Amendment 55 runs the swap on the column actually at issue — it is signed too —
+> and replaces this section's explanation of its sign, which was wrong.
+
 
 Three corrections, all from checking a peer's finding 152 at source. Two are to things I wrote in
 amendment 53 one iteration ago.
