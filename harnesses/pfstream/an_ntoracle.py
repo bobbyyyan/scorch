@@ -63,7 +63,29 @@ for r in csv.DictReader(open(A.csv)):
 keys = sorted({key for (key, _) in ms})
 ks = sorted({k for (_, k) in ms})
 FIT, TEST = set(keys[0::2]), set(keys[1::2])
-gm = lambda v: math.exp(st.median([math.log(x) for x in v])) if v else float("nan")
+# NAMED `med` BECAUSE IT IS THE MEDIAN. exp(median(log x)) == median(x): the median commutes with
+# any strictly monotone transform. It was called `gm`, which reads as geometric mean -- that would
+# be exp(MEAN(log x)). The functional is the right one (amendment 5 registers median(cur/best)
+# over its permutation null), so the numbers were always correct; the hazard was the name. A
+# reader checking "is this the registered functional?" reads `gm`, concludes geometric mean, and
+# either disbelieves a correct number or repairs the lambda to st.mean to match it -- an edit that
+# looks like a bug fix, passes anything that does not pin the value, and silently substitutes a
+# different statistic. They agree only on symmetric log-distributions, and regret ratios are not.
+# ...AND THE RENAME IS NOT VALUE-NEUTRAL, SO THE ARITHMETIC IS RESTORED UNCHANGED. The
+# commutation argument holds only for ODD n, where the median IS an order statistic and
+# exp(log(x)) == x up to rounding. For EVEN n, `statistics.median` averages the two central
+# values -- so exp(median(log x)) is their GEOMETRIC mean, sqrt(a*b), while median(x) is their
+# ARITHMETIC mean, (a+b)/2. Measured on the M5 k=2 regret row: 1.2853 under the original form
+# against 1.2879 under st.median, a real 0.2% difference.
+#
+# So this is NOT the median in general. It is the geometric interpolation of the two central
+# order statistics, exact for odd n. Amendment 5 registers "median(cur/best)", and st.median is
+# the standard reading of that word -- but the published figures were computed this way, and
+# swapping a pre-registered estimator is not a rename. The defect and its size are reported at
+# the read point; the choice is Bobby's. Renamed to say what it computes so the next reader is
+# not invited to "fix" it, which is the hazard that surfaced this.
+gmed = lambda v: math.exp(st.median([math.log(x) for x in v])) if v else float("nan")
+gm = gmed  # every existing call site keeps its exact arithmetic
 
 live = {c for c in ms if len(ms[c]) >= 2}
 # THE REGISTERED 33288-ROW NEGATIVE CONTROL IS WITHDRAWN. It was registered on the ground that
@@ -231,11 +253,20 @@ print()
 print("REGRET'S DENOMINATOR HAS A WINNER'S CURSE AND IT IS LARGE. `best(c)` is the MINIMUM over")
 print("roughly twelve readings -- about six reachable counts at two repeats each -- so it sits")
 print("below the true best count's time even when every count is identical, and every regret")
-print("below is inflated by that amount. The size is not a guess: on the same sweep, production's")
-print("own count against `best` reads 1.1856 at k=2 while a permutation null that shuffles each")
-print("cell's readings among its counts reads 1.1818, an excess of 1.0032. At the other widths")
-print("the excess is BELOW 1 (0.886-0.953). So on this host the apparent per-cell headroom is")
-print("essentially all selection, and `there is N% to recover` does not survive it.")
+print("below is inflated by that amount. The size is not a guess -- BUT THE FOUR NUMBERS BELOW ARE")
+print("THE M5's, CITED, NOT THIS RUN'S. They used to be printed under `on the same sweep` and `on")
+print("this host`, as typed literals with no format specifier, so on every other host this")
+print("paragraph described a different machine in the first person. A demonstrative inside a print")
+print("literal -- `this host`, `the same sweep`, `our build`, `here` -- binds a typed number to")
+print("the executing run, which is the one thing a literal cannot know.")
+print("  ON THE M5 (pool 6, c=4.75us): production's own count against `best` reads 1.1856 at k=2")
+print("  while the within-cell permutation null reads 1.1818, an excess of 1.0032; at the other")
+print("  widths the excess is BELOW 1 (0.886-0.953). PREREG amendment 5 prediction 1 registers")
+print("  that this statistic `will exceed 1.05 at k=2 on MKT`, so it is a per-host quantity and")
+print("  the M5's value may not be read as any other host's.")
+print("  THIS RUN's value of the same statistic is NOT computed here: it is the `shipped` column")
+print("  of the regret table below against the NULL row beneath it, and nt_k2curve.py computes it")
+print("  directly. Read it from there, per host, and never from this paragraph.")
 print()
 print("WHAT STILL STANDS AND WHAT DOES NOT. Rule-against-rule comparisons share this denominator,")
 print("so the bias largely cancels in their DIFFERENCE and the ordering of the columns below is")

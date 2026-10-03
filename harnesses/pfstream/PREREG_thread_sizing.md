@@ -1124,6 +1124,11 @@ running the tool on a *second* input -- which in two cases was the same host, on
 
 ## Amendment 18 — ALL FOUR registered predictions are now scored, on three hosts with one tool digest. The sqrt model is refuted.
 
+> **CORRECTED BY AMENDMENT 19.** The heading's "all four" is ambiguous inside this document,
+> which carries TWO prediction sets both numbered 1-4; it scored the set at `:57-68` and left
+> amendment 5's set unscored. And the rows for predictions 2 and 3 report MKT's figures for
+> predictions registered on the FIT host. Read amendment 19 for the host-labelled scorecard.
+
 MKT job 17696556 completed, so the last two unscored predictions can be read. Every figure below
 comes from `an_ntoracle.py` at digest **`222543063d02c9c1`** run on all three hosts' sweeps — the
 same object, because a prediction about an ordering across hosts cannot be scored from statistics
@@ -1202,3 +1207,107 @@ The three-object screen (`adg0`/`adgb`/`adgG`, three passes, 1296 cells) prices
 
 A lever that fires on 42% of cells, produces no pooled effect beyond the placement floor, and
 harms 58 cells by up to 1.44× is a no-ship. Recorded as a bounded negative, not as noise.
+
+---
+
+## Amendment 19 — amendment 18 scored the wrong set and two rows on the wrong host; amendment 5's prediction 1 is now scored and FAILS
+
+Three defects in amendment 18, all found by a reviewing session from inconsistencies between my own
+published numbers, and one registered prediction scored for the first time.
+
+### (a) "All four registered predictions" has no fixed domain, because this document carries two sets both numbered 1–4
+
+- The original registration at `:57-68` holds out prediction **2** (other widths {4,12,16,20,24}),
+  **3** (other matrix classes, the 72-key corpus), **4** (the two x86 hosts).
+- **Amendment 5** at `:288-296` registers a *different* set of four with its own thresholds, to be
+  "scored on the x86 sweeps when the screens clear": prediction **1** is *"MKT is NOT inert. The
+  excess ... will exceed 1.05 at k=2 on MKT. The M5 reads 1.0032."*
+
+Amendment 13 recorded amendment 5's element 1 as NOT SCOREABLE because "MKT's screen still running;
+no sweep exists". **Amendment 18 opens by announcing that exact blocker resolved — and then scores
+the other set.** Neither scorecard shows the gap, because each is complete over its own numbering.
+
+**A completeness quantifier with no stated domain cannot be wrong.** "All four of the predictions
+registered at `:57-68`" scores one set and leaves the other visibly open; "all four registered
+predictions" closes both by assertion. The two numbering schemes are the defect; the heading is
+only where it surfaced.
+
+### (b) Amendment 5's prediction 1, scored at last: FAILS
+
+Run on MKT's own sweep, `nt_k2curve.py` at `039bad6ff9b1ef22`, object `09b7b24cbceec93c`, **38016
+of 38016 rows carrying an `so_sha`** — the first real grid on which the provenance guard of
+amendment 17 has passed rather than refused.
+
+| k | cells | median | null | **excess** | reading |
+|---|---|---|---|---|---|
+| **2** | 53 | 1.1430 | 1.1435 | **0.9996** | production beats an arbitrary count by 0.0% |
+| 4 | 53 | 1.1054 | 1.1220 | 0.9852 | production beats arbitrary by 1.5% |
+| 8 | 53 | 1.1343 | 1.1092 | 1.0226 | 2.3% recoverable |
+| 12 | 53 | 1.1572 | 1.1117 | 1.0409 | 4.1% recoverable |
+| 16 | 53 | 1.1589 | 1.1133 | 1.0409 | 4.1% recoverable |
+| 20 | 54 | 1.1468 | 1.0826 | **1.0593** | 5.9% recoverable |
+| 24 | 57 | 1.1056 | 1.0860 | 1.0181 | 1.8% recoverable |
+| 32 | 59 | 1.0680 | 1.0527 | 1.0146 | 1.5% recoverable |
+
+**Registered: exceeds 1.05 at k=2. Measured: 0.9996** — not merely under the threshold but under
+**1.00**, meaning production's count is already at least as good as an arbitrary one. The
+prediction FAILS, and it fails in the direction that *supports* amendment 18's closure rather than
+undermining it.
+
+**One thing stated precisely because it would otherwise read as a near-miss.** The 1.05 threshold
+**is** exceeded — at k=20, reading 1.0593. The registration named **k=2**. So there is recoverable
+thread-sizing headroom on MKT, 1.5% to 5.9%, at k=8 through k=32; there is **none at k=2**, which
+is the width holding 129 of the 192 float64 deficit cells and 328 of the float32 DLMC deficit. The
+closure claim is specifically *"closed as a mechanism for the narrow-k deficit"* and the registered
+test now confirms it at the narrow width while refuting inertness at the wide ones.
+
+### (c) Amendment 18's predictions 2 and 3 are MKT's figures for M5 predictions
+
+Prediction 2 is registered as *"Other widths on the **same host**"* — the fit host, the M5.
+Amendment 18 reported MKT's numbers for both. Re-run under the same digest:
+
+| prediction | M5 (registered host) | MKT (what amendment 18 printed) |
+|---|---|---|
+| 2 — within ±1 at {4,12,16,20,24} | lowest width **77.8%** → HOLDS at 50%, FAILS at 80/100 | lowest 17.4% → FAILS at all three |
+| 3 clause A — ≥80% within ±1 | **87.5% of n=160 → HOLDS** | 20.0% → FAILS |
+| 3 clause B — none off by >2 | **2 cells** → FAILS | 127 cells → FAILS |
+
+**So prediction 3 does not "fail both clauses" on its registered host: clause A holds at 87.5%
+with 7.5 points of headroom, and only clause B fails, on two cells.** Amendment 18's row was
+67.5 points and 125 cells away from the registered reading, with no note that either figure had
+moved — in the amendment whose own thesis is that a statistic must not be redefined between
+scorings.
+
+The tool did not change: 105 insertions, 4 deletions, no hunk in the prediction-3 block, and the
+M5's clamp figure (82 of 345) is identical across both publications, so the M5 sweep is unchanged
+and its 87.5% stands. **The input changed hosts, not the estimator.** Every scorecard row now
+carries its host.
+
+(Incidental, found in the same diff: the `sat` assignment occurs at `:49` and `:58` and is never
+read, so an earlier "saturating was not the policy count" fix landed on a variable nothing
+consumes.)
+
+### The corrected scorecard, with hosts
+
+| set | prediction | host | verdict |
+|---|---|---|---|
+| orig | 1 — no single G suffices | MKT | passes, **uninformative** (55.2–78.6% of cells unreachable by any G) |
+| orig | 2 — within ±1 at five widths | **M5** | HOLDS at 50%, **FAILS** at 80/100 (77.8%) |
+| orig | 3 — ≥80% and none off by >2 | **M5** | clause A **HOLDS** 87.5%; clause B **FAILS** (2 cells) |
+| orig | 4 — biting order M5 > redwood > MKT | all three | **FAILS** (redwood 34.5% > M5 23.8% > MKT 22.5%) |
+| amd 5 | 1 — excess > 1.05 at k=2 on MKT | MKT | **FAILS** (0.9996) |
+| amd 5 | 2 — headroom concentrates at small counts | MKT | not computed by this tool |
+| amd 5 | 3 — redwood between the hosts | redwood | running |
+
+**The closure stands and now rests on a scored prediction rather than an unexamined one.** What
+does not stand is amendment 18's claim to have scored everything registered.
+
+### A prose correction that strengthens prediction 4's refutation
+
+Amendment 18 said `T1 >= c·pool²` needs "61 µs on MKT against 150 µs on redwood and far more on
+the M5". The M5 is **4.75 × 36 = 171 µs** against redwood's 150 — **1.14×, not "far more"**. So the
+model's own thresholds put the M5 and redwood within 14% of each other while MKT sits 2.8× below
+both; the measured clamp shares read M5 and redwood **10.7 points apart** and M5 and MKT **1.3
+points apart**. The model's near-tie reads far apart and its far-apart pair reads nearly equal.
+That is a stronger refutation than the one amendment 18 wrote, and the refutation is robust to the
+sign convention: redwood is the middle term under either direction of "bites" and it reads largest.
