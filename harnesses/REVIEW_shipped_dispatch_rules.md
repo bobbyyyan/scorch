@@ -127,3 +127,87 @@ boundary chosen *between* the two tested machines has no measurement on either s
 evidence base (one i9-14900K, 12 matrices, a bin boundary standing in for an optimum) is below the
 two-host standard the rest of this branch is held to. #1's 64-CPU/8-worker case is a real
 counterexample to the gate's stated intent, which was byte-neutrality on all-physical-core pools.
+
+### #4 continued — the probe measures its own floor on every call and never applies it to the width pick
+
+A peer supplied the structural route statically. **Verified at source rather than taken on report**,
+and it holds at every load-bearing point:
+
+- The baseline is entered **twice**, as `cands = [("v2", 0, 0)]` (`tiling.py:1285`) and
+  `cands.append(("v2", None, _baseline))` (`:1681`) — two identical arms at opposite ends of the
+  candidate list, which is this cell's own A/A control, measured on every call.
+- `_clears_noise` (`:1370`) derives `spread` from those two arms and demands the winner beat the
+  *faster* of them by more than the spread. Its docstring is explicit about why: *"the probe
+  memoizes its verdict permanently, so a coin flip decided by noise is not a one-call mistake, it
+  is every subsequent call on that shape."*
+- It has **exactly two call sites**, `:1437` and `:1694`. Both compare a winner against the
+  **baseline**. Neither compares two tiled candidates to each other.
+- The width is chosen by a bare argmin at `:1689-1692`, strict `<`, first wins ties, with no margin.
+- Each `times[i]` is a **minimum** over `rounds=2` (`:1311`, `:1357-1365`), so the pick is an argmin
+  of a downward-biased statistic over two draws — the candidate that catches one lucky round wins.
+
+**So the quantity needed to detect that two widths are indistinguishable is computed on the same
+call, by the same function, and discarded for the pick.** The file states the hazard precisely and
+applies the guard to one of the two decisions it governs.
+
+**Measured, because a structural route is not a rate.** Logging the probe's own `times` and
+`spread` on each call, 24 calls per cell, M5 at nt=6:
+
+| cell | top-two gap (median) | baseline spread (median) | calls whose top-two gap is INSIDE the measured spread |
+|---|---|---|---|
+| N=1024 | 1.0093 | 1.0380 | **21/24 = 0.88** |
+| N=2048 | 1.0184 | 1.0276 | **15/24 = 0.62** |
+
+The typical gap is well inside the typical floor. **The probe is choosing between candidates it
+cannot distinguish, and it holds the number that says so.**
+
+**This changes the fix.** My earlier note suggested a higher repetition count. That is wrong on its
+own: more rounds shrink a floor the rule never consults. The matched change is to apply the existing
+measured spread to the candidate-versus-candidate comparison and break the resulting tie
+deterministically — the analytic `_panel_width` prediction, or the incumbent — rather than by
+argmin. The same gap exists one level up: `_LEARNED_MARGIN` (`:1303-1305`) guards the tiled winner
+against the predicted v2 and nothing guards it against the other tiled candidates. **Neither level
+has a margin between two tiled candidates.**
+
+**A documented claim that the rerun refutes.** `_interleaved_times`' docstring (`:1330-1341`)
+defends rotating the start position over drawing a fresh permutation partly on the grounds that *"a
+shuffle would also make a dispatch decision nondeterministic across runs, and that decision is
+memoized; a verdict that varies run to run is worse than one carrying a bias the margin absorbs."*
+The decision **is** nondeterministic across runs — measured above — and the cause is upstream of
+ordering, so it survives any ordering discipline. "A bias the margin absorbs" is true only of the
+baseline comparison, which is the one comparison that has a margin. The docstring cites real
+measurement elsewhere (0.979–1.013 rotated against 1.001–1.051 shuffled) and rests this one clause
+on an untested claim about its own output.
+
+### The learned level's determinism prediction is VACUOUS, and declining to tile is the larger finding
+
+The peer offered a cheap falsifiable prediction: `level="learned"` picks from a model prediction
+rather than a timing, so its transition rate should be 0.00 where the probed levels flip. Measured,
+8 repeats per condition:
+
+| level | N=1024 nt=2 | N=1024 nt=6 | N=2048 nt=2 | N=2048 nt=6 |
+|---|---|---|---|---|
+| balanced | 0.29 | 0.14 | 0.71 | 0.43 |
+| learned | **0.00** | **0.00** | **0.00** | **0.00** |
+
+**The 0.00 is vacuous and the prediction is untested.** The learned level returned `('v2', None)` on
+all 32 calls — it never chose a width, so there was nothing for it to be stable about. My first
+version of this check verified only that a model was *present*, which is the wrong guard: the
+instrument has to confirm the decision under test was actually *made*. Corrected to print the whole
+pick rather than the parameter.
+
+**And the reason it is vacuous is a bigger finding than the one it was testing.** The learned model
+routes to the baseline on two cells where the probe measures tiling **54.9% and 95.0% faster**. This
+is in-domain: `_load_learned_model` (`:1232-1237`) rejects on `machine_id` mismatch, version bump
+and feature-schema drift, and it loaded, so this model was trained for this machine. It reached
+`('v2', None)` through the prediction path rather than the eligibility gate (`:1510-1514` would have
+returned `None` and memoized nothing).
+
+**This is adjacent to concern #5 and should be read with it.** The only quality figure
+`train_autotune_model.py` exports is `heldout_geomean`, and that figure is in-sample — `lreg` is
+computed over all training rows and the comment above it says "optimistic". A model whose sole
+published score is optimistic, leaving a 1.5–1.9× measured win on the table on the first two cells
+probed, is the failure mode that mislabel conceals. **Not yet a verdict**: two cells, one host, and
+I have not checked whether these shapes are inside the model's training distribution. What would
+settle it: the grouped-CV figure that `group_split` already computes at `:215` and never exports,
+plus the model's predicted-versus-measured ratio on these two cells.
