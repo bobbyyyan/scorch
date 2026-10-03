@@ -2819,10 +2819,31 @@ which holds 4153 of 4570 SuiteSparse matrices. Two populations, not two estimato
 rather than leaving it open.** Each value is normalised to *its own* deg 0-32 band, so a contrast
 over normalised values is algebraically the **top-band contrast minus the band-0 contrast**:
 
-| | contrast of normalised values | top-band dip − band-0 dip | gap |
-|---|---|---|---|
-| redwood SuiteSparse | -7.06% | -9.66 − (-2.82) -> **-7.04%** | **0.02 pp** |
-| redwood DLMC | -16.27% | -15.60 − (+0.95) -> **-16.39%** | 0.13 pp |
+**The composition is a ratio of factors, never a subtraction of percents** -- the difference is
+exact in logs and the percent form must be written as a ratio, or the printed operator does not
+produce the printed number:
+
+| | contrast of normalised values | `(1+c_top)/(1+c_0) - 1` | gap | *(wrong form: `c_top - c_0`)* |
+|---|---|---|---|---|
+| redwood SuiteSparse | -7.0608% | `(1-0.0966)/(1-0.0282) - 1` = **-7.0385%** | **0.022 pp** | *-6.84%* |
+| redwood DLMC | -16.2660% | `(1-0.1560)/(1+0.0095) - 1` = **-16.3943%** | 0.128 pp | *-16.55%* |
+
+An earlier revision of this table printed the subtraction form while carrying the ratio form's
+values, which a peer correctly read as the identity failing by 0.22 pp on SuiteSparse -- ten times
+the real gap. In logs the subtraction *is* exact: `log(1+c_top) - log(1+c_0)` = -7.2985 and
+-17.9058 pp of log. Three forms, two correct, and the incorrect one was the one printed.
+
+**What the gap establishes, and what it does not.** Perturbing the DLMC triple over all eight
+corners of +/-0.0005 moves the contrast across an envelope of +/-0.148 pp, which contains 0.128 pp
+*and* 0.022 pp -- so publication rounding is **consistent with** both gaps and **identifies**
+neither. Calling it "the rounding of the published three-decimal values" overstated it; the honest
+form is that the gap is within the rounding envelope and no alternative has been proposed. Peer
+reviewer's enumeration.
+
+**And the 0.12 pp appears twice but is one quantity.** The additive residual against the top band is
+`r = -c_0 (1+c_top)/(1+c_0)`, which gives **+2.62 pp** for SuiteSparse against an observed +2.60 and
+**-0.79 pp** for DLMC against an observed -0.67. That second 0.12 pp *is* the identity gap above,
+not a separate discrepancy, so it must not be counted twice.
 
 So the quantity is not supposed to equal any single band's figure, and **nearest-band matching is
 the wrong test** — it would pick band 1 for SuiteSparse (-6.13, 0.93 pp away) and the top band for
@@ -2878,5 +2899,11 @@ MKL, 25.68%, against 63.09% for operands — a 37.4 pp gap.** Degenerate keys ar
 half as often, which is the whole reason the share moves the way it does. The reconciliation to the
 registered 150 is exact and not a 14-key shift: 150 redwood-census non-operands minus the 2 that
 are redwood-only basenames (`bone010_B`, `boneS10_B`) = 148, and all 148 survive the shape check,
-since 4570 - 148 = 4422. The DLMC side must use the same predicate — one path per basename, shape-checked where a census exists, and the share reported on
+since 4570 - 148 = 4422. Verified against the sealed census: of the 6 redwood-only keys, exactly the
+two `_B` are `cols==1`; `bone010_C` and `boneS10_C` are `rows==3` and the two `_M` are square, so
+2 of 6 is the right count and the census predicate still splits 23 `rows==1` + 127 `cols==1` = 150.
+**A different sensitivity would lose 4, not 2:** the `_C` pair is `rows==3`, so both sit inside the
+`min(rows,cols) <= 4` set of 194 (the -1.93% to -2.08% pooled sensitivity) while neither is in the
+150. If that sensitivity is ever carried to the MKT side the shift is **4 keys**. Peer reviewer's
+note. The DLMC side must use the same predicate — one path per basename, shape-checked where a census exists, and the share reported on
 both bases — or the two shares are differently defined and not comparable.
