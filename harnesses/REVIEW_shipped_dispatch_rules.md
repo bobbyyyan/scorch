@@ -1880,14 +1880,14 @@ narrower than what was written.
 |---|---|---|---|
 | 0-32 | -3.40 .. -2.22 | +0.61 .. +1.31 | **disjoint, OPPOSITE SIGN** |
 | 32-100 | -7.58 .. -4.60 | -3.01 .. -1.74 | disjoint |
-| 100-256 | -14.13 .. -8.57 | -12.55 .. -10.85 | DLMC **contained** in SuiteSparse |
-| 256+ | -12.45 .. -6.80 | -17.25 .. -13.91 | disjoint |
+| 100-256 | -14.13 .. -8.57 | -12.59 .. -10.85 | DLMC **contained** in SuiteSparse |
+| 256+ | -12.45 .. -6.80 | -17.24 .. -13.90 | disjoint |
 
 Three of four disjoint, and at low degree the sign flips (-2.82% against **+0.95%**). So the
 collections share the **monotonicity in degree, not the level** -- the curves are offset and cross
 zero in different places. A shared sign of the derivative is what a mechanism predicts and is
 what the conclusion needs, but the sentence "the two corpora's intervals overlap" invited the
-stronger reading and is corrected here. At 100-256 the right word is **containment** (1.70 pp
+stronger reading and is corrected here. At 100-256 the right word is **containment** (1.74 pp
 inside 5.56 pp), which is the stronger claim -- weakened by the SuiteSparse band being n=58, so
 overlap between a wide interval and a narrow one is mostly a statement about the wide one.
 
@@ -3073,8 +3073,19 @@ all of which sit at degree 0 and so in band 0, exactly as the 14 dropped SuiteSp
 The first row is exactly the published `:1810` table, which identifies the convention from the
 artefact. The difference between the first two rows is **one key**. The reason is the corpus's
 distance-to-edge distribution, not the convention: DLMC holds **185 keys at degree exactly 256.000**
--- pruned dense-256 blocks such as `rows 128, nnz 32768` -- and one at 255.998046875, so 186 sit
-within 0.01 of the edge. SuiteSparse's closest approach to any edge is **0.033**, which is why
+-- pruned dense-256 blocks, modally `rows 512, nnz 131072` at 143 of the 185, over 6 distinct
+shapes of which two are `rows 33288, nnz 8521728` where the row count is not a power of two -- and
+186 sit within 0.005 of the edge (a count computed here; the scoping argument is the peer
+reviewer's). The internal check that the two conventions describe one population: 712 - 185 =
+713 - 186 = 527 strictly above 256, which is the `:1959` table's own figure.
+
+**The single flip is selected by the format's resolution, not produced by one key's coincidence.**
+**Six** keys sit strictly between 255 and 256 -- 255.998046875 (`rows 512, nnz 131071`),
+255.954589844, 255.908203125, 255.740234375, 255.320312500, 255.257812500 -- and only the first is
+within the 0.005 that `"%.2f"` can move, so it alone renders as `256.00`. That is why the count is
+1 rather than 6, and it is a fact about the format's resolution meeting the collection's
+distance-to-edge distribution. A peer put the candidate set at three; it is six, and the conclusion
+is the same but less accidental for it. SuiteSparse's closest approach to any edge is **0.033**, which is why
 2-decimal and exact agree there in every band. **Convention-invariance is a property of a
 collection's distance-to-edge distribution, so it has to be re-derived per corpus and never carried
 across one.** Peer reviewer's scoping; both censuses recomputed here.
