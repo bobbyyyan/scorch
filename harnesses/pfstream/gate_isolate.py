@@ -72,6 +72,7 @@ CELLS = [(r, n, k) for r in ROWS for n in NNZ for k in KS]
 # Both read from scorch_policy.h -- :1581 and :82. Stated here so a divergence between
 # the header and the linked object shows up as a disagreement rather than being absorbed.
 MINGRAINS, GRAIN = 2, 150000
+MAXOUT_MULT = 2          # SCORCH_SPMM_PARTITION_MAXOUT_LLC at :534
 THRESHOLD = MINGRAINS * GRAIN
 
 
@@ -154,9 +155,24 @@ def main(argv):
     for cand, lv, at in inv:
         print("     llc=%-10d  live %3d  attributable %2d%s"
               % (cand, lv, at, "   <- as measured" if cand == llc else ""))
-    print("   the prediction is CONSTANT for llc in (32000000, 64000000] bytes -- which is")
-    print("   exactly the bound the elem_size probe gives -- and changes outside it. So the")
-    print("   result does not need llc known exactly, only bounded; it is not host-free.")
+    # Derived from the grid, not asserted. The prediction can only change where maxout
+    # crosses one of the distinct rows*out_cols*elem products, so the breakpoints are
+    # those products halved. Stating the interval in prose goes silently false the moment
+    # ROWS or KS changes; deriving it tracks the grid.
+    prods = sorted({c[0] * c[2] * 4 for c in CELLS})
+    brk = sorted({pr // MAXOUT_MULT for pr in prods})
+    below = [b for b in brk if b < llc]
+    above = [b for b in brk if b >= llc]
+    print("   the prediction can only change where maxout crosses a distinct"
+          " rows*out_cols*elem product,")
+    print("   so with maxout = %d x llc the breakpoints are those products halved."
+          % MAXOUT_MULT)
+    print("   around the measured llc=%d that gives (%s, %s] -- the same interval the"
+          % (llc, below[-1] if below else 0, above[0] if above else "inf"))
+    print("   elem_size probe brackets, because both are determined by the same finite")
+    print("   product set. So every bracket the probe can return is a bracket on which the")
+    print("   prediction is constant, for any grid. The result needs llc BOUNDED, not known")
+    print("   -- but it is not host-free: outside this interval the answer moves.")
 
     # ---- does nthreads reach the answer at all? With its control.
     print("\nNTHREADS: the only predicate reading nthreads is the solo gate, and")

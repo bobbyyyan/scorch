@@ -1,92 +1,127 @@
 #!/usr/bin/env python3
-"""Which cached SuiteSparse matrices sit in concern #2's gate region?
+"""Which cached matrices sit in concern #2's gate region, composed, and emit the list.
 
-The gate forces partition_mode=0 when nnz*max(k,16) < 300000, so at k<=16 it needs
-nnz < 18750. nnz is read from each .npz's ZIP DIRECTORY rather than by decompressing:
-the uncompressed size of the `indices` member is 4 or 8 bytes per nonzero. That is an
-inference, so it is cross-checked against `indptr` on a sample and the check is printed --
-a size-derived nnz that disagrees with the array it claims to describe would silently
-select the wrong matrices.
+The gate forces partition_mode = 0 when `nnz * max(k,16) < mingrains * GRAIN_SPMM`.
+It is one predicate of four, so its fired set is an UPPER BOUND on what is attributable:
+a cell already excluded by the output-bytes predicate -- `rows * k * elem >= 2 * llc` --
+is not live at any pool and cannot be attributed to the ceiling. Both are applied here.
+
+nnz and rows are read EXACTLY, from the `.npy` header of each member rather than inferred
+from its compressed size. The header states the shape and the dtype, so there is nothing
+to infer. An earlier version of this file divided the ZIP directory's byte count by a
+guessed element size, inside a `for isz in (4,8)` loop that could only ever return 4 --
+dividing a fixed byte count by a larger element gives a smaller count, so if the first
+pair passed a positivity test the others could not be reached. It then discarded the
+element size before the filter. Its docstring described a selection the code did not make.
+
+That defect was one-signed, which is the only reason its published figure survived: a
+true int64 index read as int32 doubles the inferred nnz, and the predicate is an upper
+bound on nnz, so matrices with real nnz in [9375, 18750) were dropped and none was added.
+A lower bound was published as if exact.
+
+Usage: npz_gate_region.py <cache-root> [out.txt] [llc-bytes]
 """
 import glob
 import os
 import sys
 import zipfile
 
-ROOT = sys.argv[1] if len(sys.argv) > 1 else "/scr/bobbyy/mklsweep/csrcache/ss"
-THRESH = 300000
+MINGRAINS, GRAIN = 2, 150000
+THRESHOLD = MINGRAINS * GRAIN
+MAXOUT_LLC = 2
+KS = (1, 2, 4, 8, 16, 32)
 
 
-def nnz_from_dir(path):
-    """(nnz, rows) inferred from member sizes, or None."""
+def header_shapes(path):
+    """(nnz, rows, index_dtype) from the .npy headers. Exact, not inferred."""
+    import numpy as np
+    out = {}
     try:
         with zipfile.ZipFile(path) as z:
-            info = {os.path.splitext(n)[0]: z.getinfo(n).file_size for n in z.namelist()}
+            for member in ("indices.npy", "indptr.npy"):
+                if member not in z.namelist():
+                    return None
+                with z.open(member) as fh:
+                    np.lib.format.read_magic(fh)
+                    shape, _, dtype = np.lib.format.read_array_header_1_0(fh)
+                    out[member] = (shape, dtype)
     except Exception:                                              # noqa: BLE001
         return None
-    idx = info.get("indices")
-    ptr = info.get("indptr")
-    if idx is None or ptr is None:
+    (ishape, idt), (pshape, _) = out["indices.npy"], out["indptr.npy"]
+    if len(ishape) != 1 or len(pshape) != 1 or pshape[0] < 1:
         return None
-    # numpy .npy members carry a header; it is small and fixed-ish, so divide the payload
-    for isz in (4, 8):
-        for psz in (4, 8):
-            n, r = (idx - 128) // isz, (ptr - 128) // psz - 1
-            if n > 0 and r > 0:
-                return n, r, isz, psz
-    return None
+    return int(ishape[0]), int(pshape[0]) - 1, idt
 
 
-def main():
-    files = sorted(glob.glob(os.path.join(ROOT, "*", "*", "*.npz")))
-    print("cache %s: %d .npz files" % (ROOT, len(files)))
+def main(argv):
+    if len(argv) < 2:
+        sys.exit(__doc__)
+    root = argv[1]
+    out = argv[2] if len(argv) > 2 else None
+    llc = int(argv[3]) if len(argv) > 3 else 33554432
+    maxout = MAXOUT_LLC * llc
+
+    files = sorted(glob.glob(os.path.join(root, "**", "*.npz"), recursive=True))
+    print("cache %s: %d .npz files" % (root, len(files)))
     if not files:
         print("EXIT: no matrices found")
         return 1
 
-    got, bad = [], 0
+    got, bad = [], []
+    dtypes = {}
     for f in files:
-        r = nnz_from_dir(f)
+        r = header_shapes(f)
         if r is None:
-            bad += 1
+            bad.append(f)
             continue
-        n, rows, isz, psz = r
-        got.append((f, n, rows, isz))
-    print("readable: %d   unreadable: %d" % (len(got), bad))
+        nnz, rows, idt = r
+        dtypes[str(idt)] = dtypes.get(str(idt), 0) + 1
+        got.append((f, nnz, rows))
 
-    # the cross-check: decompress a sample and compare
-    import numpy as np
-    sample = got[:: max(1, len(got) // 12)][:12]
-    agree = 0
-    print("\nCROSS-CHECK of the size-derived nnz against the actual arrays, %d matrices:"
-          % len(sample))
-    for f, n, rows, isz in sample:
-        try:
-            with np.load(f) as z:
-                real = len(z["indices"])
-                realr = len(z["indptr"]) - 1
-        except Exception as exc:                                   # noqa: BLE001
-            print("   %-44s could not load: %s" % (os.path.basename(f), exc))
-            continue
-        ok = (n == real)
-        agree += ok
-        print("   %-40s inferred %9d  actual %9d  rows %7d/%-7d %s"
-              % (os.path.basename(f)[:40], n, real, rows, realr, "ok" if ok else "MISMATCH"))
-    print("   %d of %d agree" % (agree, len(sample)))
-    if agree != len(sample):
-        print("EXIT: the size-derived nnz is not reliable, so the selection below would be")
-        print("      a selection on the wrong quantity.")
+    print("read from .npy headers: %d   unreadable: %d" % (len(got), len(bad)))
+    for f in bad[:4]:
+        print("   unreadable: %s" % os.path.basename(f))
+    print("index dtypes present, over all readable files: %r" % dtypes)
+    print("   a single dtype here is what makes nnz exact; a mix would have made the old")
+    print("   size-division wrong on part of the corpus and right on the rest.")
+    if bad:
+        print("EXIT: %d files unreadable. The denominator for any share below would be the")
+        print("      READABLE count, not the file count, and publishing the file count")
+        print("      while computing the readable one is only correct when they coincide."
+              % len(bad))
         return 1
 
-    region = [(f, n, r) for f, n, r in [(f, n, r) for f, n, r, _ in got] if n * 16 < THRESH]
-    print("\nin the gate region (nnz < %d, so firing at every k <= 16): %d of %d = %.1f%%"
-          % (THRESH // 16, len(region), len(got), 100.0 * len(region) / len(got)))
-    region.sort(key=lambda x: -x[1])
-    print("   largest few: %r" % [(os.path.basename(f)[:28], n, r) for f, n, r in region[:6]])
-    print("   smallest few: %r" % [(os.path.basename(f)[:28], n, r) for f, n, r in region[-4:]])
-    out = os.path.join(os.path.dirname(ROOT.rstrip("/")), "gate_region_keys.txt")
+    n = len(got)
+    print("\nthe gate alone (nnz * max(k,16) < %d), and COMPOSED with the output-bytes"
+          % THRESHOLD)
+    print("predicate (rows * k * 4 >= %d excludes), llc = %d:" % (maxout, llc))
+    print("   %-5s %-14s %-14s %-10s %s" % ("k", "gate alone", "composed", "share", "removed"))
+    regions = {}
+    for k in KS:
+        gate = [(f, nz, rw) for f, nz, rw in got if nz * max(k, 16) < THRESHOLD]
+        comp = [(f, nz, rw) for f, nz, rw in gate if rw * k * 4 < maxout]
+        regions[k] = comp
+        print("   k=%-3d %-14d %-14d %-10s %d"
+              % (k, len(gate), len(comp), "%.1f%%" % (100.0 * len(comp) / n), len(gate) - len(comp)))
+    print("   denominator is the READABLE count, %d, which equals the file count here" % n)
+
+    rmax = max(rw for _, _, rw in got)
+    print("\n   largest row count in the corpus: %d. The output-bytes predicate needs" % rmax)
+    print("   rows >= %d at k=16 and %d at k=32, so it is %s on this corpus."
+          % (maxout // 4 // 16, maxout // 4 // 32,
+             "LIVE" if rmax * 32 * 4 >= maxout else "vacuous"))
+
+    if out:
+        k_emit = 16
+        with open(out, "w") as fh:
+            for f, nz, rw in sorted(regions[k_emit]):
+                fh.write("%s\t%d\t%d\n" % (f, nz, rw))
+        print("\nwrote %d members of the composed k=%d region to %s"
+              % (len(regions[k_emit]), k_emit, out))
+        print("   the earlier version computed this path and returned without writing it,")
+        print("   so the script that identifies the region never emitted the region.")
     return 0
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    sys.exit(main(sys.argv))

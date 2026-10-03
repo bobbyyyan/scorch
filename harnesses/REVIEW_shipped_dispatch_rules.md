@@ -618,23 +618,52 @@ The flat share across k <= 16 is the `max(k,16)` in the work proxy, not a coinci
 The collection's nnz runs min 6, median 52428, max 8.5M, so the region is the lower third
 rather than an edge case.
 
-And over the 4594 SuiteSparse matrices cached on mkt1, by the same predicate:
+And over the 4594 SuiteSparse matrices cached on mkt1, with **both** predicates applied:
 
-| k | matrices in the gate region | of 4594 | share |
+| k | gate alone | composed with output-bytes | share of 4594 |
 |---|---|---|---|
-| 1, 2, 4, 8, 16 | 2181 | 4594 | **47.5%** |
+| 1, 2, 4, 8 | 2181 | 2181 | 47.5% |
+| 16 | 2181 | **2180** | 47.5% |
+| 32 | 1379 | **1378** | 30.0% |
+
+The denominator is the readable count, which here equals the file count -- all 4594 parse,
+so the two coincide; an earlier version published the file count while computing the
+readable one, which is only correct when they do.
+
+**The composition matters structurally even though it removes one matrix.** The gate is one
+predicate of four, and a share computed from it alone is an upper bound -- the same omission
+the synthetic-grid section had already corrected one commit earlier, repeated here on a real
+corpus. The omitted predicate excludes when `rows * k * 4 >= 2 * llc`, needing rows >=
+1048576 at k=16, and SuiteSparse's largest row count is 9,888,048, so it is **live** on this
+corpus.
+
+On DLMC it is **vacuous**: the sealed dims ledger gives a maximum of 33288 rows over all
+3820 keys, so the largest `rows * 32 * 4` in the collection is 4,260,864 -- a factor of
+15.75 under the threshold -- and the predicate excludes 0 of 3820 at every k in
+{1,2,4,8,16,32}. So the 30.21% and 18.95% above **are** the composed shares exactly, and
+this finding is isolated to SuiteSparse, whose row counts are unbounded.
 
 **So at any caller pool of 16 or fewer, an ARM-derived gate decides the row-handout mode
 for about a third of DLMC and nearly half of SuiteSparse on an x86 host.** That is the
 reason the runtime question is worth measuring rather than leaving at reachability.
 
-Instrument for the SuiteSparse figure: `harnesses/pfstream/npz_gate_region.py`. It reads
-nnz from each `.npz`'s ZIP directory -- the uncompressed size of the `indices` member is
-four bytes per nonzero -- rather than decompressing 26 GB. That is an inference about a
-file format, so it is cross-checked against the actual arrays on a sample and the check is
-printed: 12 of 12 agree exactly, including a 1-nonzero matrix and a 4.4-million-nonzero
-one. A size-derived nnz that disagreed with the array it claims to describe would have
-selected a different set of matrices with no outward sign.
+Instrument: `harnesses/pfstream/npz_gate_region.py`. It now reads nnz and rows **exactly**,
+from each member's `.npy` header, which states the shape and the dtype -- so there is
+nothing to infer. Index dtype over all 4594 readable files is `int32` uniformly.
+
+The first version inferred nnz by dividing the ZIP directory's byte count by a guessed
+element size, inside a `for isz in (4, 8)` loop that **could only ever return 4**: dividing
+a fixed byte count by a larger element gives a smaller count, so if the first pair passed
+the positivity test the others were unreachable. It then discarded the element size before
+the filter. Its docstring described a selection the code did not make, and its twelve-matrix
+cross-check could not cover a dtype the loop could not reach.
+
+Two things about that, in opposite directions. It was **one-signed**: a true int64 index
+read as int32 doubles the inferred nnz against an upper-bound predicate, so matrices with
+real nnz in [9375, 18750) were dropped and none was added -- the published figure was a
+lower bound presented as exact. And it turns out to have been **accidentally correct here**,
+because the corpus is uniformly int32. That is luck, not design, and the fix removes the
+dependence on it.
 
 One design note for the runtime work: the region's smallest members have nnz = 1, some with
 hundreds of thousands of rows. Those are not meaningful SpMM subjects and must be excluded
