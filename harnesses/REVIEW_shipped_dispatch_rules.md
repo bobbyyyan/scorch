@@ -201,23 +201,61 @@ two True ones are the *same* product:
 
 Reduced to the quantity itself, at the tightest granularity the expression allows (`J = 1`, step 4):
 product `C + 0` is False and `C + 4` is True, which is what shows the comparison is strict `>`
-rather than something coarser.
+rather than something coarser. One premise under that pair: `J * 4 * N` over integer J and N is
+always a multiple of 4, so step 4 *is* the finest granularity, **and the equality row exists only
+when `C` is divisible by 4**. It holds for both C values on record (16777216 and the Linux fallback
+37748736, both `% 4 == 0`), so the pair is valid as published; on a C not divisible by 4 there is no
+equality row and the straddling pair is a different one.
 
 **So an all-zero operand does become a learned candidate once `J * 4 * N > C`, and that is the
 DEFAULT, not an opt-in.** `_LEARNED_WIDEN = os.environ.get("SCORCH_AUTOTUNE_WIDEN", "1") == "1"`
 (`:1061`), so the gate at `:555` --
 `if level == "learned" and _LEARNED_WIDEN and _load_learned_model() is not None` -- needs no
 configuration. My measured `is_candidate(level="learned") == True` also *proves a spec loads on
-this host*, since the third conjunct had to be non-None for it to fire.
+this host*, since the third conjunct had to be non-None for it to fire. **Which** spec is a
+separate question the conjunct cannot answer -- `:1234` forces the loaded spec to be *for* this
+machine, not to be one of the two tracked files, and the user-cache route is checked first -- so it
+was read rather than inferred: `_machine_id()` is `74c1226957b8a5ce` and `_learned_model_path()`
+returns `autotune-levels/models/model_74c1226957b8a5ce.json`, the first tracked spec, via the
+second route. A conjunct firing identifies its population as non-empty, not which member.
 
 **The conjunct that actually bounds it is the model, and that bound is width-independent.**
-`_load_learned_model` rejects on `spec["machine_id"] != _machine_id()` (`:1234`), `_machine_id()`
-hashes `platform.system()` among its five components (`:883`), and both tracked specs are
-`platform: Darwin`. So on **redwood and MKT no spec resolves at any N**, `is_candidate` falls
-through to `_degree_pays`, and the theorem makes it False. `SCORCH_AUTOTUNE_MODEL` (`:1206-1207`)
-opens no hole -- an explicit path still passes the machine_id check. This sits *beside* the width
-caveat rather than replacing it, because the width caveat is what covers a Darwin host that does
-have its own model. Peer reviewer's point.
+`_load_learned_model` rejects on `spec["machine_id"] != _machine_id()` (`:1234`) and `_machine_id()`
+hashes `platform.system()` among its five components (`:883`), so no Darwin-built spec can ever
+match a Linux host's id.
+
+**But "both tracked specs are Darwin" is a statement about the git index, and the loader stats the
+disk.** `_learned_model_path()` (`:1202-1216`) tries two routes in order:
+`$XDG_CACHE_HOME`-or-`~/.cache` + `scorch/autotune_model_<mid>.json`, then
+`<repo>/autotune-levels/models/model_<mid>.json` -- and `bench/train_autotune_model.py:307` writes
+`model_{machine_id}.json` into `MODELS_DIR = REPO/autotune-levels/models` (`:42`), **the loader's
+second route, same directory**. One trainer run on either Linux host would leave a resolving spec
+that `git ls-files` would never show, and the error runs in the dangerous direction: the widened
+gate would be live on a measurement host at every N, the opposite of what the sentence asserts.
+Peer reviewer's finding, against their own earlier point and mine.
+
+**So it was censused per host, on disk.** Only one thing writes route 1's filename pattern -- and
+it is a *read*, at `tiling.py:1209`; a tree-wide grep for `autotune_model_` returns that one hit,
+so route 1 requires hand placement.
+
+| host | route 1 (`~/.cache/scorch/autotune_model_<mid>.json`) | route 2 (`<repo>/autotune-levels/models/`) |
+|---|---|---|
+| this Mac | absent (`~/.cache/scorch/` holds `autotune.json`, a different name) | the 2 tracked specs; `model_74c1226957b8a5ce.json` **resolves** |
+| redwood | absent; `~/.cache/scorch/` holds only `autotune.json`; `XDG_CACHE_HOME` unset | **no `autotune-levels/` directory exists** in `/scratch/bobbyy/scorch`, `/scratch/bobbyy/mrhv/tree` or `/scratch/bobbyy/raisefloor/tree` |
+| MKT | `~` is AFS and `~/.cache/scorch/` **does not exist**; `XDG_CACHE_HOME` unset | `/scr/bobbyy/scorch` holds **the same two tracked Darwin filenames**; the four `pfs/{ship,shpb,strm,nopf}` trees the measurement imports from have **no `autotune-levels/` at all** |
+
+MKT's repo tree is therefore *populated* and still cannot resolve, because the two ids on disk are
+Darwin ids and `_machine_id()` hashes `platform.system()`. No `model_<linux-id>.json` exists in any
+tree on either host, so the trainer-run hazard has not occurred. The running job's own environment
+(pid 4110182 on mkt1) carries no `SCORCH_AUTOTUNE*`, `XDG_CACHE*` or `SCORCH_LLC*` entry, so no
+override is in play either, and `SCORCH_AUTOTUNE_MODEL` (`:1206-1207`) opens no hole in any case --
+an explicit path still passes the machine_id check.
+
+**On redwood and MKT, then, no spec resolves at any N**, `is_candidate` falls through to
+`_degree_pays`, and the theorem makes it False. This sits *beside* the width caveat rather than
+replacing it, because the width caveat is what covers a Darwin host that does have its own model.
+The census is a property of two directories per host, not of the repo, so it is re-checkable with
+`ls autotune-levels/models/` and `ls ~/.cache/scorch/` and should be re-run rather than carried.
 
 **The width caveat is DLMC-specific, and SuiteSparse is ruled out by something stronger.** At
 N = 32 the gate needs `cols > C/128` = 131072 at 16 MB or 294912 at the Linux 36 MB fallback. From
