@@ -163,10 +163,21 @@ print("CONFIGURATION: %s" % ("REPRESENTATIVE -- the 2x-pool adoption path IS rea
       "is attributable to the gate; this is not a user's configuration on a wide host"),
       flush=True)
 GATE_MAXTHREADS = 16
-if POOL > GATE_MAXTHREADS:
-    sys.exit("REFUSE: pool %d > the ceiling %d, so :2614 zeroes mingrains in BOTH arms and "
-             "the treatment population is empty by construction." % (POOL, GATE_MAXTHREADS))
-print("neither the pool ceiling nor the 2x-pool adoption path can fire here", flush=True)
+CEILING = POOL > GATE_MAXTHREADS
+if CEILING:
+    # Not a refusal. Above the ceiling :2614 zeroes mingrains, so R1's two arms set the same
+    # variable to values that resolve identically -- a DECLINED ARGUMENT, which is the one
+    # floor construction that sits on the treatment's OWN CELLS at the same nproc instead of
+    # beside them on a different population. R2 forces the mode directly and is unaffected,
+    # so the pool axis stays measurable above the ceiling while R1 turns into its own
+    # control. An earlier version exited here and gave up both.
+    print("pool %d is ABOVE the ceiling %d, so :2614 zeroes mingrains in both of R1's arms. "
+          "R1 is therefore a DECLINED-ARGUMENT FLOOR on the treatment's own cells here, not "
+          "a treatment; R2 forces the mode directly and remains live."
+          % (POOL, GATE_MAXTHREADS), flush=True)
+else:
+    print("pool %d is at or below the ceiling %d, so the work gate is ACTIVE and R1 is a "
+          "treatment" % (POOL, GATE_MAXTHREADS), flush=True)
 
 
 def dims(path):
@@ -247,9 +258,14 @@ print("  sampled %d of T and %d of C2 at seed %d" % (len(Ts), len(C2s), A.seed),
 # file assumed "treatment moves, controls do not" for every route, which is true of R1 and
 # false of R2: R2 forces the mode directly, so it moves every cell at every width and C1/C2
 # are treatment cells under it, not controls. The check caught it; the fix is below.
+# R1's declaration is COMPUTED from the pool rather than written down, because whether its
+# arms differ at all is decided by the ceiling at :2614. Hardcoding "T moves" would have the
+# premise check fail at every pool above 16 and report it as a broken apparatus rather than
+# as the declined argument it is.
 R1 = ("R1-gate", {"SCORCH_SPMM_PARTITION_MINGRAINS": "2"},
                  {"SCORCH_SPMM_PARTITION_MINGRAINS": "0"},
-      {"T": "all", "C1": "none", "C2": "none"})
+      {"T": "none", "C1": "none", "C2": "none"} if CEILING
+      else {"T": "all", "C1": "none", "C2": "none"})
 # R2 asks the mechanism the gate is a proxy for -- mode 0 against mode 3 -- at three work
 # scales, with the gate itself off in both arms so it cannot overwrite the override at
 # :2618. All three populations move, which is the point: if the partition's sign really
