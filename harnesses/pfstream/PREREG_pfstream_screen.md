@@ -4265,6 +4265,14 @@ shrink at 16.
 
 ## Amendment 50 — both criteria's nulls, measured on the arm-identity pair. Amendment 49's scoreboard claim is RETRACTED; the k=4 finding is the only thing above its own null, on all three criteria.
 
+> **AMENDED BY AMENDMENT 51.** The arm-identity pair is the floor this ledger's own analyser
+> prints and **declines** for this statistic (`an_c207.py:157-160`). Under the named control —
+> the object pair `dev(S_aa/S_bb)` — the count null is **33.8%**, not 61.0%, and the floor's
+> own deviation at k=4/degree≥256 is **4.51%** against the arm pair's 0.50%. The retraction
+> stands (11.2% is 3.02× below 33.8%). **The k=4 claim must be stated as a width CONTRAST,
+> not as "exceeds 1.0":** the absolute excess is only 2.2× the floor's own deviation, while
+> the k=4-against-k=8 contrast is 11.6× the floor's.
+
 Amendment 49 published a 40× ratio between two criteria and read it as what the conservative one
 hid. **Neither criterion had reported its null.** chain207 carries `ours`, `oursb` and `mkl`, and
 the ledger's own analyser (`an_c207.py:140,160`) computes `oursb/ours` as its **"arm-identity"**
@@ -4353,3 +4361,89 @@ claim arriving in the same message as checked ones is read as checked.**
 **One cross-check I am recording because two independently computed tables constraining each other
 is worth more than either alone:** over all 30 cells, *(count share > 50%)* agrees exactly with
 *(band median > 1.0)* — zero disagreements.
+
+---
+
+## Amendment 51 — the null I used is the one this ledger's analyser prints and DECLINES. Under the named control the retraction stands, and the k=4 claim has to be a width contrast rather than "exceeds 1.0".
+
+`an_c207.py:157-160`, printed beside its two floors:
+
+> *"The gate uses the ratio floor because the gated statistic is S. The arm floor is printed only
+> so the two are visible together; **it is not the control for this claim**."*
+
+`S` is `ours/mkl` — the statistic both criteria count. **The arm pair varies the ARM inside one
+object; the ratio floor varies the OBJECT while holding the statistic fixed.** Amendment 50 used
+the first. `an_f64_vs_mkl.py --null-object` now computes the second from the two builds already in
+the ledger.
+
+### The count criterion's null, under the control the chain named
+
+| null construction | count null | observed 11.2% is |
+|---|---|---|
+| **object pair `S_aa/S_bb`** — the named control | **33.8%** | **3.02× below** |
+| arm pair `oursb/ours` — amendment 50's proxy | 61.0% | 5.45× below |
+| a symmetric null, assumed | 50.0% | 4.46× below |
+
+**The retraction stands under every one of them**, which is why this is a correction to the record
+and not to the verdict.
+
+**But the three nulls straddle 50% with opposite signs, so no null here is assumable.** The arm
+pair reads **above** 50% (61.0%, `oursb` systematically slower than `ours` within one process); the
+object pair reads **below** it (33.8%, `aa` systematically faster than `bb` on `S`). **Two A/A
+constructions on one ledger, one-signed offsets in opposite directions, neither explained.**
+
+**And the arm pair's offset has no ordering explanation.** I checked the raw arm order rather than
+assuming it: the first fourteen rows read `ours, oursb, mkl, mkl, ours, oursb, mkl, ours, oursb,
+oursb, ours, mkl, mkl, oursb`, and over the whole file each arm occupies each position mod 3 within
+1.7% of a third (6240–6475 of ~6350). **It is shuffled, not cyclic, so a measured-second penalty
+cannot be the carrier.** This is adjacent to the standing puzzle about A/A medians reading below 1
+on byte-identical objects, and no mechanism is proposed for either.
+
+### One structural gap that no construction in this ledger closes
+
+Pairing objects pass-for-pass gives **six** paired readings, not twelve. So:
+
+| criterion | needs a null matched on | object pair | arm pair |
+|---|---|---|---|
+| median above 1.0 | the varied factor | **yes (33.8%)** | proxy |
+| behind in ALL readings | the varied factor **and N** | N=6 only (1.42%) | **N=12 (0.03%)**, wrong factor |
+
+**No single construction here is matched on both.** The N=6 object null of 1.42% bounds nothing
+about an N=12 observed 0.28% — halving N multiplies an intersection null by about 2⁶. So amendment
+50's *"53 against a null of 5, 10.6× above"* rests on a null matched in N and **not** in the varied
+factor, and that is now said rather than implied.
+
+### The k=4 claim, restated — and it is weaker as an absolute and stronger as a contrast
+
+The floor's own median `S_aa/S_bb`, banded by degree, is **far larger than the arm pair's**: at
+degree ≥256 it reads 0.9621 / 0.9549 / 0.9410 / 0.9662 / 0.9491 across k=2…32 — **3.4% to 5.9% off
+1.0**, against the arm pair's 0.17–0.64%. A floor ten times larger than the one amendment 50 used.
+
+**Quoted as a bound beside the raw number rather than divided into it**, because dividing imports
+an attribution — that the object offset transfers to `ours/mkl` — which nothing here establishes,
+and the shuffled arm order argues against the analogous transfer for the arm floor.
+
+| claim at degree ≥256 | observed | floor | ratio |
+|---|---|---|---|
+| k=4 exceeds 1.0 | 9.87% above 1.0 | **4.51%** | **2.2×** |
+| k=4 against k=8 | 1.1712 (17.1%) | 1.0148 (1.5%) | **11.6×** |
+| k=4 against k=2 | 1.1476 (14.8%) | 0.9925 (0.75%) | **19.7×** |
+
+**So "k=4 is the only width whose median ratio exceeds 1.0" is a weak claim — 2.2× a floor that is
+itself one-signed and unexplained.** What survives at full strength is the **width contrast within
+one degree band on the same cells**: k=4 against its two immediate neighbours is **11.6× and 19.7×
+the floor's own contrast at the same cells**, because a common object offset largely cancels in a
+ratio of two widths and does not cancel in a comparison against 1.0.
+
+**Amendment 48's and 50's framing is corrected accordingly: the finding is not "k=4 crosses 1.0", it
+is "k=4 is 15–17% worse than the widths either side of it, against a floor contrast of 0.8–1.5%."**
+The registered `spmm_halfvec=0` arm is unaffected — it tests exactly that contrast — but its
+refutation condition 1 is amended to read **the floor's own k=4-against-neighbour contrast**, not
+the floor's p05–p95 band on absolute ratios.
+
+### The reusable form, third revision
+
+> A criterion's null must be matched on the **varied factor** and on **N**. Where a ledger supplies
+> one construction for each and none for both, say which is which and what each bounds. And prefer
+> a **contrast between cells measured the same way** to a comparison against an absolute constant:
+> a one-signed floor offset cancels in the first and is indistinguishable from signal in the second.

@@ -447,6 +447,85 @@ def main(argv):
     print("  smallest degree in the corpus: %s deg %.4f = %d nnz / %d rows"
           % (lo, degree_of[lo], nnz[lo], rows_of[lo]))
     print()
+    # ---- THE OBJECT-PAIR NULL, which is the control this ledger's own analyser names.
+    # an_c207.py:157-160 prints, beside its two floors: "The gate uses the ratio floor because the
+    # gated statistic is S. The arm floor is printed only so the two are visible together; it is
+    # not the control for this claim." S is ours/mkl -- the statistic both criteria below count.
+    # Its A/A is the SAME statistic on two separately built objects, dev(S_aa/S_bb): the arm pair
+    # varies the ARM inside one object, this varies the OBJECT while holding the statistic fixed.
+    #
+    # ONE STRUCTURAL MISMATCH, NAMED RATHER THAN PAPERED OVER. Pairing objects pass-for-pass gives
+    # SIX paired readings, not twelve, so the intersection null it yields is an N=6 null and is NOT
+    # directly comparable with the N=12 observed count -- an intersection over half as many
+    # readings has a null 2^6 times larger by construction. The COUNT null (a per-cell median
+    # either way) IS directly comparable. Both are printed with their N.
+    if len(argv) > 1 and "--null-object" in argv:
+        bylist = sorted(builds)
+        if len(bylist) != 2:
+            return ("REFUSE: --null-object needs exactly two builds and this run has %s, so there "
+                    "is no object PAIR to hold the statistic fixed across" % bylist)
+        ba, bb_ = bylist
+        import re as _re
+        nS, nI, nboth = 0, 0, 0
+        for ck, obs in cell.items():
+            per = {}
+            for (b, tag, t, m) in obs:
+                mt = _re.search(r"_p(\d+)$", tag)
+                if not mt:
+                    continue
+                per.setdefault(b, {})[int(mt.group(1))] = t / m
+            if ba not in per or bb_ not in per:
+                continue
+            shared = sorted(set(per[ba]) & set(per[bb_]))
+            if not shared:
+                continue
+            nboth += 1
+            r = [per[ba][q] / per[bb_][q] for q in shared]
+            if pct(sorted(r), 0.5) > 1.0:
+                nS += 1
+            if all(x > 1.0 for x in r):
+                nI += 1
+        print()
+        print("THE OBJECT-PAIR NULL (dev(S_aa/S_bb)), the control an_c207.py:157-160 names for S")
+        print("  cells carrying both objects: %d of %d" % (nboth, len(cell)))
+        print("  median of S_%s/S_%s above 1.0 : %6d of %d = %.1f%%   <- DIRECTLY comparable with"
+              % (ba, bb_, nS, nboth, 100.0 * nS / nboth if nboth else float("nan")))
+        print("    the observed count criterion, because both are a per-cell median.")
+        print("  above 1.0 in ALL %d paired readings: %6d of %d = %.2f%%   <- an N=%d null, NOT"
+              % (len(shared), nI, nboth, 100.0 * nI / nboth if nboth else float("nan"),
+                 len(shared)))
+        print("    comparable with the observed N=12 count: halving N multiplies an intersection")
+        print("    null by about 2^%d, so this number bounds nothing about the 53." % len(shared))
+        # The same floor banded by degree, so it can be quoted BESIDE the observed median-ratio
+        # table rather than divided into it.
+        _DB = ((0, 1), (1, 4), (4, 16), (16, 64), (64, 256), (256, float("inf")))
+        print("  the floor's own median S_%s/S_%s, banded by degree and by width:" % (ba, bb_))
+        print("    %-12s %s" % ("deg band", "  ".join("%9s" % ("k=%d" % w) for w in widths)))
+        _per = {}
+        for ck, obs in cell.items():
+            per = {}
+            for (b, tag, t, m) in obs:
+                mt = _re.search(r"_p(\d+)$", tag)
+                if mt:
+                    per.setdefault(b, {})[int(mt.group(1))] = t / m
+            if ba in per and bb_ in per:
+                q = sorted(set(per[ba]) & set(per[bb_]))
+                if q:
+                    _per[ck] = pct(sorted(per[ba][x] / per[bb_][x] for x in q), 0.5)
+        for dlo, dhi in _DB:
+            row = []
+            for w in widths:
+                v = sorted(val for (key, kw), val in _per.items()
+                           if kw == w and dlo <= ((nnz.get(key, 0) / rows_of[key])
+                                                  if rows_of.get(key) else 0.0) < dhi)
+                row.append(("%9.4f" % pct(v, 0.5)) if v else "        -")
+            lab = "%g-%g" % (dlo, dhi) if dhi != float("inf") else ">=%g" % dlo
+            print("    %-12s %s" % (lab, "  ".join(row)))
+        print("  A floor this size is reported as a BOUND beside the raw statistic and NOT as a")
+        print("  divisor: dividing imports an attribution -- that the object offset transfers to")
+        print("  ours/mkl -- which nothing here establishes, to buy a correction far smaller than")
+        print("  the effect it would correct.")
+
     # ---- MEDIAN RATIO BY DEGREE BAND: the comparator that does NOT depend on resolution.
     # "Behind in every reading" is an INTERSECTION over readings, so it shrinks as noise rises and
     # two screens with different readings-per-cell or different measurement windows cannot be
