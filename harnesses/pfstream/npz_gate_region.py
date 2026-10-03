@@ -88,7 +88,7 @@ def main(argv):
         print("EXIT: no matrices found")
         return 1
 
-    got, bad = [], []
+    got, bad = [], []   # (path, nnz, rows, declared_shape)
     dtypes, fmts, layout_bad = {}, {}, []
     n_declared = n_nonsquare = 0
     for f in files:
@@ -105,7 +105,7 @@ def main(argv):
                 n_nonsquare += 1
             if declared[0] != rows:
                 layout_bad.append((f, rows, declared))
-        got.append((f, nnz, rows))
+        got.append((f, nnz, rows, declared))
 
     print("read from .npy headers: %d   unreadable: %d" % (len(got), len(bad)))
     for f in bad[:4]:
@@ -128,9 +128,12 @@ def main(argv):
           % (len(layout_bad), n_declared))
     for f, rows, dec in layout_bad[:4]:
         print("   %s  pointer gives %d, shape says %r" % (os.path.basename(f), rows, dec))
-    print("   of those, NON-SQUARE: %d. Only these discriminate CSR from CSC, because a"
+    print("   of the %d COMPARED (not of the disagreeing ones listed above), NON-SQUARE:"
+          % n_declared)
+    print("   %d. Only non-square entries discriminate CSR from CSC, because a square"
           % n_nonsquare)
-    print("   square matrix satisfies the check under either layout.")
+    print("   matrix satisfies the check under either layout. The per-region count below")
+    print("   is the one that certifies the axis for the population each figure is about.")
     if layout_bad or n_declared < len(got):
         print("EXIT: %d layout disagreements and %d files with no declared shape."
               % (len(layout_bad), len(got) - n_declared))
@@ -154,21 +157,42 @@ def main(argv):
     print("\nthe gate alone (nnz * max(k,16) < %d), and COMPOSED with the output-bytes"
           % THRESHOLD)
     print("predicate (rows * k * 4 >= %d excludes), llc = %d:" % (maxout, llc))
-    print("   %-5s %-14s %-14s %-10s %s" % ("k", "gate alone", "composed", "share", "removed"))
+    n_vec = sum(1 for r in got if r[3] and len(r[3]) == 2 and r[3][1] == 1)
+    n_ops = n - n_vec
+    print("   one-column entries in the corpus: %d of %d, so the operand denominator"
+          " is %d" % (n_vec, n, n_ops))
+    print("   %-5s %-14s %-14s %-14s %-10s %s"
+          % ("k", "gate alone", "+output-bytes", "+operands only", "share", "removed"))
     regions = {}
     for k in KS:
-        gate = [(f, nz, rw) for f, nz, rw in got if nz * max(k, 16) < THRESHOLD]
-        comp = [(f, nz, rw) for f, nz, rw in gate if rw * k * 4 < maxout]
-        regions[k] = comp
+        gate = [r for r in got if r[1] * max(k, 16) < THRESHOLD]
+        comp = [r for r in gate if r[2] * k * 4 < maxout]
+        # shape[1] == 1 is a ONE-COLUMN entry. SuiteSparse ships right-hand-side vectors
+        # alongside its operators, and a small-nnz predicate selects them preferentially
+        # because a one-column entry has the least nnz in the collection. They are valid
+        # CSR and not operators, so they belong in neither the numerator nor the
+        # denominator. "not a matrix" needs no chosen constant, unlike an nnz floor.
+        ops = [r for r in comp if not (r[3] and len(r[3]) == 2 and r[3][1] == 1)]
+        nsq = sum(1 for r in comp if r[3] and len(r[3]) == 2 and r[3][0] != r[3][1])
+        regions[k] = ops
         removed = sorted(set(gate) - set(comp))
-        print("   k=%-3d %-14d %-14d %-10s %d  %s"
-              % (k, len(gate), len(comp), "%.1f%%" % (100.0 * len(comp) / n),
-                 len(removed),
-                 "; ".join("%s nnz=%d rows=%d" % (os.path.basename(f)[:26], nz, rw)
-                           for f, nz, rw in removed[:2])))
-    print("   denominator is the READABLE count, %d, which equals the file count here" % n)
+        print("   k=%-3d %-14d %-14d %-14d %-10s %d  %s"
+              % (k, len(gate), len(comp), len(ops),
+                 "%.1f%%" % (100.0 * len(ops) / n_ops), len(removed),
+                 "; ".join("%s nnz=%d rows=%d shape=%s"
+                           % (os.path.basename(r[0])[:26], r[1], r[2], r[3])
+                           for r in removed[:2])))
+        print("          one-column entries dropped from the region: %d;"
+              " NON-SQUARE within it: %d of %d = %.1f%% -- the axis check's non-vacuity"
+              " for THIS population, not corpus-wide"
+              % (len(comp) - len(ops), nsq, len(comp), 100.0 * nsq / len(comp)))
+    print("   the share's denominator is the OPERAND count %d, not the file count %d:"
+          % (n_ops, len(files)))
+    print("   both numerator and denominator shrink when one-column entries come out, so")
+    print("   the published 47.5%% and 30.0%% move only to 46.8%% and 29.5%%. The readable")
+    print("   count equals the file count here, so no third denominator is in play.")
 
-    rmax = max(rw for _, _, rw in got)
+    rmax = max(r[2] for r in got)
     print("\n   largest row count in the corpus: %d. The output-bytes predicate needs" % rmax)
     print("   rows >= %d at k=16 and %d at k=32, so it is %s on this corpus."
           % (maxout // 4 // 16, maxout // 4 // 32,
@@ -183,8 +207,8 @@ def main(argv):
                      % (len(regions[k_emit]) - len(regions[32])))
             fh.write("# membership at any width: nnz*max(k,16) < %d and rows*k*4 < %d.\n"
                      % (THRESHOLD, maxout))
-            for f, nz, rw in sorted(regions[k_emit]):
-                fh.write("%s\t%d\t%d\n" % (f, nz, rw))
+            for r in sorted(regions[k_emit]):
+                fh.write("%s\t%d\t%d\t%s\n" % (r[0], r[1], r[2], r[3]))
         print("\nwrote %d members of the composed k=%d region to %s"
               % (len(regions[k_emit]), k_emit, out))
         print("   the earlier version computed this path and returned without writing it,")

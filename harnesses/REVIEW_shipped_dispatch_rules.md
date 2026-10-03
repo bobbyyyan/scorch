@@ -620,11 +620,33 @@ rather than an edge case.
 
 And over the 4594 SuiteSparse matrices cached on mkt1, with **both** predicates applied:
 
-| k | gate alone | composed with output-bytes | share of 4594 |
-|---|---|---|---|
-| 1, 2, 4, 8 | 2181 | 2181 | 47.5% |
-| 16 | 2181 | **2180** | 47.5% |
-| 32 | 1379 | **1378** | 30.0% |
+| k | gate alone | + output-bytes | + operands only | share of 4469 operands |
+|---|---|---|---|---|
+| 1, 2, 4, 8 | 2181 | 2181 | 2092 | **46.8%** |
+| 16 | 2181 | 2180 | 2092 | **46.8%** |
+| 32 | 1379 | 1378 | 1317 | **29.5%** |
+
+**The denominator counted vectors as matrices.** SuiteSparse ships the right-hand side of
+each linear system alongside the operator, and a one-column entry stored as CSR has
+`len(indptr)-1 = rows` with very few nonzeros -- so a predicate selecting on *small nnz*
+collects them preferentially. 125 of the 4594 cached entries have `shape[1] == 1`, and 88
+of them were inside the k=16 region. Excluding them shrinks numerator and denominator
+together, so the published 47.5% and 30.0% become 46.8% and 29.5%: a small move, but the
+earlier figures were a share of files rather than a share of operands.
+
+`shape[1] == 1` is the predicate, not the filename: only **29 of the 125** are named with a
+trailing `_b`, so the naming convention would have found less than a quarter of them. It
+also supersedes an nnz floor I had noted as a design need after seeing region members with
+nnz = 1 over hundreds of thousands of rows -- those are these, and "not an operator" needs
+no chosen constant.
+
+The single entry the output-bytes predicate removes is one of them: `Hamrle3_b.npz`, shape
+`(1447360, 1)`, nnz 440 -- the right-hand side of Hamrle3, whose operator is
+1447360 x 1447360. So that removal was never about a matrix.
+
+DLMC carries no such contamination: over all 3820 keys the minimum column count is well
+above 1 and there are no one-column or one-row entries, which is what the collections'
+contents would predict -- pruned weight matrices rather than linear systems.
 
 The denominator is the readable count, which here equals the file count -- all 4594 parse,
 so the two coincide; an earlier version published the file count while computing the
@@ -665,6 +687,20 @@ archives carry `shape`, and `len(indptr) - 1 == shape[0]` holds for all 4594 wit
 disagreements. The number that makes that non-vacuous: **1066 of the 4594 are non-square**,
 and only those can discriminate CSR from CSC, since a square matrix satisfies the check
 under either layout.
+
+Corpus-wide non-squareness does not certify the axis for the matrices a *figure* is about,
+so it is also reported per region: **611 of the 2180** at k=16 are non-square (28.0%) and
+478 of 1378 at k=32 (34.7%).
+
+One further confound, and it is bounded rather than removed. `scipy.sparse.csr_matrix`
+infers `shape = (len(indptr)-1, max(indices)+1)` when none is given, and an archive written
+from such an object satisfies the check *by construction*. The discriminator is
+`shape[1] > max(indices)+1`, which can only hold if `shape` carries information the arrays
+do not -- a matrix with an empty trailing column is not reconstructible from `indices`
+alone. On a 60-entry sample, **16 are strictly greater** and 44 are equal. So `shape` does
+have provenance outside the arrays on part of the corpus, and the check is not circular
+there; it is sampled, and stated as a sample, because it needs the large member
+decompressed.
 
 A `format == b'csr'` check was written first and is not used, because **no file in this
 cache carries a `format` member** -- they are not scipy `save_npz` archives, and a check
