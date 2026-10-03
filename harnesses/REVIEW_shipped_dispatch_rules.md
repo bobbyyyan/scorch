@@ -1053,14 +1053,44 @@ gives the purpose: "A ceiling between the two pools makes the gate PROVABLY INER
 larger host."
 
 So 16 was not chosen as a pool threshold with a measured crossover behind it. It was chosen
-to separate two specific machines by their resolved worker counts, and any value in 7..23
-separates them equally well. Every one of those values also admits **x86 at a worker count
-below the ceiling** -- a configuration that is neither of the two hosts the ceiling was
-built to distinguish, and that appears in no grid either commit reports.
+to separate two specific machines, and many values separate them equally well.
+
+**But the quoted range does not transfer to the shipped predicate, and the header records
+why.** At `3b676df` the test was `gate_maxthreads > 0 && (long)nthreads > gate_maxthreads`
+-- the RESOLVED worker count. The shipped test at `:2614` is `pool > gate_maxthreads`. That
+change is a falsification, not a refactor: per `:1587-1592`, "The first version of this
+compared the resolved count, and the ARM grid falsified it: the gated and
+gated-with-a-ceiling-of-16 arms must read identically on a six-thread host, and they
+differed by 0.7%", because the resolved count "is raised per shape and is bounded by
+omp_get_num_procs(), which is 18 there". So 7..23 was derived for a quantity that varies
+*within* a host and is being reused for one that does not. The arithmetic coincides at the
+two anchors, where `3b676df` reports the resolved count as 6 and 24; the populations do not.
+
+**And the range is off by one under either comparator.** Both versions block with
+`count > ceiling`, so the gate fires iff `count <= ceiling`, and the ceilings that fire at
+6 and not at 24 are **6..23** -- eighteen values, not seventeen. Excluding 6 is defensible
+on other grounds (at exactly 6 a per-shape-raised count makes the property
+shape-dependent), but it does not fall out of the inequality.
+
+**"Equivalent within the range" is true of the goal and false of the collateral, which
+sharpens the point rather than softening it.** Every ceiling in 6..23 separates 6 from 24.
+But the number of x86 pools each one makes live *is* the ceiling: 6 exposes pools 1-6, 16
+exposes 1-16, 23 exposes 1-23. So the members differ by nearly a factor of four in how much
+untested x86 they admit, and pool 8 -- where the effect above is measured -- is admitted
+only by ceilings of 8 or more. At a ceiling of 6 or 7 this sweep's treatment cells would be
+inert and the measurement could not have been taken. The value is unconstrained by the
+purpose it was chosen for *and* fully determines how much unmeasured territory goes live.
 
 That is an account of why the predicate's reach exceeds its evidence, and it is a reading
 of the two commits rather than an inference. It is still not a cause of the regression
 measured above: it explains why nobody had looked, not why mode 0 is slower when they do.
+
+**One name doing double duty, and it is the distinction the code was changed over.**
+`3b676df` calls the ARM figure of 6 a "resolved worker count"; the header at `:1593` calls
+the same 6 the "pool the surrounding pipeline runs"; the same passage gives that host's
+`omp_get_num_procs()` as 18; and `:1601` calls the host "the M5's 12". Four quantities in
+one neighbourhood, with 6 labelled two incompatible ways -- and the header's own paragraph
+says those two are different quantities and that conflating them cost a falsified version.
 
 ### The apparatus checked its own premises on these runs
 
@@ -1084,6 +1114,12 @@ construction at about 1% on redwood at pool 24 -- so those pools are a replicati
 prior reading rather than a new instrument. Two registered expectations for them: the floor
 at or below that 1%, where materially above would indict the shim or the affinity cap
 rather than the gate; and the R2 effect below pool 16's 46-53%, per the turn above.
+
+To be plain about what that floor is and is not: above the ceiling the gate is inert in
+*both* of R1's arms by construction, so R1 there measures the apparatus on the treatment's
+own cells. It is the matched-population floor this concern lacked, and it is not evidence
+about the gate's inertness -- that inertness is what makes it a floor in the first place.
+R2 is the only live route at those pools.
 
 **Two ambiguities in the shipped comment itself, both affecting how a later reader uses
 it.** At `:1600` the anchor is written "no-partition / partition = 0.785 pooled, 65% of
