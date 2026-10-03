@@ -41,20 +41,46 @@ if [ -f "$OUT" ]; then
   # (key, k, arm) triples per key and requires 9, which subsumes the short case too.
   # `nw` is length(want), not a line count: a duplicated or blank line in $KEYS would otherwise
   # make `wanted` disagree with the set actually built.
-  CENSUS=$(awk -F, 'NR==FNR{if($0!="") want[$0]=1; next}
-    FNR>1{c[$3]++; t[$3 SUBSEP $4 SUBSEP $8]=1}
-    END{e=0;s=0;o=0;unk=0;miss=0;bad=0
-        for(x in t){ split(x, p, SUBSEP); nt[p[1]]++ }
-        for(k in c){ if(!(k in want)) unk++; if(c[k]==9) e++; else if(c[k]<9) s++; else o++
-                     if(nt[k]!=9) bad++ }
-        for(k in want) if(!(k in c)) miss++
-        printf "%d %d %d %d %d %d %d %d", e, s, o, length(c), unk, miss, length(want), bad}' \
+  # IDENTITY AT BOTH LEVELS, AND A VALUE CHECK BELOW THEM. The previous revision checked keys by
+  # identity (!(k in want)) and cells by a NUMBER (nt[k] != 9) -- two standards in one script,
+  # with the weaker one at the level the rule was meant to strengthen. A count is invariant to a
+  # permutation of WHICH members, so a file with all 3820 keys at 9 distinct cells and ZERO k=8
+  # rows anywhere passed. That is reachable rather than hypothetical: mrgate.py:27 defaults --ks
+  # to "1,2,4,8,16,64", matching neither this study's {2,4,8} nor any screen's set, and the gate
+  # judges a file written by a job whose --ks it cannot see.
+  #
+  # So the wanted (k, arm) pairs are ENUMERATED here. Counting to 9 over exactly 9 enumerated
+  # members while requiring zero non-members forces set EQUALITY, which is identity rather than
+  # cardinality.
+  #
+  # And `badms` is the level below both: csv.DictWriter emits a MISSING key as an EMPTY field, so
+  # a dropped value is a complete-looking row. The gate previously verified a cell EXISTS and
+  # never that it holds a usable number.
+  CENSUS=$(awk -F, '
+    BEGIN{ nk=split("2,4,8",KS,","); na=split("ours,oursb,mkl",AR,",")
+           for(i=1;i<=nk;i++) for(j=1;j<=na;j++) wantcell[KS[i] SUBSEP AR[j]]=1
+           NCELL=length(wantcell) }
+    NR==FNR{ if($0!="") want[$0]=1; next }
+    FNR>1{ c[$3]++
+           cell=$4 SUBSEP $8
+           if(!(cell in wantcell)) badcell++; else seen[$3 SUBSEP cell]=1
+           if($9=="" || $9+0<=0) badms++ }
+    END{ e=0;s=0;o=0;unk=0;miss=0;cellbad=0
+         for(x in seen){ split(x,q,SUBSEP); have[q[1]]++ }
+         for(k in c){ if(!(k in want)) unk++
+                      if(c[k]==9) e++; else if(c[k]<9) s++; else o++
+                      if(have[k]!=NCELL) cellbad++ }
+         for(k in want) if(!(k in c)) miss++
+         printf "%d %d %d %d %d %d %d %d %d %d", e, s, o, length(c), unk, miss,
+                length(want), cellbad, badcell+0, badms+0 }' \
     "$KEYS" "$OUT")
   set -- $CENSUS
-  echo "per-key census: exactly9=$1 short=$2 over=$3 keys=$4 unknown=$5 missing=$6 wanted=$7 cells!=9=$8"
+  echo "per-key census: exactly9=$1 short=$2 over=$3 keys=$4 unknown=$5 missing=$6 wanted=$7"
+  echo "  cell-level: keys-missing-a-wanted-cell=$8 rows-outside-the-wanted-cells=$9 unusable-ms=${10}"
   echo "  (total rows $HAVE is NOT the check: identity of the key set is)"
   if [ "$1" = "$7" ] && [ "$2" = "0" ] && [ "$3" = "0" ] && [ "$4" = "$7" ] \
-     && [ "$5" = "0" ] && [ "$6" = "0" ] && [ "$8" = "0" ]; then
+     && [ "$5" = "0" ] && [ "$6" = "0" ] && [ "$8" = "0" ] && [ "$9" = "0" ] \
+     && [ "${10}" = "0" ]; then
     echo "SKIP: all $7 wanted keys present with 9 DISTINCT (k,arm) cells each; none short, over,"
     echo "      unknown, missing, or holding a repeated cell."
     echo "      Leaving the existing file untouched."

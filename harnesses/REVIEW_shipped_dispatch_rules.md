@@ -2347,3 +2347,55 @@ Job 17701598 cancelled while PENDING; job **17701612** submitted, spooled digest
 `b99b6bc5c4a5379e`, identical to `harnesses/pfstream/k4dip_dlmc.sbatch` as committed. Superseded
 spools on record: `b825da8309043311` (total gate), `0e154a9b737704fd` (per-key count),
 `f14b7b86c77af257` (key-set identity, no cell clause).
+
+### Identity versus count, and the cell clause was a count
+
+The asymmetry was visible in the source with no test: keys were checked by **identity**
+(`!(k in want)`, `!(k in c)`) and cells by a **number** (`nt[k] != 9`). Two standards in one
+script, with the weaker one at the level the previous revision was meant to strengthen. A count is
+invariant to a permutation of *which* members, so a file with all 3820 keys at 9 distinct
+`(k, arm)` cells and **zero k=8 rows anywhere** passed -- in a study whose question is k=4 against
+k=2 and k=8.
+
+**Reachable, not hypothetical, and it is the same hole as the screen's.** `mrgate.py:27` is
+`ap.add_argument("--ks", default="1,2,4,8,16,64")` -- six widths, matching neither this study's
+{2,4,8} nor any screen's set. The width set is argv-supplied with a differing default, and the gate
+judges a file written by a job whose `--ks` it cannot see. Argv is not the invocation, and nothing
+in the output record binds the widths.
+
+**Fixed by enumerating the wanted `(k, arm)` pairs in the gate.** Counting to 9 over exactly 9
+enumerated members *while requiring zero non-members* forces set **equality**, which is identity
+rather than cardinality -- the count alone was not.
+
+**And one level below both: no clause read the measurement.** `csv.DictWriter` emits a missing key
+as an **empty field**, and this harness family uses it in eight files under `harnesses/pfstream/`,
+so a dropped value is a complete-looking row. The gate verified that a cell *exists* and never that
+it holds a usable number. Added: rows with `ms == ""` or `ms <= 0`.
+
+| case | rows | e9 | keys | missing | cells!=9 | outside | bad-ms | verdict |
+|---|---|---|---|---|---|---|---|---|
+| complete | 34380 | 3820 | 3820 | 0 | 0 | 0 | 0 | **SKIP** |
+| widths {2,4,16}, no k=8 | 34380 | 3820 | 3820 | 0 | **3820** | **11460** | 0 | REMEASURE |
+| one blank `ms` | 34380 | 3820 | 3820 | 0 | 0 | 0 | **1** | REMEASURE |
+| repeated cell | 34380 | 3820 | 3820 | 0 | **1** | 0 | 0 | REMEASURE |
+| `mrgate.py:27` default widths | 68760 | 0 | 3820 | 0 | 0 | **34380** | 0 | REMEASURE |
+
+Every one of the first four reads **34380 rows**, which is why no total could separate them.
+
+### The transferable form, after four revisions
+
+"Name the population at every level" is **satisfiable by a count**, and a count is invariant to a
+permutation of which members -- so that rule restated the defect rather than repairing it. The
+sharper question at each level is:
+
+> **Is this check an IDENTITY against an enumerated population, or a COUNT over an unenumerated
+> one?**
+
+The one level that used identity from the start -- keys against `$KEYS` -- is the one level with no
+residual across four revisions. That is the evidence for the question being the right one, and it
+is why the fix is "enumerate the members", not "add another counter".
+
+Job 17701612 cancelled while PENDING. Spooled digests on record, one per revision:
+`b825da8309043311` total rows, `0e154a9b737704fd` per-key count, `f14b7b86c77af257` key-set
+identity, `b99b6bc5c4a5379e` plus cell count, and the current one plus cell identity and value
+validity.
