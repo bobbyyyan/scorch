@@ -1342,3 +1342,65 @@ restricted from 3820 cells to 3769, so that row is near-definitional rather than
 independent prediction. What makes the comparison informative is that the **arm** row is
 independent of the floor, which is amendment 9(5)'s argument unchanged. The two columns
 should not be read as two independent estimates.
+
+---
+
+## Amendment 12: the realized invocation, bound to the driver that ran
+
+`6374caf` committed `mrhv_screen.sh` after a peer found that a 53-hour screen's driver was
+not in the tree. That closed the instrument's CONTENT and left its INVOCATION unbound, which
+matters more here than it usually would: **the committed default float32 grid does not
+contain the width this study is about.** Line 36 reads
+
+    float32) DEFAULT_KS=2,8,12,16,20,24,32 ;;
+
+-- seven widths, no k=4 -- while the whole registration is multi-row at the half-vector
+width, float32 k=4. `KS=${3:-$DEFAULT_KS}` takes a positional override, and the row count
+proves one was used: `mrgate.py:43` has `ARMS = ["ours","oursb","mkl"]`, so the completed
+first unit's 91,680 rows is 3820 x **8** x 3, where the committed default would have given
+3820 x 7 x 3 = 80,220. A parameterised script with no arguments recorded is as unbound as no
+script, and less obviously so.
+
+**The realized invocation**, read from the live process and corroborated by the log's own
+header line:
+
+    bash /scratch/bobbyy/mrhv/mrhv_screen.sh /scratch/bobbyy/mrhv float32 \
+         2,4,8,12,16,20,24,32 9
+
+    screen.log: corpus 3820 matrices, dtype float32, widths 2,4,8,12,16,20,24,32, reps 9
+
+So root `/scratch/bobbyy/mrhv`, dtype float32, **eight** widths including k=4, 9 reps.
+
+**Bound to the file that ran**, which the committing commit could not distinguish from a file
+edited between the run's start and the fetch:
+
+| | |
+|---|---|
+| sha256 on redwood | `32c9b0f077040980` |
+| sha256 of the committed blob | `32c9b0f077040980` |
+| mtime on redwood | 2026-10-02 20:48:12 |
+| run start, per `screen.log` | 2026-10-02 20:50:29 |
+
+The mtime precedes the start by 2m17s, so the committed bytes are the bytes that ran. The
+driver is deliberately **not** edited to carry this record, because editing it would change
+the digest and break the binding; the provenance sits beside the instrument, not inside it.
+
+**The driver is inherited, verified in one command rather than by reading 226 lines.**
+
+    diff <(sed 's/mr0b/shpb/g; s/mrhv4/nopf/g; s/mrhv/strm/g; s/mr0/ship/g' \
+           mrhv_screen.sh) arm_screen.sh
+
+is empty, so this is the prefetch screen byte-for-byte modulo the four build names: it
+inherits the grid check, the pool guard with its pool-2 comment, the refuse-on-missing-build
+loop and the per-unit `--- p$p $tag start/done` echoes. Nothing study-specific was added or
+removed. The rotation is therefore the same cyclic Latin square, checked by enumeration:
+mr0 at positions 1,4,3,2; mr0b at 2,1,4,3; mrhv at 3,2,1,4; mrhv4 at 4,3,2,1 -- every build
+leading exactly once, so each object absorbs one leading unit and a position effect cannot
+load onto one arm of the byte-identical floor pair.
+
+**One inherited sentence is inverted for this study**, flagged because it is self-description
+rather than measurement. The grid check prints that k=4 "routes to the half-vector kernel on
+this dtype ... excluded from the tail census", which is correct for the prefetch screen and
+backwards here: k=4 is the only width under test, so the driver's coverage requirement
+describes the seven widths that are *not* the subject. The k=4 data is collected regardless,
+because the width is in `$KS` and reaches `mrgate.py` the same as any other.
