@@ -2882,6 +2882,52 @@ binning moves DLMC 256+ from n=713 to n=712 and the figure by **+0.0052 pp**, 25
 0.128. The pairing route is untestable from what is held locally, since redwood's per-key five-width
 board is not on this host.
 
+**And the high bands are the same KEYS on both hosts, which removes a population difference from the
+registered test.** Band censuses over exact `nnz/rows`:
+
+| | deg 0-32 | 32-100 | 100-256 | 256+ | sum |
+|---|---|---|---|---|---|
+| redwood sealed census | 4167 | 308 | 58 | 51 | 4584 |
+| MKT keep-set | 4153 | **308** | **58** | **51** | 4570 |
+
+Band 0 loses exactly 14 and the three high bands lose exactly 0 -- verified by naming all 14, not
+by the partition sums: the 6 redwood-only keys and the 8 shape-disagreeing ones have exact degrees
+0.000, 1.000, 24.211, 0.000, 1.000, 20.209, 3.951, 3.903, 3.940, 3.943, 3.371, 9.310, 11.850,
+3.185, every one inside band 0 and the largest at 24.2 against the 32 edge. With equal cardinality
+and containment in the 4578 common basenames, **the high bands are the same 308, 58 and 51 matrices
+on both hosts**, so at exactly the bands the band-matched registration rests on, a population
+difference is not available as an explanation of a between-host disagreement. Peer reviewer's
+finding.
+
+**The census is convention-invariant in every band, not only the top one.** The harness writes
+`deg="%.2f" % (nnz / max(M, 1))` (`mrgate.py:143`), which can move a degree by at most 0.005, and
+**zero keys sit within 0.005 of an edge** -- so the 2-decimal census equals the exact one exactly:
+
+| convention | census |
+|---|---|
+| exact `nnz/rows` | 4167 / 308 / 58 / 51 |
+| 2-decimal, the shipped harness form | **4167 / 308 / 58 / 51** |
+| integer rounding | 4164 / 310 / 59 / 51 |
+
+The third row is what moves 3 keys across 32 and 1 across 100 -- `Goodwin_054` 31.71,
+`Goodwin_071` 32.09, `Goodwin_095` 32.25, `Goodwin_127` 32.38, `e40r0100` 32.03, `lock_700` 31.68,
+`m_t1` 99.96, `mcfe` 31.87, the 8 keys within 0.5 of an edge. But integer rounding is a convention
+nothing in this work uses, so those 8 bound a sensitivity that is not live. A peer's
+4164 / 310 / 59 / 51 is that convention's census, not this one's.
+
+**One narrowing I decline, because it is a different population.** It does not follow from the
+between-host set identity that the SuiteSparse top band's 0.022 pp gap has only rounding left. Two
+distinct questions are in play: (a) are redwood's and MKT's high-band key sets the same -- answered
+yes above; and (b) within redwood, does each per-width geomean's population equal the paired-dip
+population -- which is the identity's premise. The 0.022 pp lives entirely inside redwood's own
+data, as the gap between redwood's normalised triple and redwood's band dips, so what MKT measures
+cannot bear on it. What would settle (b) is **redwood's own grid completeness**, and the precedent
+is on record for the other corpus: chain207's DLMC board is 19100 cells with 229200 observations
+against an expected 229200, fully balanced. If the SuiteSparse board is likewise complete then (b)
+holds within redwood and rounding is the only live branch -- but that is an argument from
+completeness, not from between-host identity, and the SuiteSparse board's own completeness figure
+has not been read here.
+
 **And the 0.12 pp appears twice but is one quantity.** The additive residual against the top band is
 `r = -c_0 (1+c_top)/(1+c_0)`, which gives **+2.62 pp** for SuiteSparse against an observed +2.60 and
 **-0.79 pp** for DLMC against an observed -0.67. That second 0.12 pp *is* the identity gap above,
