@@ -1987,7 +1987,19 @@ dip**, not the dip. Read as the dip it understates by up to 2.7 pp:
 | 256+ | -7.06% | -9.66% |
 
 The relation is `(1 + dip_band) = (1 + dip_{0-32}) x (k=4/nbr)`, which recovers the published
-figures to 0.01 pp. The column is kept because the normalised view is what separates the widths'
+figures to **0.03 pp** -- the "0.01 pp" an earlier revision claimed here is wrong, and is corrected
+in place. Recomposed from the printed two-decimal figures with `dip_{0-32} = -2.82`:
+
+| band | `k=4/nbr` | recomposed | published | gap | own input envelope |
+|---|---|---|---|---|---|
+| 32-100 | -3.40 | -6.1241 | -6.13 | 0.0059 | +/-0.0097 (within) |
+| 100-256 | -8.67 | -11.2455 | -11.23 | **0.0155** | +/-0.0094 (**exceeds**) |
+| 256+ | -7.06 | -9.6809 | -9.66 | **0.0209** | +/-0.0095 (**exceeds**) |
+
+Two of three rows exceed the old tolerance, and the same two exceed the envelope their own printed
+inputs carry over all four corners at +/-0.005. Either the claim is about unrounded internals, in
+which case it has to say so, or the tolerance is 0.03 pp. It now says 0.03. Peer reviewer's
+recomputation. The column is kept because the normalised view is what separates the widths'
 trends, but its base is now named beside it.
 
 ## The disagreement as a rank reversal, which is sharper than "what is special"
@@ -2833,12 +2845,42 @@ values, which a peer correctly read as the identity failing by 0.22 pp on SuiteS
 the real gap. In logs the subtraction *is* exact: `log(1+c_top) - log(1+c_0)` = -7.2985 and
 -17.9058 pp of log. Three forms, two correct, and the incorrect one was the one printed.
 
-**What the gap establishes, and what it does not.** Perturbing the DLMC triple over all eight
-corners of +/-0.0005 moves the contrast across an envelope of +/-0.148 pp, which contains 0.128 pp
-*and* 0.022 pp -- so publication rounding is **consistent with** both gaps and **identifies**
-neither. Calling it "the rounding of the published three-decimal values" overstated it; the honest
-form is that the gap is within the rounding envelope and no alternative has been proposed. Peer
-reviewer's enumeration.
+**This same algebra is stated correctly at `:1990`, two sections above**, as
+`(1 + dip_band) = (1 + dip_{0-32}) x (k=4/nbr)`. So the subtraction form was not a missing insight
+-- the document contradicted its own earlier equation, which is the worse of the two failures.
+
+**What the gap establishes, and what it does not -- and a rounding envelope must name WHICH
+publication it is the envelope of.** Perturbing the DLMC triple over all eight corners of +/-0.0005
+gives an envelope of +/-0.148 pp, which contains 0.128 pp *and* 0.022 pp, so publication rounding is
+**consistent with** both and **identifies** neither. Worse for the SuiteSparse half: that number is
+reachable by two different input chains that disagree about whether anything is unexplained --
+inside +/-0.148 pp if its input is the three-decimal normalised triple, and **2.2x** the +/-0.0095
+envelope if its input is the two-decimal band figures, where it appears as the 256+ row of the table
+at `:1990`. **One residual, two available attributions, opposite verdicts.** For DLMC the statement
+is unconditional, because the triple is the only chain available and the `:1990` table is
+SuiteSparse-only, so there is no second appearance to cross-check. Peer reviewer's enumeration and
+his localisation of the double appearance.
+
+**The premise the identity rests on, now stated and tested rather than assumed.** The identity is
+exact only if the per-width normalisation geomeans and the three-width *paired* band dips are taken
+over **one key set per band** -- a paired dip is a mean of per-key contrasts, so its population is
+the paired set, while a per-width geomean's need not be. MKT's grid is balanced, so the premise is
+checkable there, and it holds to machine precision:
+
+| band | contrast of normalised geomeans | `(1+c_b)/(1+c_0) - 1` | gap |
+|---|---|---|---|
+| 32-100 | +8.92244045% | +8.92244045% | 0.00e+00 pp |
+| 100-256 | +7.30735329% | +7.30735329% | 0.00e+00 pp |
+| 256+ | +1.38783240% | +1.38783240% | 2.22e-14 pp |
+
+with the three per-width key sets and the paired set verified identical in all four bands
+(4153 / 308 / 58 / 51). **So the identity contributes nothing to a gap: when the populations
+coincide it is exact by linearity of the mean, and a nonzero gap on redwood is therefore
+publication rounding or a population mismatch, nothing else.** The one partition route the file
+already quantifies is closed by a number measured earlier in it -- rounded-versus-exact degree
+binning moves DLMC 256+ from n=713 to n=712 and the figure by **+0.0052 pp**, 25x too small to be
+0.128. The pairing route is untestable from what is held locally, since redwood's per-key five-width
+board is not on this host.
 
 **And the 0.12 pp appears twice but is one quantity.** The additive residual against the top band is
 `r = -c_0 (1+c_top)/(1+c_0)`, which gives **+2.62 pp** for SuiteSparse against an observed +2.60 and
