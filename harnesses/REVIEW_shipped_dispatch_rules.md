@@ -3921,3 +3921,63 @@ estimate: both arms change float32 content, differently -- `hi01` moves a compil
 inside `spmm_csr_v2_core<float>`, `rvec` adds a kernel -- so subtracting them differences two
 mixtures rather than isolating the component they differ in. The `_F64` arms remain the only ones
 where content is provably fixed.
+
+### 8. The invariant could not fire, and the exclusion had a live hole
+
+Two follow-ups, both from the peer reviewer, both acted on. The peer also withdrew 323's count
+claim: `|A| - |B|` is the net and equals the loss only if the after-set is a subset, which the K=6
+gain refutes, and nothing in two cardinalities says whether it is.
+
+**The cross-product invariant was a self-check on the fold, not a check on the data.** Once
+`symtab` collapses to one row per name the join is 1:1 and `joined <= min(table sizes)` holds *by
+construction*, so the refusal could never fire on correct input. What had been validated were the
+metric's **values** (0, 974, 6), which is a different claim -- and the standard applied to the
+concurrency guard earlier in this document ("a guard I hadn't seen trigger wouldn't have counted")
+was not applied here.
+
+`harnesses/rowvec/rvlf_select_selftest.sh` plants each refusal on real objects and requires it to
+fire. The planted input is not invented: the uncollapsed `name<TAB>addr` table is the form this
+script shipped with at `ea78f6b`. A **control runs first**, because a metric that refuses
+unconditionally would pass every plant while measuring nothing:
+
+| check | expectation | result |
+|---|---|---|
+| collapsed tables, identical pair | must pass, read 0 | `OK joined=1093 displaced=0` |
+| uncollapsed table (the `ea78f6b` form) | must refuse | `REFUSE: join returned 1412 rows against a smaller table of 1190 -- a cross product` |
+| empty tag table | must refuse | `REFUSE: tag table empty -- tool failure, not a null` |
+| non-empty but disjoint names | must refuse | `REFUSE: join matched 0 names -- not a null displacement` |
+
+**And the exclusion had a live hole, found by printing a number instead of expecting one.** `XPAT`
+matches the *string* `double`. `nm -C` fails to demangle two symbols in this object -- GCC's
+demangler rejects the lambda-inside-a-template-argument form, and stripping the `._omp_fn.N`
+suffix does not help -- so they keep their mangled names, where a `double` template parameter is
+encoded as `d`:
+
+```
+_ZN2at8internal15invoke_parallelIZNS_12parallel_forIZ16spmm_csr_v2_coreIdLb0EE..._omp_fn.0
+_ZN2at8internal15invoke_parallelIZNS_12parallel_forIZ16spmm_csr_v2_coreIfLb0EE..._omp_fn.0
+```
+
+The first is `spmm_csr_v2_core<double, false>`'s parallel-region body -- **where the float64 loop
+actually runs**. `XPAT` cannot see it, so it stayed in `rest`, and for a `_F64` arm it would move
+legitimately, inflate `rest_displ`, and **keep an arm that measures nothing** -- the exact
+direction the exclusion exists to prevent. The expected count was zero; the measured count is
+**two**. Mangled forms now get their own rule (`coreId` excluded as float64, `coreIf` kept as
+float32) and anything still unclassified is a **refusal** rather than a default into `rest`, so a
+new one forces a look instead of silently weakening every `UNUSABLE` verdict. Verified: 2 mangled,
+2 classified, 0 unresolved, `rest` 1041 -> 1040.
+
+**And the float32 path is four frames deep, of which `KPAT` matches one.** `spmm.h:5680-5690`
+shows `spmm_csr_float_v2_core` returning `spmm_csr_v2_rowsplit<float>(...)` rather than calling
+`spmm_csr_v2_core<float>` directly, so the chain is
+
+```
+spmm_csr_float_v2 -> spmm_csr_float_v2_core -> spmm_csr_v2_rowsplit<float> -> spmm_csr_v2_core<float>
+```
+
+and only the innermost matches the kernel pattern. The three above it are where the dispatch, the
+row-split policy and the thread sizing live. That is the sharpest statement of why a name pattern
+could not carry a refusal, and the exclusion-based population covers them by default.
+
+One over-exclusion check, run rather than argued: none of those three names carries a `double`
+parameter (`:5680-5687` is `int`, `const float*`, `bool`), so they stay in `rest`.

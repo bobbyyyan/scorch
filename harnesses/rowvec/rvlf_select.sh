@@ -211,7 +211,25 @@ KPAT='scorch_spmm_row_(narrow_exact|narrow_rowvec|regblock|gather)<(float|scalar
 # The exclusion: symbols the _F64 arms are entitled to move. Deliberately broad -- over-excluding
 # shrinks `rest` and can only make UNUSABLE easier to reach, which is the conservative direction
 # for a verdict that sends an arm away.
+#
+# IT MATCHES A STRING, AND TWO SYMBOLS IN THIS OBJECT DO NOT CARRY IT. `nm -C` fails to demangle
+# the OpenMP outlined bodies of the SpMM dispatch -- GCC's demangler rejects the
+# lambda-inside-a-template-argument form, and stripping the `._omp_fn.N` suffix does not help --
+# so they keep their mangled names, where a `double` template parameter is encoded as `d`:
+#
+#   _ZN2at8internal15invoke_parallelIZNS_12parallel_forIZ16spmm_csr_v2_coreIdLb0EE..._omp_fn.0
+#   _ZN2at8internal15invoke_parallelIZNS_12parallel_forIZ16spmm_csr_v2_coreIfLb0EE..._omp_fn.0
+#
+# The first is spmm_csr_v2_core<double, false>'s parallel-region body -- the place the float64
+# loop actually runs. XPAT cannot see it, so it would stay in `rest`, move legitimately for a
+# _F64 arm, inflate rest_displ and KEEP an arm that should have been sent away. That is the
+# direction the exclusion exists to prevent, so the mangled forms get their own rule and anything
+# still unclassified is a REFUSAL rather than a default into `rest`.
 XPAT='double|_f64|F64|<double'
+# Mangled-form exclusion: in a mangled template-id, `coreId` is a double instantiation.
+XPAT_MANGLED='coreId'
+# Mangled forms known to be float32 and therefore to BELONG in `rest`.
+KEEP_MANGLED='coreIf'
 # ONE ROW PER NAME, CARRYING ITS SORTED ADDRESS LIST. A name<TAB>addr table is NOT join-safe:
 # `nm -C` emits 1190 lines for 1093 distinct names in this object -- 83 names appear more than
 # once (weak/local aliases, COMDAT folding, pybind holder templates at up to 3 addresses each) --
@@ -232,8 +250,12 @@ symtab() {  # $1 = .so, $2 = prefix; writes <prefix>.all, .rest, .kern as name<T
     | awk -F'\t' '{ if ($1==p) a=a","$2; else { if(p!="") print p"\t"a; p=$1; a=$2 } }
                    END { if(p!="") print p"\t"a }' \
     | LC_ALL=C sort -t'\t' -k1,1 > "$2.all"
-  grep -Ev "$XPAT" "$2.all" > "$2.rest" || true
+  # rest = everything the define may not change. Demangled names are classified by XPAT; a
+  # still-mangled name is classified by XPAT_MANGLED/KEEP_MANGLED, and anything left over is
+  # written to .unres so the caller can refuse on it instead of silently keeping it.
+  grep -Ev "$XPAT" "$2.all" | grep -Ev "$XPAT_MANGLED" > "$2.rest" || true
   grep -E  "$KPAT" "$2.all" > "$2.kern" || true
+  grep '^_Z' "$2.all" | grep -Ev "$XPAT_MANGLED|$KEEP_MANGLED" > "$2.unres" || true
 }
 disp() {    # $1 = base table, $2 = tag table; echoes "joined displaced"
   local j d
@@ -253,7 +275,26 @@ BT=$(textsize "$BSO" "$ROOT/base/text.bin") || {
   echo "        would be computed against nothing"; exit 1; }
 symtab "$BSO" "$ROOT/base/sym"
 NA=$(wc -l < "$ROOT/base/sym.all"); NR=$(wc -l < "$ROOT/base/sym.rest"); NK=$(wc -l < "$ROOT/base/sym.kern")
-echo "  base: .text $BT bytes;  symbols all $NA, rest $NR (all minus double/f64), kernels $NK"
+# THE EXCLUSION'S OWN NON-VACUITY NUMBER. XPAT matches the STRING "double", but a symbol nm failed
+# to demangle keeps its mangled form, where a double template parameter is encoded as `d`. Such a
+# symbol matches none of XPAT's alternatives, stays in `rest`, and for a _F64 arm then moves
+# legitimately -- inflating rest_displ and KEEPING an arm that should have been sent away, which is
+# the direction the exclusion exists to prevent. Expected zero, printed rather than expected: the
+# symbols that fail to demangle here are C-linkage ones and those are not double instantiations.
+NM=$(grep -c '^_Z' "$ROOT/base/sym.all" || true)
+NU=$(wc -l < "$ROOT/base/sym.unres")
+echo "  base: .text $BT bytes;  symbols all $NA, rest $NR, kernels $NK"
+echo "  still-mangled: $NM, of which unclassified: $NU"
+if [ "${NU:-0}" -gt 0 ]; then
+  echo "REFUSE: $NU mangled symbol(s) match neither the double nor the float rule, so they would"
+  echo "        default into 'rest'. If any is a float64 instantiation it moves legitimately for a"
+  echo "        _F64 arm, inflates rest_displ, and KEEPS an arm that measures nothing. Classify"
+  echo "        them in XPAT_MANGLED or KEEP_MANGLED first:"
+  cut -c1-110 "$ROOT/base/sym.unres" | sed 's/^/        /'
+  exit 1
+fi
+echo "  (the two known mangled forms are the SpMM OpenMP outlined bodies; coreId is excluded as"
+echo "   float64, coreIf is kept as float32 -- see XPAT_MANGLED above)"
 for pair in "all:$NA" "rest:$NR" "kernels:$NK"; do
   n=${pair#*:}
   [ "$n" -gt 0 ] || { echo "REFUSE: zero symbols in the '${pair%%:*}' population, so its"
