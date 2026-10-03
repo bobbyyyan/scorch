@@ -2199,3 +2199,94 @@ If the quantity of interest is a magnitude relative to an optimum, a label permu
 very structure being measured and the statistic reads null at any effect size.** Check a candidate
 null by feeding it a noise-free case with a known answer — three numbers were enough here, and the
 statistic had already been published on three hosts and eight widths.
+
+---
+
+## Amendment 29 — the all-392 sweep reports: reach is bounded at 23.8%, and where it reaches the HEADROOM is monotone in the worker count
+
+Job 17698209, COMPLETED rc=0 in 1:08:44 on mkt1, pool 32, one object `4c11296ce2a68c3d`,
+206,976 rows = 392 keys × 8 widths × 33 counts × 2 readings. Transported from `/scr` through a
+single-task `srun` and verified by digest on both ends
+(`e25356a743d1b93288486070b9a6afc740d8872c12cd8a1fc2c12dabbb82f373`); the two key lists likewise
+(`24e386ce…` for the 392, `57eb6834…` for the 328, with all 328 confirmed inside the 392).
+
+This is the first time the thread-count oracle has run on the population the project's goal is
+stated over. Every earlier reading was on `adg_keys.txt` (72 keys), which shares only 20 keys with
+the deficit.
+
+### The four registered conditions, read as registered
+
+| # | condition | reading | fires? |
+|---|---|---|---|
+| 1 | pooled k=2 excess ≤ 1.00 → thread sizing closes | **0.9227** | **YES** |
+| 2 | s328 ≥ 0.50 causal; 0.25–0.50 no causal claim; **< 0.25 a BOUND ON REACH** | **0.2378** | **bound, not a pass** |
+| 3 | `<=2` excess not exceeding `>=8`'s → element 2 does not transfer | 1.1059 vs **0.8380** | **NO** |
+| 4 | bootstrap CI on s328 − s64 containing zero → mechanism does not track the deficit | +0.2378 [+0.1921, +0.2835] | **NO — but see below** |
+
+### Condition 1 fires on an instrument this document has already invalidated
+
+Amendment 28 established that the excess is a **rank** test: the permutation null's support is
+`{t_i/min(t)}`, so its median is the middle-rank count's ratio, and timings 1.0/1.2/2.0 with
+production at 1.2 and zero noise give an excess of exactly 1.0000 against 20% real headroom. **So
+0.9227 ≤ 1.00 does not mean there is nothing to recover.** The headroom is the `median` column:
+
+| half | live cells | median (= headroom) | null | excess |
+|---|---|---|---|---|
+| deficit 328 | 298 | **1.1355 → 13.6%** | 1.2306 | 0.9227 |
+| control 64 | **6** | 1.0606 → 6.1% | 1.0908 | 0.9723 |
+
+13.6% of headroom on the deficit's own population, against 6.1% on the control. Condition 1 is
+recorded as firing because it was registered, and it is **not** read as closure.
+
+### Condition 3 does not fire, and the reason is stronger than the condition asked for
+
+Element 2 of amendment 5 — "the excess for cells resolving to ≤2 workers will exceed that for cells
+resolving to ≥8" — **transfers to the deficit's own population**, now on the right corpus:
+
+| group | n | median (= headroom) | null | excess |
+|---|---|---|---|---|
+| `<=2` | 78 | **1.3565 → 35.7%** | 1.2265 | 1.1059 |
+| `3-7` | 68 | 1.1374 → 13.7% | 1.2338 | 0.9219 |
+| `>=8` | 152 | 1.0292 → **2.9%** | 1.2282 | 0.8380 |
+
+Dominance check PASS at every width, on the median and the null separately.
+
+**The ordering is in the HEADROOM, not only in the rank statistic, and that is what makes it
+survive amendment 28.** 35.7% / 13.7% / 2.9% is a monotone gradient in a magnitude-valued quantity
+against a null that is nearly constant across the three groups (1.2265 / 1.2338 / 1.2282). The
+excess column's ordering could have been an artefact of the rank construction; the median column's
+cannot, because it is the measured ratio of production's count to the best reachable one.
+
+### Condition 4 nominally does not fire, and is VOID
+
+The difference is +0.2378 with a CI excluding zero, which as registered would mean the mechanism
+tracks the deficit. It cannot be read that way. The instrument's own tripwire fired: live fractions
+are **0.9085 in the deficit half against 0.0938 in the control**, differing by 81.5 pp against a
+5 pp threshold. Only **6 of 64** control keys are live at k=2, and the control's `<=2` group is
+**empty (n=0)**. So `s64 = 0` is structurally forced rather than measured, and the positive
+difference is a composition effect in the denominator shaped exactly like the association under
+test. **Condition 4 is declared void**, on the same grounds that voided amendment 23: the
+comparison half is almost entirely cells where the quantity is undefined.
+
+This is a defect in the registration, not in the run. Amendment 22(c) chose the 64 non-behind keys
+as "the clean control — same corpus, same run, same instrument, and OUTSIDE the population being
+certified". What it did not check is whether the effect is *defined* there. 94% of it is the
+clamped-to-one set, which this document already established is exactly the non-live set. **A
+control must be outside the population being certified AND inside the domain where the quantity
+exists**; this one satisfies the first and fails the second.
+
+### What the sweep establishes
+
+**Thread sizing is a real but minority mechanism for the k=2 float32 DLMC deficit.** Its reach is
+bounded at **≤23.8%** of the 328 keys (condition 2, the registered not-a-pass), against the
+deficit's own prevalence of 83.7% — 3.52× less. Where it does reach, the headroom is **35.7%** and
+falls monotonically to 2.9% as production's resolved count rises. Both halves of that sentence are
+needed: the gradient is clean and the population it covers is a quarter of the problem.
+
+**No rule or gate is proposed, as registered.** A mechanism bounded at a quarter of its target
+population does not justify a dispatch threshold, and the measurement that would change the picture
+is the one named in amendment 28 — a fixed-worker-count sweep at matched work, separating a fixed
+per-call overhead share from thread sizing proper. The `<=2` group's 35.7% is the only part of this
+worth that run.
+
+**Still one host.** mkt1 only. The equivalent redwood sweep has not run.
