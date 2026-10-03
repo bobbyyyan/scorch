@@ -3292,6 +3292,11 @@ through an indirect load stays one accumulator register. **A width-independent p
 predicts a flat ours-vs-k curve, and that is what the table shows**, including the k=4 row at 0.926
 where the 128-bit half-vector form already gives full lane use and still buys nothing.
 
+**[WITHDRAWN, in place: this lever is `SCORCH_NARROWK_DEEP_UNROLL`, it ships at 0, and
+`scorch_policy.h:933-981` records it measured twice and rejected at nvec=1 -- which is the whole
+region this gate would fire in. The refutation is at "The nnz-unroll lever is REFUTED" below. Do
+not read past this clause with the recommendation below it.]**
+
 So the lever is **not** wider or narrower vectors: it is amortising the per-nonzero overhead by
 processing **more nonzeros per iteration** when the lanes are underused -- unrolling along nnz
 instead of along k. The gate writes itself from the quantity that makes it safe: it can only fire
@@ -3303,6 +3308,9 @@ ahead, which is where the gate would not fire.
 **Not yet established:** that MKL's advantage *is* nnz-amortisation rather than something else, and
 that an unrolled narrow-k inner loop recovers it without harming the k=8 path. Both are measurable.
 This is a hypothesis with a mechanism and a provably-inert gate, not a result.
+**[SUPERSEDED, in place: the second of those is no longer open -- it is measured and negative at
+k=4 and k=8, 4 of 4 against. "Both are measurable" is the exact phrasing the withdrawal below
+replaces. What survives is k=2 alone, untested in both campaigns.]**
 
 ## The nnz-unroll lever is REFUTED by the shipped policy comment, and k=2 is the only live region
 
@@ -3368,7 +3376,23 @@ the number of labels that **flip**. Under this work's own "behind in every readi
 | DLMC | 11460 | **9395 (81.98%)** | 2031 | **34 (0.30%)** | 9 / 11 / 14 |
 | SuiteSparse (restricted keep-set) | 13710 | **5692 (41.52%)** | 7939 | **79 (0.58%)** | 25 / 41 / 13 |
 
-So the published 9408 (82.09%) and 5730 (41.80%) are upper bounds by **13** and **38** cells
-respectively, and the confirmed shares are 81.98% and 41.52%. The headline barely moves -- which is
-worth knowing, because the 3.2% p95 magnitude spread invited the opposite expectation. Peer
-reviewer's correction of what the bound had to be; the counts are measured here.
+So the published 9408 (82.09%) and 5730 (**41.79%**, not the 41.80% an earlier revision printed --
+5730/13710 = 41.7943%) are upper bounds by **13** and **38** cells respectively, and the confirmed
+shares are 81.98% and 41.52%. The headline barely moves -- which is worth knowing, because the 3.2%
+p95 magnitude spread invited the opposite expectation.
+
+**And the flip set splits directionally, which closes the partition-identity hazard rather than
+leaving the counts to sum by construction.** The published behind-count, `behind in both` and
+`ahead in both` jointly determine both halves:
+
+| | behind `ours`, ahead `oursb` | ahead `ours`, behind `oursb` | `ahead in both` check |
+|---|---|---|---|
+| DLMC | 9408 - 9395 = **13** | 34 - 13 = **21** | (11460-9408) - 21 = **2031** ✓ |
+| SuiteSparse | 5730 - 5692 = **38** | 79 - 38 = **41** | (13710-5730) - 41 = **7939** ✓ |
+
+The 13 and 38 quoted as bound slack are the *smaller* halves, and the fourth column confirms the
+larger ones independently -- so a misrouted cell could not both sum to n and reproduce `ahead in
+both`, which is the failure mode `partition_identity_hides_misrouting` names. The same-sign
+asymmetry in both corpora (21 against 13, 41 against 38) is recorded as a reading and not
+interpreted. Peer reviewer's correction of what the bound had to be, and their derivation of the
+split; the counts are measured here.
