@@ -1127,6 +1127,11 @@ a genuine prediction about a different sample. The plant's seven null widths rea
 > was computed on a different A/A construction than the scorer builds, understating the
 > defect threefold. Amendment 11 carries the power measurement and the corrected table.
 
+> **Corrected by amendment 11:** this amendment's verification plant was DEGENERATE
+> (zero-width intervals), so it proved unbiasedness and not power; and its defect table
+> was computed on a different A/A construction than the scorer builds, understating the
+> defect threefold. Amendment 11 carries the power measurement and the corrected table.
+
 
 Written 2026-10-02, screen still on pass 1, nothing from it scored. Found by a peer
 session reading `score_mrhv.py`; reproduced here with my own code before changing anything.
