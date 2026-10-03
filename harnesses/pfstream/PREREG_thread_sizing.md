@@ -1969,7 +1969,9 @@ sentence is what gets read after the job lands.
 
 ### CONDITION 2, NUMERATOR PINNED
 
-**`s328` = (keys among the 328 that resolve to `<=2` AND are live) / 328.** The all-`<=2` count and
+**`s328` = (keys among the 328 that resolve to `<=2` AND are live, **both evaluated at
+k=2**) / 328.** (The width clause is amendment 27's; the sentence as first committed named
+none, and both conjuncts are per-(key, width) properties.) The all-`<=2` count and
 the live count are both printed beside it, so all three shares are recoverable from the output and
 no later reader has to guess which was meant.
 
@@ -2020,3 +2022,86 @@ narrow the currently 2.4×-wide window — which is set by the comparator's unce
 anything physical — without being able to change the verdict. **Deferred rather than done now: the
 data is on `mkt1` and job 17698209 is timing there, so even a short read competes with a live
 measurement.**
+
+---
+
+## Amendment 27 — the numerator's third degree of freedom is a WIDTH, it does not lean, and counting conjuncts finds the class that units/base/predicate were instances of
+
+Amendment 26's registered sentence — *"`s328` = (keys among the 328 that resolve to `<=2` AND are
+live) / 328"* — **names no width**, and both conjuncts are per-`(key, width)` properties. Job
+17698209 is still running, so this is still free.
+
+### Pinned: both conjuncts at k=2
+
+**k=2 is the right value and not a choice**: the 328 is itself defined at k=2 over N=16 readings,
+and the whole reach question is about the width that carries the deficit. `an_reach328.py` already
+takes `--k` as a **required** argument with the comment *"the behind set and the resolved count
+both differ by width"*, so the implementation was pinned and the sentence was not. **The sentence is
+what gets read.**
+
+### The two conjuncts move OPPOSITELY in width, measured rather than argued
+
+Both directions follow from element 4's own premise — *"at k=32 the work measure `nnz*max(k,16)` is
+`nnz*32`, so the same matrices resolve to roughly twice the count"* — and both are visible in the
+reference sweep:
+
+| k | keys | `<=2` | live | live & `<=2` | registered share | all-`<=2` share |
+|---|---|---|---|---|---|---|
+| 2 | 72 | 28 | 53 | 9 | 0.1250 | 0.3889 |
+| 4 | 72 | 28 | 53 | 9 | 0.1250 | 0.3889 |
+| 8 | 72 | 28 | 53 | 9 | 0.1250 | 0.3889 |
+| 12 | 72 | 28 | 53 | 9 | 0.1250 | 0.3889 |
+| 16 | 72 | 28 | 53 | 9 | 0.1250 | 0.3889 |
+| 20 | 72 | 26 | 54 | 8 | 0.1111 | 0.3611 |
+| 24 | 72 | 25 | 57 | 10 | 0.1389 | 0.3472 |
+| 32 | 72 | 23 | 59 | 10 | 0.1389 | 0.3194 |
+
+**`<=2` falls monotonically, 28 → 23. Live rises monotonically, 53 → 59.** The conjunction is
+therefore **non-monotone** and its span is **0.1111 to 0.1389 — 1.25×, and band-preserving**: every
+width reads inside the same *bound on reach* band.
+
+**And the five identical rows are the formula, not a coincidence.** `max(k, 16)` makes the work
+measure `nnz*16` for every `k <= 16`, so the resolved count cannot vary there at all. The variation
+begins at exactly the width where `k` starts exceeding 16.
+
+### Why the other three leaked in the same direction, and why this one cannot
+
+The numerator is a **conjunction of restrictions**: in the 328 **AND** resolving to `<=2` **AND**
+live. For a conjunction, **the looser reading of any conjunct is a superset, and every cell it adds
+is one where the effect is absent or undefined.** So a share with a conjunctive numerator is
+inflated by every unpinned restriction, **with no coincidence required** — which is also why
+amendment 26 could state the damage as exactly 3.11× from the reference census before any new data:
+the loosest reading bounds it.
+
+**The audit method that follows: count the conjuncts in the numerator's predicate and require each
+to carry a stated value.** For `s328` the count is three — *"among the 328"* (pinned: behind in all
+16 readings at k=2), *"resolves to `<=2`"*, *"live"*. Reviewing by diff finds the last repair's
+flaw; counting conjuncts finds the class.
+
+**The limit that keeps the rule true, stated because it would otherwise over-promise.** A
+**parameter** is not a restriction. The width does not lean, precisely because the two conjuncts
+move oppositely in it, so **its direction is not boundable by inspection** and the
+loosest-reading argument is unavailable. It needs pinning for a different reason than the other
+three: not because it leans, but because nothing lets you reason about it without a value.
+
+> *"Every unpinned degree of freedom leans favourably"* is true of the three found and **false in
+> general**. The true version: **every unpinned RESTRICTION leans favourably; parameter choices
+> have to be pinned blind.**
+
+### The instruments that score this, written and tested before the sweep reports
+
+- **`nt_k2curve.py`** takes `--keys` so conditions 1 and 3 are scored on the deficit half and the
+  control half **without reimplementing the excess estimator** — same binary, same permutation
+  null, same seed, different population. It REFUSES when no requested key appears in the sweep, and
+  prints the present/absent split so an absent key reads as unmeasured rather than excluded.
+- **`an_reach328.py`** at `c8dea455180727e6` computes conditions 2 and 4, printing the registered
+  share **and both alternative readings** beside it, plus the non-live count inside the `<=2` group
+  and the live fraction per half, so every reading in amendment 26's table is recoverable from the
+  output rather than from this document.
+- **`an_reach328_selftest.py`**: **14 counted checks, all passing**, including that the registered
+  numerator excludes non-live `<=2` cells while the alternative includes them, that the inflation
+  equals `n_all/n_live_le2`, that the bootstrap CI excludes zero on an injected +0.40 and covers it,
+  that a no-effect control spans zero, and that the **value** digest moves with the data while the
+  **index** digest does not.
+- **Planted mutation**: substituting the unpinned numerator — the exact defect amendment 26 pins —
+  gives **3 of 14 FAILED, rc=1**. The suite fires on the one defect it exists to catch.

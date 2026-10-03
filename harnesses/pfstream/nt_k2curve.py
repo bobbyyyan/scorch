@@ -58,11 +58,34 @@ ap.add_argument("--allow-unknown-object", action="store_true",
                 help="accept a sweep with no so_sha column; pooled-curve numbers are "
                      "then withheld and the rest is labelled provisional")
 ap.add_argument("--ks", default="", help="widths to report; default every width present")
+ap.add_argument("--keys", default="", help="restrict to these keys, one per line. Registered in "
+                "PREREG_thread_sizing amendments 21(c) and 22 so conditions 1 and 3 can be scored "
+                "on the deficit half and the control half of one sweep WITHOUT reimplementing the "
+                "excess estimator in a second script -- the same binary, the same null, the same "
+                "seed, a different population.")
 A = ap.parse_args()
 
 rows = list(csv.DictReader(open(A.csv)))
 if not rows:
     raise SystemExit("REFUSE: %s holds no rows, so a flat verdict would be vacuous" % A.csv)
+if A.keys:
+    _want = set(l.strip() for l in open(A.keys) if l.strip())
+    if not _want:
+        raise SystemExit("REFUSE: %s is empty, so restricting to it would drop every row" % A.keys)
+    _before = len(rows)
+    _hadkeys = {r.get("key", "") for r in rows}
+    rows = [r for r in rows if r.get("key", "") in _want]
+    if not rows:
+        raise SystemExit("REFUSE: none of the %d keys in %s appears in %s, so every table below "
+                         "would be empty by construction rather than by measurement. The sweep "
+                         "holds %d distinct keys; compare a sample from each side."
+                         % (len(_want), A.keys, A.csv, len(_hadkeys)))
+    print("KEY RESTRICTION  %s: %d requested, %d of them present, %d rows of %d kept"
+          % (A.keys, len(_want), len({r["key"] for r in rows}), len(rows), _before))
+    if len({r["key"] for r in rows}) < len(_want):
+        print("  %d requested keys are ABSENT from this sweep. They are unmeasured here, not"
+              % (len(_want) - len({r["key"] for r in rows})))
+        print("  excluded by any criterion, so every denominator below is the PRESENT count.")
 
 # so_sha names the object that answered. It is read rather than assumed because the whole
 # reason the column exists is that an in-place build in the tree this environment imports from
