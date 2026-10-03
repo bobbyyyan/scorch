@@ -53,8 +53,24 @@ RVLF_KPAT='scorch_spmm_row_(narrow_exact|narrow_rowvec|regblock|gather)<(float|s
 #   scorch_sparse_attention_csr_float(at::Tensor, ..., double, int)
 #
 # float32 kernels whose SCALE PARAMETER is a double, plus their OpenMP outlined bodies. Matching
-# the instantiation forms instead puts them back in `rest` (5 attention entries, from 0) while
-# every float64 instantiation stays excluded -- checked by name, not assumed.
+# the instantiation forms instead puts them back in `rest` while every float64 instantiation stays
+# excluded -- checked by name, not assumed.
+#
+# NAME THE POPULATION BESIDE EACH COUNT; two different ones were both called "back in rest".
+# Over `all` (1093 names) the fix releases 20. Of those 20, 16 are in `moved` and 4 are not --
+# `.cold` partners and a pybind trampoline of the same two float32 functions, over-excluded just
+# as much, but outside `moved` and so never members of the 47. That is why
+# excluded-AND-moved drops 47 -> 31, by 16 and not by 20. The softmax/attention family in `rest`
+# goes 0 -> 9, which is 4 softmax + 5 attention.
+#
+# Of the 31 that remain excluded AND moved, 30 are unambiguous float64 instantiations. The 31st is
+# `pybind11::detail::type_caster<double, void>::load` -- instantiated on double, but shared
+# argument-conversion machinery reachable from the float32 entry points that carry a double scale.
+# Excluding it is right for this object (it is not float32 kernel code) and it is the one name for
+# which "float64 instantiation" and "float64 kernel code" disagree, so it is named rather than
+# counted silently. The two excluded-but-unmoved names are `spmm_csr_v2_core<double,false>`'s
+# lambda and `scorch_spmm_row_regtile_partial<double,5,false>`: float64, no nested-`<double>`
+# float32 case hiding behind the branch that still matches `std::vector<double>`.
 #
 # `_f64` and `F64` match zero symbols in this object. They are kept because they cost nothing and
 # a future constant could use that spelling, but they are inert today and should not be read as
