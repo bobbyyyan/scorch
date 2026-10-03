@@ -1007,9 +1007,22 @@ four widths, 4 of 4, so the shape is a rise to a maximum at pool 8 followed by a
 A reversal at the low end was the outcome that would have made the gate defensible with
 only its threshold placement in question, and it does not occur.
 
-**The turn matters for the pools still running, so the expectation is registered here.**
-Pools 20 and 24 sit on the falling side, so R2 there should read *below* pool 16's 46-53%.
-A reading at or above pool 8's level would mean the turn is not a trend. And the header
+**The turn is real and it is NOT a trend -- a registered expectation that did not hold.**
+Before pools 20 and 24 ran, the prediction recorded here was that R2 would read *below*
+pool 16's 46-53% if the decline continued. Measured:
+
+| pool | R2 ratio, mode 0 over mode 3 | as a percentage |
+|---|---|---|
+| 8 | 1.568 - 1.623 | 56.8 - 62.3% |
+| 16 | 1.460 - 1.534 | 46.0 - 53.4% |
+| 20 | 1.379 - 1.477 | 37.9 - 47.7% |
+| 24 | 1.459 - 1.518 | 45.9 - 51.8% |
+
+Pool 24 reads **above** pool 20 at all four widths, and at k=16 pool 20's 1.477 is above
+pool 16's 1.460. So the sharp drop from pool 8 to pool 16 is reproduced, and past it the
+three higher pools form a plateau in the 1.38-1.52 band with no monotone ordering. The
+prediction is withdrawn: what the data support is one step down after pool 8, not a
+continuing decline. And the header
 supplies a prior for it at `:1600`: its pool-24 anchor is 0.785, which in this file's
 time-ratio convention is **1.274** -- below pool 16 and consistent with a continuing
 decline. Different host and different population, so suggestive rather than matched.
@@ -1136,6 +1149,28 @@ To be plain about what that floor is and is not: above the ceiling the gate is i
 own cells. It is the matched-population floor this concern lacked, and it is not evidence
 about the gate's inertness -- that inertness is what makes it a floor in the first place.
 R2 is the only live route at those pools.
+
+**Measured, and it is the registered expectation that did hold.** R1 at pools 20 and 24 is
+labelled an A/A floor by the harness, from the ceiling predicate rather than by hand, and
+reads a maximum absolute ratio departure of **0.08% to 0.21%** across all three populations
+and four widths -- against the ~1% that `8ccd104`'s two capped arms measured on redwood at
+pool 24. So the shim and the affinity cap add about a fifth of the dispersion that prior
+reading had, which was the outcome that would have indicted the apparatus had it gone the
+other way. It is also a replication of a construction that already had a reading, on a
+different host, rather than a new instrument.
+
+**And the mode comparison corroborates the header's own pool-24 anchor in direction.** That
+anchor says the partition wins at pool 24; R2 measures mode 3 winning there by 45.9-51.8%.
+The anchor's 0.785 converts to 1.274 in this convention, so the magnitudes differ -- a
+different host, and a corpus-pooled figure against gate-region cells -- but the sign is the
+same, and that is the one claim in the header that a reader could have taken backwards from
+its direction-free ratio.
+
+**What the pool axis therefore shows overall: mode 3 beats mode 0 at every pool measured,
+2 through 24.** By 6.8-9.9% at pool 2, 17-23% at pool 4, 56.8-62.3% at pool 8, and 37.9-53.4%
+across 16, 20 and 24. The gate forces mode 0 wherever it fires, which is pools 1-16, so it
+is harmful across its whole active range and inert above it -- and above it the default is
+already mode 3, which is the better arm at those pools too.
 
 **Two ambiguities in the shipped comment itself, both affecting how a later reader uses
 it.** At `:1600` the anchor is written "no-partition / partition = 0.785 pooled, 65% of
