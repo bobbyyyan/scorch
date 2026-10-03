@@ -230,7 +230,22 @@ as `heldout_geomean`. Two things the concern did not say, both from a peer and b
 
 **Scope, which bounds it.** `tiling.py`'s loader reads only `version`, `machine_id` and
 `feature_names` (`:1233-1235`), so `heldout_geomean` is not consumed by dispatch and the mislabel
-cannot misroute anything. It misleads a reader. The shipped value is **0.9896**.
+cannot misroute anything. It misleads a reader. **Two specs ship the field, not one** —
+`autotune-levels/models/model_74c1226957b8a5ce.json` carries `heldout_geomean` 0.9896
+(`n_train_rows` 1572) and `model_83841bfe8e6c0539.json` carries 0.9861 (`n_train_rows` 1504). Both
+are tracked and both sit in `MODELS_DIR` (`train_autotune_model.py:42`), so the mislabel ships
+twice; an earlier revision of this paragraph named only the first and understated it by one
+artefact.
+
+**Both shipped specs are `platform=Darwin`, which bounds this whole section to two Mac
+machine_ids.** `_load_learned_model` (`tiling.py:1219-1241`) rejects a spec whose `machine_id` is
+not this machine's and returns `None`; its own docstring names the consequence, `-> analytic
+fallback`, and the `except` arm repeats it as "silent analytic fallback". So on redwood and MKT the
+learned level runs the analytic selector, and every finding below about the learned path is a
+finding about those two Darwin hosts. The module docstring's redwood figure
+(`train_autotune_model.py:16-18`) therefore has no shipped artefact to attach to — that
+parenthetical is ambiguous between naming the analytic baselines and the learned held-out results,
+and I am not reading it further than that.
 
 **There is no domain check anywhere on the learned path.** `_eligible_learned` (`:1269-1276`) has a
 one-line body: `return _operand_over_cache(J, N, C)`. Its docstring states the delegation —
@@ -241,7 +256,7 @@ derived combination of three of them is all that is constrained.
 
 **And the shipped artefact could not support a domain check even if the code wanted one.** The spec
 carries `feature_names`, `trees`, `init`, `learning_rate`, `machine_id`, `platform`,
-`n_train_rows` (1572) and `heldout_geomean` — and **no feature ranges, quantiles or bounds**. A
+`n_train_rows` (1572 and 1504, one per shipped spec) and `heldout_geomean` — and **no feature ranges, quantiles or bounds**. A
 consumer cannot tell whether an input is inside the training domain from what ships.
 
 **The measurement that discriminates, run because a structure is not a rate.** Capturing the
@@ -272,7 +287,7 @@ wrong numbers carries no information about either. The floor cited to justify re
 gates is the model grading its own homework — and that is specific to the path the widening opened.
 
 **What is still not established.** Whether these two cells' features lie outside the training rows'
-ranges. The shipped spec carries no ranges and the 1572 training rows are not in the repo, so
+ranges. Neither shipped spec carries ranges, and neither one's training rows (1572 and 1504) are in the repo, so
 saturation remains a candidate structure rather than the demonstrated mechanism. Two cells, one
 host. **But the consequence does not depend on the mechanism**: on these cells the learned level
 routes to the arm it would measure as 1.5–1.9× slower, and nothing in its path can detect that.
