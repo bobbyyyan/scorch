@@ -103,7 +103,13 @@ is defined against MKL — and the ~1.1% x86 cost per environment variable an ar
   `ROWS_F32=2` admits plain multi-row. The header already measured ROWS=2 one width up at
   **1.0652 / 1.0825**. If k=8 does not move, the arm did not fire.
 
-## The four refutation conditions, registered before the run
+## The four refutation conditions
+
+> Superseded in part. Condition 1, 3 and 4: see amendments 1, 2 and 3. Condition 3 again:
+> amendment 2 (question changed) and amendment 6(c) (estimator). Condition 2 stands as
+> written. The gated-cell range quoted below and in amendments 2-3 is WITHDRAWN by
+> amendment 6(a) as not reproducible.
+, registered before the run
 
 > **CONDITIONS 1, 3 AND 4 BELOW ARE SUPERSEDED — DO NOT SCORE THEM.** Condition 1 is replaced by
 > amendment 1(c) (it certified a width where one macro under test is provably inert). Condition 3
@@ -328,6 +334,10 @@ whole run confounded.
 ---
 
 # Amendment 2 — amendment 1's floor-gated primary is withdrawn: it can only return zero
+> **Superseded in part by amendment 6(a):** the gated-cell range for "gain needed"
+> quoted in this amendment is withdrawn as not reproducible from the sealed ledger. The
+> gate membership counts 2/8/34 are withdrawn with it.
+
 
 Still before any timing. Amendment 1 replaced condition 3 because its pass line exceeded the
 mechanism's measured range. **The replacement is worse: its primary can only return zero, and that
@@ -422,6 +432,10 @@ differing from ship by **+4385** instruction lines, `mrhv4` differing from `mrhv
 ---
 
 # Amendment 3 — the two criteria select nearly DISJOINT populations, and my gate and my report used different reductions
+> **Superseded in part by amendment 6(a):** the gated-cell range for "gain needed"
+> quoted in this amendment is withdrawn as not reproducible from the sealed ledger. The
+> gate membership counts 2/8/34 are withdrawn with it.
+
 
 Still before any timing.
 
@@ -508,6 +522,10 @@ defect's transferable form, and it is a different one from what was reported.
 
 ## (d) My reconstruction still differs from the sealed analyser, and the sealed definition governs
 
+> **Resolved by amendment 6(a), in the other direction:** the sealed definition does not
+> govern, because it cannot be recovered. The number is withdrawn.
+
+
 My gated count at k=4 is **2**; the sealed analysis headlines **8**; a second reader reconstructs
 **8**. At k=8 I get 0, they get 3, the sealed says 1. **Three reconstructions, three answers.**
 Scoring uses the sealed definition, and the discrepancy is logged as unresolved — it is not
@@ -529,6 +547,10 @@ explained by the reduction mismatch in (c), which affects the reported gain and 
 ---
 
 # Amendment 4 — `pct` has no single index convention: it flips with n, and that is the whole 2-against-8
+> **Superseded in part by amendment 6(a):** the gated-cell range for "gain needed"
+> quoted in this amendment is withdrawn as not reproducible from the sealed ledger. The
+> gate membership counts 2/8/34 are withdrawn with it.
+
 
 Still before any timing. This is an instrument defect in the canonical estimator, not a choice.
 
@@ -635,6 +657,10 @@ sensitivity above is the bound — but every future threshold applied through `p
 ---
 
 # Amendment 5 — the convention's exposed set in closed form, and the one n in this run that lands in it
+> **Superseded in part by amendment 6(c):** the registered reduction for the scoring
+> path is the geometric middle `exp(median(log))`, not `statistics.median`. The p95 floor
+> registered here is unchanged.
+
 
 Still before any timing. Verified independently rather than taken on report; all six checks below
 reproduce exactly.
@@ -720,3 +746,83 @@ been checked.** Any other quantile used anywhere needs its own modulus computed.
 
 And the width-contrast blast radius (≤1.91 pp) is from a different ledger and has not been
 independently recomputed; it is mine, not confirmed.
+
+# Amendment 6 — the gated-cell range is withdrawn, not corrected; and the scoring path uses the geometric middle
+
+Written 2026-10-02, with the four-build screen running and no reading from it yet scored.
+
+### (a) The gated-cell range and the gate membership counts are WITHDRAWN as not reproducible
+
+Amendments 2 and 3 quote a range for "gain needed" over the floor-gated cells: first
+38–63%, then 36–57%, then 38.1–56.0% as max(aa,bb). A peer session reading the sealed
+`an_c207.py` reported it should be 34.6–54.6% (median 45.6%) under that file's estimator.
+Amendment 4 quotes gate membership at k=4 as 2 (lower median) / 8 (averaged) / 34 (upper).
+
+I tried to reproduce all of it from the sealed chain207 DLMC ledger before quoting the
+peer's correction. **I could not reproduce any of the five numbers.** Reconstructing the
+gate as "a cell of the sign-only 51 whose per-build reduction clears the 0.2783 floor,
+admitted on max(aa,bb)", over the 12 readings per cell at k=4:
+
+| reduction of the 6 readings per build | gate n | gain needed to reach parity |
+|---|---|---|
+| lower order statistic | 6 | 22.0% .. 41.4%, median 28.8% |
+| geometric middle, `exp(median(log))` | 9 | 23.0% .. 42.2%, median 27.4% |
+| arithmetic middle, `statistics.median` | 9 | 23.1% .. 42.2%, median 27.8% |
+| upper order statistic | 23 | 21.8% .. 43.1%, median 26.7% |
+
+Dropping the sign-only restriction and gating the whole k=4 population gives n=200 and
+21.8–45.8%. No variant I can construct lands on 2/8/34 or on any of the quoted ranges,
+and the ranges are all roughly 15 percentage points below every figure ever published
+here. A cell needing 38% gain has S = 1.61, i.e. a deficit of 61% — more than twice the
+floor the gate is supposed to apply, so the published lower endpoint is not consistent
+with a 0.2783 gate at all.
+
+What this means: the definition that produced the published range is not recorded
+anywhere I hold, and three successive "corrections" to it — two mine, one a peer's —
+were each computed from a different unstated procedure. **The range and the membership
+counts are withdrawn outright rather than corrected to a fourth value.** Quoting
+34.6–54.6% here would repeat the exact failure amendment 3 recorded, where I passed on a
+peer's "43 of 51" while holding the data that said 50 of 51.
+
+The qualitative claim amendment 4 rests on does survive, and is reproducible: the choice
+of middle moves gate membership by a factor of 3.8 (6 to 23) on a fixed population and a
+fixed floor. That is the point amendment 4 was making, and it does not need the
+unreproducible counts to stand.
+
+What is unaffected: the sign-only population is exactly 51, reproducible, and uses no
+median at all. Nothing in the live scoring path reads the withdrawn range.
+
+### (b) `an_c207.py` is immune to the `pct` convention defect by construction
+
+Amendment 5 registered which analysers the `pct` half-integer defect reaches. The sealed
+board's own analyser is not one of them. `an_c207.py:59` is
+
+    p95 = lambda d: sorted(d)[int(0.95 * (len(d) - 1))] if d else float("nan")
+
+— truncation, not `round`, and it never calls `pct`. So that ledger is immune because of
+how it is written, not because its populations happen to sit at n ≡ 0 (mod 20). It should
+not be on the list of files for Bobby's `pct` decision; that list is
+`an_f64_arms.py`, `an_floor2x2.py`, `an_f64_vs_mkl.py`.
+
+### (c) The scoring path uses the geometric middle — supersedes amendment 5
+
+Amendment 5 registered that "the 0.5 quantiles throughout the scoring path use
+`statistics.median`". That is changed, before any reading is scored, to
+
+    red = lambda v: math.exp(statistics.median([math.log(x) for x in v]))
+
+for every reduction of a ratio. Three reasons, in order of weight:
+
+1. S is a ratio. Its natural scale is logarithmic: the middle of {0.5, 2.0} is 1.0, not
+   1.25, and only the geometric middle gives an estimator that is invariant when the
+   ratio is inverted. Every quantity this arm is scored on is a ratio.
+2. The board this arm's result will be set beside reduces the same way
+   (`an_c207.py:57`). Comparing a geometric displacement against an arithmetic baseline
+   is a units error of the same family as amendment 30's headroom-vs-raw mistake.
+3. It is measurable, not free. On the gated cells above, the two middles differ by 0.4 pp
+   in the median (27.4% vs 27.8%) — far below the effect under test, but not zero, so the
+   choice has to be stated rather than defaulted.
+
+The p95 floor registered in amendment 5 is unchanged and remains the upper order
+statistic at index `ceil(0.95 x 50) = 48`, printed with its index and convention beside
+its value. The sign-only 51 remains convention-free: it reduces nothing.
