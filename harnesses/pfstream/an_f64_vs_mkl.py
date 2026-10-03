@@ -458,6 +458,40 @@ def main(argv):
         print("  %-14s %s   n=%s" % (lab, "  ".join(row), ns[0] if len(set(ns)) == 1 else ns))
     print("  A dash is an EMPTY band, not a 1.0; n is the cell count per width, printed so a")
     print("  band holding three matrices cannot be read beside one holding two thousand.")
+    print()
+    print("CELLS WHOSE MEDIAN READING EXCEEDS 1.0, counted rather than bounded. A band median")
+    print("above 1.0 implies at least half the band is, but the count is the quantity and the")
+    print("implication is only its floor -- and the two criteria answer DIFFERENT questions:")
+    print("'behind in every reading' asks whether a cell is RELIABLY slower, this asks whether")
+    print("its TYPICAL call is. For a goal stated as 'faster than MKL everywhere' the second is")
+    print("the operative one, and on this ledger it is an order of magnitude larger.")
+    print("  %-14s %s" % ("deg band", "  ".join("%9s" % ("k=%d" % w) for w in widths)))
+    colsum = dict((w, 0) for w in widths)
+    for dlo, dhi in DBANDS:
+        row, nb = [], 0
+        for w in widths:
+            c = n_ = 0
+            for (key, kw), rs in ratios.items():
+                if kw != w:
+                    continue
+                r0 = rows_of.get(key, 0)
+                d = (nnz.get(key, 0) / r0) if r0 else 0.0
+                if dlo <= d < dhi:
+                    n_ += 1
+                    if pct(sorted(rs), 0.5) > 1.0:
+                        c += 1
+            colsum[w] += c
+            nb = n_
+            row.append("%9d" % c)
+        lab = "%g-%g" % (dlo, dhi) if dhi != float("inf") else ">=%g" % dlo
+        print("  %-14s %s   of %d" % (lab, "  ".join(row), nb))
+    print("  %-14s %s   of %d"
+          % ("TOTAL", "  ".join("%9d" % colsum[w] for w in widths), len(cell) // max(1, len(widths))))
+    tot_med = sum(colsum.values())
+    print("  %d of %d cells over all widths: %.1f%% by the MEDIAN criterion against %.2f%% by"
+          % (tot_med, len(cell), 100.0 * tot_med / len(cell), 100.0 * counts[BEHIND] / len(cell)))
+    print("  'behind in every reading' -- a %.0fx difference between two criteria on ONE ledger."
+          % ((tot_med / counts[BEHIND]) if counts[BEHIND] else float("inf")))
 
     print("STRUCTURE: the behind set against the ahead set, same widths")
     print("  %-6s %-7s %7s %9s %9s %9s %9s" % ("k", "set", "cells", "med deg", "p10 deg", "p90 deg", "med nnz"))

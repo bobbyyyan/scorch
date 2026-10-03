@@ -4171,3 +4171,85 @@ cell at a **high** count. That configuration appears zero times in the reference
 `an_reach328.py` at `5d081809d2971eda` now **asserts** it and names the first exception if the
 392-key sweep produces one. A non-live cell outside `<=2` would mean the confounding is
 corpus-specific and the numerator fix has a different size at each width.
+
+---
+
+## Amendment 49 — amendment 48 miscounted its own table and understated its own finding by 25×. The redwood board is not 0.28% behind; it is 11.2% slower by the criterion the goal is stated in.
+
+Three corrections to amendment 48, all raised by a reviewing session, **all in the direction of
+making the finding larger**. Two are mine; one is the review's and it is wrong in a way worth
+recording.
+
+### (a) "Exactly one cell exceeds 1.0" is two cells, in a sentence that quotes both
+
+Amendment 48 wrote *"exactly one cell of this table exceeds 1.0: k=4, at degree ≥64. 1.0103 and
+**1.0987**"* — one cell, two readings, one sentence. **Two of the 30 cells exceed 1.0: 1.0103 at
+degree 64–256 and 1.0987 at degree ≥256, both at k=4.**
+
+**The slip understates the evidence, which is why it matters.** "One cell" reads as an isolated
+outlier and invites a noise explanation; **both top degree bands at one width, and no other width
+at any degree, is a column pattern** — which is what a kernel boundary looks like and what the
+thesis needs. **Stated at the column level: exactly one of five widths contains any value above
+1.0, and within it the two highest degree bands both do.** Column maxima, for the record:
+
+| k=2 | k=4 | k=8 | k=16 | k=32 |
+|---|---|---|---|---|
+| 0.9574 | **1.0987** | 0.9491 | 0.8179 | 0.7699 |
+
+`1.0987/0.9574 = 1.1476` and `1.0987/0.9381 = 1.1712`, so at degree ≥256 the half-vector width is
+**14.8% and 17.1% worse than its two immediate width neighbours** — three adjacent widths, three
+different kernels, one host, the same matrices and the same readings. **That contrast is immune to
+the 12-against-16 reading difference entirely**, because it never compares across screens.
+
+### (b) One claim offered in the review does not hold: the columns are not all monotone
+
+The review proposed *"every column rises monotonically with degree."* **Three of five do** — k=2,
+k=4, k=16. **k=8 dips at the top band** (0.9491 → 0.9381) and **k=32 dips at 64–256** (0.7537 →
+0.7436). Every column rises **substantially** from the lowest band to the highest (k=2 goes
+0.2853 → 0.9574), and that is the statement the degree finding needs; monotonicity is a stronger
+claim the data does not support, and it is not required by anything.
+
+### (c) The 51 understates the affected population by 25×, and counting beats bounding
+
+The review's argument — a band median above 1.0 implies at least half the band is above 1.0, so
+≥1106 of the 2211 matrices in the two top bands — is sound, and **the count is the quantity while
+the implication is only its floor.** `an_f64_vs_mkl.py` now counts it, so the number is
+reproducible rather than derived in a message:
+
+| deg band | k=2 | k=4 | k=8 | k=16 | k=32 | of |
+|---|---|---|---|---|---|---|
+| 0–1 | 0 | 0 | 0 | 0 | 0 | 24 |
+| 1–4 | 0 | 0 | 0 | 0 | 0 | 86 |
+| 4–16 | 0 | 1 | 0 | 0 | 0 | 493 |
+| 16–64 | 3 | 17 | 4 | 0 | 2 | 1006 |
+| 64–256 | 74 | **796** | 310 | 44 | 17 | 1499 |
+| ≥256 | 110 | **506** | 200 | 41 | 19 | 712 |
+| **TOTAL** | 187 | **1320** | 514 | 85 | 38 | 3820 |
+
+**At k=4, degree ≥64: 1302 of 2211 cells (58.9%) have a median reading above 1.0, against 51
+counted behind-in-every-reading — 25.5×**, not the review's floor of 21.7×. So redwood's k=4
+weakness is **a majority of the matrices in the two top degree bands**, not a 51-cell tail
+curiosity, and the registered `spmm_halfvec=0` arm will have real power in the bands that matter.
+
+### And the correction that changes the project's scoreboard, not just this amendment
+
+**2144 of 19100 cells — 11.2% — have a median reading above 1.0, against 53 (0.28%) behind in every
+reading. A 40× difference between two criteria on one ledger.**
+
+The two criteria answer different questions. *"Behind in every reading"* asks whether a cell is
+**reliably** slower; the median asks whether its **typical call** is. **For a goal stated as
+"faster than MKL on all of DLMC", the second is the operative one**, and amendment 48 led with the
+first. "redwood is 0.28% behind" and "redwood is 11.2% slower by median" are both true of the same
+229200 observations.
+
+**This does not retract amendment 48's cross-host conclusion**, which rests on the degree table and
+not on the counts: the margin still collapses with mean degree on both hosts, and k=2 on redwood
+still reads 0.9574 at degree ≥256 where MKT reads behind. **What it retracts is the impression that
+redwood is nearly clean.** It is not: 1320 of 3820 matrices at k=4 and 514 at k=8 are slower than
+MKL on a typical call, and the intersection criterion hid every one of them.
+
+**The reusable form.** An intersection over N readings is a *conservative* criterion by
+construction, so it is the right headline for *"here is a cell we must fix"* and the wrong one for
+*"here is how much is left to fix."* Report both, with the ratio between them, because the ratio is
+a property of the screen's resolution and not of the kernel — 40× here at 12 readings, and it would
+shrink at 16.
