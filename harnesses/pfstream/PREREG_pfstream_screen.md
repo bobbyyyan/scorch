@@ -3729,3 +3729,92 @@ by **0.031 pp**. Those are measurements that landed on the boundary, and the sam
 to the 0.009 pp case in amendment 30: a verdict is not to be read from which side of a line a value
 fell when the distance is this far below the band's own width. The paired CIs are the usable
 statement at those widths, and they say FASTER at both — but by existence, not by actionability.
+
+---
+
+## Amendment 45 — a THIRD instance of the withdrawn comparison, and it was an UNCONDITIONAL verdict I introduced while fixing the second
+
+Amendment 42 said a withdrawal that fixes one call site is not a withdrawal, and that the way to
+find the rest is to grep the verdict strings. A reviewing session ran that rule one file-region
+further than my sweep went and found a third instance — **which I wrote in amendment 30, as part
+of the fix.**
+
+`an_f64_arms.py`, inside `if 32 in widths:`, at ec9951d:
+
+```python
+print("    comparison is |%.3f| vs |%.3f|, so the pooled effect is INSIDE the floor and"
+      % (100 * pct(vn32, 0.5), 100 * pct(fl32, 0.5)))
+```
+
+**"INSIDE the floor" is a literal in the format string, and the only guard between it and the
+block head is `if vn32 and fl32:` — a non-emptiness check.** There is no conditional on the
+verdict at all. An arm far outside the band would still have printed *inside*. This is worse than
+`:405`, which amendment 42 fixed: that one compared the wrong quantities; **this one compared
+nothing.** It also states the withdrawn |arm median| vs |floor median| reasoning explicitly, with
+the correct operands — the p05/p95 band — printed on the line immediately above.
+
+**Reachable and firing, not latent.** `arm_screen.sh:36` sets
+`float32) DEFAULT_KS=2,8,12,16,20,24,32`, so k=32 is in every float32 grid and this block runs on
+every float32 analysis. float64's `2,4,6,8,10,12,16` is what misses it, which is why a day of f64
+work never surfaced it.
+
+### Why it survived three amendments: the wrong comparison and the right one agreed
+
+At k=32 on DLMC: arm −0.973%, floor median +1.381%, floor p05 −0.982%.
+
+| comparison | verdict | margin |
+|---|---|---|
+| magnitude (withdrawn) | inside | **0.408 pp** |
+| band (correct) | inside | **0.009 pp** |
+
+Same verdict, **margins 45× apart**. They agreed by coincidence. **Two methods agreeing on a
+verdict is not evidence that they agree — the margin is where the disagreement shows.** That is
+the case for printing the distance and not just the verdict, which is the fix amendment 42 applied
+at `:405` and which this block needed too.
+
+### And the dangling connective was the fossil of the branch I collapsed
+
+Four lines down sat `print("    Either way this")`. "Either way" presupposes two branches: the
+if/else was collapsed, the `inside` text kept, and the connective kept with it. **A stranded
+"either way" / "in both cases" / "whichever holds" is a grep-able signature of a conditional that
+no longer exists** — a cheap, mechanical check, and the only one of these that would have found
+this defect by reading rather than by running.
+
+Now computed, with three branches that say different things: inside → the harm does not reproduce,
+*and it does not license a claim that the arm wins*; outside-slower → corroborates the SuiteSparse
+harm on a second corpus; outside-faster → the harm is corpus-specific and still does not clear
+shipping. Verified on the DLMC f32 grid: `BAND verdict: -0.973% vs edge -0.982% (margin 0.010 pp)
+-> INSIDE the band.`
+
+### Amendment 43's DEGRADED caveat was wrong on the axis it said was unrecoverable
+
+I wrote that the pass-file completeness check could not be recovered when the width set is passed
+as an argument, because "16 files are present and 16 is what the count reports". **A total is not a
+completeness check, but a per-cell minimum is — and the output already carried it.** The MKT f64
+run printed `readings per cell: {16: 2926}`, a single bucket, so every cell has exactly 16
+readings and min = max = 16. A missing pass file would show as cells with 15.
+
+So the caveat is retired: **both axes were closed**, the key axis by the log's independent "418
+matrices" and the pass axis by the per-cell histogram in the same output I was reading. The total
+`418 × 7 × 16 = 46816` genuinely proves nothing here — it survives one file missing and another
+duplicated — and quoting it as the completeness evidence was the error.
+
+### The glob fix was necessary and not sufficient
+
+Amendment 43 traced `an_adg.py`'s `KeyError: 'build'` to two producers sharing `$ADG_OUT`. The fix
+selected by schema (`NEED <= header`). **That is necessary and not sufficient, and the crash was
+the lucky case.** The two schemas overlap on **eight** columns — `key,k,rows,cols,nnz,deg,nthreads,
+so_sha` — so a consumer needing only those would have silently merged two populations with
+different semantics and reported a statistic over the union. **A collision that raises announces
+itself; one that type-checks does not.**
+
+Now also requires the selected files to share **one** header, printing it, and refusing with every
+offending filename and its columns listed if they do not. Verified:
+`all 9 usable files share one header: build,key,k,rows,cols,nnz,deg,arm,ms,batch,nthreads,refbackend,so_sha`,
+beside `SKIPPED oracle.csv: lacks arm,build`.
+
+### One figure corrected
+
+Amendment 18 quoted prediction 1's null as "50% to 79%". The true range over the per-threshold
+reachable-cell counts is **55.2% to 78.6%** (15/26, 22/28, 16/29). The verdict is unaffected — the
+pass is uninformative either way — but the range was loose in the direction that understated it.

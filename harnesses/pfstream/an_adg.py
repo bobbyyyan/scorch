@@ -44,6 +44,25 @@ if not _use:
     raise SystemExit("REFUSE: no CSV in %s carries the ADOPT_GRAIN schema (%s). Every verdict "
                      "below would be computed over zero rows and would print as a clean pass."
                      % (A.csvdir, ",".join(sorted(NEED))))
+# AND THE SELECTED FILES MUST SHARE ONE HEADER, because `NEED <= header` is necessary and not
+# sufficient. The crash that exposed this was the LUCKY case: oracle.csv lacks `build`, so it
+# raised. The two schemas here overlap on EIGHT columns -- key,k,rows,cols,nnz,deg,nthreads,so_sha
+# -- so a consumer needing only those would have silently merged two populations with different
+# semantics and reported a number over the union. A collision that raises announces itself; one
+# that type-checks does not. So require homogeneity and name the offender.
+_hdrs = {}
+for _p, _ in _use:
+    with open(_p) as _fh:
+        _hdrs[_p] = tuple(csv.reader(_fh).__next__() or [])
+_distinct = sorted(set(_hdrs.values()))
+if len(_distinct) > 1:
+    print("REFUSE: the %d usable files carry %d DIFFERENT headers, so they are %d producers, not"
+          % (len(_use), len(_distinct), len(_distinct)))
+    print("        one. Pooling them would report a statistic over the union of two populations.")
+    for _p, _h in sorted(_hdrs.items()):
+        print("  %-28s %s" % (os.path.basename(_p), ",".join(_h)))
+    raise SystemExit(1)
+print("all %d usable files share one header: %s" % (len(_use), ",".join(_distinct[0])))
 for p, _ in _use:
     for r in csv.DictReader(open(p)):
         key, k, b = r["key"], int(r["k"]), r["build"]

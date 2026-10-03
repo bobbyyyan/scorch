@@ -364,20 +364,51 @@ def main(argv):
             nb = sum(1 for x in vn32 if x < 0)
             print("    k=32 IS in this grid (%d cells): nopf reads %+.3f%% against a floor whose"
                   % (len(vn32), 100 * pct(vn32, 0.5)))
-            print("    median is %+.3f%% and whose p05/p95 band is %+.3f%% to %+.3f%%. The MAGNITUDE"
-                  % (100 * pct(fl32, 0.5), 100 * pct(fl32, 0.05), 100 * pct(fl32, 0.95)))
-            print("    comparison is |%.3f| vs |%.3f|, so the pooled effect is INSIDE the floor and"
-                  % (100 * pct(vn32, 0.5), 100 * pct(fl32, 0.5)))
-            print("    carries NO sign from its magnitude. Cells-better: nopf %d/%d against the"
-                  % (nb, len(vn32)))
-            print("    floor pair's own %d/%d -- compare those two, never nopf against 0.5."
-                  % (fb, len(fl32)))
-            print("    The recorded harm is large enough to have been recorded over 115 matrices,")
-            print("    so an effect inside this floor establishes that it DOES NOT REPRODUCE here;")
-            print("    that is what a corpus-specificity claim needs, and it is all it may use.")
-            print("    Either way this")
-            print("    table DOES see the side of the trade that blocks shipping, so the sentence")
-            print("    above must not be read as an excuse for not looking.")
+            # THIS VERDICT USED TO BE A LITERAL. The line below once read "...so the pooled
+            # effect is INSIDE the floor", with "INSIDE the floor" hardcoded in the format string
+            # and NO conditional between it and the block head -- so it printed inside whatever
+            # the numbers were. It also stated the |arm median| vs |floor median| comparison that
+            # amendment 30 withdrew, with the correct operands printed on the line directly
+            # above. It survived because at k=32 on DLMC the wrong comparison and the right one
+            # AGREED: magnitude said inside with margin 0.408 pp, the band said inside with
+            # margin 0.009 pp. Same verdict, margins 45x apart. TWO METHODS AGREEING ON A VERDICT
+            # IS NOT EVIDENCE THEY AGREE -- the margin is where the disagreement shows.
+            #
+            # The dangling "Either way this" four lines down was the fossil of the branch that
+            # used to be here: the if/else was collapsed, the `inside` text kept, and the
+            # connective kept with it. A stranded "either way" / "in both cases" / "whichever
+            # holds" is a grep-able signature of a conditional that no longer exists.
+            m32, lo32, hi32 = pct(vn32, 0.5), pct(fl32, 0.05), pct(fl32, 0.95)
+            if m32 < lo32:
+                v32, e32 = "OUTSIDE the band, FASTER", lo32
+            elif m32 > hi32:
+                v32, e32 = "OUTSIDE the band, SLOWER", hi32
+            else:
+                v32, e32 = "INSIDE the band", (lo32 if m32 < 0 else hi32)
+            print("    median is %+.3f%% and its p05/p95 band is %+.3f%% to %+.3f%%."
+                  % (100 * pct(fl32, 0.5), 100 * lo32, 100 * hi32))
+            print("    BAND verdict: %+.3f%% vs edge %+.3f%% (margin %.3f pp) -> %s."
+                  % (100 * m32, 100 * e32, abs(100 * (m32 - e32)), v32))
+            print("    Cells-better: nopf %d/%d against the floor pair's own %d/%d -- compare"
+                  % (nb, len(vn32), fb, len(fl32)))
+            print("    those two, never nopf against 0.5.")
+            if v32 == "INSIDE the band":
+                print("    The recorded harm is large enough to have been recorded over 115")
+                print("    matrices, so an effect inside the band establishes that it DOES NOT")
+                print("    REPRODUCE here -- which is what a corpus-specificity claim needs, and")
+                print("    all it may use. It does NOT license a claim that this arm wins at k=32.")
+            elif v32 == "OUTSIDE the band, SLOWER":
+                print("    The arm is SLOWER outside the band, which is the same SIGN as the")
+                print("    recorded SuiteSparse harm. That CORROBORATES the harm on a second")
+                print("    corpus and is the one outcome that argues against shipping outright.")
+            else:
+                print("    The arm is FASTER outside the band, the OPPOSITE sign to the recorded")
+                print("    harm. That makes the harm corpus-specific rather than width-specific,")
+                print("    and it still does not clear it to ship: the SuiteSparse harm is real")
+                print("    on SuiteSparse, and 115 regressed matrices is a regression.")
+            print("    Whichever of those three printed, this table DOES see the side of the")
+            print("    trade that blocks shipping, so the sentence above must not be read as an")
+            print("    excuse for not looking.")
         else:
             print("    k=32 is in the grid but lacks a nopf or shpb reading, so it is still unseen.")
     else:
