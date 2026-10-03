@@ -257,7 +257,18 @@ ROUTES = (R1, R2, R2F)
 ALLVARS = ("SCORCH_SPMM_PARTITION_MINGRAINS", "SCORCH_SPMM_PARTITION")
 
 
+N_SWITCH = [0]
+
+
 def setarm(env):
+    """Set exactly one arm's variables, and COUNT the switch.
+
+    The count exists to check the shim's flush. If a flush were missed across an arm
+    switch, both arms would read the first arm's cached values, the measured difference
+    would collapse to the floor, and the readout would say the gate does not matter --
+    the most flattering way for an apparatus to fail, and indistinguishable from a real
+    null. The invariant asserted below is flushes >= arm switches."""
+    N_SWITCH[0] += 1
     for v in ALLVARS:
         os.environ.pop(v, None)
     os.environ.update(env)
@@ -389,10 +400,16 @@ for route, ea, eb, popname, pop, k in CELLS:
         ua, ub = 0.5 * (min(a1) + min(a2)), 0.5 * (min(b1) + min(b2))
         ma = 0.5 * (statistics.median(a1) + statistics.median(a2))
         mb = 0.5 * (statistics.median(b1) + statistics.median(b2))
-        # Within-cell spread per arm, as a fraction of that arm's own level. This is the
-        # quantity that decides whether min-based and median-based differences can diverge.
-        sa = (max(ra) - min(ra)) / max(statistics.median(ra), 1e-9)
-        sb = (max(rb) - min(rb)) / max(statistics.median(rb), 1e-9)
+        # Within-cell spread per arm, measured WHERE THE ESTIMATOR REDUCES. Both estimators
+        # reduce inside each ABBA half and then average the halves, so they never see the
+        # drift between halves -- which is the drift ABBA exists to cancel. Pooling the two
+        # halves would fold that drift into a diagnostic about a quantity the estimator does
+        # not use. The larger of the two halves is taken, so the figure is an upper bound on
+        # the spread either estimator actually faces.
+        def spread(v):
+            return (max(v) - min(v)) / max(statistics.median(v), 1e-9)
+        sa = max(spread(a1), spread(a2))
+        sb = max(spread(b1), spread(b2))
         nt = so.scorch_spmm_nthreads(nnz * max(k, 16), rows, POOL, nnz * k, nnz)
         for arm, us in (("A", ua), ("B", ub)):
             w.writerow(dict(route=route, pop=popname, key=key, k=k, kt=KT, rows=rows,
@@ -419,10 +436,26 @@ def boot_med(v, B=4000, seed=7):
 
 
 if SHIM:
-    print("\nshim counters: %d real getenv, %d cache hits, %d flushes (one per env write). "
-          "A flush count of 0 would mean the arms never reached the environment."
-          % (SHIM.scorch_fastenv_real(), SHIM.scorch_fastenv_hits(),
-             SHIM.scorch_fastenv_flushes()))
+    fl, sw = SHIM.scorch_fastenv_flushes(), N_SWITCH[0]
+    hp, hs = SHIM.scorch_fastenv_hits_ptr(), SHIM.scorch_fastenv_hits_str()
+    ev = SHIM.scorch_fastenv_evictions()
+    print("\nSHIM COUNTERS, and two of them are premises rather than trivia.")
+    print("   real getenv %d   cache hits %d   evictions %d"
+          % (SHIM.scorch_fastenv_real(), hp + hs, ev))
+    print("   flushes %d against %d arm switches  -- %s"
+          % (fl, sw, "OK, every switch reached the environment" if fl >= sw else
+             "FAIL: a flush was missed across a switch, so both arms may have read one "
+             "arm's cached values and the difference would collapse toward the floor"))
+    print("   hits by pointer identity %d, by string compare %d  -- %s"
+          % (hp, hs, "every caller passed a stable literal, which is the cache's premise"
+             if hs == 0 else "some caller passed a non-literal; the lookup is still correct "
+             "because keys are owned copies, but the premise is not universal"))
+    if ev:
+        print("   NOTE %d evictions: the table filled, so those calls were uncached and "
+              "paid full cost. Correct, just slower." % ev)
+    if fl < sw:
+        sys.exit("EXIT: the shim did not flush on every arm switch. Readings under it are "
+                 "not trustworthy and the failure direction is toward a null.")
 print("\n" + "=" * 78)
 print("PRIMARY: per-cell A-minus-B in MICROSECONDS. Arm A has the partition OFF on the")
 print("treatment cells (mode 0) and arm B has it ON (mode 3), so a NEGATIVE difference")
@@ -453,24 +486,41 @@ for route, ea, eb, want in ROUTES:
         print("   %-3s %-9s n %3d   median A-B %+8.3f us  CI [%+7.3f, %+7.3f]  %s"
               % (popname, tag, len(d), statistics.median(d), lo, hi,
                  "spans 0" if lo <= 0 <= hi else "excludes 0"))
-        print("       SIGN COUNT %3d of %3d positive, %3d negative  (no reduction step, "
-              "invariant to min-vs-median and to the tax)" % (npos, len(d), nneg))
-        print("       median-of-reps A-B %+8.3f us  (against the min-of-reps %+8.3f above; "
-              "they agree to %.3f us)"
+        print("       SIGN COUNT %3d of %3d positive, %3d negative%s  (no reduction step, "
+              "invariant to min-vs-median and to the tax)"
+              % (npos, len(d), nneg,
+                 "  <- the NULL for the treatment row above, matched on n but NOT on "
+                 "population" if tag == "A/A FLOOR" else "  null is %d, i.e. the floor "
+                 "rows' own sign counts below" % (len(d) // 2)))
+        glo, ghi = boot_med([x - y for x, y in zip(dmed, d)])
+        print("       median-of-reps A-B %+8.3f us  vs min-of-reps %+8.3f  gap %+.3f "
+              "CI [%+.3f, %+.3f] %s"
               % (statistics.median(dmed), statistics.median(d),
-                 abs(statistics.median(dmed) - statistics.median(d))))
-        print("       within-cell spread, arm A %.4f of level, arm B %.4f  -- comparable "
-              "spreads are what let the two differences agree" % (spa, spb))
+                 statistics.median([x - y for x, y in zip(dmed, d)]), glo, ghi,
+                 "AGREE" if glo <= 0 <= ghi else "DIFFER, so the estimator choice matters"))
+        print("       within-HALF spread, arm A %.4f of level, arm B %.4f (worse half, over "
+              "%d reps)  -- comparable spreads are what let the two differences agree; this "
+              "is a between-arm comparison at matched n, not a noise level, since max-min "
+              "grows with n" % (spa, spb, A.reps))
         print("       scale %8.2f us   median ratio A/B %.4f%s"
               % (scale, rat, "" if SHIM else " (attenuated by the per-call tax)"))
-print("\nTHE DIFFERENCE IS TAX-FREE AND THE SCALE IS NOT, SO THE `scale` COLUMN ABOVE MUST")
-print("NOT BE COMPARED WITH THE MICROSECOND BANDS IN THE SHIPPED COMMENT. That comment puts")
-print("the cells where the partition loses at 19-30 us and the ones where it wins at 31-110.")
-print("This object charges a per-call getenv tax on top of every reading, so a cell printed")
-print("here at 50 us may be a 25-30 us cell on a release object -- which is the other side")
-print("of the comment's crossover. Placing these cells in those bands needs the tax measured")
-print("and subtracted; until then the sign and size of A-B stand and their position relative")
-print("to the comment's threshold does not.")
+if SHIM:
+    print("\nTHE `scale` COLUMN IS COMPARABLE TO THE SHIPPED COMMENT'S BANDS, AND READING IT")
+    print("DIRECTLY IS WHY THE SHIM EXISTS. That comment puts the cells where the partition")
+    print("loses at 19-30 us and the ones it wins at 31-110. Under the shim the getenv tax is")
+    print("amortised to a per-batch rather than a per-call cost, so `scale` is the kernel's")
+    print("own level and lands in one of those bands without a subtracted constant. The ratio")
+    print("column is likewise unattenuated, which matters because the comment's criterion is")
+    print("itself a ratio -- 'falls more than 10% behind' -- so an additive tax would shrink")
+    print("the very quantity the threshold is stated in.")
+else:
+    print("\nTHE DIFFERENCE IS TAX-FREE AND THE SCALE IS NOT, SO THE `scale` COLUMN ABOVE MUST")
+    print("NOT BE COMPARED WITH THE MICROSECOND BANDS IN THE SHIPPED COMMENT. That comment")
+    print("puts the cells where the partition loses at 19-30 us and the ones where it wins at")
+    print("31-110. This object charges ~20 us of getenv per call, measured, so a cell printed")
+    print("here at 50 us is a ~30 us cell without it -- the other side of the comment's")
+    print("crossover. The sign and size of A-B stand; their position relative to the")
+    print("comment's threshold does not. Re-run under the shim to read the band directly.")
 print("\nR1's two controls are matched on different axes: C1 is the SAME MATRICES as T at")
 print("another width, C2 is the same width as T at another nnz. An R1 effect has to clear")
 print("both to be a property of the gate rather than of the population.")
