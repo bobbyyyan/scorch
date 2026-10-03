@@ -1539,3 +1539,102 @@ being scored. Every geomean falls under it (k=32 1.6052 -> 1.2993) because cells
 much faster are preferentially removed. It buys a floor matched in dispersion at the cost of
 conditioning on the outcome -- acceptable for a within-width noise comparison, not for a
 population estimate, and the reason the full table stays the headline figure.
+
+---
+
+# The k=4 shortfall is a DEGREE effect, confirmed on both collections
+
+Measured 2026-10-03. The earlier section here localised a DLMC float32 deficit at k=4 and left
+its cause open. Two further readings change the finding's scope in both directions: it is **not**
+specific to DLMC, and it is **not** present at low degree.
+
+## First, the reading that looked like a refutation
+
+SuiteSparse float32, 22920 cells over 4584 matrices, min over the six passes of `c196`'s `sh_c0`
+set, A/A floor (oursb/ours) median 1.0000 with p05 0.9764:
+
+| k | geomean MKL/ours | behind parity |
+|---|---|---|
+| 2 | 1.7351 | 19/4584 = 0.4% |
+| 4 | 1.9346 | 39/4584 = 0.9% |
+| 8 | 2.3038 | 12/4584 = 0.3% |
+| 16 | 2.7101 | 3/4584 = 0.1% |
+| 32 | 2.9065 | 3/4584 = 0.1% |
+
+**k=4 is not the worst width here -- k=2 is -- and the curve is monotone in k.** Taken at face
+value that says the DLMC k=4 result does not generalise, which under this project's standard
+would make a k=4 change an overfit to one collection.
+
+## It was a composition effect, and the dip is in both corpora
+
+The statistic that settles it is **paired within each matrix**: for every key, the log of its k=4
+ratio minus the mean of the logs of its k=2 and k=8 ratios. Each matrix's own level cancels, so
+this measures the *shape* of the width curve and not how fast the matrix is. Bootstrapped over
+matrices, 4000 resamples:
+
+| degree band | SuiteSparse n | dip, 95% CI | DLMC n | dip, 95% CI |
+|---|---|---|---|---|
+| 0-32 | 4167 | -2.82% [-3.40, -2.22] | 1051 | **+0.95%** [+0.61, +1.31] |
+| 32-100 | 308 | -6.13% [-7.58, -4.60] | 781 | -2.39% [-3.01, -1.74] |
+| 100-256 | 58 | **-11.23%** [-14.13, -8.57] | 1275 | **-11.72%** [-12.55, -10.85] |
+| 256+ | 51 | **-9.66%** [-12.45, -6.80] | 713 | **-15.59%** [-17.25, -13.91] |
+
+Sign counts at 100-256 are 51 of 58 and 1083 of 1275. Every interval excludes zero, the two
+corpora's intervals **overlap** at 100-256, and the effect is monotone in degree on both.
+
+**Why the aggregate hid it:** 90.9% of SuiteSparse keys have mean degree below 32, where the dip
+is small, against 52.1% of DLMC keys at degree >= 100, where it is -11% to -16%. The pooled
+SuiteSparse number is an average over a population that is almost entirely outside the affected
+region. So the previous paragraph's "k=4 is not the worst width" is true of the collection and
+false of the mechanism.
+
+| | deg 0-32 | 32-100 | 100-256 | 256+ |
+|---|---|---|---|---|
+| SuiteSparse share of keys | 90.9% | 6.7% | 1.3% | 1.1% |
+| DLMC share of keys | 27.5% | 20.4% | 33.4% | 18.7% |
+
+**This is the two-corpus confirmation the no-overfitting standard asks for.** The population is
+named by a structural property of the matrix (mean nonzeros per row), the width is fixed by the
+SIMD lane count rather than chosen (`scorch_simd_half<float>::lanes == 4`), and the same effect
+with overlapping intervals appears in two corpora collected for different purposes.
+
+## In absolute terms, which is what the MKL goal is about
+
+The dip is a shape statistic; the goal is parity. Geomean MKL/ours at k=4:
+
+| | deg 100-256 | deg 256+ |
+|---|---|---|
+| SuiteSparse | 1.1894 | 1.0853 |
+| DLMC | 1.0198 | **0.9823** |
+
+So k=4 at high degree is the weakest cell on both collections, and on DLMC above degree 256 it
+is **below parity**. Everywhere else both collections are comfortably ahead.
+
+## Two caveats that bound the claim
+
+**The interpolation baseline mixes three kernels.** float32 k=2 is owned by the narrow-k exact
+kernel, k=4 by the half-vector kernel (`HALFVEC_F32=1`, taken when `B1_size == lanes == 4`), k=8
+by the register block. So the dip is k=4's kernel measured against the geometric mean of two
+*other* kernels, and it cannot by itself separate "k=4 is bad" from "k=2 and k=8 are both good".
+The absolute table above is what carries the parity claim; the dip is what shows the effect is
+degree-dependent and cross-corpus.
+
+**The two boards differ in method.** SuiteSparse is min-over-six-passes with a p05 floor of
+0.9764; DLMC is a single pass with 0.9394. The dip is computed within a board and within a degree
+band, so the method difference moves levels rather than the shape -- but the SuiteSparse
+high-degree bands rest on 58 and 51 matrices, and that is the thinnest part of the evidence.
+
+## What this implies for the open cause, without closing it
+
+A prior half-vector study on this host measured the **multi-row plus half-vector conjunction** at
++12.95% to +39.28% on DLMC float32 at degree >= 256, n=712 -- the same population, the same
+width, and the band where the dip is largest. That conjunction is
+`SCORCH_SPMM_MULTIROW_HALFVEC`, which ships at 0 (`scorch_policy.h:662`, "the mechanism is new
+and unmeasured"), and it is what the running screen is collecting. The already-shipping
+single-row half-vector (`HALFVEC_F32=1`) does not close the dip, which is what the measurements
+above establish.
+
+**Still not a mechanism.** What is established is the population and the width; what the
+conjunction would need in order to ship is the screen's own result plus the missing
+`(rows 2, halfvec 0)` arm, since without it `mr0 -> mrhv` attributes to the package and not to
+either component.
