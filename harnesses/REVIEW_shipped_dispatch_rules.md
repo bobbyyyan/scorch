@@ -149,14 +149,48 @@ over all 3846 local DLMC matrices, then calling the *production* `_locality_rati
 The 4 sampled entries separate 2162 of the 2188, so **the dimension-only bound overstates the
 collision population by 84x** -- reported beside the exact figure rather than instead of it.
 
+DLMC's largest bound-group is **144 keys at `(512, 512, 26214)`** -- larger than SuiteSparse's 94,
+and on the corpus where the exact figure is available, so both extrema are named rather than
+whichever one reads smaller.
+
 **And the 26 are not a defect.** All three groups carry `nnz = 0`: they are exactly the 26 DLMC
 keys with no nonzeros (`chain209-dlmc-dims/dlmc_dims.csv`, sealed digest `ff167f71d50abf74`,
 manifest 9 of 9 OK) -- variational_dropout 0.98 layers pruned away entirely. Being all-zero they
 are *identical* as CSR operands: `_locality_ratio` 0.0, `_scattered` False and `_degree_cv` 0.0 for
-all 26, ranges exactly 0.000000. Replaying one's memo entry for another therefore returns the right
-answer rather than a misroute. They also never reach the memo at all -- `is_candidate` is False,
-and `_eligible` / `_eligible_learned` are False at N = 2, 4, 8, 256 and 2048, because
-`_degree_pays` cannot pass at nnz = 0.
+all 26, ranges exactly 0.000000. **Replaying one's memo entry for another therefore returns the
+right answer rather than a misroute, and that is the reason the verdict rests on.**
+
+**The floor of this result is forced by the sealed census; the ceiling is the measurement's alone.**
+`chain209-dlmc-dims` carries only `key, rows, cols, nnz`, and within it the 26 `nnz == 0` keys fall
+in exactly 3 `(M, J, nnz)` groups of sizes 5, 5 and 16. An all-zero CSR has an all-zero `indptr`
+and an empty `indices`, so the 4 sampled entries are identical within a group and the dimensions
+differ across groups -- those 3 groups and 26 keys **must** collide at the full signature, with no
+access to the arrays. What needs the run is only that *nothing else* collides. Stating the
+decomposition matters because an error in the separation would appear as **more** than 26, and the
+sealed floor would still hold. Peer reviewer's observation.
+
+**A correction to the second reason, which is narrower than first committed.** "They never reach
+the memo" is true for the analytic levels and **false for the learned one.** `_degree_pays`
+(`:466`) is `nnz / max(1, J) > max(_DEG_FLOOR, 2.0 * (J * 4 * N) / C)`; at `nnz = 0` the left side
+is exactly 0.0 and the right is `max(64.0, a non-negative term)`, so it is False **for every N, J
+and C** rather than at the five widths I sampled -- a theorem, not a sweep, and the peer reviewer's
+point. (Precisely: unconditional at the default `_DEG_FLOOR = 64`; an override would need both a
+negative floor *and* a negative `SCORCH_LLC_BYTES` to reach the right side below zero.) But
+`_eligible_learned(J, N, C)` is `_operand_over_cache(J, N, C)` and **reads no nnz at all**, so it
+is not structurally False here, and my five N values simply all sat below the cache boundary:
+
+| J | N | `_operand_over_cache` | `_eligible_learned` | `is_candidate(level="learned")` |
+|---|---|---|---|---|
+| 512 | 8192 | False | False | False |
+| 512 | **16384** | True | **True** | **True** |
+| 2048 | **4096** | True | **True** | **True** |
+
+So an all-zero operand *does* become a candidate at the learned level once `J * 4 * N > C`
+(C = 16777216 on this host), and `is_candidate` is False at analytic, balanced and max for every N
+tested. This does not revive the hazard -- the operands are identical, so the replay is still
+correct -- but it removes one of the two independent reasons at one level, and the remaining reason
+is the one about correctness rather than reachability. It is also outside every width we measure:
+our screens run N <= 32.
 
 **So the hazard has zero reachable instances on DLMC, for two independent reasons, and that is a
 measurement rather than a reading.** Scope, exactly: exact on DLMC because all 3846 matrices are
