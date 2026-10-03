@@ -65,7 +65,18 @@ def main():
     # instead; if that column never holds 0 the filter yields an EMPTY table, which at this
     # marginal would print as a clean "all shared keys are behind, NOT SCOREABLE" and read like a
     # measurement.
+    # LIVENESS IS NOT OPTIONAL HERE, and getting it wrong was the defect that prompted this
+    # paragraph. A cell reaching ONE distinct worker count has no argmin, so the headroom statistic
+    # is UNDEFINED there -- not small. Grouping every shared key by its resolved count silently
+    # widens the predicate to a superset of the population the effect was measured on: the nine
+    # live `<=2` cells of the 72-key corpus, of which exactly ONE is in the shared set. A table
+    # whose `<=2` cell held seven keys therefore had apparent power 7 and real power 1, and a
+    # verdict read off the four non-behind keys in it was read off cells where no headroom can
+    # exist. Liveness is counted the same way `nt_k2curve.py` counts it -- distinct `resolved`
+    # values for the cell across every override row -- and reported per group rather than applied
+    # silently, because n=1 labelled n=1 is worth more than n=7 carrying six undefined cells.
     seen = collections.defaultdict(set)
+    reach = collections.defaultdict(set)
     rows = 0
     for r in csv.DictReader(open(A.oracle)):
         rows += 1
@@ -73,8 +84,10 @@ def main():
             if int(r["k"]) != A.k:
                 continue
             seen[r["key"]].add(int(r["res_ovr0"]))
+            reach[r["key"]].add(int(r["resolved"]))
         except (KeyError, TypeError, ValueError):
             continue
+    live = {k for k, v in reach.items() if len(v) >= 2}
     bad = {k: sorted(v) for k, v in seen.items() if len(v) != 1}
     if bad:
         raise SystemExit("REFUSE: %d key(s) carry more than one res_ovr0 at k=%d, so production's "
@@ -95,20 +108,36 @@ def main():
                          "side: an unnormalised prefix is the usual cause.")
 
     GRP = (("<=2", lambda n: n <= 2), ("3-7", lambda n: 3 <= n <= 7), (">=8", lambda n: n >= 8))
-    tab = collections.Counter()
-    for key in shared:
-        g = next(name for name, pred in GRP if pred(res[key]))
-        tab[(g, "behind" if key in behind else "not")] += 1
-    print()
-    print("  %-8s %8s %8s %8s   %s" % ("group", "behind", "not", "total", "behind share"))
-    for name, _p in GRP:
-        b, n_ = tab[(name, "behind")], tab[(name, "not")]
-        t = b + n_
-        print("  %-8s %8d %8d %8d   %s"
-              % (name, b, n_, t, ("%.1f%%" % (100.0 * b / t)) if t else "n=0, no share"))
-    tb = sum(tab[(g, "behind")] for g, _ in GRP)
-    tn = sum(tab[(g, "not")] for g, _ in GRP)
-    print("  %-8s %8d %8d %8d" % ("TOTAL", tb, tn, tb + tn))
+    print("LIVENESS    %d of %d oracle keys at k=%d reach >=2 counts; among the %d shared, %d live"
+          % (len(live), len(oracle_keys), A.k, len(shared), sum(1 for x in shared if x in live)))
+
+    def build(pop, label):
+        tab = collections.Counter()
+        for key in pop:
+            g = next(name for name, pred in GRP if pred(res[key]))
+            tab[(g, "behind" if key in behind else "not")] += 1
+        print()
+        print("  %s" % label)
+        print("  %-8s %8s %8s %8s   %s" % ("group", "behind", "not", "total", "behind share"))
+        for name, _p in GRP:
+            b, n_ = tab[(name, "behind")], tab[(name, "not")]
+            t = b + n_
+            print("  %-8s %8d %8d %8d   %s"
+                  % (name, b, n_, t, ("%.1f%%" % (100.0 * b / t)) if t else "n=0, no share"))
+        tb = sum(tab[(g, "behind")] for g, _ in GRP)
+        tn = sum(tab[(g, "not")] for g, _ in GRP)
+        print("  %-8s %8d %8d %8d" % ("TOTAL", tb, tn, tb + tn))
+        return tab, tb, tn
+
+    _, _, _ = build(shared, "ALL SHARED KEYS -- NOT the population the effect was measured on; "
+                            "printed only so the widening is visible")
+    livshared = [x for x in shared if x in live]
+    if not livshared:
+        raise SystemExit("REFUSE: no shared key is live at k=%d, so the effect's population is "
+                         "empty here and every share below would be undefined rather than small"
+                         % A.k)
+    tab, tb, tn = build(livshared, "LIVE SHARED KEYS ONLY -- THIS is the effect's population, "
+                                   "because a cell reaching one count has no argmin")
 
     # The registered reading, applied rather than described.
     nonb = [(g, tab[(g, "not")]) for g, _ in GRP if tab[(g, "not")]]

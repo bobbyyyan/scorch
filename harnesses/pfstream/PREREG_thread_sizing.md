@@ -1730,6 +1730,12 @@ it, which is the ceiling-not-the-count point in its sharpest form.
 
 ## Amendment 23 — the only direct test of the association runs OPPOSITE to the hypothesis, and that is a prediction for the job now running
 
+> **VOID. The table was built on the wrong population and the directional prediction is
+> WITHDRAWN by amendment 25, before job 17698209 reported.** The `<=2` cell held seven keys
+> of which six are NON-LIVE — one reachable count, so the headroom statistic is undefined
+> there, not small — and all four non-behind keys the verdict turned on were among them. On
+> the effect's own population the sign reverses and n is 1.
+
 Amendment 22(d) registered the 20-key cross-tabulation and its reading before running it.
 `an_xtab_resolved_behind.py` at `eb71b2c2f0034df2`, on MKT's existing oracle (38016 rows, 72 keys
 with a production count at k=2) against the float32 DLMC board's behind set (328 of 392 = 83.7%,
@@ -1839,3 +1845,97 @@ submitted at the amended design and is running; `sbatch` spools the script at su
 conditions in its header are fixed as of submission. This amendment pins a **denominator for reading
 them**, written before the job has produced an analysable CSV and before any share has been computed
 on either base.
+
+---
+
+## Amendment 25 — amendment 23 is VOID: "unconditional" widened the predicate instead of the sample. Apparent power 20, real power 1. The prediction is withdrawn before readout.
+
+Amendment 22(d) diagnosed amendment 21(b)'s join as **conditioning on the predictor** and replaced
+it with an unconditional cross-tabulation. The replacement fixed the conditioning and **silently
+widened the predicate**, which is the same error one level up.
+
+### The arithmetic, from two numbers already published
+
+The effect — `<=2` excess **1.3454** — was measured on the **nine LIVE `<=2` cells** of the 72-key
+corpus at k=2. Amendment 21(b) reports *"9 keys requested, 1 PRESENT in the screen's corpus"*, and
+the shared 20 **is** that intersection. **So exactly one of the nine is in the table. The table's
+`<=2` cell held seven.** At least six of the seven cannot be in the mechanism's population, and the
+registered verdict turned on *"four of the six non-behind keys sit at `<=2`"*.
+
+### Confirmed at the source, and the confounding is near-total
+
+`an_xtab_resolved_behind.py` at `6a1dd1…` now counts liveness the way `nt_k2curve.py` does —
+distinct `resolved` values for the cell across every override row — and prints both tables:
+
+| | `<=2` | `3-7` | `>=8` |
+|---|---|---|---|
+| all 72 keys | **28** | 11 | 33 |
+| LIVE (53) | **9** | 11 | 33 |
+| NON-LIVE (19) | **19** | 0 | 0 |
+
+**Every one of the 19 non-live keys resolves to `<=2`, and none to `3-7` or `>=8`.** Liveness and
+the `<=2` group are therefore almost entirely confounded on this corpus: a cell resolving to `<=2`
+workers is non-live **19 times in 28 (67.9%)**, because a small work measure under
+`min(override, rows/16)` leaves only one reachable count. `3-7` and `>=8` are 100% live.
+
+The two tables on the shared 20:
+
+| population | `<=2` behind/not | `>=8` behind/not | registered reading | Fisher p |
+|---|---|---|---|---|
+| all 20 shared | 3 / 4 → 42.9% | 11 / 2 → 84.6% | **NOT SUPPORT** | 0.1219 |
+| **LIVE 14 shared** | **1 / 0 → n=1** | 11 / 2 → 84.6% | **SUPPORT** | **1.0000** |
+
+### Both readings are worthless, in opposite directions, and that is the finding
+
+**The all-shared reading was built on cells where the quantity is undefined.** The four non-behind
+`<=2` keys that produced NOT SUPPORT are all non-live: the live `<=2` cell is 1 behind and 0 not.
+
+**The live reading returns SUPPORT vacuously.** With one cell in `<=2` and no non-behind key in it,
+amendment 22(d)'s rule — *"support only if every non-behind key sits at `>=8`"* — **cannot fail**.
+Fisher's p is exactly 1.0000. **A registered reading with no minimum-n clause can return SUPPORT
+from a table that carries no information**, and that is a defect in the registration, not in the
+data. The 20-key test is declared **VOID** rather than re-scored: a reading rule repaired after
+seeing the table it will score is not a registration.
+
+### Amendment 23's directional prediction is WITHDRAWN
+
+It registered *"`s328 - s64` should be NEGATIVE"* from the all-shared sign (42.9% against 84.6%).
+**That sign comes from six non-live cells.** On the effect's own population the direction reverses —
+100.0% against 84.6% — on n=1.
+
+**Withdrawal is still free and that is the only reason it is worth anything.** Job 17698209 is
+running and has not produced an analysable CSV. Had it landed negative first, the prediction would
+have "confirmed" a direction that was never the mechanism's, and nothing in the output could have
+shown the difference. **Registering a direction before readout is right; registering it off a
+contaminated sign spends the pre-registration for nothing.** Conditions 1 through 4 of amendments
+21(c), 22 and 24 are untouched — they are defined on the 392-key sweep's own live cells, not on
+this table.
+
+### A second bound on reach, which does not depend on the deficit overlap at all
+
+**The subgroup where element 2 locates the headroom is the subgroup where the headroom is most often
+undefined.** Of 72 keys at k=2, the cells where a thread rule can act *and* the `<=2` excess applies
+number **9 — 12.5%**. The other 19 `<=2` cells reach one worker count, so there is nothing for any
+rule to choose. That is independent of whether the `<=2` cells are behind MKL, and it is the same
+12.5% that amendment 24 fixed as the base-matched prevalence, now with a mechanical reason rather
+than a coincidence of denominators.
+
+### Two incidental facts worth recording, both weak
+
+**The shared 20's marginal is low because of the non-live keys.** 70.0% behind against the corpus's
+83.7% is `z = -1.66` (p ≈ 0.10). Decomposed: the 14 live shared keys are **85.7% behind** and the 6
+non-live ones **33.3%**. So the shared set is not a less-behind random subsample — it carries six
+single-count cells that are mostly ahead.
+
+**And the `3-7` cell being empty among the 20 is not surprising after all.** `3-7` is 11 of 72 keys
+= 15.3%, so `20 × 0.153 = 3.1` expected and 0 observed is unremarkable at this n. Amendment 23
+reported the empty cell as a fact about the table; it is a fact about the sample size.
+
+### The reusable form
+
+**A table is only as informative as the cell where the effect could exist.** Widening a group to
+include cells where the quantity is undefined is not more power, it is a different question — and
+it reads as more power, because the n goes up. The nine-key join kept 1 cell by conditioning on the
+predictor; the 20-key table kept 20 by redefining the predictor to a superset of the effect's
+domain, and the effect's domain inside it was still 1 cell. **Apparent power 20, real power 1.**
+Print the undefined-cell count per group, always, beside the n.
