@@ -416,13 +416,28 @@ per call and that tax manufactures deficits on short kernels.
 
 Measured 2026-10-02, same host and allocation. Three corrections and one enabling result.
 
-**The earlier design could not attribute its own number.** The first sweep varied the
-caller's pool and recomputed the resolved thread count from it, so it moved two things at
-once. `scorch_spmm_partition_mode` takes the resolved count and the pool as *separate*
-arguments: the pool ceiling reads the pool, and a different single-worker gate reads the
-count. On the grid used, the resolved count at pool 8 is **<= 1 on 36 of 216 cells**, and
-on those mode 0 is forced by the single-worker gate with the ceiling unreadable. So "29 of
-165 forced at pool <= 16" conflated the ceiling with the worker count.
+**WITHDRAWN: the earlier design was not confounded, and this paragraph originally said it
+was.** The first sweep varied the caller's pool and recomputed the resolved thread count
+from it, so one swept variable reached both arguments of `scorch_spmm_partition_mode`. I
+concluded from that structure that the number was not attributable, and named the
+single-worker gate as the second consumer.
+
+That gate is `partition_solo_off && nthreads <= 1` and
+`SCORCH_SPMM_PARTITION_SOLO_OFF` is **0** at `:531`, so it cannot fire in a shipped build
+-- and it is the only one of the four predicates that reads `nthreads` at all. Measured
+over 288 cells at a fixed pool, `partition_mode` is identical at nthreads of 1, 2, 8, 32
+and 128, at both pools: **zero cells differ**. With the solo gate switched on by its hook,
+nthreads=8 against nthreads=1 moves **215** cells, which is the control showing the
+comparison could have detected a difference had one existed.
+
+So the second argument the swept variable reached has no effect at shipped settings, the
+old figure was not confounded, and the 29-against-35 difference was entirely the grid
+(175 cells against 216). I reasoned from the shape of the call rather than measuring
+whether the shape mattered, which is the same error as inventing a mechanism for a
+misattributed failure -- a structural argument standing in for a measurement.
+
+What survives: holding the count fixed is still the right construction, and running it is
+how the independence above is now known rather than assumed. It is a result, not a repair.
 
 Instrument: `harnesses/pfstream/gate_isolate.py`, grid 6 rows x 8 nnz x 6 k = 288 cells,
 committed so every figure below is regenerable. The first version of this entry quoted
@@ -434,16 +449,16 @@ reproduced from the repository. That is the defect `scratchpad is not storage` n
 
 | held nthreads | gate-attributable | live cells | share |
 |---|---|---|---|
-| 2 | 35 | 210 | 16.7% |
-| 4 | 35 | 210 | 16.7% |
-| 8 | 35 | 210 | 16.7% |
-| 16 | 35 | 210 | 16.7% |
-| 32 | 35 | 210 | 16.7% |
+| 2 | 65 | 280 | 23.2% |
+| 4 | 65 | 280 | 23.2% |
+| 8 | 65 | 280 | 23.2% |
+| 16 | 65 | 280 | 23.2% |
+| 32 | 65 | 280 | 23.2% |
 
-With the two bracket points added the grid is 288 cells and the figures become 65 of 280
-live, 23.2%, again identical at every held count. The share is a property of the grid and
-moves when the grid does, which is why the prevalence section below computes it on a real
-collection instead.
+Identical at every held count, and every row now reads **exact** against the composed
+prediction. The share moved from 16.7% to 23.2% when two cells were added to the grid,
+which is the plainest possible demonstration that a share of a synthetic grid is a property
+of the grid -- the prevalence section below computes it on a real collection instead.
 
 Identical at every held count, which is the expected result rather than a suspicious one:
 the gate's test is `work_proxy = nnz * max(k,16)` against `mingrains * SCORCH_GRAIN_SPMM`,
@@ -457,11 +472,17 @@ two committed constants -- `SCORCH_SPMM_PARTITION_MINGRAINS 2L` at `:1581` and
 `SCORCH_GRAIN_SPMM 150000L` at `:82`, giving a threshold of 300000. The prediction is 36
 cells, from 6 `(nnz,k)` pairs (all at nnz=3000) times 6 row values.
 
-Production attributes **35 of the 36**, and the single difference is named:
-`(rows=1000000, nnz=3000, k=32)` returns mode 0 at the small pool *and* at the large one,
-so it is not live at either and cannot be attributed to the ceiling -- a matrix with 0.003
-nonzeros per row is excluded by something else first. Both env routes differ from the
-prediction by exactly that one cell and by nothing else.
+**Composed, the prediction is exact.** A closed form for one predicate in a chain is an
+upper bound, not a prediction, and an uncomposed one turns a disagreement into a narrative
+instead of a defect -- which is what the first version of this section did, explaining its
+one leftover cell in prose afterwards. `scorch_llc_bytes()` is exported, reads 33554432
+(32.0 MiB) on mkt1, and `MAXOUT_LLC` is 2L, so maxout is 67108864 exactly. Composing the
+work gate with maxout predicts **65** of the 66 the work gate alone predicts, removing
+exactly `(rows=1000000, nnz=3000, k=32)` at `1000000 x 32 x 4 = 128000000 >= 67108864`.
+Production returns 65. The cell is predicted rather than accounted for.
+
+The measured bound of (64M, 128M] from the elem_size probe contains the exported 67108864,
+so the two routes to the constant agree.
 
 **Corrected: as first run, leg 3 BOUNDED the constant rather than confirming it.** The
 original grid was geometric, with a 16x gap between nnz=3000 and nnz=20000. Its largest

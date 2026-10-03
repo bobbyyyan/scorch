@@ -27,15 +27,26 @@ THREE INDEPENDENT LEGS, because the first two share a weakness.
      with each other -- but both go through the same exported function, so neither can
      tell whether that function reads the constants the header declares.
 
-  3. THE CLOSED FORM, which is what leg 2 cannot do. work_proxy has no thread term and
-     no row term, so the fired set is determined by (nnz, k) and the two committed
-     constants alone. Production must return exactly the predicted set. If the linked
-     object's MINGRAINS or GRAIN_SPMM differs from the header -- which is what a
-     defines-only rebuild relinking stale objects produces -- the two env routes still
-     agree with each other and both disagree with the prediction.
+  3. THE COMPOSED CLOSED FORM, which is what leg 2 cannot do. Production must return
+     exactly the predicted set. If the linked object's MINGRAINS or GRAIN_SPMM differs
+     from the header -- which is what a defines-only rebuild relinking stale objects
+     produces -- the two env routes still agree with each other and both disagree.
 
-  Plus two free invariances the predicate's own form demands: the fired set must not
-  depend on the held thread count, and must not depend on rows.
+     COMPOSED is the operative word. A closed form for ONE predicate in a chain is an
+     upper bound, not a prediction, and an uncomposed one turns a disagreement into a
+     narrative instead of a defect. The function holds four predicates:
+
+       solo       partition_solo_off && nthreads <= 1    DISABLED by default (:531 is 0)
+       ceiling    pool > gate_maxthreads                 reads pool
+       work gate  work_proxy < mingrains * GRAIN_SPMM     reads nnz, k
+       maxout     rows * out_cols * elem_size >= maxout   reads rows, out_cols, elem_size
+
+     Composing the work gate with maxout predicts 65 of the 66 the work gate alone
+     predicts, and 65 is what production returns. The single excluded cell is predicted
+     rather than accounted for afterwards.
+
+  Plus the invariances the predicate's form demands, each with the control that shows the
+  check is not vacuous.
 
 Usage: gate_isolate.py [small-pool] [big-pool]
 """
@@ -64,9 +75,16 @@ MINGRAINS, GRAIN = 2, 150000
 THRESHOLD = MINGRAINS * GRAIN
 
 
-def predicted():
-    """The cells the gate must force, from the committed constants alone."""
-    return {c for c in CELLS if c[1] * max(c[2], 16) < THRESHOLD}
+def predicted(maxout, elem=4):
+    """The cells the gate must force, COMPOSED with the predicates downstream of it.
+
+    The work gate alone is an upper bound: a cell it forces may already be mode 0 from
+    maxout, in which case it is not live at either pool and cannot be attributed to the
+    ceiling. Returns (composed, work_gate_only) so the difference is visible.
+    """
+    work_only = {c for c in CELLS if c[1] * max(c[2], 16) < THRESHOLD}
+    composed = {c for c in work_only if c[0] * c[2] * elem < maxout}
+    return composed, work_only
 
 
 def run(code, env=None):
@@ -107,22 +125,41 @@ def main(argv):
           % (len(exact), "-> `<` vs `<=` is testable" if exact else "-> strictness UNTESTED"))
     print()
 
-    pred = predicted()
-    pairs = sorted({(n, k) for _, n, k in pred})
-    print("LEG 3  closed-form prediction: %d cells, from %d (nnz,k) pairs x %d row values"
-          % (len(pred), len(pairs), len(ROWS)))
-    print("   pairs: %r" % pairs)
-
-    # ---- the confound the first sweep could not separate
-    nts = run("import json,scorch_ops as S;print(json.dumps("
-              "[S.scorch_spmm_nthreads(n*max(k,16),r,%d,n*k,n) for (r,n,k) in %r]))"
-              % (small, CELLS))
-    if nts is None:
+    llc = run("import scorch_ops as S;print(S.scorch_llc_bytes())")
+    if llc is None:
+        print("EXIT: scorch_llc_bytes is not exported, so maxout cannot be composed and")
+        print("      leg 3 would be an upper bound presented as a prediction.")
         return 1
-    print("\n   for reference, the resolved count at pool %d is <= 1 on %d of %d cells --"
-          % (small, sum(1 for x in nts if x <= 1), len(CELLS)))
-    print("   on those, mode 0 is forced by the single-worker gate and the ceiling cannot")
-    print("   be read at all. That is the confound leg 1 removes.")
+    maxout = 2 * llc          # SCORCH_SPMM_PARTITION_MAXOUT_LLC is 2L at :534
+    print("llc_bytes from the build: %d (%.1f MiB), so maxout = %d"
+          % (llc, llc / 1048576.0, maxout))
+    pred, work_only = predicted(maxout)
+    print("\nLEG 3  work gate alone predicts %d cells; COMPOSED with maxout, %d."
+          % (len(work_only), len(pred)))
+    print("   composition removes %r" % sorted(work_only - pred))
+
+    # ---- does nthreads reach the answer at all? With its control.
+    print("\nNTHREADS: the only predicate reading nthreads is the solo gate, and")
+    print("   SCORCH_SPMM_PARTITION_SOLO_OFF is 0 at :531, so it cannot fire in a shipped")
+    print("   build. If that reading is right, partition_mode is INDEPENDENT of nthreads")
+    print("   and a sweep that recomputed nthreads from the pool was never confounded.")
+    for pool in (small, big):
+        ref = modes(1, pool, CELLS)
+        if ref is None:
+            continue
+        diffs = []
+        for nt in (2, 8, 32, 128):
+            got = modes(nt, pool, CELLS)
+            diffs.append("nt=%d:%d" % (nt, sum(1 for a, b in zip(ref, got) if a != b)
+                                       if got else -1))
+        print("   pool %-4d cells differing from nt=1 --  %s" % (pool, "  ".join(diffs)))
+    ref = modes(1, small, CELLS, {"SCORCH_SPMM_PARTITION_SOLO_OFF": "1"})
+    got = modes(8, small, CELLS, {"SCORCH_SPMM_PARTITION_SOLO_OFF": "1"})
+    if ref and got:
+        print("   CONTROL, solo gate ENABLED: nt=8 vs nt=1 -> %d cells differ. Without this"
+              % sum(1 for a, b in zip(ref, got) if a != b))
+        print("   row the zeros above would be indistinguishable from a probe that cannot")
+        print("   vary nthreads at all.")
 
     # ---- LEG 1, and the two invariances
     print("\nLEG 1  isolation: resolved count HELD, only the pool varies")
