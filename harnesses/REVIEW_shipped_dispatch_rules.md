@@ -977,15 +977,44 @@ Positive = the gate selects the slower mode; the ratio is mode 0 over mode 3.
 
 Every cell is positive, every interval excludes zero, and the sign count is 120 of 120 in
 15 of the 16 cells and 118 of 120 in the other. Tax-free cell scales run 20.5 to 34.6 us.
-The A/A floors over the same 16 configurations have a maximum absolute median of 0.029 us
-and most span zero -- three of the eight pool-and-control combinations contain at least one
-width whose interval excludes zero, at magnitudes of 0.01 to 0.029 us against effects of 2
-to 15 us, so they are measured and 100 to 1000 times too small to matter here.
 
-**The sign does not depend on the pool across the gate's whole active range on x86.** Only
-the magnitude does, and it grows: about 7-10% at pool 2, 17-23% at pool 4, and 46-62% at
-pools 8 and 16. A reversal at the low end was the outcome that would have made the gate
-defensible with only its threshold placement in question, and it does not occur.
+**The floor multiple is computed per cell, not from two ranges.** An earlier version of
+this section said the floors were "0.01 to 0.029 us against effects of 2 to 15 us, so 100
+to 1000 times too small" -- which multiplies the ends of two separate ranges and is only
+the range of the ratio if the extremes co-occur. Those inputs in fact permit 69x to 1500x.
+Measured per configuration, against the larger of that cell's own two controls:
+
+| pool | k=2 | k=4 | k=8 | k=16 |
+|---|---|---|---|---|
+| 2 | 249x | 610x | 227x | 431x |
+| 4 | 1877x | 425x | 329x | 329x |
+| 8 | 1765x | 6416x | 3856x | 2284x |
+| 16 | 12185x | 3675x | 1200x | 377x |
+
+The minimum is **227x** at pool 2, k=8. The upper end is not a stable quantity -- a floor
+that happens to land near zero inflates the ratio without saying anything -- so the claim
+is the minimum. Note that the published 100-to-1000 figure was wrong in *both* directions:
+arrived at by an invalid method, and understating the measured separation by an order of
+magnitude at the top. It needed correcting irrespective of which way it moved.
+
+**The sign does not depend on the pool across the gate's whole active range on x86.** But
+the magnitude does not simply grow, and saying so pooled two levels that should be
+separated. By pool: about 7-10% at pool 2, 17-23% at pool 4, **57-62% at pool 8**, and
+**46-53% at pool 16**. Those last two supports are disjoint and pool 16 is lower at all
+four widths, 4 of 4, so the shape is a rise to a maximum at pool 8 followed by a fall.
+
+A reversal at the low end was the outcome that would have made the gate defensible with
+only its threshold placement in question, and it does not occur.
+
+**The turn matters for the pools still running, so the expectation is registered here.**
+Pools 20 and 24 sit on the falling side, so R2 there should read *below* pool 16's 46-53%.
+A reading at or above pool 8's level would mean the turn is not a trend. And the header
+supplies a prior for it at `:1600`: its pool-24 anchor is 0.785, which in this file's
+time-ratio convention is **1.274** -- below pool 16 and consistent with a continuing
+decline. Different host and different population, so suggestive rather than matched.
+The header's own `:1605-1612` says the same thing a second way: with the ceiling disabled
+so the gate fires at pool 24, "that is the configuration x86 measured at 4-9% cost" -- same
+sign as this whole table, far below the pool 8 peak.
 
 **One qualification the gate's own criterion supplies.** `dcf2e1f` defines materiality as
 "falls more than 10% behind". At pool 2 all four ratios -- 1.068, 1.099, 1.077, 1.086 --
@@ -1019,9 +1048,20 @@ One host, float32, 120 cells per configuration, isolated allocations where conce
 cannot fire. Pools 20 and 24 are running: above the ceiling R1 becomes a declined argument,
 which supplies a floor on the treatment's own cells, and `8ccd104` already measured that
 construction at about 1% on redwood at pool 24 -- so those pools are a replication of a
-prior reading rather than a new instrument. A registered expectation for them: the floor
-should read at or below that 1%, and materially above it would indict the shim or the
-affinity cap rather than the gate.
+prior reading rather than a new instrument. Two registered expectations for them: the floor
+at or below that 1%, where materially above would indict the shim or the affinity cap
+rather than the gate; and the R2 effect below pool 16's 46-53%, per the turn above.
+
+**Two ambiguities in the shipped comment itself, both affecting how a later reader uses
+it.** At `:1600` the anchor is written "no-partition / partition = 0.785 pooled, 65% of
+cells more than 10% behind". Read as a time ratio that says the counter wins, contradicting
+the clause it sits inside; read as a performance ratio it agrees. The clause settles it --
+"65% of cells more than 10% behind" only parses with the counter behind -- but a later
+reader extracts the number, not the clause, and this file's own tables had to state their
+direction explicitly for the same reason. Separately, `:1593` gives the ARM host's pipeline
+pool as 6 and `:1601` calls it "the M5's 12"; the surrounding text gives that host's
+`omp_get_num_procs()` as 18, so three counts are in play under similar phrasing and only
+the 6 is the pool the contention argument is about.
 
 Not established: a cause. The explanation attempted above is withdrawn, and the remaining
 candidate questions are about `dcf2e1f`'s grid -- its arm labels, and the regressed and
