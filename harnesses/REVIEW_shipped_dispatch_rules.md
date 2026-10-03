@@ -620,11 +620,21 @@ rather than an edge case.
 
 And over the 4594 SuiteSparse matrices cached on mkt1, with **both** predicates applied:
 
-| k | gate alone | + output-bytes | + operands only | share of 4469 operands |
+| k | gate alone | + output-bytes | + operands only | share of 4446 operands |
 |---|---|---|---|---|
-| 1, 2, 4, 8 | 2181 | 2181 | 2092 | **46.8%** |
-| 16 | 2181 | 2180 | 2092 | **46.8%** |
-| 32 | 1379 | 1378 | 1317 | **29.5%** |
+| 1, 2, 4, 8 | 2181 | 2181 | 2069 | **46.5%** |
+| 16 | 2181 | 2180 | 2069 | **46.5%** |
+| 32 | 1379 | 1378 | 1294 | **29.1%** |
+
+**The operand predicate is symmetric and I verified one half where it cannot fire.** The
+first version excluded `shape[1] == 1` on SuiteSparse and reported 0 one-row entries on
+DLMC -- the corpus where *both* halves are vacuous. On SuiteSparse, `shape[0] == 1` catches
+**23** more entries, and all 23 sit inside the region at every width: a one-row CSR has
+`len(indptr)-1 = 1`, so its nnz is tiny and its `rows * k * 4` is `4k`, which never trips
+the output-bytes predicate. They inflate the region exactly as column vectors do.
+
+With both halves, non-operators are 125 + 23 = 148, the operand denominator is 4446, and
+the shares are 46.5% and 29.1% -- 0.93 and 0.92 pp below the uncomposed 47.47% and 30.02%.
 
 **The denominator counted vectors as matrices.** SuiteSparse ships the right-hand side of
 each linear system alongside the operator, and a one-column entry stored as CSR has
@@ -634,8 +644,12 @@ of them were inside the k=16 region. Excluding them shrinks numerator and denomi
 together, so the published 47.5% and 30.0% become 46.8% and 29.5%: a small move, but the
 earlier figures were a share of files rather than a share of operands.
 
-`shape[1] == 1` is the predicate, not the filename: only **29 of the 125** are named with a
-trailing `_b`, so the naming convention would have found less than a quarter of them. It
+The suffixes say what these are. Of the 125 one-column entries: 34 end `_B`, 29 end `_b`,
+11 end `_iv`, and the rest are numbered or bare; the one-row entries are `_C` members like
+`LF10_C` at shape (1, 18) and `LF10000_C` at (1, 19998). These are the components of linear
+systems and state-space models -- right-hand sides, input matrices, initial values, output
+matrices -- shipped alongside the operators. `shape` is the predicate and the filename is
+not: a convention matching `_b` alone would have found 29 of 148. It
 also supersedes an nnz floor I had noted as a design need after seeing region members with
 nnz = 1 over hundreds of thousands of rows -- those are these, and "not an operator" needs
 no chosen constant.
@@ -697,10 +711,21 @@ infers `shape = (len(indptr)-1, max(indices)+1)` when none is given, and an arch
 from such an object satisfies the check *by construction*. The discriminator is
 `shape[1] > max(indices)+1`, which can only hold if `shape` carries information the arrays
 do not -- a matrix with an empty trailing column is not reconstructible from `indices`
-alone. On a 60-entry sample, **16 are strictly greater** and 44 are equal. So `shape` does
-have provenance outside the arrays on part of the corpus, and the check is not circular
-there; it is sampled, and stated as a sample, because it needs the large member
-decompressed.
+alone. On a 60-entry sample, **16 are strictly greater** and 44 are equal.
+
+**And one witness settles it, not sixteen** -- a correction to how the first version of this
+paragraph read the result. Whether `shape` was inferred from `indices` is a property of the
+code that *wrote* the archives, not of any individual matrix, so a single entry where
+`shape[1] > max(indices)+1` proves the writer did not infer, for every archive that writer
+produced. The 44 equal cases are resolved by the same argument rather than left open; the
+26.7% rate answers a different question (how often a matrix happens to carry an empty
+trailing column), which is a fact about the matrices and says nothing about the check.
+
+The premise is a single writer for the whole cache, and two uniformity counts collected for
+other reasons support it: the member set is identical on 4594 of 4594, and the index dtype
+is `int32` on 4594 of 4594. A second writer would have had to match both. What would retract
+it is evidence of incremental or multi-script construction, and those two counts are the
+evidence against.
 
 A `format == b'csr'` check was written first and is not used, because **no file in this
 cache carries a `format` member** -- they are not scipy `save_npz` archives, and a check

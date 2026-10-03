@@ -157,22 +157,34 @@ def main(argv):
     print("\nthe gate alone (nnz * max(k,16) < %d), and COMPOSED with the output-bytes"
           % THRESHOLD)
     print("predicate (rows * k * 4 >= %d excludes), llc = %d:" % (maxout, llc))
-    n_vec = sum(1 for r in got if r[3] and len(r[3]) == 2 and r[3][1] == 1)
+    n_col = sum(1 for r in got if r[3] and len(r[3]) == 2 and r[3][1] == 1)
+    n_row = sum(1 for r in got if r[3] and len(r[3]) == 2 and r[3][0] == 1)
+    n_vec = sum(1 for r in got if r[3] and len(r[3]) == 2
+                and (r[3][0] == 1 or r[3][1] == 1))
     n_ops = n - n_vec
-    print("   one-column entries in the corpus: %d of %d, so the operand denominator"
-          " is %d" % (n_vec, n, n_ops))
+    print("   non-operators: %d one-column + %d one-row = %d of %d, so the operand"
+          % (n_col, n_row, n_vec, n))
+    print("   denominator is %d" % n_ops)
     print("   %-5s %-14s %-14s %-14s %-10s %s"
           % ("k", "gate alone", "+output-bytes", "+operands only", "share", "removed"))
     regions = {}
     for k in KS:
         gate = [r for r in got if r[1] * max(k, 16) < THRESHOLD]
         comp = [r for r in gate if r[2] * k * 4 < maxout]
-        # shape[1] == 1 is a ONE-COLUMN entry. SuiteSparse ships right-hand-side vectors
-        # alongside its operators, and a small-nnz predicate selects them preferentially
-        # because a one-column entry has the least nnz in the collection. They are valid
-        # CSR and not operators, so they belong in neither the numerator nor the
-        # denominator. "not a matrix" needs no chosen constant, unlike an nnz floor.
-        ops = [r for r in comp if not (r[3] and len(r[3]) == 2 and r[3][1] == 1)]
+        # BOTH axes. SuiteSparse ships the components of linear systems and state-space
+        # models alongside the operators: `_b` right-hand sides and `_B` input matrices
+        # are n x 1, `_C` output matrices are 1 x n. A small-nnz predicate selects them
+        # preferentially because a single-row or single-column entry has the least nnz in
+        # the collection, and neither trips the output-bytes predicate -- a one-row entry
+        # has rows*k*4 = 4k. They are valid CSR and not operators, so they belong in
+        # neither the numerator nor the denominator.
+        #
+        # The one-ROW half was added after being checked only on DLMC, where both halves
+        # are vacuous. On SuiteSparse it removes 23 entries, all of them inside the region
+        # at every width. Verifying one half of a symmetric predicate on the corpus where
+        # it cannot fire is not verifying it.
+        nonop = lambda r: r[3] and len(r[3]) == 2 and (r[3][0] == 1 or r[3][1] == 1)
+        ops = [r for r in comp if not nonop(r)]
         nsq = sum(1 for r in comp if r[3] and len(r[3]) == 2 and r[3][0] != r[3][1])
         regions[k] = ops
         removed = sorted(set(gate) - set(comp))
@@ -188,9 +200,10 @@ def main(argv):
               % (len(comp) - len(ops), nsq, len(comp), 100.0 * nsq / len(comp)))
     print("   the share's denominator is the OPERAND count %d, not the file count %d:"
           % (n_ops, len(files)))
-    print("   both numerator and denominator shrink when one-column entries come out, so")
-    print("   the published 47.5%% and 30.0%% move only to 46.8%% and 29.5%%. The readable")
-    print("   count equals the file count here, so no third denominator is in play.")
+    print("   both numerator and denominator shrink when non-operators come out, so the")
+    print("   move is small: against the uncomposed 47.47%% and 30.02%% the operand shares")
+    print("   are 46.54%% and 29.10%%, i.e. 0.93 and 0.92 pp. The readable count equals the")
+    print("   file count here, so no third denominator is in play.")
 
     rmax = max(r[2] for r in got)
     print("\n   largest row count in the corpus: %d. The output-bytes predicate needs" % rmax)
