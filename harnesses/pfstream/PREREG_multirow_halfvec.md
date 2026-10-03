@@ -307,11 +307,12 @@ rate**, and **k=8's 2 is inside the null's observed range at every width and not
 
 ## (g) The floors row is a FRACTION, so 27.7% at DLMC k=4
 
+> **Not transferable (amendment 9(4)):** this is a chain207 6-pass figure. The screen is 4 passes, so it does not transfer as a threshold. The reasoning about the functional -- that the floors row is a fraction -- is unaffected and stands.
+
+
 Recomputing p95 of the two-build spread per width against the published ratio-floor row:
 `max/min − 1` agrees to ≤0.008 at four of five widths (0.2573/0.2774/0.2930/0.3085/0.2974 against
 0.2607/0.2783/0.2858/0.3010/0.2960) while `|r−1|` is low by 0.02–0.05 everywhere. **So the
-> **Not transferable (amendment 9(4)):** this is a chain207 6-pass figure. The screen is 4 passes, so it does not transfer as a threshold. The reasoning about the functional -- that the floors row is a fraction -- is unaffected and stands.
-
 functional is the two-sided spread and the gate floor at DLMC k=4 is 27.7%, not 0.28%.** The board's
 own arithmetic confirms it: 1258 cells behind on `aa` at k=4 with only 8 clearing the floor is
 impossible at 0.28%. The SuiteSparse figures (0.0482 / 0.0355 / 0.0449 / 0.0576 / 0.0848) are left
@@ -1049,6 +1050,8 @@ A/A floor by matrix size, arriving through a stratifier not chosen for size. Tha
 inference across axes. Measured directly -- p95 of the within-cell aa-vs-bb displacement
 at k=4 over all 3820 cells, banded by nonzero count:
 
+> **A 6-pass chain207 floor table, cited as a MECHANISM and not as a bar (amendment 9(4)):** these levels do not transfer as thresholds to the 4-pass screen. What transfers is the SHAPE -- the inverted U and which band peaks.
+
 | nnz band | n | p95 floor, of S-1 |
 |---|---|---|
 | < 1e4 | 748 | 4.14% |
@@ -1112,6 +1115,18 @@ over fewer readings is noisier, so this run's A/A floor will be wider, and every
 chain207-derived floor or spread quoted anywhere in this document is a 6-pass estimate
 that does not transfer as a threshold -- including the 27.7%-of-S-1 k=4 gate floor of
 amendment 1(g), the per-cell two-build spreads, and the CV figures of amendment 3(b).
+
+**Which figures this class contains, because a sweep finds twenty-five and only a few are
+omissions.** A chain207 figure used to DESCRIBE chain207 -- its own gate definition, its
+own floor row, the arithmetic of a reconstruction, a corpus-CV correction -- is correct
+usage and needs no note. The class is figures a reader might take as a BAR FOR THIS RUN.
+That is the deciding predicate, and without it the rule is not decidable by a reader: the
+sweep returns twenty-five sites with no way to sort them, and the next session applying it
+literally will either re-report nineteen false positives or stop trusting the sweep. Notes
+are therefore placed only where a figure is offered as a threshold, and a floor cited as a
+MECHANISM -- such as amendment 9(1)'s A/A-floor-by-nnz table, which exists to show the
+inverted U and not to bound anything -- is outside the class and marked as such at the
+table itself.
 
 Verified rather than assumed: `score_mrhv.py` contains no floor constant at all. Every
 floor it uses is computed per width from this run's own mr0/mr0b pair, which are

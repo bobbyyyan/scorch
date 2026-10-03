@@ -411,3 +411,69 @@ there is a second host rather than a first measurement, and the bands are n=22 a
 Neither #1 nor #2 has a runtime measurement on mkt1 yet. The next step for each is
 arm-vs-arm at a fixed small pool -- not against MKL, because this build reads env vars
 per call and that tax manufactures deficits on short kernels.
+
+### Concern #2, continued — the 17.6% was not attributable, the isolated figure is 16.7%, and the gate is toggleable on MKT
+
+Measured 2026-10-02, same host and allocation. Three corrections and one enabling result.
+
+**The earlier design could not attribute its own number.** The first sweep varied the
+caller's pool and recomputed the resolved thread count from it, so it moved two things at
+once. `scorch_spmm_partition_mode` takes the resolved count and the pool as *separate*
+arguments: the pool ceiling reads the pool, and a different single-worker gate reads the
+count. On the grid used, the resolved count at pool 8 is **<= 1 on 36 of 216 cells**, and
+on those mode 0 is forced by the single-worker gate with the ceiling unreadable. So "29 of
+165 forced at pool <= 16" conflated the ceiling with the worker count.
+
+**Isolated, by holding the resolved count fixed and varying only the pool:**
+
+| held nthreads | gate-attributable | live cells | share |
+|---|---|---|---|
+| 2 | 35 | 210 | 16.7% |
+| 4 | 35 | 210 | 16.7% |
+| 8 | 35 | 210 | 16.7% |
+| 16 | 35 | 210 | 16.7% |
+| 32 | 35 | 210 | 16.7% |
+
+Identical at every held count, which is the expected result rather than a suspicious one:
+the gate's test is `work_proxy = nnz * max(k,16)` against `mingrains * SCORCH_GRAIN_SPMM`,
+and neither side contains a thread term. The conclusion of the earlier entry is unchanged
+-- the gate is active on x86 at pool <= 16 and its sign was established on ARM -- but the
+share is now attributable where before it was not.
+
+**A defect in my own toggle, which read as a missing feature.** To test whether the build
+could switch the gate off I set `SCORCH_SPMM_PARTITION_GATE_MAXTHREADS=0`. That is
+backwards. The source is
+
+    if (gate_maxthreads > 0) { if (pool > gate_maxthreads) mingrains = 0; }
+    if (mingrains > 0) { if (work_proxy < mingrains * SCORCH_GRAIN_SPMM) partition_mode = 0; }
+
+so 0 skips the *pool ceiling*, which leaves `mingrains` at its default and the work gate
+**active at every pool** -- the opposite of off. Zero means "unset this guard" in one
+constant and would have to mean "disable this mechanism" in the other, and the knob's name
+discloses neither. The probe reported "hooks are NOT live" on a build where they are.
+
+**The gate is toggleable on MKT, so no build is needed.** Ten hooks builds already exist
+there; `adg/*` are not among them (0 of 4 knob strings present in any, which is why the
+first probe read nothing). `/scr/bobbyy/raisefloor/tree` carries 49 `SCORCH_SPMM_*`
+environment strings. With the resolved count held at 8 and the pool at 8:
+
+| arm | cells with mode != 0 | moved vs shipped |
+|---|---|---|
+| `MAXTHREADS=16` (shipped) | 175 | - |
+| `MAXTHREADS=4` (ceiling fires, so the gate is skipped) | 210 | 35 |
+| `MINGRAINS=0` (the gate's own documented "leaves it out") | 210 | 35 |
+| `MINGRAINS=2` (shipped value, as a control) | 175 | **0** |
+
+The two independent routes to "gate off" agree on all 35 cells and disagree on none, so
+the two readings of the source are consistent. The last row is the control that matters:
+setting a knob to its compiled default must move nothing, and it moved nothing -- without
+it, a live hook and a hook whose default differs from the header would look the same.
+
+Each arm sets exactly one environment variable, so the hooks build's per-call `getenv` tax
+is equal on both sides. That tax is why the runtime contrast must be arm-against-arm and
+never against MKL.
+
+**What this enables, and what is still not measured.** The runtime question -- does the
+ARM-derived gate help or hurt on x86 at pool <= 16 -- is now a single-binary A/B on 35
+identified cells, with no second build and so no layout artefact between the arms. Still
+unmeasured: any runtime at all, for either concern.
