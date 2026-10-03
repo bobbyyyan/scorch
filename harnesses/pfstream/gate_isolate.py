@@ -45,7 +45,16 @@ import subprocess
 import sys
 
 ROWS = (64, 256, 512, 4096, 65536, 1000000)
-NNZ = (3000, 20000, 50000, 200000, 1000000, 20000000)
+# 18749 and 18750 are BRACKET POINTS, not samples. At k=16 they give work proxies of
+# 299984 and 300000, so exactly one fires under a strict `<` against the declared
+# threshold of 300000 and neither distinguishes any other candidate. Without them the
+# grid's largest firing proxy is 96000 and its smallest non-firing one is 320000, so ANY
+# threshold in (96000, 320000] -- a factor of 3.33, covering MINGRAINS of 1 or 2 and
+# GRAIN_SPMM of 50000 or 150000 -- predicts the identical fired set. A geometric grid
+# cannot resolve candidates 2x apart, so the closed form BOUNDED the product rather than
+# confirming it. The pair also supplies the only cell where work == threshold exactly,
+# which is what separates `<` from `<=`; nothing else in the grid tests the strictness.
+NNZ = (3000, 18749, 18750, 20000, 50000, 200000, 1000000, 20000000)
 KS = (1, 2, 4, 8, 16, 32)
 CELLS = [(r, n, k) for r in ROWS for n in NNZ for k in KS]
 
@@ -84,6 +93,19 @@ def main(argv):
           % (len(ROWS), len(NNZ), len(KS), len(CELLS), small, big))
     print("closed form: nnz*max(k,16) < %d*%d = %d  (no thread term, no row term)\n"
           % (MINGRAINS, GRAIN, THRESHOLD))
+
+    # the discrimination window: what range of thresholds this grid cannot tell apart
+    procs = sorted({c[1] * max(c[2], 16) for c in CELLS})
+    fires = [w for w in procs if w < THRESHOLD]
+    nofire = [w for w in procs if w >= THRESHOLD]
+    print("DISCRIMINATION: largest firing proxy %d, smallest non-firing %d, so this grid"
+          % (max(fires), min(nofire)))
+    print("   cannot distinguish any threshold in (%d, %d] -- a factor of %.2f."
+          % (max(fires), min(nofire), min(nofire) / float(max(fires))))
+    exact = [w for w in procs if w == THRESHOLD]
+    print("   cells with work EXACTLY at the threshold: %d %s"
+          % (len(exact), "-> `<` vs `<=` is testable" if exact else "-> strictness UNTESTED"))
+    print()
 
     pred = predicted()
     pairs = sorted({(n, k) for _, n, k in pred})
@@ -145,6 +167,24 @@ def main(argv):
                       % (c, small, a[idx[c]], big, b[idx[c]],
                          "already 0 at the big pool, so not live and not attributable"
                          if b[idx[c]] == 0 else "UNEXPLAINED"))
+
+    # ---- the one predicate in this function that can read `rows`
+    print("\nROWS: exactly one of the five predicates in scorch_spmm_partition_mode reads")
+    print("   rows -- `rows * out_cols * elem_size >= maxout`. So any row-dependent")
+    print("   exclusion must be that gate. Testing it behaviourally: at elem_size 8 the")
+    print("   exclusion must MOVE from k=32 to k=16, since the product doubles.")
+    for esz in (4, 8):
+        cells = [(1000000, 3000, k) for k in (8, 16, 32)]
+        got = run("import json,scorch_ops as S;print(json.dumps("
+                  "[S.scorch_spmm_partition_mode(r,n,k,k,%d,8,%d) for (r,n,k) in %r]))"
+                  % (esz, big, cells))
+        if got is None:
+            continue
+        print("   elem_size=%d  rows=1e6 nnz=3000:  %s" % (esz, "  ".join(
+            "k=%d product=%d mode=%d" % (k, 1000000 * k * esz, m)
+            for (_, _, k), m in zip(cells, got))))
+    print("   if the exclusion did not move, the single-predicate identification is WRONG")
+    print("   and that is the more useful outcome than confirming the bound.")
 
     # ---- LEG 2, the two env routes, plus the default control
     print("\nLEG 2  two routes to 'gate off', and the control that matters most")

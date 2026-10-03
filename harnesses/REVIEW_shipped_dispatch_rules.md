@@ -424,7 +424,7 @@ count. On the grid used, the resolved count at pool 8 is **<= 1 on 36 of 216 cel
 on those mode 0 is forced by the single-worker gate with the ceiling unreadable. So "29 of
 165 forced at pool <= 16" conflated the ceiling with the worker count.
 
-Instrument: `harnesses/pfstream/gate_isolate.py`, grid 6 rows x 6 nnz x 6 k = 216 cells,
+Instrument: `harnesses/pfstream/gate_isolate.py`, grid 6 rows x 8 nnz x 6 k = 288 cells,
 committed so every figure below is regenerable. The first version of this entry quoted
 figures from a script that existed only in a scratchpad, in a commit that touched no code,
 so its "grid used" was not the committed probe's 175-cell grid and no number in it could be
@@ -439,6 +439,11 @@ reproduced from the repository. That is the defect `scratchpad is not storage` n
 | 8 | 35 | 210 | 16.7% |
 | 16 | 35 | 210 | 16.7% |
 | 32 | 35 | 210 | 16.7% |
+
+With the two bracket points added the grid is 288 cells and the figures become 65 of 280
+live, 23.2%, again identical at every held count. The share is a property of the grid and
+moves when the grid does, which is why the prevalence section below computes it on a real
+collection instead.
 
 Identical at every held count, which is the expected result rather than a suspicious one:
 the gate's test is `work_proxy = nnz * max(k,16)` against `mingrains * SCORCH_GRAIN_SPMM`,
@@ -458,12 +463,47 @@ so it is not live at either and cannot be attributed to the ceiling -- a matrix 
 nonzeros per row is excluded by something else first. Both env routes differ from the
 prediction by exactly that one cell and by nothing else.
 
+**Corrected: as first run, leg 3 BOUNDED the constant rather than confirming it.** The
+original grid was geometric, with a 16x gap between nnz=3000 and nnz=20000. Its largest
+firing work proxy was 96000 and its smallest non-firing one 320000, so *any* threshold in
+(96000, 320000] -- a factor of 3.33, covering `MINGRAINS` of 1 or 2 against `GRAIN_SPMM` of
+50000 or 150000 -- predicts the identical 36-cell set. A geometric grid cannot resolve
+candidates 2x apart. No cell had work exactly equal to the threshold either, so the
+comparison's strictness was untested as well.
+
+Fixed with two bracket points rather than a finer grid. At k=16, nnz=18749 gives a proxy of
+299984 and nnz=18750 gives exactly 300000, so under a strict `<` exactly one fires -- and no
+other candidate threshold produces that split (100000 and 150000 give zero firing, 450000
+and 600000 give two). Re-run with them in: the prediction is 66 cells, production attributes
+**65 with zero extra**, so every nnz=18749 cell fires and every nnz=18750 cell does not.
+**The product is exactly 300000 and the comparison is strict.** The constant is now
+confirmed rather than bracketed.
+
 This leg matters because the two env routes only establish that two readings of the source
 agree with each other; both go through the same exported function, so neither can tell
 whether that function reads the constants the header declares. A linked object whose
 `MINGRAINS` or `GRAIN_SPMM` differs from the header -- which is what a defines-only rebuild
 relinking stale objects produces -- would leave the two routes agreeing and both
 disagreeing with the closed form.
+
+**The row-dependent exclusion is identified, and confirmed from a second direction.**
+`scorch_spmm_partition_mode` holds five predicates, and exactly one of them has a `rows`
+term: `rows * out_cols * elem_size >= maxout`. So a row-dependent exclusion can only be
+that gate -- an enumeration with a one-member candidate set, not a proposed mechanism.
+
+It predicts a movable boundary, which is what makes it testable rather than merely
+plausible. The probe passes `elem_size`, so at 8 bytes the product doubles and the
+exclusion must move from k=32 to k=16. Measured at rows=1e6, nnz=3000:
+
+| elem_size | k=8 | k=16 | k=32 |
+|---|---|---|---|
+| 4 | product 32M, mode 3 | product 64M, mode 3 | product 128M, **mode 0** |
+| 8 | product 64M, mode 3 | product 128M, **mode 0** | product 256M, mode 0 |
+
+The exclusion moved exactly as predicted, and the boundary sits at the same product both
+times. With `SCORCH_SPMM_PARTITION_MAXOUT_LLC 2L` at `:534` that bounds the host's
+`scorch_llc_bytes()`: live at 64,000,000 and excluded at 128,000,000 gives
+maxout in (64M, 128M], hence an LLC of (32 MiB, 64 MiB] on mkt1.
 
 **Two invariances the predicate's own form demands, both run.** Over the held thread count:
 identical sets, as required. Over rows: the harness reports **DIFFERS**, and correctly --
@@ -519,7 +559,9 @@ how much of a real collection the gate governs, and the closed form answers it f
 dimensions alone: the gate forces `partition_mode = 0` when
 `nnz * max(k,16) < 300000`, so it needs `nnz < 18750` at k <= 16 and `nnz < 9375` at k=32.
 
-Over all 3820 DLMC matrices:
+Over the 3820 DLMC matrices **this project measures** -- the screen's corpus and
+chain207's, which is the right population here but is not all of DLMC; the same predicate
+over chain209's 3846 keys gives 1180 = 30.68%:
 
 | k | matrices in the gate region | of 3820 | share |
 |---|---|---|---|
@@ -534,7 +576,15 @@ rather than an edge case.
 for about a third of this collection on an x86 host.** That is the reason the runtime
 question is worth measuring rather than leaving at reachability.
 
-Provenance: two independent records of rows and nnz -- the sealed `verifier-dlmc-dims`
-ledger (digest verified) and `dlmc_rowdisp.py`'s own read of the `.smtx` row pointers --
-agree on all 3820 keys with zero disagreements. A prevalence figure computed from one
+Provenance: **three** independent records of rows and nnz agree on all 3820 common keys
+with zero disagreements -- the sealed `verifier-dlmc-dims` ledger (digest verified),
+`dlmc_rowdisp.py`'s own read of the `.smtx` row pointers, and `chain209-dlmc-dims`, sealed
+in a different milestone before this thread existed. A prevalence figure computed from one
 record of the corpus would be a claim about that record.
+
+The two dims ledgers share the filename `dlmc_dims.csv` and look unrelated on inspection:
+different row counts (3846 against 3820), different byte sizes, different digests, `cmp`
+reports DIFFER and `diff` reports every line changed. The causes are a `dlmc/` key prefix
+on one side and a two-line `#` preamble on the other. Normalized, they are identical. **A
+digest mismatch between two records of the same quantity is evidence of nothing until the
+comparison is normalized** -- this nearly read as a provenance alarm.

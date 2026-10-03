@@ -85,18 +85,34 @@ def dispersion(counts):
 
 
 def ledger_dims(ledger_dir):
-    """key -> (rows, nnz) from every CSV in the ledger that carries those columns."""
-    dims, conflict = {}, []
+    """key -> (rows, nnz) from every CSV in the ledger that carries those columns.
+
+    Comment lines are dropped before parsing. A ledger CSV may carry a `#` preamble, and
+    `csv.DictReader` then takes the comment text as the field names, so the file is
+    skipped as "lacking the columns" while sitting right there holding them. Pointed at a
+    directory of only such files the reader fails closed, which is correct; pointed at a
+    directory holding both kinds it would quietly use the smaller population. Every file
+    that IS skipped is now named, because a silently smaller key count is the failure this
+    whole guard exists to prevent.
+    """
+    dims, conflict, skipped = {}, [], []
     for path in sorted(glob.glob(os.path.join(ledger_dir, "*.csv"))):
         with open(path) as fh:
-            rdr = csv.DictReader(fh)
+            lines = [ln for ln in fh if not ln.lstrip().startswith("#")]
+        rdr = csv.DictReader(lines)
+        if True:
             if not rdr.fieldnames or not {"key", "rows", "nnz"} <= set(rdr.fieldnames):
+                skipped.append((os.path.basename(path), rdr.fieldnames))
                 continue
             for rec in rdr:
                 got = (int(rec["rows"]), int(rec["nnz"]))
                 was = dims.setdefault(rec["key"], got)
                 if was != got:
                     conflict.append((rec["key"], was, got))
+    if skipped:
+        print("   CSVs in the ledger WITHOUT key/rows/nnz, named rather than dropped silently:")
+        for nm, flds in skipped:
+            print("      %s  fields=%r" % (nm, (flds or [])[:3]))
     return dims, conflict
 
 
