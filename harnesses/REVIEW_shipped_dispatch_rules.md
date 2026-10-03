@@ -2797,10 +2797,15 @@ SuiteSparse, since k=2 is the live deficit and DLMC's matrices are smaller and l
 
 ### Amendment to that pre-registration, made before reading any dlmc row
 
-Written while the dlmc phase runs and **before any dlmc row has been read** — rows exist on disk,
-which is weaker than writing this before the phase started, so the claim is the one that can be
-checked: nothing below is informed by a dlmc reading, and the only dlmc file access this session has
-been `wc -l` on the ss CSV and the phase's start line.
+Written while the dlmc phase runs. **Stated as a bound rather than an assurance**, which is the
+checkable form: this section committed at 04:58:44 against a dlmc start of 04:41:07, so 1057 s had
+elapsed, and at the ss phase's logged 4.52 rows/s **at most ~4.8k of 34380 rows (~14%) existed** --
+about 531 of 3846 keys, and since the driver walks the key list in order that is a **specific
+non-random prefix**, more informative about whatever the list ordering correlates with than about
+the corpus. The dlmc rate may differ from ss's, so 14% is an estimate with its rate named. The
+access record, separately: no dlmc CSV has been opened this session; the only dlmc-related read was
+`tail -3` of the job's stdout, which printed the phase's start line. Peer reviewer's framing, and it
+is better than "no rows informed it" because a bound can be checked and a negative cannot.
 
 **First, the redwood SuiteSparse anchor is not inconsistent — the two figures are different
 populations.** A peer computed `-7.06%` from the co-registered summaries `{0.682, 0.540, 0.495}`
@@ -2808,10 +2813,29 @@ and read it against the doc's `-3.24%`, a 2.2x gap. But those three numbers are 
 values normalised to each width's own deg 0-32 band**, so a contrast over them is a deg-256+
 quantity. The registered redwood band figures are -2.82 / -6.13 / -11.23 / **-9.66**, and -7.06 sits
 beside the top band's -9.66, not beside the pooled -3.24. The pooled figure is dominated by band 0,
-which holds 4153 of 4570 SuiteSparse matrices. Two populations, not two estimators, so there is
-nothing to reconcile and no 3.8 pp estimator spread to carry. (The same arithmetic on redwood DLMC's
-`{0.587, 0.520, 0.657}` gives -16.27%, beside that corpus's top band -15.60 — the same agreement,
-which is the check that the explanation is right rather than convenient.)
+which holds 4153 of 4570 SuiteSparse matrices. Two populations, not two estimators.
+
+**And the gap to the top band is not a residual — it is an identity, which closes the question
+rather than leaving it open.** Each value is normalised to *its own* deg 0-32 band, so a contrast
+over normalised values is algebraically the **top-band contrast minus the band-0 contrast**:
+
+| | contrast of normalised values | top-band dip − band-0 dip | gap |
+|---|---|---|---|
+| redwood SuiteSparse | -7.06% | -9.66 − (-2.82) -> **-7.04%** | **0.02 pp** |
+| redwood DLMC | -16.27% | -15.60 − (+0.95) -> **-16.39%** | 0.13 pp |
+
+So the quantity is not supposed to equal any single band's figure, and **nearest-band matching is
+the wrong test** — it would pick band 1 for SuiteSparse (-6.13, 0.93 pp away) and the top band for
+DLMC (-15.60, 0.67 pp away), an apparent 4x asymmetry that is simply the band-0 contrast appearing
+with its own sign and size: -2.82 on SuiteSparse against +0.95 on DLMC. Under the identity both
+corpora agree to within the rounding of the published three-decimal values, and nothing is left
+unexplained. My earlier phrasing, "both agree on the band they came from", invited exactly the
+nearest-band reading a peer then applied to it; the identity is the statement that does not.
+
+The provenance was never inferred from closeness in any case — it is stated in this file at the
+table's own heading, "Ranking k=4's degree-robustness among the five widths **in the top band**",
+over values defined one section earlier as "Each width's geomean normalised to its own deg 0-32
+value".
 
 **Second, and this is a defect in my own registration: the pooled branch is not well posed.**
 Redwood DLMC's paired dip by band is **+0.95** / -2.39 / -11.72 / -15.60 — the lowest band is a
@@ -2848,6 +2872,11 @@ a bump in every population, with the margin named.
 
 **Fourth, the secondary's base.** k=2's **61.9%** behind-MKL share is over the **4570**
 common-basename set *including* the 148 non-operands; operands only it is **63.1%** (2790/4422), so
-dropping the degenerate keys raises it rather than lowering it. The DLMC side must use the same
-predicate — one path per basename, shape-checked where a census exists, and the share reported on
+dropping the degenerate keys raises it rather than lowering it. The size of that, exactly, since
+the counts are integers and need no rounding: 2828 - 2790 = **38 of the 148 non-operands are behind
+MKL, 25.68%, against 63.09% for operands — a 37.4 pp gap.** Degenerate keys are behind less than
+half as often, which is the whole reason the share moves the way it does. The reconciliation to the
+registered 150 is exact and not a 14-key shift: 150 redwood-census non-operands minus the 2 that
+are redwood-only basenames (`bone010_B`, `boneS10_B`) = 148, and all 148 survive the shape check,
+since 4570 - 148 = 4422. The DLMC side must use the same predicate — one path per basename, shape-checked where a census exists, and the share reported on
 both bases — or the two shares are differently defined and not comparable.
