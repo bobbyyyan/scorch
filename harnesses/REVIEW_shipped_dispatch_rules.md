@@ -3303,3 +3303,72 @@ ahead, which is where the gate would not fire.
 **Not yet established:** that MKL's advantage *is* nnz-amortisation rather than something else, and
 that an unrolled narrow-k inner loop recovers it without harming the k=8 path. Both are measurable.
 This is a hypothesis with a mechanism and a provably-inert gate, not a result.
+
+## The nnz-unroll lever is REFUTED by the shipped policy comment, and k=2 is the only live region
+
+**Withdrawn.** `571ec5e` proposed amortising the per-nonzero overhead by processing more nonzeros
+per iteration at narrow k, gated on `k < SL` so it is inert at k=8. That lever is already
+implemented, already measured twice, and already rejected -- `scorch_policy.h:933-981`,
+`SCORCH_NARROWK_DEEP_UNROLL`, which ships at 0. Found by the reviewing peer; verified at source
+here.
+
+| campaign | float32 nvec=1, k=4 | k=8 |
+|---|---|---|
+| 302 matrices, kernel timer | 0.8034 (-19.7%) | 0.8124 (-18.8%) |
+| chain199, release-shaped, 89 matrices x 10 passes, depth 4 | 0.9528 | 0.8701 |
+| chain199, depth 8 | 0.8323 | 0.8503 |
+
+"Depth 8 is worse than depth 4 on every group at every firing width, four comparisons out of four",
+and chain199 ran *after* correcting two handicaps that were not depth. So the rejection is an
+ordering result, not a layout accident.
+
+**And the refutation runs from my own premise to the opposite conclusion**, which is the part worth
+keeping. I argued: the per-nonzero cost is width-independent, therefore amortise along nnz. The
+block argues from the identical observation: *"the three loads per nonzero (the B-row gather,
+A_val, A1_crd) are paid once per nonzero whatever the width, while the FMAs scale with the vector
+count. At nvec=1 the loads dominate and extra accumulators are dead weight carrying a prologue, a
+remainder loop and register pressure."* **Accumulator depth adds FMA parallelism; it cannot reduce
+the load count, and at nvec=1 the loads are the limiter.** The mechanism I identified is right and
+the lever I drew from it was the wrong one.
+
+**Three further checks, all against the proposal.** First, the baseline already amortises:
+`spmm.h:4299-4300` states that unroll 0 "keeps the shipped **2-stream** form", so the flat
+ours-versus-k curve was measured with two independent nonzero streams already in flight, and the
+proposal is depth > 2 -- exactly the comparison that went 4 of 4 the wrong way. Second, the block's
+own closing caution lands *inside* the gate I proposed: *"an object built with UNROLL=4 reads about
+2.3% fast at k=4 against an object built with UNROLL=0 ... Do not price a layout control at k=4"* --
+and `k < SL` fires at k in {2..7}, which contains k=4. Third, the untested prediction the block
+names is the opposite region: *"NOTHING has yet measured nvec 3 or 4 at depth 4"*, which is k=24 and
+k=32, not k=2.
+
+**The one real gap, and it is the whole registration.** **k=2 appears in neither table.** Both
+campaigns report float32 nvec=1 at k=4 and k=8 only, so the width where the deficit is deepest --
+geomean 0.7195, 89.8% behind -- is precisely the width the rejection does not reach. The block
+states its rule in nvec deliberately (*"a rule in k would have been right on one dtype and wrong on
+the other by exactly the lane ratio"*), and k=2 is nvec=1 like k=4, so **the mechanism groups k=2
+with the rejected cell while the data does not.** The honest registration is therefore not "both are
+measurable" but: *an untested k=2 inside a regime rejected at k=4 and k=8, where the recorded
+mechanism predicts the same sign.* That also fixes the first arm -- k=2 specifically, not narrow-k
+generally.
+
+**`SL = 8` is host-robust, checked hostilely.** `scorch_simd<float>` has exactly one x86
+specialisation (`spmm.h:2155`, `__m256`, `lanes = 8`) and `__m512` appears **0 times** anywhere in
+`src/scorch/csrc/`, so SL=8 on Zen4 as well and "provably inert at k=8" holds on the host the
+deficit is measured on. ARM's `lanes = 4` leaves k=8 inert too. The peer went looking for an
+AVX-512 widening that would have made the gate fire at k=8 on MKT; there is none.
+
+### The label-flip bound on the behind-counts, which is the figure the headline should carry
+
+The `ours`/`oursb` table sized the disagreement's **magnitude**; what bounds a count of labels is
+the number of labels that **flip**. Under this work's own "behind in every reading" standard
+(`:2779`), a cell behind under one object and ahead under the other is not confirmed behind:
+
+| | cells | behind in **both** | ahead in both | label flips | by k |
+|---|---|---|---|---|---|
+| DLMC | 11460 | **9395 (81.98%)** | 2031 | **34 (0.30%)** | 9 / 11 / 14 |
+| SuiteSparse (restricted keep-set) | 13710 | **5692 (41.52%)** | 7939 | **79 (0.58%)** | 25 / 41 / 13 |
+
+So the published 9408 (82.09%) and 5730 (41.80%) are upper bounds by **13** and **38** cells
+respectively, and the confirmed shares are 81.98% and 41.52%. The headline barely moves -- which is
+worth knowing, because the 3.2% p95 magnitude spread invited the opposite expectation. Peer
+reviewer's correction of what the bound had to be; the counts are measured here.
