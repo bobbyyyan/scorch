@@ -3592,55 +3592,100 @@ correction; the three assignment sites and the `{0,2,4,8}` hook range are confir
 `if (exact_width)`. Neither `ship` nor `hi01` can reach k=8. The control does not depend on the
 shipped value of the constant it controls for.
 
-### 3. The floor I quoted is the wrong floor -- and the control cannot supply the right one
+### 3. The floor I quoted is the wrong floor, and so was my replacement for it
 
-The peer observed that `rvec/ship` at k=8 (0.9885) and `shpb/ship` (1.0053) are two estimates of
-unity 1.70 pp apart, and concluded the floor's spread is 1.70 pp rather than 0.53 pp. The
-conclusion that I quoted the wrong floor is right. The reason offered -- that they are the same
-measurement -- is not, and the correct reason is worse for the claim:
+This subsection has been corrected once already. Both revisions are kept because the second error
+was caused by the fix for the first.
 
-- `shpb/ship` is **byte-identical `.text`** at equal-length paths. It measures run-to-run noise
-  only.
-- `rvec/ship` at k=8 is **different `.text`** (983314 against 1073586 bytes) executing the same
-  decision. It additionally carries the code-layout artefact.
+**The original mistake.** I quoted `shpb/ship` (1.0053) as the floor for `rvec/ship`. A peer
+observed that `rvec/ship` at k=8 reads 0.9885 and that the two therefore disagree by 1.70 pp.
 
-Those are two tiers, not two estimates of one quantity, and this project measured the tiers
-directly. chain185 (redwood, 37 SuiteSparse matrices, 8 balanced passes, float32) compared builds
-whose **decisions agree** at a given width, so the ratio reads the object rather than the policy:
+**My first repair, which was right in structure.** They are two *tiers*, not two estimates of one
+quantity. `shpb/ship` is byte-identical `.text` at equal-length paths and measures run-to-run noise
+only; `rvec/ship` at k=8 is different `.text` (983314 against 1073586 bytes) executing the same
+decision, so it additionally carries the code-layout artefact. They should disagree. The peer
+withdrew the 1.70 pp reading.
 
-| width | identical-decision, different object | identical source |
-|---|---|---|
-| 1 | -1.14% | |
-| 2 | **-2.61%**, CI [0.9640, 0.9841], excludes parity | +0.27% |
-| 3 | +0.64% | equivalent |
-| 4 | +0.87% | |
-| 8 | **+0.14%** | |
+**My second mistake, caught by the same peer.** I then calibrated the layout tier from chain185,
+quoting a by-width table -- "-2.61% at width 2, +0.14% at width 8" -- and concluded the artefact is
+width-dependent, that k=8 understates the k=2 floor ~19x, and that the smoke's margin is ~2.5x.
+**Every figure in that table is a candidate arm, not an identical-decision pair.** `an_w1fix.py`
+takes `--fix c0 --aa c0b --cands w1s8,w1pg`, so chain185's A/A is `c0b/c0`, and I had tabulated
+`w1s8/c0` and `w1pg/c0` rows alternating between the two candidates. The -2.61% carries the verdict
+**FASTER** in its own row -- it is a measured effect, not a floor -- and on the same pass set
+`w1pg/c0` at width 2 reads **+16.56% SLOWER**. Reading the verdict column would have caught it
+immediately. Verified here against the sealed ledger at
+`~/.cache/scorch-codex/spmm-beat-mkl/chain185-w1fix-redwood/analysis.txt:15,27,28,30,39,42`.
 
-**The artefact is width-dependent and collapses by width 8.** So k=8 is an excellent control for
-*routing* -- it proves the define changed nothing it should not -- and a near-useless estimator of
-the layout floor **at k=2**, where the recorded artefact is up to 2.61% against the +0.14% that
-width 8 shows. Importing the control's spread to k=2 understates the floor by roughly nineteenfold.
-Against the recorded width-2 artefact the margin on the 31-matrix smoke is about **2.5x**, not the
-12.3x the identical-source floor suggests nor the 3.5x the control's spread suggests.
+**What chain185 actually measured.** `c0b/c0`, n=37, 8 passes, each row annotated "flat at +-1%":
 
-**And none of this screen's four builds can measure it.** The estimate needs a pair with different
+| | k=1 | k=2 | k=3 | k=4 | k=8 |
+|---|---|---|---|---|---|
+| redwood | 1.0003 | 1.0027 | 0.9998 | 1.0013 | 1.0028 |
+| MKT | 1.0069 | 1.0027 | 1.0053 | 1.0070 | 1.0011 |
+
+Flat, **no width trend** -- +0.03% to +0.28% on redwood, +0.11% to +0.70% on MKT. The "identical
+source +0.27%" cell I had listed separately *is* this pair's redwood k=2 reading of 1.0027, so the
+same measurement appeared in both columns of that row. MKT's A/A is additionally flagged in its own
+analysis as itself off parity at k=1, k=2 and k=4, so MKT's noise tier is not clean. The two hosts'
+half-widths are not directly comparable: redwood's published rows use `raw` and MKT's use `norm`,
+each chosen at width 4 as a control.
+
+**And the number I imported is the one cell its own file says does not transfer.**
+`chain185-w1fix-mkt/twohost.txt` annotates `w1s8` at width 2 **HOSTS DISAGREE** -- redwood 0.9739
+FASTER against MKT 1.0133 indeterminate, opposite sign. Of the ten cells in that table it is the
+single one marked as not transferring, and I used it to calibrate an MKT floor. `c0b/c0` agrees to
+two decimals across hosts (1.0027 both).
+
+**The quantity is UNMEASURED, not mismeasured.** `chain185-w1fix-redwood/w1fix_body.sh:118` reads
+`NEED="c0 and c0b: identical .text`, so `c0b` is an identical-`.text` relink of `c0` -- the noise
+tier, exactly as `shpb` is of `ship`. `w1s8` and `w1pg` both change decisions at the widths in
+question. **chain185 contains no identical-decision different-`.text` pair at any width**, and
+nothing else in this line has measured one. So there is no prior calibration to lean on, in either
+direction: the ~19x understatement and the ~2.5x margin are both withdrawn, and so is any claim
+that the artefact is width-dependent.
+
+**What is actually known.** The only reading of the layout tier available is this screen's own k=8
+control, `rvec/ship` = 0.9885 on 31 matrices -- a 1.15% deviation, roughly 4x chain185's largest
+any-width `c0b/c0` figure. That is a hint the layout tier exceeds the noise tier, at one width and
+n=31. It is not a floor at k=2, and nothing here establishes whether the tier varies with width.
+
+**The design gap stands and is now the whole question.** The estimate needs a pair with different
 `.text` that routes **identically at k=2**. `ship` vs `shpb` is identical `.text`; `ship` vs `rvec`,
-`ship` vs `hi01` and `rvec` vs `hi01` all route differently at k=2. That is a real gap in the
-design, not a limitation of the corpus size, and no amount of data from job 17704079 closes it.
+`ship` vs `hi01` and `rvec` vs `hi01` all route differently at k=2. No amount of data from job
+17704079 closes that.
 
-**What closes it, registered now rather than chosen after seeing the result.** A fifth object
-defined by `-DSCORCH_SPMM_HALFVEC_F32=0`, which is provably inert at k=2 and k=3: `halfvec_exact`
-is `B1_size == LH` (4 for float) and `halfvec_under` additionally requires `!exact_width`, false at
-both widths, so the define can only change k=4. It therefore gives a different `.text` that routes
-identically at k=2, k=3 **and** k=8 -- a different-object same-decision pair at all three widths,
-which is exactly the per-width floor chain185 says to measure rather than assume.
+**The instrument, registered now.** `-DSCORCH_SPMM_HALFVEC_F32=0` is inert at every width **except
+4** -- and for a stronger reason than the `!exact_width` clause I had relied on, which matters
+because that clause's staleness is the subject of items 1 and 2 above. `spmm.h:5004` opens the
+block with `if (spmm_halfvec > 0)`; `:5010`'s `halfvec_under` requires `spmm_halfvec >= 2` while
+`scorch_policy.h:1512` ships 1, so it short-circuits on `1 >= 2` **before** `!exact_width` is
+evaluated; and `halfvec_exact` is `B1_size == LH` (4 for float), false at k=2 and k=3 by width
+alone. So the instrument is inert under any `EXACT_HI`, any `MINDEG`, and `EXACT_UNROLL=0`, and it
+yields a same-decision pair at every width in the grid except 4 rather than only at 2, 3 and 8.
 
-It must be built into a **separate root at an equal-length path** (`/scr/bobbyy/rvlf/{ship,hv00}`,
-21 characters, matching `/scr/bobbyy/rvec/ship`), because `rvec_build.sh` begins each tag with
-`rm -rf` and job 17704079 is reading those objects right now. The artefact is then estimated
-entirely **within** that job, as a ratio of our own times between its two objects, so
-between-job drift does not enter it. Deferred until 17704079 completes: a concurrent build
-contends for the cores the live measurement is using.
+Two build requirements, the second from the peer:
+
+- **A separate root at an equal-length path** (`/scr/bobbyy/rvlf/{ship,hv00}`, 21 characters,
+  matching `/scr/bobbyy/rvec/ship`), because `rvec_build.sh` opens each tag with `rm -rf` and job
+  17704079 is reading those objects.
+- **Hooks OFF.** `spmm.h:4235` reads `SCORCH_SPMM_HALFVEC` from the environment under
+  `#ifdef SCORCH_TUNE_HOOKS`, and `:4160` records that the value is read early "so the dispatch
+  below is a compile-time constant when the hook is off". With hooks **on**, `spmm_halfvec` is not
+  constant-foldable, the block survives dead-code elimination, and `=0` changes an *immediate*
+  rather than removing code -- two nearly-identically-laid-out objects, understating the artefact in
+  the same direction the k=8 control does. `rvec_build.sh` already asserts
+  `spmm_tune_hooks=False` on every object, so this is satisfied by construction, but it is a
+  property the instrument depends on rather than a convenience.
+
+**A limitation of that instrument, stated rather than hidden.** With hooks off, `=0` lets DCE
+remove the whole halfvec block, so this pair's object perturbation is **smaller** than ROWVEC's,
+which moves `.text` by 90272 bytes. It would therefore understate the artefact relevant to a ROWVEC
+comparison. The artefact is a property of a specific object pair, not a constant. So the right
+design is **several** inert-at-k=2 defines of differing perturbation size, reporting the **spread**,
+which bounds the tier instead of point-estimating it. `SCORCH_SPMM_REGBLOCK_PFD=0` is a second
+candidate: at k=2 and k=3 `exact_width` is nonzero so the register block is never reached, making it
+inert there, while it changes code the k>=4 widths use.
 
 ### 4. Byte-neutrality at ROWVEC=0: what the evidence supports, and what it does not
 
