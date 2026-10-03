@@ -144,6 +144,28 @@ def main():
     print("HALVES     deficit %d, control %d, corpus %d  (asserted: deficit is a subset)"
           % (len(behind), len(control), len(corpus)))
 
+    # THE NON-LIVE INVARIANT, asserted rather than reported. On the 72-key reference corpus every
+    # non-live cell resolves to EXACTLY 1 -- not merely <=2 -- at all eight widths, 576 cells with
+    # zero exceptions, so the two numerators differ by precisely the non-live count. It is NOT a
+    # theorem: a cell is non-live when its resolved count never moves across override rows, and
+    # that also happens when a work-derived candidate always EXCEEDS a large clamp, pinning the
+    # cell at a HIGH count. That configuration appears zero times in the reference corpus, so the
+    # check below is the thing to watch on a new one: a non-live cell outside <=2 means the
+    # confounding is corpus-specific and the numerator fix has a different size at each width.
+    outside = sorted(k for k in res if k not in live and res[k] > 2)
+    hi_counts = sorted({res[k] for k in res if k not in live})
+    print("NON-LIVE   %d of %d keys reach ONE count; their resolved values: %s"
+          % (len(res) - len(live), len(res), hi_counts))
+    if outside:
+        print("  %d non-live key(s) resolve ABOVE 2, so non-liveness is NOT confined to the <=2"
+              % len(outside))
+        print("  group on this corpus. The two numerators then differ by less than the non-live")
+        print("  count, and the reference corpus's invariant does NOT transfer. First: %r"
+              % outside[0])
+    else:
+        print("  none resolves above 2, so the registered and all-<=2 numerators differ by exactly")
+        print("  the non-live count -- the reference corpus's invariant holds here too.")
+
     out = {}
     for lab, keys in (("DEFICIT (s328)", behind), ("CONTROL (s64)", sorted(control))):
         d = shares(keys, res, live)

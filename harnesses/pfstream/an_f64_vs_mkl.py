@@ -427,6 +427,38 @@ def main(argv):
     print("  smallest degree in the corpus: %s deg %.4f = %d nnz / %d rows"
           % (lo, degree_of[lo], nnz[lo], rows_of[lo]))
     print()
+    # ---- MEDIAN RATIO BY DEGREE BAND: the comparator that does NOT depend on resolution.
+    # "Behind in every reading" is an INTERSECTION over readings, so it shrinks as noise rises and
+    # two screens with different readings-per-cell or different measurement windows cannot be
+    # compared on it. This table is a median over cells of a median over readings, so a noisier
+    # screen widens it without moving it, and two hosts ARE comparable on it. Printed beside the
+    # verdict counts rather than instead of them: the counts answer "is there a cell we must fix",
+    # this answers "where does the kernel lose", and a screen can read 0 on the first while this
+    # one is well above 1.
+    DBANDS = ((0, 1), (1, 4), (4, 16), (16, 64), (64, 256), (256, float("inf")))
+    print()
+    print("MEDIAN ours/mkl BY MEAN DEGREE, resolution-independent (median over cells of the")
+    print("cell's median reading). Degree is nnz/rows from the components, not the rounded column.")
+    print("  %-14s %s" % ("deg band", "  ".join("%9s" % ("k=%d" % w) for w in widths)))
+    for dlo, dhi in DBANDS:
+        row, ns = [], []
+        for w in widths:
+            v = []
+            for (key, kw), rs in ratios.items():
+                if kw != w:
+                    continue
+                r0 = rows_of.get(key, 0)
+                d = (nnz.get(key, 0) / r0) if r0 else 0.0
+                if dlo <= d < dhi:
+                    v.append(pct(sorted(rs), 0.5))
+            v.sort()
+            ns.append(len(v))
+            row.append(("%9.4f" % pct(v, 0.5)) if v else "        -")
+        lab = "%g-%g" % (dlo, dhi) if dhi != float("inf") else ">=%g" % dlo
+        print("  %-14s %s   n=%s" % (lab, "  ".join(row), ns[0] if len(set(ns)) == 1 else ns))
+    print("  A dash is an EMPTY band, not a 1.0; n is the cell count per width, printed so a")
+    print("  band holding three matrices cannot be read beside one holding two thousand.")
+
     print("STRUCTURE: the behind set against the ahead set, same widths")
     print("  %-6s %-7s %7s %9s %9s %9s %9s" % ("k", "set", "cells", "med deg", "p10 deg", "p90 deg", "med nnz"))
     for w in widths:

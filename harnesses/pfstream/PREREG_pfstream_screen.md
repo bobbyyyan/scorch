@@ -4033,3 +4033,124 @@ Both axes are now closed from the artefacts:
 **So the dispersion row is safe on both axes, and the 1.9× host ratio is not an artefact of unequal
 measurement design.** That is worth stating plainly: the caution was raised against my own
 comparison and it is the fourth cell, not the three screens, that it disqualifies.
+
+---
+
+## Amendment 48 — the DLMC float32 narrow-k deficit does NOT reproduce on redwood, and the one place redwood loses names a kernel: the half-vector path at k=4
+
+All of this comes from a **sealed ledger already on disk** — `chain207-dlmc-redwood`, read-only, no
+new measurement — scored by `an_f64_vs_mkl.py`, the same instrument that produced MKT's board.
+
+### The redwood board, full DLMC collection
+
+3820 keys × 5 widths = **19100 cells**, 12 readings each, **229200 observations against an expected
+229200, asserted equal**. Object pair `aa`/`bb`, `.text`-identical by construction.
+
+| | |
+|---|---|
+| ahead in every reading | 6501 (34.04%) |
+| **behind in every reading** | **53 (0.28%)** |
+| mixed sign | 12546 (65.69%) |
+| per-width behind | **`{2: 0, 4: 51, 8: 2, 16: 0, 32: 0}`** |
+| pooled geomean ours/mkl | 0.7584 = **1.319× faster** |
+
+**Zero cells behind at k=2, over the entire 3820-matrix collection.** MKT reads **328 of 392** at
+the same width and dtype. So the float32 narrow-k deficit is a **single-host** phenomenon, exactly
+as float64's 192-against-0 was.
+
+**The resolution caveat, stated before the comparison is used for anything.** "Behind in every
+reading" is an **intersection over readings**, so it shrinks as noise rises, and these two screens
+do not have equal resolution: redwood's mixed share is **65.69%** against MKT's **15.01%**, from 12
+readings at a 5.69 ms median window against 16 at 15 ms. **A zero obtained at lower resolution is
+much weaker than a 328 obtained at higher resolution**, so the two counts cannot carry the
+comparison on their own.
+
+### The comparator that does not depend on resolution
+
+`an_f64_vs_mkl.py` now prints the **median over cells of the cell's median reading, banded by mean
+degree**. A noisier screen widens that distribution without moving it, so two screens are
+comparable on it. It uses the file's own `pct`, so the percentile convention cannot drift from the
+verdict tables beside it.
+
+| mean degree | k=2 | k=4 | k=8 | k=16 | k=32 | n |
+|---|---|---|---|---|---|---|
+| 0–1 | 0.2853 | 0.2724 | 0.2757 | 0.2535 | 0.2379 | 24 |
+| 1–4 | 0.3297 | 0.3213 | 0.3458 | 0.3216 | 0.3281 | 86 |
+| 4–16 | 0.4347 | 0.4364 | 0.4853 | 0.4846 | 0.6460 | 493 |
+| 16–64 | 0.8902 | 0.9040 | 0.8732 | 0.8077 | 0.7537 | 1006 |
+| 64–256 | 0.9043 | **1.0103** | 0.9491 | 0.8166 | 0.7436 | 1499 |
+| ≥256 | 0.9574 | **1.0987** | 0.9381 | 0.8179 | 0.7699 | 712 |
+
+**Two readings, and the first is the one that unifies the hosts.**
+
+**The margin over MKL collapses monotonically with mean degree, on both hosts.** At degree under 1
+we are 3.5–4× faster; by degree ≥256 at k=2 we are 4.3% faster. So the **degree-dependent weakness
+is present on redwood at k=2 as well** — it simply does not cross 1.0 there. MKT's 328 and
+redwood's 0 are then the same effect at two magnitudes, not two different phenomena, and the degree
+carrier that survived its own null on MKT survives on a second host.
+
+**And exactly one cell of this table exceeds 1.0: k=4, at degree ≥64.** 1.0103 and **1.0987**,
+against neighbours at 0.9043/0.9574 (k=2) and 0.9491/0.9381 (k=8) — the width is **non-monotone**,
+and the 51 behind cells sit precisely there (median degree **256.00**, p10 184.79, p90 269.16,
+median nnz 131072; all 20 worst cells are k=4, rows 512 or 2048).
+
+### The mechanism is nameable, and it is a kernel boundary rather than a shape
+
+Verified in `src/scorch/csrc/spmm.h` rather than inferred: **the three widths take three different
+kernels.**
+
+- `:4899` — `const bool halfvec_exact = (B1_size == LH);` with `LH` the half-vector lane count, so
+  **float32 k=4 is exactly the half-vector width** and takes `scorch_spmm_row_regblock<…, 1, true,
+  VH>`, a 128-bit register block. `:4891-4895` records the placement: *"Placed ahead of the
+  exact-width scalar kernel but gated so it only takes widths that kernel does not already own."*
+- **k=2** takes `scorch_spmm_row_narrow_exact` — `exact_lo_ = 2`, `exact_hi_` capped at 7 for float
+  (`:4147-4160`), and `halfvec_under` requires `!exact_width`, so k=2 never reaches the
+  half-vector arm.
+- **k=8** takes the full-width register block, mask-free — `:2096`: *"At float k=8 and double k=4
+  the last vector is full and regblock is already mask-free."*
+
+**One inference of mine was wrong and is recorded rather than dropped.** I first read the deficit as
+"k=4 is the first width above the narrow-k exact kernel's range." The header is explicit at `:2096`
+that the range is **float k=1..7**, so k=4 is inside it — and it is the half-vector arm *placed
+ahead of it* that takes the width. **A memory entry stating the exact kernel owns float k in
+{1,2,3} is stale against this header and should be read as path-specific.**
+
+### Registered before it runs, because `spmm_halfvec` is an existing switch and this must not become a special case
+
+**Hypothesis:** the 128-bit half-vector register block is slower than MKL at mean degree ≥64 on
+AVX2, and its two neighbouring kernels are not.
+
+**The arm:** `spmm_halfvec=0` against the shipped value, at k=4, float32, on a corpus **stratified
+by mean degree** across all six bands above — not on the 51 behind keys alone, because an arm
+measured only where it is expected to win cannot show what it costs. The floor is the `aa`/`bb`
+pair of the same construction.
+
+**Refutation conditions, all four fixed now.**
+
+1. **If `spmm_halfvec=0` does not move the degree ≥64 cells at k=4 by more than the floor's
+   p05–p95 band**, the half-vector path is not the carrier and the k=4 excess has another cause.
+2. **If it harms any degree band below 64 outside the band**, the switch cannot ship under any gate
+   expressible in mean degree, and the finding is a bound rather than a lever.
+3. **If the k=4 excess reproduces with `spmm_halfvec=0`**, the carrier is the width and not the
+   kernel, which would also refute the three-kernels reading above.
+4. **If MKT shows no k=4 excess at degree ≥64**, the effect is host-conditional — and MKT's float32
+   screen **has never measured k=4 at all** (its widths are 2, 8, 12, 16, 20, 24, 32), so that is
+   an unscreened width on the host carrying the larger deficit, not a known null.
+
+**No gate is proposed by this amendment.** A width-equals-half-vector condition is already what the
+dispatch tests, so a change here would be a value for an existing switch and not a new branch — but
+whether it may take one depends on condition 2, and mean degree is a property the kernel can read
+at runtime from `nnz_total / A0_size`, which `:4183` and `:4194` already do.
+
+### Incidental, from the same instrument: the non-live set is exactly the clamped-to-one set
+
+On the 72-key thread-sizing corpus, **every non-live cell resolves to exactly 1** — not merely
+`<=2` — at **all eight widths, 576 cells, zero exceptions**. The non-live count falls 19, 19, 19,
+19, 19, 18, 15, 13 as k rises, and no mechanism is proposed for that here.
+
+**It is not a theorem**: a cell is non-live when its resolved count never moves across override
+rows, which also happens when a work-derived candidate always *exceeds* a large clamp — a non-live
+cell at a **high** count. That configuration appears zero times in the reference corpus, so
+`an_reach328.py` at `5d081809d2971eda` now **asserts** it and names the first exception if the
+392-key sweep produces one. A non-live cell outside `<=2` would mean the confounding is
+corpus-specific and the numerator fix has a different size at each width.
