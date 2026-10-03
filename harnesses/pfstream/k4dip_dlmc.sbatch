@@ -11,6 +11,7 @@ BUILD=/scr/bobbyy/pfs/ship
 OUT=$ROOT/dlmc_float32_ship_p1.csv
 KEYS=$ROOT/dlmc_keys.txt
 WANTKEYS=3820   # and 9 rows each: 3 widths x 3 arms
+BUILDTAG=ship   # ONE definition, passed to the gate AND to --build so they cannot drift
 
 # SELF-SKIPPING BACKSTOP. Job 17701502 runs ss then dlmc inside one 6h limit; at the observed
 # 4.45 rows/s the dlmc phase must hold above 2.79 rows/s to fit. If it already finished, this
@@ -56,12 +57,20 @@ if [ -f "$OUT" ]; then
   # And `badms` is the level below both: csv.DictWriter emits a MISSING key as an EMPTY field, so
   # a dropped value is a complete-looking row. The gate previously verified a cell EXISTS and
   # never that it holds a usable number.
-  CENSUS=$(awk -F, '
+  # AND THE DIGEST GUARDS THE BRANCH THAT DOES NOT RUN. The object sha256 below is checked
+  # against the object this job would use IF it re-measured; it says nothing about the object
+  # that WROTE the file being accepted. Columns 1 and 2, `build` and `slice`, were the only two
+  # the gate never read -- and `build` is the one naming the object. A file written by another
+  # build, or a mixed-build file whose per-key ours/mkl ratio spans two objects, passed every
+  # clause. The documented failure in this family is a filename not matching its content
+  # (arm_screen.sh:49-56), and the gate was taking the filename's word for the build.
+  CENSUS=$(awk -F, -v BUILD="$BUILDTAG" '
     BEGIN{ nk=split("2,4,8",KS,","); na=split("ours,oursb,mkl",AR,",")
            for(i=1;i<=nk;i++) for(j=1;j<=na;j++) wantcell[KS[i] SUBSEP AR[j]]=1
            NCELL=length(wantcell) }
     NR==FNR{ if($0!="") want[$0]=1; next }
     FNR>1{ c[$3]++
+           if($1 != BUILD) badbuild++; bs[$1]=1
            cell=$4 SUBSEP $8
            if(!(cell in wantcell)) badcell++; else seen[$3 SUBSEP cell]=1
            if($9=="" || $9+0<=0) badms++ }
@@ -71,16 +80,17 @@ if [ -f "$OUT" ]; then
                       if(c[k]==9) e++; else if(c[k]<9) s++; else o++
                       if(have[k]!=NCELL) cellbad++ }
          for(k in want) if(!(k in c)) miss++
-         printf "%d %d %d %d %d %d %d %d %d %d", e, s, o, length(c), unk, miss,
-                length(want), cellbad, badcell+0, badms+0 }' \
+         printf "%d %d %d %d %d %d %d %d %d %d %d %d", e, s, o, length(c), unk, miss,
+                length(want), cellbad, badcell+0, badms+0, badbuild+0, length(bs) }' \
     "$KEYS" "$OUT")
   set -- $CENSUS
   echo "per-key census: exactly9=$1 short=$2 over=$3 keys=$4 unknown=$5 missing=$6 wanted=$7"
   echo "  cell-level: keys-missing-a-wanted-cell=$8 rows-outside-the-wanted-cells=$9 unusable-ms=${10}"
+  echo "  provenance: rows-not-from-$BUILDTAG=${11} distinct-builds-in-file=${12}"
   echo "  (total rows $HAVE is NOT the check: identity of the key set is)"
   if [ "$1" = "$7" ] && [ "$2" = "0" ] && [ "$3" = "0" ] && [ "$4" = "$7" ] \
      && [ "$5" = "0" ] && [ "$6" = "0" ] && [ "$8" = "0" ] && [ "$9" = "0" ] \
-     && [ "${10}" = "0" ]; then
+     && [ "${10}" = "0" ] && [ "${11}" = "0" ] && [ "${12}" = "1" ]; then
     echo "SKIP: all $7 wanted keys present with 9 DISTINCT (k,arm) cells each; none short, over,"
     echo "      unknown, missing, or holding a repeated cell."
     echo "      Leaving the existing file untouched."
@@ -109,7 +119,7 @@ echo "torch pool $POOL"
 echo "--- dlmc start $(date +%H:%M:%S) -> $OUT"
 OMP_NUM_THREADS=${SLURM_CPUS_PER_TASK:-32} PYTHONPATH="$BUILD/src" \
   python "$ROOT/mrgate.py" --cache /scr/bobbyy/mklsweep/csrcache/dlmc --keys "$KEYS" \
-    --csv "$OUT" --dtype float32 --ks 2,4,8 --reps 9 --build ship --slice all --pass-tag p1 \
+    --csv "$OUT" --dtype float32 --ks 2,4,8 --reps 9 --build "$BUILDTAG" --slice all --pass-tag p1 \
     > "$ROOT/dlmc_backstop.log" 2>&1
 RC=$?
 R=0; [ -f "$OUT" ] && R=$(( $(wc -l < "$OUT") - 1 ))

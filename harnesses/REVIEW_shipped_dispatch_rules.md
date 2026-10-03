@@ -2399,3 +2399,42 @@ Job 17701612 cancelled while PENDING. Spooled digests on record, one per revisio
 `b825da8309043311` total rows, `0e154a9b737704fd` per-key count, `f14b7b86c77af257` key-set
 identity, `b99b6bc5c4a5379e` plus cell count, and the current one plus cell identity and value
 validity.
+
+### The object digest guarded the branch that does not run
+
+The gate digested `$BUILD/src/scorch_ops*.so` against `4c11296ce2a68c3d` -- the object this job
+would use **if it re-measured** -- and never read the `build` column of the file it was
+**accepting**. Columns 1 and 2, `build` and `slice`, were the only two the gate never touched, and
+`build` is the one naming the object.
+
+| case | e9 | keys | cellbad | outside | bad-ms | not-`ship` | distinct builds | verdict |
+|---|---|---|---|---|---|---|---|---|
+| complete | 3820 | 3820 | 0 | 0 | 0 | 0 | 1 | **SKIP** |
+| mixed build | 3820 | 3820 | 0 | 0 | 0 | **17190** | **2** | REMEASURE |
+| other build | 3820 | 3820 | 0 | 0 | 0 | **34380** | 1 | REMEASURE |
+
+All nine prior clauses read clean in every row. **The mixed case is the worse of the two**: a
+per-key `ours`/`mkl` ratio then spans two objects, so the comparison is corrupted rather than
+merely unattributed.
+
+**Both new clauses are needed and they are complementary, not redundant.** `other build` is
+*uniform* -- distinct builds is 1 -- so a "one build per file" check alone misses it; the
+`!= BUILDTAG` count catches it. The mixed case trips both.
+
+**Fixed with a single source of truth rather than a duplicated literal:** `BUILDTAG=ship` is
+defined once and passed both to the gate (`awk -v BUILD="$BUILDTAG"`) and to the measurement
+(`--build "$BUILDTAG"`), so the expected tag and the written tag cannot drift.
+
+**Reachability is the weak part and is stated rather than leaned on:** one invocation writes one
+build and the filename encodes it, so a mixed file needs two writes to one path. What makes it
+worth the clause is that the documented failure in this family is precisely a filename not matching
+its content (`arm_screen.sh:49-56`), and the gate was taking the filename's word for the build while
+the column stating it went unread.
+
+**The general shape is new rather than a fifth instance of identity-versus-count:**
+
+> **A provenance check scoped to the path not taken proves nothing about the data kept. Ask which
+> branch the digest guards.**
+
+Job 17701623 cancelled while PENDING. **Gate work stops here** -- the proportionality rule being
+applied is: report what changes a verdict, not what could. This one changed three.
