@@ -106,7 +106,8 @@ is defined against MKL — and the ~1.1% x86 cost per environment variable an ar
 ## The four refutation conditions
 
 > Superseded in part. Condition 1, 3 and 4: see amendments 1, 2 and 3. Condition 3 again:
-> amendment 2 (question changed) and amendment 6(c) (estimator). Condition 2 stands as
+> amendment 2 (question changed) and amendment 6(c) (estimator). Condition 4 again:
+> amendment 7 (stratifier withdrawn). Condition 2 stands as
 > written. The gated-cell range quoted below and in amendments 2-3 is WITHDRAWN by
 > amendment 6(a) as not reproducible.
 , registered before the run
@@ -261,6 +262,11 @@ is a gloss on a non-monotone sequence whose max is **1.61×** its min, earned by
 −0.45 correlation rather than by a point prediction.
 
 ## (e) CONDITION 4 IS REPLACED. Unnamed functional, wrong floor, wrong moment
+
+> **Superseded by amendment 7:** the row-dispersion stratifier registered here is
+> withdrawn -- it sorts cells by their own A/A floor (2.7x across terciles) and predicts
+> the outcome (rho -0.62). Condition 4 is scored with no stratification.
+
 
 Three defects:
 
@@ -826,3 +832,71 @@ for every reduction of a ratio. Three reasons, in order of weight:
 The p95 floor registered in amendment 5 is unchanged and remains the upper order
 statistic at index `ceil(0.95 x 50) = 48`, printed with its index and convention beside
 its value. The sign-only 51 remains convention-free: it reduces nothing.
+
+# Amendment 7 — condition 4's row-dispersion stratifier is withdrawn: it sorts cells by their own noise floor
+
+Written 2026-10-02 with the screen running and nothing from it scored. The instrument is
+`harnesses/pfstream/dlmc_rowdisp.py`, committed with this amendment; every number below
+is from the sealed chain207 DLMC ledger plus that reader, which read 3820 of 3820 ledger
+keys with zero disagreement on rows or nnz.
+
+Amendment 1(e) replaced condition 4 because its functional "stratified on mean degree
+where the header names row DISPERSION". The replacement stratifies on the coefficient of
+variation of the per-row nonzero count. Having now measured that quantity, the
+replacement is worse than the thing it replaced, for three reasons in order of weight.
+
+**1. The strata have different noise floors, by a factor of 2.7.** Condition 4 compares a
+displacement to an A/A floor. Over the 3769 cells it covers, split at the corpus CV
+terciles, with the floor as the p95 of the within-cell aa-vs-bb |log| displacement:
+
+| tercile | n | geomean S vs MKL | median mean degree | A/A floor p95 |
+|---|---|---|---|---|
+| low cv (<= 0.132) | 1239 | 1.0341 | 221.3 | 35.47% |
+| mid cv (0.132, 0.310] | 1261 | 0.9259 | 102.4 | 27.40% |
+| high cv (> 0.310) | 1269 | 0.8701 | 23.9 | 12.91% |
+| pooled | 3769 | 0.9232 | | |
+
+A single pooled floor applied across these strata is too lenient in one and too strict in
+another, in a criterion whose only operation is a comparison against a floor. This is the
+A/A-floor-is-an-inverted-U-by-size effect arriving through a stratifier that was not
+chosen for size: low CV means high mean degree means the noisy middle of the size range.
+
+**2. The stratifier predicts the outcome.** Spearman rho between row CV and S at k=4 is
+**-0.622** over all 3820 scored cells. So the strata differ in baseline S by 16.4
+percentage points of level (1.034 to 0.870), and a per-stratum displacement is confounded
+with the stratum's own level rather than isolated from it.
+
+**3. It is substantially the stratifier it replaced.** Spearman rho between row CV and
+mean degree is **-0.780**. Row dispersion in this corpus is largely mean degree inverted,
+so amendment 1(e) swapped a rejected variable for 61% of the same variable.
+
+### Condition 4, replaced a second time, with no stratification at all
+
+The defence stratification was meant to provide -- that a no-regression average is not
+hiding a hurt subpopulation -- is better had from the pairing that is already in the
+design, because a within-cell paired ratio cannot carry the cell's level or its stratum's
+level into the answer. That is the same construction that made the k=4 half-vector claim
+survive every correction, and it needs no strata.
+
+Condition 4 is now scored as, over all cells not in the sign-only 51:
+
+1. the geometric middle of the per-cell paired displacement, arm object against control
+   object, paired by pass index within the cell, against the paired A/A floor computed by
+   the identical reduction on the two byte-identical builds;
+2. the count of cells displaced worse than the floor, beside the count the floor's own
+   definition implies under the null -- a p95 floor is exceeded by 5% of cells when
+   nothing is happening, so this criterion reports its own null arithmetically rather
+   than needing a separate run;
+3. the single worst cell, named, with its matrix dimensions. A regression is a finding to
+   report, not a shape to tune around, so the criterion has to be able to produce one.
+
+Any stratified table stays in the readout as description only, and each stratum then
+carries its **own** floor from the column above -- never the pooled 0.9232-population
+figure. No threshold is applied to a stratified number.
+
+The row-dispersion reader is kept and committed regardless: it is the only source in this
+project for per-key mean degree and empty-row counts checked against an independent
+record, and the descriptive table needs it. Its guard earned its place on the first run
+by catching that chain207's keys carry a leading `dlmc/` component that a path relative
+to `~/dlmc` does not -- without it the run would have produced 3846 perfectly plausible
+dispersion values for a population overlapping the ledger in zero keys.
