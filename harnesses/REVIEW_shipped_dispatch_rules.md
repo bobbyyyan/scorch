@@ -276,3 +276,89 @@ ranges. The shipped spec carries no ranges and the 1572 training rows are not in
 saturation remains a candidate structure rather than the demonstrated mechanism. Two cells, one
 host. **But the consequence does not depend on the mechanism**: on these cells the learned level
 routes to the arm it would measure as 1.5–1.9× slower, and nothing in its path can detect that.
+
+## Concerns #1 and #2 — both predicates are REACHABLE on x86; the inertness argument is a statement about one host's core count
+
+Measured 2026-10-02 on mkt1 (AMD EPYC 9334 Zen4, 128 CPUs), inside a 64-CPU Slurm
+allocation, against `/scr/bobbyy/adg/adg0` — verified to carry the shipped constants
+(`SCORCH_SPMM_PARTITION_GATE_MAXTHREADS 16`, `SCORCH_SPMM_NT_CAP -2`,
+`SCORCH_SPMM_RECRUIT_MIN_WORK 1e7`). Probe: `harnesses/pfstream/pool_reach.py`.
+
+**This is a reachability result and not a performance result.** No runtime was measured.
+What follows says the predicates can fire on x86, not that firing helps or hurts.
+
+The probe asks production rather than restating it: `scorch_spmm_nthreads` and
+`scorch_spmm_partition_mode` are both exported to Python for exactly this purpose, and a
+harness that recomputed either predicate would be wrong silently and flatteringly.
+
+### Concern #1 — `scorch_policy.h:2313`, `nthreads >= 2 * pool`
+
+The source comment at `:333` reads: *"On an all-physical-cores pool no recruit is EVER at
+stake (x86: pool 24, gate at 48, count at most 32), so this condition provably cannot fire
+there."* Sweeping the caller's pool over a 175-cell grid of rows x nnz x k:
+
+| pool | gate = 2 x pool | max resolved count | cells reaching the gate, of 175 |
+|---|---|---|---|
+| 8 | 16 | 64 | 85 |
+| 16 | 32 | 64 | 85 |
+| 24 | 48 | 64 | **85** |
+| 32 | 64 | 64 | 83 |
+
+**At pool 24 -- the exact pool the comment names -- the gate is reachable on 85 of 175
+cells.** The comment's premise is that the resolved count is "at most 32". That bound is
+`omp_get_num_procs()`, which is 32 on redwood (i9-14900K) and 128 on mkt1. So the
+inertness is real and the reasoning is sound, but what it depends on is the ratio
+`omp_get_num_procs() / pool`, not the instruction set:
+
+> the predicate is reachable exactly when `omp_get_num_procs() >= 2 * pool`.
+
+On redwood at its 24-thread pool that is 32 >= 48, false, inert -- which is what the x86
+grid measured. On mkt1 at the same 24-thread pool it is 128 >= 48, true. The comment
+states a one-host fact as a property of "x86" and of "an all-physical-cores pool", and
+mkt1 is both an x86 host and an all-physical-cores pool where it does not hold.
+
+### Concern #2 — `scorch_policy.h:2612`, `pool > gate_maxthreads` disables the work gate
+
+The comment reads: *"Above the ceiling this whole block is unreachable, which is how the
+x86 reading is preserved."* That is correct and the boundary reproduces exactly at the
+shipped 16. But the converse is what matters: at or below 16 the gate is **active on
+x86**, and its sign was established on ARM.
+
+| pool | cells with mode != 0 at the reference pool | of those, forced to mode 0 | share |
+|---|---|---|---|
+| 1 .. 16 | 165 | 29 | 17.6% |
+| 20 .. 32 | 165 | 0 | 0.0% |
+
+A clean step at the documented constant. The `cells with mode != 0` column is the
+non-vacuity check: it is 165 at every pool, so the zero rows are genuine zeros and not an
+empty population.
+
+Reachable by ordinary means. `torch.set_num_threads(16)` or less is a normal thing for a
+caller to do -- it is what a process sharing a node, or running inside a dataloader
+worker, will have -- and it puts an ARM-derived gate in charge of 17.6% of the cells in
+this grid on an x86 host.
+
+### A defect in my own probe, caught by its own premise check
+
+The first run of this probe reported predicate 1 as "reachable at pool 1 and nowhere
+else". It had run inside a default `srun -n 1`, which grants 2 CPUs, so the resolved count
+was 2 at every pool and `2 >= 2 x 1` held for reasons having nothing to do with x86 or
+with the policy. Every other row read "never fired" because the allocation could not
+supply the threads, not because the predicate refused.
+
+A thread-policy probe is bounded by the CPUs its process may use, so it has to state that
+number and compare it against the largest threshold it intends to test. The probe now
+prints `len(os.sched_getaffinity(0))` beside `2 * max(POOLS)` and says, before any table,
+that a "never reached" verdict is uninformative when the allocation is smaller than the
+gate. This is the same shape as the harnesses that report DONE having measured nothing:
+the output was well-formed, plausible, and about the allocation rather than the subject.
+
+### What is still open
+
+Concern #3 (the mean-degree-16 width-1 unroll at `:1420`) is untouched. Its comment
+already carries a redwood grid with confidence intervals by degree band, so the question
+there is a second host rather than a first measurement, and the bands are n=22 and n=12.
+
+Neither #1 nor #2 has a runtime measurement on mkt1 yet. The next step for each is
+arm-vs-arm at a fixed small pool -- not against MKL, because this build reads env vars
+per call and that tax manufactures deficits on short kernels.
