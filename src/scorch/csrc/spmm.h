@@ -2234,6 +2234,114 @@ template <> struct scorch_simd_half<double> {
   }
 };
 
+// Load exactly the K values of one B row into a 128-bit register, and store
+// exactly K values back. A row of K values occupies K*sizeof(T) bytes, and where
+// that is a native load width -- 4, 8 or 16 bytes -- the row IS a register and
+// needs no mask at all; only the 12-byte case (float k=3) does. This is the same
+// observation scorch_simd_half was introduced for at k=4, applied to the widths
+// below it, which the scalar exact-width kernel has owned until now.
+//
+// An over-wide load would be simpler and is wrong: B's last row ends the buffer,
+// so reading 16 bytes for a 12-byte row reads past it.
+template <typename T, int K>
+static inline typename scorch_simd_half<T>::vec scorch_narrow_rowvec_load(
+    const T* SCORCH_RESTRICT p, typename scorch_simd_half<T>::mask m) {
+  using VH = scorch_simd_half<T>;
+  constexpr int BYTES = K * (int)sizeof(T);
+  if constexpr (BYTES == 16) {
+    return VH::load(p);
+  } else if constexpr (BYTES == 8) {
+    if constexpr (std::is_same<T, float>::value) {
+      return _mm_castpd_ps(_mm_load_sd((const double*)p));
+    } else {
+      return _mm_load_sd(p);
+    }
+  } else if constexpr (BYTES == 4) {
+    return _mm_load_ss(p);
+  } else {
+    return VH::maskload(p, m);
+  }
+}
+
+template <typename T, int K>
+static inline void scorch_narrow_rowvec_store(
+    T* SCORCH_RESTRICT p, typename scorch_simd_half<T>::mask m,
+    typename scorch_simd_half<T>::vec v) {
+  using VH = scorch_simd_half<T>;
+  constexpr int BYTES = K * (int)sizeof(T);
+  if constexpr (BYTES == 16) {
+    VH::store(p, v);
+  } else if constexpr (BYTES == 8) {
+    if constexpr (std::is_same<T, float>::value) {
+      _mm_store_sd((double*)p, _mm_castps_pd(v));
+    } else {
+      _mm_store_sd(p, v);
+    }
+  } else if constexpr (BYTES == 4) {
+    _mm_store_ss(p, v);
+  } else {
+    VH::maskstore(p, m, v);
+  }
+}
+
+// The row-as-vector form of the exact-width narrow-k kernel. Same signature and
+// same arithmetic as scorch_spmm_row_narrow_exact, so the two are a one-macro
+// swap at the call site and the comparison is attributable to the kernel.
+//
+// The scalar kernel holds acc[UNROLL][K] in scalar registers and pays K loads and
+// K FMAs per nonzero. That is not what the compiler emits. GCC 13 vectorizes the
+// nonzero loop, cannot use a hardware gather for B_val[A1_crd[p]*K] because the
+// K values of a row are a contiguous group rather than a stride-1 element, and
+// synthesizes the gather with per-lane vmovss + vinsertps. Measured on the
+// shipped object, scorch_spmm_row_narrow_exact<float, 2, 4> on mkt1 (Zen4): the
+// main counted loop is 294 instructions with 105 shuffles against 8 packed FMAs
+// covering 16 nonzeros -- 6.6 shuffle instructions per nonzero, to avoid 2 FLOPs.
+// Zen4 issues 2 shuffles per cycle, so that overhead alone is ~3.3 cycles per
+// nonzero against ~1.33 for four scalar loads at 3 loads per cycle.
+//
+// Loading the row as one register removes the reason to vectorize across
+// nonzeros: one B-row load and one FMA per nonzero, whatever K is.
+template <typename T, int K, int UNROLL>
+static inline void scorch_spmm_row_narrow_rowvec(
+    const int* SCORCH_RESTRICT A1_crd, const T* SCORCH_RESTRICT A_val,
+    const T* SCORCH_RESTRICT B_val, T* SCORCH_RESTRICT C_row,
+    int pA_begin, int pA_end) {
+  using VH = scorch_simd_half<T>;
+  constexpr int BYTES = K * (int)sizeof(T);
+  if constexpr (BYTES > 16) {
+    // Wider than one 128-bit register, so the row is not a register and this
+    // kernel has nothing to say about the width. Float k=5..7 and double k=3 keep
+    // the scalar kernel, which is what makes this change scoped to its premise
+    // rather than to a width range chosen by measurement.
+    scorch_spmm_row_narrow_exact<T, K, UNROLL>(A1_crd, A_val, B_val, C_row,
+                                               pA_begin, pA_end);
+  } else {
+    const typename VH::mask m = VH::lane_mask(K);
+    typename VH::vec acc[UNROLL];
+    #pragma unroll
+    for (int u = 0; u < UNROLL; u++) acc[u] = VH::zero();
+    int pA = pA_begin;
+    for (; pA + UNROLL <= pA_end; pA += UNROLL) {
+      #pragma unroll
+      for (int u = 0; u < UNROLL; u++) {
+        // K is a compile-time constant, so this is a shift or an lea, never a multiply.
+        const T* SCORCH_RESTRICT Bp =
+            B_val + (size_t)A1_crd[pA + u] * (size_t)K;
+        acc[u] = VH::fma(VH::splat(A_val[pA + u]),
+                         scorch_narrow_rowvec_load<T, K>(Bp, m), acc[u]);
+      }
+    }
+    #pragma unroll
+    for (int u = 1; u < UNROLL; u++) acc[0] = VH::add(acc[0], acc[u]);
+    for (; pA < pA_end; pA++) {
+      const T* SCORCH_RESTRICT Bp = B_val + (size_t)A1_crd[pA] * (size_t)K;
+      acc[0] = VH::fma(VH::splat(A_val[pA]),
+                       scorch_narrow_rowvec_load<T, K>(Bp, m), acc[0]);
+    }
+    scorch_narrow_rowvec_store<T, K>(C_row, m, acc[0]);
+  }
+}
+
 // Register-blocked narrow-k SpMM row kernel: accumulate the whole output row in
 // NVEC YMM registers across the row's nonzeros (2-nnz ILP for two independent
 // FMA chains), with a masked load/store on the final partial vector. Avoids the
@@ -4977,9 +5085,18 @@ torch::Tensor spmm_csr_v2_core(
               }
             }
             if (exact_width) {
+              // One macro, two kernels, same signature: the arm is a flag flip on one tree
+              // rather than two trees that have to be kept in step. At the shipped value of 0
+              // the #else branch is the text that was here before, so emission is unchanged.
+              #if SCORCH_NARROWK_EXACT_ROWVEC && defined(__AVX2__) && defined(__FMA__)
+              #define SCORCH_RNE(KK, UN) \
+                scorch_spmm_row_narrow_rowvec<scalar_t, KK, UN>( \
+                    A1_crd, A_val, B_val, C_row, pA_begin, pA_end)
+              #else
               #define SCORCH_RNE(KK, UN) \
                 scorch_spmm_row_narrow_exact<scalar_t, KK, UN>( \
                     A1_crd, A_val, B_val, C_row, pA_begin, pA_end)
+              #endif
               // The unroll is a compile-time template argument, so adapting it to the
               // row costs one halving loop over at most three steps and picks an
               // instantiation that already exists. Rows at or above the configured
@@ -5144,9 +5261,18 @@ torch::Tensor spmm_csr_v2_core(
         // story. Whether it pays here is a question for the ARM grid; the compiled-in
         // default leaves the family off on both architectures.
         if (exact_width) {
+          // One macro, two kernels, same signature: the arm is a flag flip on one tree
+          // rather than two trees that have to be kept in step. At the shipped value of 0
+          // the #else branch is the text that was here before, so emission is unchanged.
+          #if SCORCH_NARROWK_EXACT_ROWVEC && defined(__AVX2__) && defined(__FMA__)
+          #define SCORCH_RNE(KK, UN) \
+            scorch_spmm_row_narrow_rowvec<scalar_t, KK, UN>( \
+                A1_crd, A_val, B_val, C_row, pA_begin, pA_end)
+          #else
           #define SCORCH_RNE(KK, UN) \
             scorch_spmm_row_narrow_exact<scalar_t, KK, UN>( \
                 A1_crd, A_val, B_val, C_row, pA_begin, pA_end)
+          #endif
           #define SCORCH_RNE_U(KK) \
             do { \
               int un_ = exact_unroll; \

@@ -1517,6 +1517,54 @@
 #ifndef SCORCH_NARROWK_EXACT_HI
 #  define SCORCH_NARROWK_EXACT_HI 3
 #endif
+
+// Route the exact-width narrow-k widths to the row-as-vector kernel instead of the
+// scalar one. 0 = scalar (what ships), 1 = row-as-vector where the row fits a
+// 128-bit register (float k<=4, double k<=2); wider widths keep the scalar kernel
+// inside the new kernel itself, so this is not a width range chosen by measurement.
+//
+// WHY THERE IS ANYTHING TO WIN. The scalar kernel's source says K loads and K FMAs
+// per nonzero. The object says otherwise. GCC 13 vectorizes the nonzero loop, has
+// no hardware gather for B_val[A1_crd[p]*K] -- the K values of a row are a
+// contiguous group, not a stride-1 element -- and fakes one per lane. In the
+// shipped object on mkt1 (Zen4), scorch_spmm_row_narrow_exact<float, 2, 4>'s main
+// counted loop is 294 instructions: 105 shuffles against 8 packed FMAs covering 16
+// nonzeros. That is 6.6 shuffle instructions per nonzero to avoid 2 FLOPs, and at
+// Zen4's 2 shuffles per cycle it costs ~3.3 cycles per nonzero where four scalar
+// loads at 3 loads per cycle cost ~1.33.
+//
+// MEASURED, kernel in isolation, three arms in ONE binary so no process boundary
+// separates them (mkt1, g++ 13, shipped flags, nnz fixed at 2^20, 7 reps, arms
+// interleaved ABBA). Arm "vec" is the shipped kernel, "sca" is the same source with
+// -fno-tree-vectorize, "rowvec" is this kernel; a third copy of "vec" under another
+// name gives the floor. rowvec/vec over 40 cells spanning k in {2,3,4}, UNROLL in
+// {4,8}, mean degree in {8,32,64,256,1024} and a B that is L1-resident (1024 rows)
+// or not (2^20 rows):
+//
+//   k=2: 1.289 .. 2.536      k=3: 1.352 .. 2.865      k=4: 1.769 .. 3.233
+//
+// Not one cell below 1.28, against an A/A floor of 0.963 .. 1.201 (one outlier at
+// 1.20, the rest inside 0.96 .. 1.05) -- so the smallest effect clears the worst
+// floor reading. Disabling the vectorizer alone gets 0.99 .. 2.13, i.e. most but
+// not all of it, which is what identifies the vectorizer as the mechanism rather
+// than merely something that correlates with it. Agreement with the shipped kernel
+// is 6e-07 relative at worst, which is float32 reassociation and not a defect.
+//
+// WHAT THIS DOES NOT YET SHOW. Those are kernel-isolation numbers, single-threaded,
+// on uniform-degree synthetic CSR. The end-to-end figure on the real dispatch path
+// against MKL is a separate measurement and the only one that decides the default.
+//
+// A NOTE ON SCORCH_SPMM_HALFVEC_F32=2, which looks like it already did this and did
+// not. Its gate is `halfvec_under = (spmm_halfvec >= 2 && B1_size < LH &&
+// B1_size >= 2 && !exact_width)`. With float LH=4 the only widths it can take are
+// k=2 and k=3, and SCORCH_NARROWK_EXACT_HI=3 makes exact_width nonzero at exactly
+// those two. So for float32 that gate cannot fire at any width, and the recorded
+// "taking the widths BELOW the exact one as well adds nothing (1.0997)" compared
+// two builds that route identically. That null is vacuous, not a refutation; it is
+// also only vacuous at EXACT_HI=3, so it may have been live when it was taken.
+#ifndef SCORCH_NARROWK_EXACT_ROWVEC
+#  define SCORCH_NARROWK_EXACT_ROWVEC 0
+#endif
 // Per dtype, on the same grounds as SCORCH_SPMM_HALFVEC_F32/_F64 and
 // SCORCH_SPMM_MULTIROW_ROWS_F32/_F64 above: the measurement splits by dtype and one number cannot
 // carry both. Both default to the combined value, so a build that names neither emits what it

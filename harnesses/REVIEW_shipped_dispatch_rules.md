@@ -2640,9 +2640,34 @@ enumerated members *while requiring zero non-members* forces set **equality**, w
 rather than cardinality -- the count alone was not.
 
 **And one level below both: no clause read the measurement.** `csv.DictWriter` emits a missing key
-as an **empty field**, and this harness family uses it in eight files under `harnesses/pfstream/`,
-so a dropped value is a complete-looking row. The gate verified that a cell *exists* and never that
-it holds a usable number. Added: rows with `ms == ""` or `ms <= 0`.
+as an **empty field**, so a dropped value is a complete-looking row. The gate verified that a cell
+*exists* and never that it holds a usable number. Added: rows with `ms == ""` or `ms <= 0`.
+
+An earlier revision of this paragraph said "eight files under `harnesses/pfstream/`", which was
+wrong in both directions, and the correction is worth more than the number. There are **nine**
+`DictWriter` constructions, and they are not one population. Seven pass a **hardcoded `fieldnames`
+literal** -- `ntoracle.py:146`, `fmgate.py:169`, `pfs_bits.py:110`, `pfs_bits_fused.py:344`,
+`mrgate.py:102`, `adggate.py:154`, `gate_runtime.py:342` -- and those carry the mechanism exactly
+as stated, because the schema is fixed independently of the data. Two derive `fieldnames` from the
+first record: `bstream_locality.py:292` (`list(rows_out[0].keys())`) and `dlmc_rowdisp.py:202`
+(`list(recs[0].keys())`). There the first row *defines* the schema and so cannot have a missing
+key; the exposure is row-to-row heterogeneity instead, and it splits by direction -- a later row
+missing a key blanks silently, a later row with an extra key raises `ValueError` under the default
+`extrasaction='raise'`. One is silent and one is loud, which is a different detectability and
+therefore a different finding.
+
+**The figure that shows the claim is not vacuous: zero** of the nine set `restval` or
+`extrasaction`, so every site runs on the library defaults -- which is what keeps the blanking
+mechanism live at all seven. Taken with a positive control, since an empty grep result is also
+what a broken grep prints: `grep -rn 'restval\|extrasaction' harnesses/ --include='*.py'` returns
+rc=1 with 0 matches, while the identically-shaped `grep -rn 'DictWriter' ...` returns 9. All nine
+are under `harnesses/pfstream/`; the tree holds no others.
+
+And the reason this is in the file twice: the paragraph immediately above argues that a check
+should be an **identity against an enumerated population** rather than a **count over an
+unenumerated one**, and then supported itself with "eight files" -- a count over an unenumerated
+population. Enumerating the nine is the identity version, and it is what exposed that two of them
+are not instances of the mechanism as written.
 
 | case | rows | e9 | keys | missing | cells!=9 | outside | bad-ms | verdict |
 |---|---|---|---|---|---|---|---|---|
@@ -3396,3 +3421,138 @@ both`, which is the failure mode `partition_identity_hides_misrouting` names. Th
 asymmetry in both corpora (21 against 13, 41 against 38) is recorded as a reading and not
 interpreted. Peer reviewer's correction of what the bound had to be, and their derivation of the
 split; the counts are measured here.
+
+## The k=2 kernel is scalar in its source and a gather emulation in its object
+
+The previous section closed the nonzero-unroll lever and left k=2 as the only region neither
+rejected campaign had tested. This one reads what the k=2 path actually emits, and the answer is
+not what the source says.
+
+**What the source says.** `scorch_spmm_row_narrow_exact<T, K, UNROLL>` (`spmm.h:2102`) holds
+`T acc[UNROLL][K]` in scalar registers with both loops `#pragma unroll`'d. Per nonzero that is one
+`A1_crd` load, one `A_val` load, K `Bp[j]` loads and K scalar FMAs. At K=2: four loads, two scalar
+FMAs, no SIMD. Two knobs that must not be conflated: `SCORCH_NARROWK_EXACT_UNROLL` ships at **4**
+(`scorch_policy.h:547`), so the kernel already runs four nonzero streams, while the
+`SCORCH_NARROWK_DEEP_UNROLL` rejected four-of-four at nvec=1 is a **different** mechanism on a
+different kernel. The exact kernel's comment says its range is "float k=1..7", but
+`SCORCH_NARROWK_EXACT_HI` ships at 3, so float k=4..7 are instantiated and not routed to it.
+
+**What the object says.** GCC 13 vectorizes the nonzero loop. It has no hardware gather for
+`B_val[A1_crd[p]*K]` -- the K values of a row are a contiguous *group*, not a stride-1 element --
+so it synthesizes one with per-lane `vmovss` + `vinsertps`. Read off the shipped object on mkt1
+(`/scr/bobbyy/pfs/ship/src/scorch_ops.cpython-312-x86_64-linux-gnu.so`, sha `4c11296ce2a68c3d`),
+not off a probe:
+
+| shipped symbol | insns | shuffles | FMAs | scalar loads | hw gathers |
+|---|---|---|---|---|---|
+| `narrow_exact<float, 2, 4>` | 1042 | 244 | 33 | 111 | 0 |
+| `narrow_exact<float, 2, 8>` | 1694 | 432 | 49 | 196 | 0 |
+| `narrow_exact<float, 3, 4>` | 1381 | 319 | 50 | 151 | 0 |
+| `narrow_exact<float, 7, 4>` | 3836 | 1025 | 103 | 492 | 0 |
+
+Instruction totals are inflated by `-funroll-loops` peeling and epilogues, so the figure that
+matters is the **main counted loop**, isolated by taking every backward conditional branch in the
+symbol and censusing its span. In `<float, 2, 4>` that loop is at entry+0x150: **294 instructions,
+105 shuffles, 8 packed FMAs**. Eight 4-wide FMAs cover 32 floats = 16 nonzeros, so it is **6.6
+shuffle instructions per nonzero** -- spent to avoid 2 FLOPs. Zen4 issues 2 shuffles per cycle, so
+that overhead alone is ~3.3 cycles per nonzero where four scalar loads at 3 loads/cycle are ~1.33.
+The nonzero UNROLL ladder actually instantiated is {2,4,8}, and K runs 2..7 (no float K=1 symbol).
+
+**The probe reproduces the shipped codegen, which is what licenses using it.** Compiling the
+kernel text extracted verbatim by line range, with the prebuilt extension's own flags
+(`-O3 -march=native -ffast-math -funroll-loops`, `pyproject.toml:49`), gives 1430 instructions for
+K=2 against the shipped symbol's 5165 **bytes**; at x86's ~3.6 bytes/instruction those agree to
+within a percent. The probe also establishes that this is the **loop** vectorizer and not the SLP
+vectorizer: `-fno-tree-slp-vectorize` moves the K=2 shuffle count only 357 -> 341, while
+`-fno-tree-vectorize` takes it to **0** and the instruction count 1430 -> 229.
+
+### The fix is the row, not the vectorizer
+
+Disabling the vectorizer is a diagnostic, not a design. A B row of K values occupies
+`K*sizeof(T)` bytes, and where that is a native load width the row **is** a register: one load and
+one FMA per nonzero, whatever K is. That is the same observation `scorch_simd_half` was introduced
+for at k=4, and its own comment already anticipates serving k=3; it was never applied below k=4.
+
+Three arms of the same kernel in **one binary**, so no process boundary separates them
+(mkt1, g++ 13, shipped flags, nnz fixed at 2^20, 7 reps, arms interleaved ABBA). `vec` is the
+shipped kernel, `sca` is the same source with `-fno-tree-vectorize`, `rowvec` loads the row as one
+128-bit register; a third copy of `vec` under another name is the floor. Over 40 cells spanning
+k in {2,3,4}, UNROLL in {4,8}, mean degree in {8,32,64,256,1024}, and a B that is L1-resident
+(1024 rows) or not (2^20 rows):
+
+| k | `rowvec`/`vec` | `sca`/`vec` |
+|---|---|---|
+| 2 | 1.289 .. 2.536 | 0.999 .. 1.881 |
+| 3 | 1.352 .. 2.865 | 1.083 .. 2.001 |
+| 4 | 1.769 .. 3.233 | 0.989 .. 1.723 |
+
+Not one `rowvec` cell is below 1.28, against an A/A floor of 0.963 .. 1.201 -- one outlier at
+1.20, the rest inside 0.96 .. 1.05 -- so **the smallest effect clears the worst floor reading**.
+Agreement with the shipped kernel is 6e-07 relative at worst, which is float32 reassociation under
+`-ffast-math` and not a defect. Census: 131 instructions, **0** shuffles, 16 FMAs against the
+shipped kernel's 1217 / 296 / 27.
+
+That `sca` recovers most but not all of `rowvec`'s gain is the part that identifies the mechanism
+rather than merely correlating with it: removing the vectorizer removes the emulated gather, and
+loading the row as a register additionally removes K-1 of the K loads.
+
+**The A/A pair's digests differed and that was an artefact of the check, not of the code.**
+`objdump -d` prints the object's filename on its first line, so digesting its whole output makes
+two identically-compiled arms differ. With that line stripped, `vec` and `aa` have identical code
+digests (`bb439b118653694a`), and their instruction censuses were already identical at
+1217/296/27. Reported because an unexplained digest difference between arms that are supposed to
+be identical would invalidate the floor.
+
+### `SCORCH_SPMM_HALFVEC_F32=2` looks like it already did this. Its gate cannot fire.
+
+The policy header records: "Taking the widths BELOW the exact one as well adds nothing (1.0997),
+so 1 and not 2." The gate is `halfvec_under = (spmm_halfvec >= 2 && B1_size < LH && B1_size >= 2
+&& !exact_width)` (`spmm.h:4903`). With float `LH = 4` the only widths it can take are k=2 and
+k=3. And `exact_width = B1_size` for `B1_size` in `[exact_lo_, exact_hi_]` (`spmm.h:4160`), with
+`exact_hi_ = SCORCH_NARROWK_EXACT_HI = 3` -- so `exact_width` is nonzero at exactly k=2 and k=3,
+and `!exact_width` is false at both. **For float32 that gate cannot fire at any width**, and the
+recorded comparison was between two builds that route identically. The null is vacuous rather than
+a refutation. It is vacuous *at EXACT_HI=3*; it may have been live when it was taken, which is the
+same staleness-by-ordering the file already flags at `spmm.h:4151` ("anything in this file that
+still reasons from 'K1 is off' is stale").
+
+This also explains why k=2 is absent from both rejected campaigns' tables. `arm_screen.sh`'s own
+header uses k<=3 as its **negative control**, "a width at which SCORCH_SPMM_REGBLOCK_PFD provably
+cannot change executed code". For `SCORCH_NARROWK_EXACT_ROWVEC` the roles invert exactly: k<=3 is
+the live set and every width above it is the control.
+
+### Shipped as a flag at 0, and the production measurement is pending
+
+`SCORCH_NARROWK_EXACT_ROWVEC` (`scorch_policy.h`, default **0**) selects the kernel at both call
+sites via the existing `SCORCH_RNE` macro, whose `#else` branch is the text that was there before.
+Widths wider than one 128-bit register delegate to the scalar kernel *inside the new kernel*, so
+the change is scoped to its premise and not to a width range chosen by measurement.
+
+Three objects from one tree at equal-length paths (`harnesses/rowvec/rvec_build.sh`, derived from
+`pfs_build.sh` with its guards kept): `ship == shpb` in `.text` and `rvec` differs, all three
+report `spmm_tune_hooks=False`. `rvec`'s `.text` is 983314 bytes against ship's 1073586.
+
+**A neutrality claim I set up and cannot make.** I predicted the edit is byte-neutral at
+ROWVEC=0 and captured the pre-edit object's `.text` digest to check it. The pre-edit object was
+built at `/scr/bobbyy/pfs/ship` (20 characters) and the new one at `/scr/bobbyy/rvec/ship` (21),
+and path length changes `.text` -- this harness family's own recorded finding, and the reason
+`pfs_build.sh` insists on equal-length paths. Sizes agree exactly (1073586 both) and digests
+differ, which under a path-length difference distinguishes nothing. Testing it needs the unedited
+headers built at an equal-length path, which has not been done. The arm comparison is unaffected:
+ship, shpb and rvec are one tree, one flag, equal-length paths.
+
+**Early read, 31 SuiteSparse matrices, ks 2,3,8, three builds** (a smoke test sized to check
+direction before committing the long job, not a result):
+
+| k | role | ship/mkl | rvec/mkl | rvec/ship | A/A floor shpb/ship |
+|---|---|---|---|---|---|
+| 2 | live | 1.0087 | 1.0714 | 1.0653 | 1.0053 |
+| 3 | live | 1.0490 | 1.1523 | 1.0867 | 1.0057 |
+| 8 | control | 1.3032 | 1.3021 | 0.9885 | 1.0076 |
+
+The control width moves -1.2% and the live widths +6.5% and +8.7% against a ~0.5% floor. End-to-end
+is far below the kernel-isolation figures, which is expected: the kernel is one term of the call.
+Whether +6.5% closes anything is not decided here -- MKT SuiteSparse k=2 stands at 0.9480 and DLMC
+k=2 at 0.7195, so SuiteSparse would cross parity and DLMC would not. Job **17704056** runs all
+three builds over all 4594 SuiteSparse and 3820 DLMC keys; its result decides the default, and
+nothing above should be quoted as the production figure.
