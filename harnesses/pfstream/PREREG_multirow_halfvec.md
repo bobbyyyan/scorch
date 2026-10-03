@@ -1454,7 +1454,7 @@ The key list's mtime precedes the run start by 57 seconds, so the corpus definit
 the same way the driver is. Its first entries are `rn50/extended_magnitude_pruning/0.8/...`,
 which is DLMC by content and not only by cardinality.
 
-**The sentinel does not close this, though its field name suggests it does.** Line 226 is
+**The sentinel does not close this, though its field name suggests it does.** Lines 223-225 are
 
     printf "...\nks %s\nkeys %s\n..."  "$KS" "$NK" ...
 
@@ -1501,3 +1501,73 @@ come from the environment, and bind those too** -- preferring `/proc/<pid>/envir
 process lives, because it is the only form that is a reading rather than a reconstruction. A
 default that points at a *different experiment* makes the gap worse than a missing record: it
 supplies a plausible wrong answer instead of no answer.
+
+---
+
+## Amendment 14: the corpus is now in the tree, and the sentinel has three fields that cannot do their job
+
+### One of amendment 13's three unbound inputs was already bound, and the narrowing sharpens the rest
+
+`mrgate.py` is committed at `harnesses/pfstream/mrgate.py`, sha256
+`a55e07bf03e1fb34644072da299f4e34645f3d4c1363f45aaa3b4fd382163fc8` -- the full form of the
+digest read on redwood -- and `pfs_screen_dlmc.sbatch:99` **already gates on that exact value**
+in its `declare -A WANT`. So the measurement code was bound before this thread started, on two
+hosts. "Nowhere" was true of the log and the sentinel and false of the tree, which is the part
+amendment 13 did not check. Two unbound inputs, not three.
+
+### The remaining one was worse than "absent": the tree holds a DIFFERENT list under a confusingly close name
+
+`harnesses/pfstream/dlmc_keys.txt` is committed, and it is **392 keys**, sha `24e386cee4371ce9`
+-- not the 3820 that ran. Its entries already begin `rn50/...`, so there is no prefix transform
+that maps one to the other; stripping a leading `dlmc/` leaves the digest unchanged. A reader
+finding a committed `dlmc_keys.txt` beside this screen's record would reasonably take it for the
+corpus, and it is a tenth of it. That is the same hazard as `CACHE`'s SuiteSparse default one
+layer out: **a plausible wrong answer available where the right one is missing.**
+
+**Fixed by committing the list that ran**, since a 332 KB corpus definition is an input and not a
+result:
+
+    harnesses/pfstream/dlmc_keys_full3820.txt
+      3820 lines, 3820 distinct
+      sha256 a8132f50d2c44fe4acabe673a9394b341453bd636ade9ae45831968612d275d8
+
+The digest of the fetched file equals the digest read on redwood before transport, so the copy is
+verified rather than assumed. The relationship between the two lists is also now measured: **the
+392 are a strict subset of the 3820** -- `comm -23` gives 0 keys present in the small list and
+absent from the large one -- and neither has duplicates. So the small list is a declared subset,
+and the hazard was its name, not its content.
+
+### Three sentinel fields cannot attain a value that would contradict them
+
+| `:223-225` field | value | what it can attain |
+|---|---|---|
+| `nonzero_rc` | `$failed` | **0 only.** `:210` increments it and `:213` exits, with no other assignment but `failed=0`. The printf is unreachable while it is nonzero. |
+| `passes 4`, `builds 4` | literals in the format string | the design, asserted |
+| `csvs` | `ls "$OUT"/${PREFIX}_*.csv \| wc -l` | derived -- the one number that could contradict the two literals, and **nothing compares them** |
+| `keys` | `$NK` = `wc -l < $KEYS` | a cardinality, under a field name that promises a path |
+
+So the record states its design twice as a literal, measures the quantity that could falsify it,
+and never does the comparison -- `csvs == passes * builds` is one line away. And `$OUT` is only
+ever `mkdir -p`'d (`:171`), with the sole writes under it being the per-unit CSV (`:200`), the
+per-unit log (`:205`) and `screen.done` (`:225`); there is no `rm`, `-delete`, `unlink` or
+`truncate` anywhere in the file. So a file left by an earlier run under the same prefix counts as
+this run's. This project has hit exactly that and resolved it by renaming the directory.
+
+**And the quantity that would have caught the defect this whole thread is about is the one the
+sentinel drops.** `rows=$(( $(wc -l < "$out") - 1 ))` is computed at `:207` and echoed at `:208`,
+and never reaches `screen.done`. The per-unit row count is what showed an 8-width grid had run
+where the committed default was 7 (91680 = 3820 x 8 x 3, against 80220 for seven widths); a
+*total* of CSV files cannot do that and a per-unit minimum can. Since `mrhv_screen.sh` is
+byte-identical to `arm_screen.sh` modulo four build names, this is the completion record of every
+screen in this project.
+
+**Not claimed:** that any of these fields has misled a reading. They are unexercised, and the
+outcome that would make them matter is a screen that half-completes and still leaves a sentinel.
+The general move is the one worth keeping: **for every field in a status artefact, ask what range
+it can attain at the point it is written.** A field whose only attainable value is the good one is
+an identity dressed as an observation.
+
+### Mitigation for this run, since the driver cannot be changed mid-flight
+
+The per-unit row counts are being recorded here as each unit closes, which is the quantity the
+sentinel omits. Unit 1: `mr0` 91680 rows, rc=0, 20:50:29 to 00:08:43.
