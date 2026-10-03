@@ -3667,6 +3667,12 @@ is the mechanism that turns it into a crash.
 
 ## Amendment 44 — the floor decomposes: its LOCATION is a dtype/corpus property, its DISPERSION is a host property
 
+> **THE k=2 ROW IS THE REGISTERED NEGATIVE CONTROL, NOT A DATA POINT — see amendment 52.**
+> This document at `:1545-1548` registered that `SCORCH_SPMM_REGBLOCK_PFD` *"provably
+> cannot change executed code at double k=2"*. The `+0.429%` is the object pair's layout
+> offset, it EXCLUDES ZERO, and the paired test's claim to have removed that offset is
+> withdrawn.
+
 > **AMENDED BY AMENDMENT 46.** The 2x2 had an empty cell and only the DISPERSION claim was
 > identified by it. The fourth cell is now measured and it **refutes** the stronger
 > location reading: the offset belongs to the (MKT, float32/DLMC) COMBINATION, not to
@@ -4447,3 +4453,85 @@ the floor's p05–p95 band on absolute ratios.
 > one construction for each and none for both, say which is which and what each bounds. And prefer
 > a **contrast between cells measured the same way** to a comparison against an absolute constant:
 > a one-signed floor offset cancels in the first and is indistinguishable from signal in the second.
+
+---
+
+## Amendment 52 — the float64 k=2 prefetch reading is this screen's own registered negative control, it MOVED, and the paired test's artefact-removal claim is withdrawn
+
+A reviewing agent read amendment 44 against this document's own registration. Both points hold and
+both are verified at source.
+
+### The registration, verbatim, at `:1545-1548`
+
+> *"**k=2 is a negative control, not a data point.** `SCORCH_SPMM_REGBLOCK_PFD` provably cannot
+> change executed code at double k=2, so whatever that width reads is the object pair's layout
+> offset rather than an effect."*
+
+`pfs_build.sh:76` sets `DEFS[nopf]="-DSCORCH_SPMM_REGBLOCK_PFD=0"` — **exactly that macro**. And
+`narrow_exact` owns double k=1..3 (`exact_cap_ = exact_f32_ ? 7 : 3`), with the
+`narrowk_exact_mindeg` gate that could withdraw it shipping at 0.
+
+**So amendment 44's headline — *"`nopf` goes the wrong way where the deficit lives: MKT f64 k=2
++0.429% CI [+0.274, +0.611] SLOWER"* — is a reading of the negative control.** It is not evidence
+that removing prefetch harms that kernel; **the kernel does not contain the prefetch.** I registered
+that width as a control and then reported it as the finding, in the one row that holds 129 of the
+192 deficit cells.
+
+### And the control MOVED, which has a pre-committed consequence
+
+The reading is **+0.429% with a CI of [+0.274, +0.611] — excluding zero.** The rule I had already
+written down for exactly this case: *"if it moves beyond the A/A floor, the floor is understated at
+every width and no result from that run is readable. That is a finding about the instrument."*
+
+**So the correct reading of +0.429% is that object/layout artefacts on this grid are detectable at
+~0.43% with a CI excluding zero**, which is a statement about the floor and not about prefetch — and
+it bounds what the other six widths can show.
+
+### The paired statistic does not remove the artefact, and its own control proves it
+
+`an_f64_arms.py:295-296` claimed the paired difference *"removes the object-change artefact cell by
+cell."* Writing each object's offset relative to a Platonic time as `o_X`:
+
+```
+(arm   - ship)/ship  ≈  o_arm  - o_ship
+(floor - ship)/ship  ≈  o_shpb - o_ship
+d                    ≈  o_arm  - o_shpb
+```
+
+**It cancels `ship`, not the artefact.** `ship`, `shpb` and the arm are **three distinct objects**,
+so subtracting `shpb`'s offset cannot cancel the arm's: `d` trades one object artefact for a
+**difference of two**, which has *larger* spread, not zero.
+
+**And the measurement is already in hand.** At f64 k=2 the arm is inert, so `d` there is **purely**
+`o_nopf − o_shpb` — exactly the quantity the comment said it had removed — and it reads +0.429%
+with a CI excluding zero. **The paired test's artefact-removal claim is refuted by the screen's own
+registered control.** Withdrawn in the source at `an_f64_arms.py` (`af5c191c497202f1`), which now
+prints the algebra and the measured residual where the claim used to be.
+
+### What this does and does not weaken
+
+**It does not show the other widths' readings are false.** It shows they are **not readable at or
+below ~0.43%**, which is the residual the control measures. Amendment 44 reported `nopf` as FASTER
+at the other six widths; **those magnitudes must be re-read against this residual rather than
+against the paired CI alone**, and three of its boundary verdicts were already at 0.070 / 0.028 /
+0.031 pp — two orders of magnitude inside it.
+
+**Registered, before the re-read runs:** report each width's `|d|` beside the k=2 control's 0.429%,
+and treat any width whose CI does not exclude ±0.429% as unreadable rather than as null. **Deferred
+rather than done now** because the data is on `mkt1` and job 17698209 is timing there.
+
+### What the reviewer got right that I would have missed
+
+The two errors are the same error at different scales: **a quantity registered as a control was
+read as a measurement.** In the thread-sizing document it was a statistic whose null absorbs the
+signal; here it is a width where the knob is inert. In both cases the registration was correct and
+written first, **and the later reading did not consult it.** A registration that is not re-read at
+the moment of interpretation is a record, not a safeguard.
+
+### One correction to the reviewer, for the record
+
+The review describes the paired form as *"`(candidate − duplicate baseline) / baseline`"*. The code
+is `(arm − base)/base − (floor − base)/base` with `base = ship`, `floor = shpb` and three distinct
+objects — so the duplicate baseline enters as a **subtracted second term**, not as the denominator.
+**The conclusion is unaffected and is in fact slightly stronger than the description**: the residual
+is a difference of two independent object offsets rather than one.
