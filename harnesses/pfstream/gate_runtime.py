@@ -49,6 +49,11 @@ ap.add_argument("--pool", type=int, default=8)
 ap.add_argument("--k", type=int, default=16, help="treatment width; the gate's proxy is "
                 "nnz*max(k,16), so membership is identical for every k <= 16 while the "
                 "kernel selected is not -- which is why this is swept")
+ap.add_argument("--nproc-cap", type=int, default=0,
+                help="restrict this process's CPU affinity to N of the allocated CPUs "
+                     "BEFORE importing torch. Slurm's -c is a request and it rounds up to "
+                     "a whole core, so -c 15 on an SMT-2 host yields 16 and lands exactly "
+                     "ON 2*pool instead of below it; setting the affinity here is exact.")
 ap.add_argument("--allow-adoption", action="store_true",
                 help="permit omp_get_num_procs() >= 2*pool. The isolated configuration "
                      "forbids it so the gate is the only thing moving, but a user at pool "
@@ -60,11 +65,47 @@ ap.add_argument("--target-ms", type=float, default=12.0)
 ap.add_argument("--seed", type=int, default=20251002)
 A = ap.parse_args()
 
+# BEFORE the heavy imports: omp_get_num_procs() reads the cpuset, and libgomp latches
+# parts of its view at load time, so the cap has to be in place first.
+if A.nproc_cap:
+    have = sorted(os.sched_getaffinity(0))
+    if A.nproc_cap > len(have):
+        sys.exit("REFUSE: asked to cap at %d CPUs but the allocation holds %d"
+                 % (A.nproc_cap, len(have)))
+    os.sched_setaffinity(0, set(have[:A.nproc_cap]))
+    print("affinity capped to %d of %d allocated CPUs"
+          % (len(os.sched_getaffinity(0)), len(have)))
+
+import ctypes as _ct
 import glob
 import zipfile
 import numpy as np
 import torch
 import scorch_ops as so
+
+# IS THE CACHING getenv SHIM LIVE, AND DID IT ACTUALLY CACHE. A hooks object performs 99
+# getenv per SpMM call, measured by interposition, which costs ~20 us per call end-to-end
+# on this host -- comparable to the whole kernel on the cells this gate selects. That tax
+# cancels in an A-minus-B difference and does NOT cancel in the cell scale, so comparing a
+# cell against the microsecond bands in the comment at :1577 requires it gone. The shim
+# returns the same pointer the real getenv would and flushes on any write to the
+# environment, so decisions are unchanged and an arm flip is still seen; a release object
+# performs no getenv at all, so a shimmed hooks object is CLOSER to what ships.
+#
+# The counters are read rather than the shim's presence assumed: LD_PRELOAD silently does
+# nothing if the path is wrong, and a tax-free claim resting on an inactive shim would read
+# as a plausible number.
+SHIM = None
+try:
+    _c = _ct.CDLL("libfastenv.so")
+    for _f in ("scorch_fastenv_real", "scorch_fastenv_hits", "scorch_fastenv_flushes"):
+        getattr(_c, _f).restype = _ct.c_long
+    SHIM = _c
+except Exception:                                                      # noqa: BLE001
+    pass
+print("getenv shim: %s" % ("LIVE, so readings are tax-free and the cell scale is "
+      "comparable to the comment's bands" if SHIM else "ABSENT, so every reading carries "
+      "~20 us of getenv; A-B is still valid, the cell SCALE is not"), flush=True)
 
 GRAIN = 150000
 THRESH = 2 * GRAIN                      # the shipped constant, pinned to exactly this
@@ -261,7 +302,7 @@ SYM = so.spmm_csr_float_v2
 out = open(A.csv, "w", newline="")
 w = csv.DictWriter(out, fieldnames=["route", "pop", "key", "k", "kt", "rows", "cols",
                                     "nnz", "arm", "us", "batch", "mode", "nthreads",
-                                    "pool", "nproc", "adoption", "so_sha"])
+                                    "pool", "nproc", "adoption", "shim", "so_sha"])
 w.writeheader()
 
 
@@ -284,14 +325,22 @@ def time_once(fn):
 
 
 def timeit(fn, batch):
-    best = float("inf")
+    """ALL reps in microseconds, not just the minimum.
+
+    Min-of-n is the right estimator for one arm's cost -- it is the reading least
+    contaminated by preemption and interrupts. But the quantity reported here is a
+    DIFFERENCE of two arms, and the minimum of n draws sits further below the centre the
+    wider that arm's own spread, so unequal arm noise leaves a bias in the paired
+    difference that pairing does not remove. Its direction depends on which arm is noisier.
+    Returning every rep lets the readout print the min-based and median-based differences
+    side by side and the per-arm spread that decides whether they can disagree."""
+    reps = []
     for _ in range(A.reps):
         t0 = time.perf_counter()
         for _ in range(batch):
             fn()
-        dt = (time.perf_counter() - t0) / batch
-        best = min(best, dt)
-    return best * 1e6                                      # microseconds
+        reps.append((time.perf_counter() - t0) / batch * 1e6)
+    return reps
 
 
 CELLS = []
@@ -336,15 +385,22 @@ for route, ea, eb, popname, pop, k in CELLS:
         setarm(eb); b1 = timeit(run, batch)
         setarm(eb); b2 = timeit(run, batch)
         setarm(ea); a2 = timeit(run, batch)
-        ua, ub = 0.5 * (a1 + a2), 0.5 * (b1 + b2)
+        ra, rb = a1 + a2, b1 + b2
+        ua, ub = 0.5 * (min(a1) + min(a2)), 0.5 * (min(b1) + min(b2))
+        ma = 0.5 * (statistics.median(a1) + statistics.median(a2))
+        mb = 0.5 * (statistics.median(b1) + statistics.median(b2))
+        # Within-cell spread per arm, as a fraction of that arm's own level. This is the
+        # quantity that decides whether min-based and median-based differences can diverge.
+        sa = (max(ra) - min(ra)) / max(statistics.median(ra), 1e-9)
+        sb = (max(rb) - min(rb)) / max(statistics.median(rb), 1e-9)
         nt = so.scorch_spmm_nthreads(nnz * max(k, 16), rows, POOL, nnz * k, nnz)
         for arm, us in (("A", ua), ("B", ub)):
             w.writerow(dict(route=route, pop=popname, key=key, k=k, kt=KT, rows=rows,
                             cols=J, nnz=nnz, arm=arm, us="%.4f" % us, batch=batch,
                             nproc=NPROC, adoption=int(ADOPTION),
-                            mode=decide(s, k, ea if arm == "A" else eb), nthreads=nt,
+                            shim=int(SHIM is not None), mode=decide(s, k, ea if arm == "A" else eb), nthreads=nt,
                             pool=POOL, so_sha=SO_SHA))
-        per.append((key, nnz, rows, ua, ub))
+        per.append((key, nnz, rows, ua, ub, ma, mb, sa, sb))
         if i % 50 == 0:
             print("   %s %s %d/%d  %s nnz %d  A %.1f us  B %.1f us  batch %d"
                   % (route, popname, i, len(pop), key, nnz, ua, ub, batch), flush=True)
@@ -362,6 +418,11 @@ def boot_med(v, B=4000, seed=7):
     return s[int(0.025 * (B - 1))], s[int(0.975 * (B - 1))]
 
 
+if SHIM:
+    print("\nshim counters: %d real getenv, %d cache hits, %d flushes (one per env write). "
+          "A flush count of 0 would mean the arms never reached the environment."
+          % (SHIM.scorch_fastenv_real(), SHIM.scorch_fastenv_hits(),
+             SHIM.scorch_fastenv_flushes()))
 print("\n" + "=" * 78)
 print("PRIMARY: per-cell A-minus-B in MICROSECONDS. Arm A has the partition OFF on the")
 print("treatment cells (mode 0) and arm B has it ON (mode 3), so a NEGATIVE difference")
@@ -375,18 +436,33 @@ for route, ea, eb, want in ROUTES:
         if not per:
             print("   %-3s no cells" % popname)
             continue
-        d = [a - b for (_, _, _, a, b) in per]
+        d = [c[3] - c[4] for c in per]
+        dmed = [c[5] - c[6] for c in per]
         lo, hi = boot_med(d)
-        scale = statistics.median([0.5 * (a + b) for (_, _, _, a, b) in per])
-        rat = statistics.median([a / b for (_, _, _, a, b) in per if b > 0])
+        scale = statistics.median([0.5 * (c[3] + c[4]) for c in per])
+        rat = statistics.median([c[3] / c[4] for c in per if c[4] > 0])
+        # The sign count has no reduction step, is invariant to min-versus-median, and is
+        # invariant to the additive per-call tax. It is the statistic that transfers.
+        npos = sum(1 for x in d if x > 0)
+        nneg = sum(1 for x in d if x < 0)
+        spa = statistics.median([c[7] for c in per])
+        spb = statistics.median([c[8] for c in per])
         # The label comes from the route's own declaration, so a population cannot be
         # printed as a floor in a route that moves it.
         tag = "TREATMENT" if want[popname] == "all" else "A/A FLOOR"
         print("   %-3s %-9s n %3d   median A-B %+8.3f us  CI [%+7.3f, %+7.3f]  %s"
               % (popname, tag, len(d), statistics.median(d), lo, hi,
                  "spans 0" if lo <= 0 <= hi else "excludes 0"))
-        print("       scale %8.2f us   median ratio A/B %.4f (attenuated by the per-call "
-              "tax)" % (scale, rat))
+        print("       SIGN COUNT %3d of %3d positive, %3d negative  (no reduction step, "
+              "invariant to min-vs-median and to the tax)" % (npos, len(d), nneg))
+        print("       median-of-reps A-B %+8.3f us  (against the min-of-reps %+8.3f above; "
+              "they agree to %.3f us)"
+              % (statistics.median(dmed), statistics.median(d),
+                 abs(statistics.median(dmed) - statistics.median(d))))
+        print("       within-cell spread, arm A %.4f of level, arm B %.4f  -- comparable "
+              "spreads are what let the two differences agree" % (spa, spb))
+        print("       scale %8.2f us   median ratio A/B %.4f%s"
+              % (scale, rat, "" if SHIM else " (attenuated by the per-call tax)"))
 print("\nTHE DIFFERENCE IS TAX-FREE AND THE SCALE IS NOT, SO THE `scale` COLUMN ABOVE MUST")
 print("NOT BE COMPARED WITH THE MICROSECOND BANDS IN THE SHIPPED COMMENT. That comment puts")
 print("the cells where the partition loses at 19-30 us and the ones where it wins at 31-110.")
