@@ -1,8 +1,10 @@
 import copy
 import os
+import sys
 import time
 from typing import Any, Dict, Union, Sequence, Optional, List, Tuple
 
+import scorch_ops as _scorch_ops
 import torch
 from torch.fx import Proxy
 
@@ -1084,6 +1086,34 @@ def matmul(
         result = result.to_torch()
 
     return result
+
+
+# The planned fast path in C (csrc/planned_matmul.h). It serves exactly the calls the probe at
+# the top of `matmul` serves -- two positional operands, no keywords, `type(a) is STensor`,
+# `type(b) is torch.Tensor`, plans enabled, a plan under the same key -- and passes every other
+# call, arguments untouched, to the Python function above, which still carries the probe for a
+# build without this entry point. A cold planned call through the Python probe cost 1.2-1.5 us
+# more than the legacy entry point on mkt1, which is what this removes.
+#
+# Rebinding the module global is what keeps tracing whole: a Proxy is never served here, so it
+# reaches the Python function, which records its global `matmul` -- this object -- as the
+# node's target, and `node.target is ops.matmul` (trace.py) holds. `_matmul_python` stays
+# importable for tests that compare the two paths.
+_matmul_python = matmul
+_install_planned_matmul = getattr(_scorch_ops, "install_planned_matmul", None)
+if _install_planned_matmul is not None:
+    matmul = _install_planned_matmul(  # type: ignore[assignment]
+        _matmul_python,
+        STensor,
+        _TENSOR,
+        _PLAN_GENERATION,
+        _PLAN_ENABLED,
+        _PLANS_ATTR,
+        _MATCH_HOST_THREADS,
+        _PLAN_ATPARALLEL,
+        sys.modules[__name__],
+        _matmul_python.__doc__ or "",
+    )
 
 
 # Activation codes for the fused Linear kernel (must match spmm.h

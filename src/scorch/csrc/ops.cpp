@@ -7,6 +7,7 @@
 #include "spmm.h"
 #include "kernels.h"
 #include "plan.h"
+#include "planned_matmul.h"
 
 namespace scorch {
 namespace py = pybind11;
@@ -957,6 +958,14 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           py::arg("kind"), py::arg("A_shape"), py::arg("A_mode_indices"),
           py::arg("A_values"), py::arg("free_dim"), py::arg("panel_free") = 0,
           py::arg("panel_contraction") = 0);
+    // scorch.matmul's planned fast path in C (planned_matmul.h). ops.py binds what this
+    // returns as `matmul`; every call it does not serve goes to `ordinary` unchanged.
+    m.def("install_planned_matmul", &scorch_native::install_planned_matmul,
+          "Build the C callable ops.py binds as matmul",
+          py::arg("ordinary"), py::arg("stensor_type"), py::arg("tensor_type"),
+          py::arg("generation"), py::arg("enabled"), py::arg("plans_attr"),
+          py::arg("match_host_threads"), py::arg("atparallel"), py::arg("module"),
+          py::arg("doc"));
 
     py::class_<Tensor>(m, "Tensor")
       .def_readonly("storage", &Tensor::storage);
