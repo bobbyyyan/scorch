@@ -1,0 +1,228 @@
+# Probe build behind the cursor-placement measurements. Reproduce it with
+#   git archive cc1bef5 src | tar -x -C <dir> && patch -p2 -d <dir> < probe_cursor_placement.diff
+# It adds scorch_ops.probe_set(steal, trace, cmode) / probe_dump() and, in spmm_csr_v2_core,
+# a run-time switch for stealing (steal), a per-call per-worker trace (trace), and the cursor
+# placement (cmode 0 caller stack, 1 persistent written by the caller, 2 persistent written by
+# each owner). Drivers: probe_steal.py, probe_setup.py; readers: probe_ab_read.py, trace_read.py.
+
+diff -ru -x *.so -x build -x *.o -x __pycache__ -x *.egg-info pm/src0/src/scorch/csrc/ops.cpp sw3/src/scorch/csrc/ops.cpp
+--- pm/src0/src/scorch/csrc/ops.cpp	2026-10-03 21:38:36
++++ sw3/src/scorch/csrc/ops.cpp	2026-10-04 08:19:02
+@@ -685,6 +685,23 @@
+ 
+ #endif  // SCORCH_TUNE_HOOKS
+ 
++    m.def("probe_set", [](int steal, int trace, int cmode) {
++      scorch_probe_steal() = steal; scorch_probe_trace() = trace; scorch_probe_cmode() = cmode; scorch_probe_ncalls() = 0;
++    }, py::arg("steal"), py::arg("trace"), py::arg("cmode") = 0);
++    m.def("probe_dump", []() {
++      std::vector<std::vector<double>> out;
++      const long n = std::min(scorch_probe_ncalls(), 256L);
++      for (long c = 0; c < n; ++c) {
++        const double* w = scorch_probe_walls() + c * 5;
++        out.push_back({-1.0, (double)c, w[0], w[1], w[2], w[3], w[4], 0, 0});
++        for (int t = 0; t < (int)w[1] && t < 64; ++t) {
++          const ScorchProbeRec& r = scorch_probe_recs()[c * 64 + t];
++          out.push_back({(double)t, (double)c, r.t_entry, r.t_own, r.t_exit, (double)r.rows_own,
++                         (double)r.rows_stolen, (double)r.steals, (double)r.scanned});
++        }
++      }
++      return out;
++    });
+     m.def("scorch_spmm_chunk", &scorch_spmm_chunk,
+           "Rows per work-stealing chunk the SpMM would use for (rows, nnz, k, nthreads)",
+           py::arg("rows"), py::arg("nnz"), py::arg("k"), py::arg("nthreads"));
+diff -ru -x *.so -x build -x *.o -x __pycache__ -x *.egg-info pm/src0/src/scorch/csrc/spmm.h sw3/src/scorch/csrc/spmm.h
+--- pm/src0/src/scorch/csrc/spmm.h	2026-10-03 21:38:36
++++ sw3/src/scorch/csrc/spmm.h	2026-10-04 08:19:02
+@@ -3617,6 +3617,24 @@
+ // hands over, and SpmmCsrPlan (plan.h), which already holds the unpacked and
+ // validated structure and so pays none of that per call. Splitting them is what
+ // lets a warm dispatch be a single Python->C++ hop; the body is unchanged.
++// ---- PROBE (scratch tree only): runtime steal switch + per-call per-worker trace ----
++struct ScorchProbeRec { double t_entry, t_own, t_exit; int rows_own, rows_stolen, steals, scanned; };
++inline volatile int& scorch_probe_cmode() { static volatile int v = 0; return v; }
++struct alignas(128) ScorchGenCursor {
++  std::atomic<uint64_t> ht{0};    // head (low 32 bits) | exclusive tail (high 32)
++  std::atomic<uint64_t> gen{0};   // 2g: being initialised for call g; 2g+1: ready for call g
++};
++struct ScorchCursorTLS { uint64_t g = 0; ScorchGenCursor c[256]; };
++inline ScorchCursorTLS& scorch_cursor_tls() { thread_local ScorchCursorTLS t; return t; }
++inline volatile int& scorch_probe_steal() { static volatile int v = 1; return v; }
++inline volatile int& scorch_probe_trace() { static volatile int v = 0; return v; }
++inline ScorchProbeRec* scorch_probe_recs() { static ScorchProbeRec r[256 * 64]; return r; }
++inline double* scorch_probe_walls() { static double w[256 * 5]; return w; }
++inline long& scorch_probe_ncalls() { static long n = 0; return n; }
++inline double scorch_probe_now() {
++  return (double)std::chrono::duration_cast<std::chrono::nanoseconds>(
++             std::chrono::steady_clock::now().time_since_epoch()).count();
++}
+ template <typename scalar_t, bool REDIRECT = false>
+ torch::Tensor spmm_csr_v2_core(
+                 int C0_size, int C1_size, int A0_size,
+@@ -4010,7 +4028,16 @@
+   std::unique_ptr<scorch_spmm_cursor[]> cursor_heap;
+   int* row_split = nullptr;
+   scorch_spmm_cursor* cursors = nullptr;
+-  if (partition_mode != 0) {
++  const int probe_steal = scorch_probe_steal();
++  const int probe_trace = scorch_probe_trace();
++  const long probe_call = probe_trace ? (scorch_probe_ncalls()++ & 255) : 0;
++  double probe_t0 = 0.0;
++  const int probe_cmode = (partition_mode == 3 && nsplit <= 256) ? scorch_probe_cmode() : 0;
++  ScorchCursorTLS* gtls = probe_cmode ? &scorch_cursor_tls() : nullptr;
++  const uint64_t gcall = gtls ? ++gtls->g : 0;
++  ScorchGenCursor* gc = gtls ? gtls->c : nullptr;
++  const double probe_s0 = probe_trace ? scorch_probe_now() : 0.0;
++  if (partition_mode != 0 && probe_cmode != 2) {
+     if (nsplit <= kSplitOnStack) {
+       row_split = split_stack;
+       cursors = cursor_stack;
+@@ -4045,7 +4072,12 @@
+     // cells on the float64 general corpus. The cost it removes is real and too small to
+     // find; the nonzeros it moves between workers are not free. See
+     // SPMM_BEAT_MKL_RESULTS.md.
+-    for (int w = 0; w < nsplit; ++w) {
++    if (probe_cmode == 1)
++      for (int w = 0; w < nsplit; ++w) {
++        gc[w].ht.store(scorch_ht_pack(row_split[w], row_split[w + 1]), std::memory_order_relaxed);
++        gc[w].gen.store(2 * gcall + 1, std::memory_order_release);
++      }
++    for (int w = 0; w < nsplit && probe_cmode == 0; ++w) {
+       if (partition_mode == 3)
+         cursors[w].ht.store(scorch_ht_pack(row_split[w], row_split[w + 1]),
+                             std::memory_order_relaxed);
+@@ -4057,6 +4089,7 @@
+   // core cannot become the critical path, and never narrower than the arithmetic
+   // chunk. SCORCH_SPMM_ZERO_SLICES sets the slices-per-worker target; 4 is where
+   // the grid put it.
++  const double probe_s1 = probe_trace ? scorch_probe_now() : 0.0;
+   int zchunk = chunk;
+   if (zero_stolen_slice) {
+     long per_worker = 4;
+@@ -4607,6 +4640,9 @@
+     const double wstat_t0 = wstat_on ? scorch_spmm_now_ns() : 0.0;
+     long wstat_nnz = 0, wstat_rows = 0, wstat_claims = 0;
+ #endif
++    const double pt_entry = probe_trace ? scorch_probe_now() : 0.0;
++    double pt_own = 0.0;
++    int p_rows_own = 0, p_rows_stolen = 0, p_steals = 0, p_scanned = 0;
+     scalar_t* SCORCH_RESTRICT ws = nullptr;
+ #if SCORCH_SPMM_NEEDS_WORKSPACE
+     ws = worker_workspaces.get() +
+@@ -4670,7 +4706,38 @@
+ 
+     // Home-range progress for partition modes 1 and 2 (see the setup above).
+     int own_w = worker_id;   // next own split to try
+-    int steal_t = 1;         // next victim offset to try
++    int steal_t = probe_steal ? 1 : nsplit;   // next victim offset to try
++    auto split_at = [&](int w) -> int {
++      if (w <= 0) return 0;
++      if (w >= nsplit) return A0_size;
++      const long target = (nnz_total + (long)A0_size) * (long)w / (long)nsplit;
++      int lo = 0, hi = A0_size;
++      while (lo < hi) {
++        const int mid = lo + ((hi - lo) >> 1);
++        if ((long)A1_pos[mid] + (long)mid < target) lo = mid + 1; else hi = mid;
++      }
++      return lo;
++    };
++    // true once cursor w holds this call's range. An owner (wait) always gets there; a thief
++    // initialises an untouched cursor itself (so a descheduled owner's rows still get done) but
++    // does not wait on one someone else is initialising.
++    auto gc_ready = [&](int w, bool wait) -> bool {
++      const uint64_t ready = 2 * gcall + 1, busy = 2 * gcall;
++      uint64_t cur = gc[w].gen.load(std::memory_order_acquire);
++      if (cur == ready) return true;
++      if (cur < busy && gc[w].gen.compare_exchange_strong(cur, busy, std::memory_order_acq_rel)) {
++        gc[w].ht.store(scorch_ht_pack(split_at(w), split_at(w + 1)), std::memory_order_relaxed);
++        gc[w].gen.store(ready, std::memory_order_release);
++        return true;
++      }
++      if (!wait) return gc[w].gen.load(std::memory_order_acquire) == ready;
++      while (gc[w].gen.load(std::memory_order_acquire) != ready) {
++#if defined(__x86_64__) || defined(__i386__)
++        __builtin_ia32_pause();
++#endif
++      }
++      return true;
++    };
+ 
+     // Atomic work-stealing loop with adaptive chunk size
+     while (true) {
+@@ -4694,18 +4761,34 @@
+         // is computed twice and none is skipped.
+         bool got = false;
+         const int stride = team_size > 0 ? team_size : 1;
+-        if (partition_mode == 3) {
++        if (partition_mode == 3 && probe_cmode != 0) {
+           while (!got && own_w < nsplit) {
+-            if (scorch_ht_claim(cursors[own_w].ht, chunk, true, &start, &end))
+-              got = true;
+-            else own_w += stride;
++            if (gc_ready(own_w, true) && scorch_ht_claim(gc[own_w].ht, chunk, true, &start, &end)) {
++              got = true; if (probe_trace) p_rows_own += end - start;
++            } else own_w += stride;
+           }
++          if (probe_trace && !got && pt_own == 0.0) pt_own = scorch_probe_now();
+           while (!got && steal_t < nsplit) {
+             const int w = (worker_id + steal_t) % nsplit;
+-            if (scorch_ht_claim(cursors[w].ht, chunk, false, &start, &end))
+-              got = true;
+-            else steal_t++;
++            if (probe_trace) p_scanned++;
++            if (gc_ready(w, false) && scorch_ht_claim(gc[w].ht, chunk, false, &start, &end)) {
++              got = true; if (probe_trace) { p_steals++; p_rows_stolen += end - start; }
++            } else steal_t++;
+           }
++        } else if (partition_mode == 3) {
++          while (!got && own_w < nsplit) {
++            if (scorch_ht_claim(cursors[own_w].ht, chunk, true, &start, &end)) {
++              got = true; if (probe_trace) p_rows_own += end - start;
++            } else own_w += stride;
++          }
++          if (probe_trace && !got && pt_own == 0.0) pt_own = scorch_probe_now();
++          while (!got && steal_t < nsplit) {
++            const int w = (worker_id + steal_t) % nsplit;
++            if (probe_trace) p_scanned++;
++            if (scorch_ht_claim(cursors[w].ht, chunk, false, &start, &end)) {
++              got = true; if (probe_trace) { p_steals++; p_rows_stolen += end - start; }
++            } else steal_t++;
++          }
+         } else {
+           while (!got && own_w < nsplit) {
+             const int lim = row_split[own_w + 1];
+@@ -5375,6 +5458,13 @@
+     // whatever is left is still this worker's to finish.
+     while (zero_slices_left && zero_one_slice()) {
+     }
++    if (probe_trace && worker_id >= 0 && worker_id < 64) {
++      ScorchProbeRec& r = scorch_probe_recs()[probe_call * 64 + worker_id];
++      const double now = scorch_probe_now();
++      r.t_entry = pt_entry - probe_t0; r.t_own = (pt_own > 0.0 ? pt_own : now) - probe_t0;
++      r.t_exit = now - probe_t0; r.rows_own = p_rows_own; r.rows_stolen = p_rows_stolen;
++      r.steals = p_steals; r.scanned = p_scanned;
++    }
+ #ifdef SCORCH_TUNE_HOOKS
+     if (wstat_on && worker_id >= 0 && worker_id < 256) {
+       ScorchSpmmWStat& st = scorch_spmm_wstat()[worker_id];
+@@ -5436,6 +5526,7 @@
+ #endif
+   { const int _atpf = scorch_flags::atparallel();     // cached per process; see scorch_policy.h
+     if (_atpf >= 0) use_atparallel = (_atpf != 0); }
++  if (probe_trace) probe_t0 = scorch_probe_now();
+ #ifdef SCORCH_TUNE_HOOKS
+   const double wstat_wall_t0 = wstat_on ? scorch_spmm_now_ns() : 0.0;
+   wstat_region_t0 = wstat_wall_t0;
+@@ -5475,6 +5566,11 @@
+     {
+       scorch_spmm_worker(omp_get_thread_num(), omp_get_num_threads());
+     }
++  }
++  if (probe_trace) {
++    double* pw = scorch_probe_walls() + probe_call * 5;
++    pw[0] = scorch_probe_now() - probe_t0; pw[1] = (double)nthreads; pw[2] = use_atparallel ? 1.0 : 0.0;
++    pw[3] = probe_s1 - probe_s0; pw[4] = probe_t0 - probe_s1;
+   }
+ #ifdef SCORCH_TUNE_HOOKS
+   if (wstat_on) {

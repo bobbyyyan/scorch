@@ -20,6 +20,7 @@ def bench(fn):
     ts.sort(); return ts[len(ts) // 2] * 1e6
 rows = []
 GCN = {"cora": (1433, 16, 7), "citeseer": (3703, 16, 6), "pubmed": (500, 16, 3)}
+if os.environ.get("WL_ONLY") == "ae": GCN = {}
 with torch.no_grad():
     for g, (fin, hid, ncls) in GCN.items():
         z = np.load(os.path.join(gdir, g + ".npz")); n = int(z["shape"][0])

@@ -3572,7 +3572,9 @@ struct alignas(128) scorch_spmm_cursor {
   // independent, so it uses ht instead: head in the low 32 bits, exclusive tail in
   // the high 32, moved by compare-exchange. Packing them in one word is what makes
   // a claim atomic -- with two separate counters an owner and a thief can each read
-  // a stale view of the other and claim the same rows.
+  // a stale view of the other and claim the same rows. (spmm_csr_v2_core's mode 3
+  // now keeps the same packed word in scorch_spmm_gen_cursor below; ht here serves
+  // the tile-ijk kernel.)
   std::atomic<int> v;
   std::atomic<uint64_t> ht;
 };
@@ -3610,6 +3612,82 @@ static inline bool scorch_ht_claim(std::atomic<uint64_t>& ht, int chunk, bool fr
     }
     // A failed exchange refreshed cur; retry against the view it handed back.
   }
+}
+
+// Mode 3's cursors live in memory owned by the CALLING thread across calls, and each
+// worker writes its own -- not on the caller's stack, written by the caller.
+//
+// The steal search reads every other worker's cursor line, so at the end of a call each
+// of those lines is cached by up to the whole team. On the stack, the caller then reuses
+// that memory as soon as it returns -- pybind11, the interpreter -- and each first write
+// to such a line waits for every other copy to be invalidated, one line after another.
+// Measured on MKT (Zen4, 32-thread team; probe build with the placement switchable at
+// run time, same binary, arms interleaved): 3.3-3.7 us per call spent OUTSIDE the
+// kernel on every small matrix traced, against 0.3-1.7 us of difference inside the
+// parallel region. Turning stealing off removed it, which made "no stealing" read
+// 7-16% faster in back-to-back calls -- and 0.97-1.02 with up to 25 SuiteSparse cells
+// per width more than 5% slower once A is evicted before each call, because eviction
+// also removes the stale copies. Moving the cursors into persistent storage but still
+// writing them from the caller moved most of the cost back into the setup (+0.45 us);
+// letting each owner initialise its own line spreads the invalidations over the team
+// and takes the setup to 0.02 us. Over the 200-matrix screening sample, on the 921
+// cells where it applies: 1.140 gmean back to back (99% of cells faster, none slower
+// by more than 5%) and 1.015 cold (none slower by more than 5%), outputs bit-identical.
+//
+// gen says which call a cursor's range belongs to: 2g while someone is writing the
+// range for call g, 2g+1 once it is there. g is a per-calling-thread counter that only
+// rises, so a cursor last touched by any earlier call -- including one made with more
+// workers, which used entries this call does not -- can never read as current. ht is
+// the same packed head|tail as scorch_spmm_cursor's and is claimed with the same
+// scorch_ht_claim.
+struct alignas(128) scorch_spmm_gen_cursor {
+  std::atomic<uint64_t> ht{0};
+  std::atomic<uint64_t> gen{0};
+};
+struct scorch_spmm_cursor_pool {
+  uint64_t call = 0;
+  int cap = 0;
+  std::unique_ptr<scorch_spmm_gen_cursor[]> c;
+};
+// One pool per thread that LAUNCHES a SpMM; the workers only ever see the launcher's.
+// Grown, never shrunk: a fresh array starts at gen 0, which is older than any call.
+inline scorch_spmm_gen_cursor* scorch_spmm_cursors_for_call(int nsplit, uint64_t* call) {
+  thread_local scorch_spmm_cursor_pool pool;
+  if (nsplit > pool.cap) {
+    const int cap = nsplit > 2 * pool.cap ? nsplit : 2 * pool.cap;
+    pool.c.reset(new scorch_spmm_gen_cursor[cap]);
+    pool.cap = cap;
+  }
+  *call = ++pool.call;
+  return pool.c.get();
+}
+// Make cursor w hold this call's range, writing it if no one has. An owner (wait=true)
+// always succeeds, waiting out a thief that is mid-write. A thief (wait=false) writes an
+// untouched cursor itself -- so a worker the OS has not scheduled yet still has its rows
+// taken -- but passes over one another thread is writing. The range written is the
+// caller-supplied split, the same function every writer evaluates, so who writes it does
+// not change it.
+template <typename SplitAt>
+static inline bool scorch_spmm_gen_ready(scorch_spmm_gen_cursor& c, uint64_t call,
+                                         int w, const SplitAt& split_at, bool wait) {
+  const uint64_t busy = 2 * call, ready = 2 * call + 1;
+  uint64_t cur = c.gen.load(std::memory_order_acquire);
+  if (cur == ready) return true;
+  if (cur < busy && c.gen.compare_exchange_strong(cur, busy, std::memory_order_acq_rel,
+                                                  std::memory_order_acquire)) {
+    c.ht.store(scorch_ht_pack(split_at(w), split_at(w + 1)), std::memory_order_relaxed);
+    c.gen.store(ready, std::memory_order_release);
+    return true;
+  }
+  if (!wait) return c.gen.load(std::memory_order_acquire) == ready;
+  while (c.gen.load(std::memory_order_acquire) != ready) {
+#if defined(__x86_64__) || defined(__i386__)
+    __builtin_ia32_pause();
+#elif defined(__aarch64__)
+    __asm__ __volatile__("yield");
+#endif
+  }
+  return true;
 }
 
 // The kernel proper takes plain pointers and sizes. Two callers reach it: the
@@ -4010,7 +4088,27 @@ torch::Tensor spmm_csr_v2_core(
   std::unique_ptr<scorch_spmm_cursor[]> cursor_heap;
   int* row_split = nullptr;
   scorch_spmm_cursor* cursors = nullptr;
-  if (partition_mode != 0) {
+  // Mode 3: persistent per-launcher cursors, each written by its owner (see
+  // scorch_spmm_gen_cursor). Nothing is computed or stored here for it.
+  uint64_t gen_call = 0;
+  scorch_spmm_gen_cursor* gen_cursors =
+      partition_mode == 3 ? scorch_spmm_cursors_for_call(nsplit, &gen_call) : nullptr;
+  // Range w is [split_at(w), split_at(w + 1)): the first row whose prefix of nonzeros plus
+  // rows reaches w/nsplit of the total. The prefix is strictly increasing, so a search from
+  // row 0 gives the same boundary as the incremental search below, and the boundaries are
+  // distinct whenever there are at least nsplit rows.
+  auto split_at = [&](int w) -> int {
+    if (w <= 0) return 0;
+    if (w >= nsplit) return A0_size;
+    const long target = (nnz_total + (long)A0_size) * (long)w / (long)nsplit;
+    int lo = 0, hi = A0_size;
+    while (lo < hi) {
+      const int mid = lo + ((hi - lo) >> 1);
+      if ((long)A1_pos[mid] + (long)mid < target) lo = mid + 1; else hi = mid;
+    }
+    return lo;
+  };
+  if (partition_mode == 1 || partition_mode == 2) {
     if (nsplit <= kSplitOnStack) {
       row_split = split_stack;
       cursors = cursor_stack;
@@ -4045,13 +4143,8 @@ torch::Tensor spmm_csr_v2_core(
     // cells on the float64 general corpus. The cost it removes is real and too small to
     // find; the nonzeros it moves between workers are not free. See
     // SPMM_BEAT_MKL_RESULTS.md.
-    for (int w = 0; w < nsplit; ++w) {
-      if (partition_mode == 3)
-        cursors[w].ht.store(scorch_ht_pack(row_split[w], row_split[w + 1]),
-                            std::memory_order_relaxed);
-      else
-        cursors[w].v.store(row_split[w], std::memory_order_relaxed);
-    }
+    for (int w = 0; w < nsplit; ++w)
+      cursors[w].v.store(row_split[w], std::memory_order_relaxed);
   }
   // Width of a stolen ZERO slice, in rows. Several slices per worker so a slow
   // core cannot become the critical path, and never narrower than the arithmetic
@@ -4696,13 +4789,15 @@ torch::Tensor spmm_csr_v2_core(
         const int stride = team_size > 0 ? team_size : 1;
         if (partition_mode == 3) {
           while (!got && own_w < nsplit) {
-            if (scorch_ht_claim(cursors[own_w].ht, chunk, true, &start, &end))
+            if (scorch_spmm_gen_ready(gen_cursors[own_w], gen_call, own_w, split_at, true) &&
+                scorch_ht_claim(gen_cursors[own_w].ht, chunk, true, &start, &end))
               got = true;
             else own_w += stride;
           }
           while (!got && steal_t < nsplit) {
             const int w = (worker_id + steal_t) % nsplit;
-            if (scorch_ht_claim(cursors[w].ht, chunk, false, &start, &end))
+            if (scorch_spmm_gen_ready(gen_cursors[w], gen_call, w, split_at, false) &&
+                scorch_ht_claim(gen_cursors[w].ht, chunk, false, &start, &end))
               got = true;
             else steal_t++;
           }
