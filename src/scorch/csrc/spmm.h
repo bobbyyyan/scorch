@@ -5398,31 +5398,42 @@ torch::Tensor spmm_csr_v2_core(
   };
 #endif
 
-  // Launch. Default: private libgomp team (#pragma omp) — byte-identical to the
+  // Launch. Default: private libgomp team (#pragma omp) -- byte-identical to the
   // pre-composition kernel. When this is a drop-in pipeline op (the caller sets
-  // `atparallel` together with nthreads_override), run the SAME workers on torch's
-  // own intra-op pool via at::parallel_for so the SpMM shares one warm team with
-  // the surrounding torch epilogue (bias/act): no cross-runtime team reformation
-  // at each op boundary — the sparse-AE @0.99 pool-transition tax (mid-size @0.99
-  // cur/mkl 1.2-1.3 -> 0.9). Gate it to products that (a) clear the fork/join
-  // floor (work >= grain, same test that adopts the host count) AND (b) can feed
-  // the FULL host pool: a ROW-STARVED product (rows < nthreads_override*
-  // ROWS_PER_THREAD) leaves too few rows per worker, so at::parallel_for's task
-  // fan-out costs more than a raw omp team. That row-count test is the exact
-  // discriminator measured on the SuiteSparse panel: only arc130 (130 rows) is
-  // row-starved and it is the ONLY cell at::parallel_for regresses; every AE layer
-  // (>=512 rows) and GCN graph clears it and is neutral-to-better. at::parallel_for
-  // over [0,nthreads) grain 1 spawns min(nthreads, at::get_num_threads()) workers,
-  // each draining rows via the atomic, so a short/excess worker count stays
-  // correct. Env SCORCH_SPMM_ATPARALLEL forces the choice for A/B (1/0), bypassing
-  // the gate.
-  // work_nnz, not work: the zeroing term above sizes the TEAM, and this gate is a
-  // different question -- whether the surrounding torch pipeline's warm pool should
-  // be shared with this op. Nothing measured says an output span full of empty rows
-  // changes that answer, so the launch path every existing shape takes is unchanged.
+  // `atparallel` together with nthreads_override), every call with more than one worker
+  // runs the SAME workers on torch's own intra-op pool via at::parallel_for, whose team is
+  // always torch's full width: only the first `nthreads` members take an id. (Under libgomp;
+  // see the end of this note for every other runtime.)
+  //
+  // The width is the point. libgomp releases the surplus threads of its pool when a region
+  // asks for a narrower team and creates them again when the next region is wider: on MKT
+  // (Zen4, 32-CPU cgroup) alternating 16/32-wide regions cost 300 us each against 2.8-5.2 us
+  // at a constant width, and a 256-row layer whose private team was 16 wide paid +365-467 us
+  // per call next to a 32-wide torch op, against 2-6 us for calls already on torch's team.
+  // torch's at::parallel_for omits the num_threads clause for this reason. The old gate kept
+  // row-starved products (rows < pool * ROWS_PER_THREAD) on a private team of their own
+  // width because that measured faster IN ISOLATION -- arc130 on the SuiteSparse panel, the
+  // small rn50 layers of DLMC (1.7-1.9x) -- which is a back-to-back loop of one op at one
+  // width, the one setting where the resize never happens. In a model it always does.
+  //
+  // Measured over the fixed 200-matrix screening sample on MKT, production launch path:
+  // SuiteSparse 0.98-1.00x per width in isolation, DLMC 0.95-0.98x with those layers 1.7x
+  // slower in isolation; beside a torch op, calls paying >100 us went from 4 of 60 to 0.
+  //
+  // GNU libgomp only. LLVM's libomp (the M5) keeps its threads when a team narrows:
+  // alternating 6/18-wide regions there cost 37.1 us against 35.2 us for the mean of the
+  // two constant widths, so the old gate stays where the resize does not exist. The
+  // marker is the OpenMP header's own: libgomp's omp.h defines _LIBGOMP_OMP_LOCK_DEFINED,
+  // LLVM's defines KMP_VERSION_MAJOR instead.
+  // Env SCORCH_SPMM_ATPARALLEL forces the choice for A/B (1/0).
+#if defined(_LIBGOMP_OMP_LOCK_DEFINED)
+  (void)work_nnz;
+  bool use_atparallel = atparallel && nthreads_override > 0 && nthreads > 1;
+#else
   bool use_atparallel = atparallel && nthreads_override > 0
       && work_nnz >= SCORCH_GRAIN_SPMM
       && (long)A0_size >= (long)nthreads_override * SCORCH_ROWS_PER_THREAD;
+#endif
   { const int _atpf = scorch_flags::atparallel();     // cached per process; see scorch_policy.h
     if (_atpf >= 0) use_atparallel = (_atpf != 0); }
 #ifdef SCORCH_TUNE_HOOKS
