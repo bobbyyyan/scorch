@@ -1,5 +1,7 @@
 #!/usr/bin/env python3
 """End-to-end forward passes through the PRODUCTION path (scorch.matmul) vs torch.sparse.mm (MKL).
+scorch.matmul is called without keyword arguments, as a drop-in user would: any keyword (format=...)
+skips the cached plan, which cost 13-14 us per call on the M5.
 
 GCN (Kipf & Welling, 2 layers) on the cached normalized adjacencies, and the sparse autoencoder
 shapes of bench_sparse_autoencoder.py with uniformly pruned weights. Both interleave the SpMM
@@ -31,7 +33,7 @@ with torch.no_grad():
         def mkl():
             h = torch.relu(torch.sparse.mm(A, X @ W1) + b1); return torch.sparse.mm(A, h @ W2) + b2
         def sc():
-            h = torch.relu(scorch.matmul(Ast, X @ W1, format="dd") + b1); return scorch.matmul(Ast, h @ W2, format="dd") + b2
+            h = torch.relu(scorch.matmul(Ast, X @ W1) + b1); return scorch.matmul(Ast, h @ W2) + b2
         rel = float((mkl() - sc()).norm() / mkl().norm()); assert rel < 1e-5, ("gcn rel err", g, rel)
         rows.append(("gcn", g, n, int(z["indptr"][-1]), bench(sc), bench(mkl)))
     for name, din, h1, h2 in [("mnist", 784, 1024, 512), ("mnist_big", 784, 4096, 2048), ("svhn", 3072, 2048, 1024)]:
@@ -48,11 +50,11 @@ with torch.no_grad():
                 return h
             def sc():
                 h = x
-                for W, b, act in zip(Sts, bs, acts): h = act(scorch.matmul(W, h.T.contiguous(), format="dd").T + b)
+                for W, b, act in zip(Sts, bs, acts): h = act(scorch.matmul(W, h.T.contiguous()).T + b)
                 return h
             h = x                                     # per-layer relative error against MKL
             for W, St, b in zip(Ws, Sts, bs):
-                ref = torch.sparse.mm(W, h.T.contiguous()); got = scorch.matmul(St, h.T.contiguous(), format="dd")
+                ref = torch.sparse.mm(W, h.T.contiguous()); got = scorch.matmul(St, h.T.contiguous())
                 rel = float((got - ref).norm() / ref.norm()); assert rel < 1e-5, ("layer rel err", name, sp, rel)
                 h = torch.relu(ref.T + b)
             rows.append(("ae", "%s@%.2f" % (name, sp), dims[1], sum(int(W._nnz()) for W in Ws), bench(sc), bench(mkl)))

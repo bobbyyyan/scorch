@@ -4,10 +4,14 @@ OpenMP region, as any layer of a real model does. Per cell, for ours (production
 atparallel=True) and MKL: isolated time, and in-pipeline time = T(spmm + op) - T(op).
 
 usage: pipe_screen.py <cache_dir> <sample_dir> <out_csv> [ks]
+SCREEN_DTYPE=float64 in the environment runs the double-precision kernel and MKL in double; the
+default is float32. Set it the same way for every arm.
 """
 import csv, os, sys, time, zlib, numpy as np, torch, scorch_ops as so
 sys.path.insert(0, "/matx/u/bobbyy/pfsstage")
 from csrresolve import resolve_all
+DT = {"float32": (torch.float32, np.float32, so.spmm_csr_float_v2),
+      "float64": (torch.float64, np.float64, so.spmm_csr_double_v2)}[os.environ.get("SCREEN_DTYPE", "float32")]
 cache, sdir, out = sys.argv[1:4]; KS = [int(x) for x in (sys.argv[4] if len(sys.argv) > 4 else "2,3,4,8,16,32").split(",")]
 P = torch.get_num_threads(); X = torch.rand(1 << 18); Y = torch.empty_like(X)
 def op(): torch.mul(X, 2.0, out=Y)
@@ -28,12 +32,12 @@ for corpus in ("ss", "dlmc"):
     for key in keys:
         z = np.load(paths[key]); M, J = int(z["shape"][0]), int(z["shape"][1])
         ipt = torch.from_numpy(z["indptr"].astype(np.int32)); ixt = torch.from_numpy(z["indices"].astype(np.int32))
-        vt = torch.from_numpy(z["data"].astype(np.float32)); nnz = int(z["indptr"][-1])
+        vt = torch.from_numpy(z["data"].astype(DT[1])); nnz = int(z["indptr"][-1])
         A = torch.sparse_csr_tensor(ipt, ixt, vt, size=(M, J))
         for k in KS:
             g = torch.Generator().manual_seed(zlib.crc32(("%s|%d" % (key, k)).encode()) % (2**31))
-            B = torch.rand((J, k), generator=g); Bv = B.reshape(-1).contiguous()
-            ours = lambda: so.spmm_csr_float_v2([M, k], [M, J], [[], [ipt, ixt]], vt, [J, k], [[], []], Bv, 256, P, True)
+            B = torch.rand((J, k), generator=g, dtype=DT[0]); Bv = B.reshape(-1).contiguous()
+            ours = lambda: DT[2]([M, k], [M, J], [[], [ipt, ixt]], vt, [J, k], [[], []], Bv, 256, P, True)
             mkl = lambda: torch.sparse.mm(A, B)
             t_op = tmin(op)
             res = {"ours": tmin(ours), "mkl": tmin(mkl), "ours_pipe": tmin(lambda: (ours(), op())) - t_op,
