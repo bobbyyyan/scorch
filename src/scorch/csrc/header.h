@@ -238,7 +238,7 @@ static inline void scorch_zero_dense(T* __restrict__ p, int64_t n) {
     }
   }
 #endif
-  const int thread_count = omp_get_num_procs();
+  const int thread_count = scorch_num_procs();
   if (bytes < SCORCH_MEMSET_GRAIN_BYTES || thread_count <= 1) {
     std::memset(p, 0, static_cast<size_t>(bytes));
     return;

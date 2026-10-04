@@ -65,6 +65,31 @@
 #include <sched.h>    // scorch_phys_cores_avail reads the process's affinity mask
 #endif
 
+// The processor count, read once per process. On Linux, libgomp's omp_get_num_procs()
+// re-reads the affinity mask with a sched_getaffinity system call on EVERY call, and the
+// thread-count policy below asked for it 7 times per SpMM call: measured on MKT (Zen4,
+// Slurm cgroup) as 7 syscalls per call by strace, inside a 7.07 us fixed cost against
+// 1.47 us for the same call on the M5. LLVM's libomp (the M5) already answers from a value
+// it computed at initialisation, so this gives every platform the semantics one of them
+// had. What it gives up: a process that narrows its own affinity mask after its first
+// SpMM keeps the old count as a CEILING; the resolved thread count still comes from the
+// work and the caller's pool, so the effect of a stale ceiling is an over-wide cap.
+//
+// noinline on purpose: each call site stays a plain call, exactly the shape the external
+// omp_get_num_procs() call had. Inlined, the one-time-initialisation guard landed in every
+// caller and re-shaped the 56 KB row worker (55.9 -> 59.5 KB), moving per-matrix timings
+// on large SuiteSparse inputs by up to 10% in both directions for reasons unrelated to the
+// syscalls this removes.
+//
+// Effect on MKT over the fixed 200-matrix screening sample (100 SuiteSparse + 100 DLMC,
+// k = 2..32), together with the single-worker launch in spmm_csr_v2_core: the kernel is
+// 1.22-1.31x faster per width (geometric mean), outputs bit-identical, fixed per-call
+// cost 7.07 -> 3.17 us against MKL's 3.39 us single-threaded.
+__attribute__((noinline)) inline int scorch_num_procs() {
+  static const int n = omp_get_num_procs();
+  return n;
+}
+
 // --- Per-host autotune overrides (optional, generated, gitignored) -----------
 #if defined(__has_include)
 #  if __has_include("scorch_policy_tuned.h")
@@ -1720,7 +1745,7 @@
 inline int scorch_nthreads(long work, long rows, long grain_default = SCORCH_GRAIN_DEFAULT,
                            int nfloor = 1,
                            long rows_per_thread = SCORCH_ROWS_PER_THREAD) {
-  int hw = omp_get_num_procs();               // stable; torch mutates omp_get_max_threads
+  int hw = scorch_num_procs();                // stable; torch mutates omp_get_max_threads
   if (rows_per_thread < 1) rows_per_thread = 1;
   long n = rows / rows_per_thread;            // row-axis parallel capacity
   if (work >= 0) {
@@ -1828,7 +1853,7 @@ inline int scorch_pcore_count() {
     // a ceiling above the resolved count never binds -- but it is wrong, and this is a host
     // property other rules may come to read. On both project machines the bound is inactive:
     // 8 against 32 procs on redwood, 6 against 18 on the M5.
-    const int hw = omp_get_num_procs();
+    const int hw = scorch_num_procs();
     if (best > 0) return (hw > 0 && best > hw) ? hw : best;
     return hw > 0 ? hw : 1;
   }();
@@ -1900,7 +1925,7 @@ inline int scorch_phys_cores_avail() {
       best = n;
     }
 #endif
-    const int hw = omp_get_num_procs();
+    const int hw = scorch_num_procs();
     if (best > 0) return (hw > 0 && best > hw) ? hw : best;
     return hw > 0 ? hw : 1;
   }();
@@ -2163,7 +2188,7 @@ inline int scorch_spmm_nthreads(long work, long rows, int nthreads_override,
 #endif
     const long by_true = raise_work / (SCORCH_SPMM_RAISE_GRAINS * SCORCH_GRAIN_SPMM);
     if (cand > by_true) cand = by_true;
-    const long hw = (long)omp_get_num_procs();
+    const long hw = (long)scorch_num_procs();
     if (cand > hw) cand = hw;
     if (cand > (long)nthreads) nthreads = (int)cand;
   }
@@ -2212,7 +2237,7 @@ inline int scorch_spmm_nthreads(long work, long rows, int nthreads_override,
       if (by_real < 1) by_real = 1;
       if (cand > by_real) cand = by_real;
     }
-    const long hw = (long)omp_get_num_procs();   // never oversubscribe the box
+    const long hw = (long)scorch_num_procs();    // never oversubscribe the box
     if (cand > hw) cand = hw;
     if (cand > (long)nthreads) nthreads = (int)cand;
   }
@@ -2225,7 +2250,7 @@ inline int scorch_spmm_nthreads(long work, long rows, int nthreads_override,
   // asymmetry that the MKL comparison has. Compiled out of the shipped .so.
   { const char* e = std::getenv("SCORCH_SPMM_NT_FORCE");
     if (e && *e) { long v = std::atol(e);
-      if (v > 0) { const long hw2 = (long)omp_get_num_procs();
+      if (v > 0) { const long hw2 = (long)scorch_num_procs();
                    nthreads = (int)(v > hw2 ? hw2 : v); } } }
 #endif
   // The final ceiling (see SCORCH_SPMM_NT_CAP). Deliberately last: the adoption branch

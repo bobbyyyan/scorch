@@ -5453,6 +5453,12 @@ torch::Tensor spmm_csr_v2_core(
           scorch_spmm_worker(static_cast<int>(w), nthreads);
       });
     }
+  } else if (nthreads == 1) {
+    // One worker needs no team. libgomp still builds a team of one for it and ends the
+    // region on a barrier whose last arrival issues an unconditional FUTEX_WAKE system
+    // call -- one per SpMM call, seen by strace on MKT -- so the single worker runs
+    // inline. The worker contains no OpenMP construct, so this is the same code path.
+    scorch_spmm_worker(0, 1);
   } else {
     #pragma omp parallel num_threads(nthreads)
     {
@@ -5859,7 +5865,7 @@ torch::Tensor spmm_csr_float_tilej_core(
   const long work = total_nnz * k_eff;
   int nthreads = scorch_nthreads(work, A0_size, SCORCH_GRAIN_SPMM);
   if (nthreads_override > 0) {
-    const long hw = (long)omp_get_num_procs();
+    const long hw = (long)scorch_num_procs();
     long cand = (long)nthreads_override < hw ? (long)nthreads_override : hw;
     if (cand > (long)nthreads) nthreads = (int)cand;
   }
@@ -6000,7 +6006,7 @@ torch::Tensor spmm_csr_float_tileijk_core(
   const long work = total_nnz * k_eff;
   int nthreads = scorch_nthreads(work, A0_size, SCORCH_GRAIN_SPMM);
   if (nthreads_override > 0) {
-    const long hw = (long)omp_get_num_procs();
+    const long hw = (long)scorch_num_procs();
     long cand = (long)nthreads_override < hw ? (long)nthreads_override : hw;
     if (cand > (long)nthreads) nthreads = (int)cand;
   }
