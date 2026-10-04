@@ -2301,6 +2301,7 @@ static inline void scorch_narrow_rowvec_store(
 //
 // Loading the row as one register removes the reason to vectorize across
 // nonzeros: one B-row load and one FMA per nonzero, whatever K is.
+// A row of up to 16 bytes is a 128-bit register, up to 32 bytes a 256-bit one.
 template <typename T, int K, int UNROLL>
 static inline void scorch_spmm_row_narrow_rowvec(
     const int* SCORCH_RESTRICT A1_crd, const T* SCORCH_RESTRICT A_val,
@@ -2308,13 +2309,43 @@ static inline void scorch_spmm_row_narrow_rowvec(
     int pA_begin, int pA_end) {
   using VH = scorch_simd_half<T>;
   constexpr int BYTES = K * (int)sizeof(T);
-  if constexpr (BYTES > 16) {
-    // Wider than one 128-bit register, so the row is not a register and this
-    // kernel has nothing to say about the width. Float k=5..7 and double k=3 keep
-    // the scalar kernel, which is what makes this change scoped to its premise
-    // rather than to a width range chosen by measurement.
+  if constexpr (BYTES > 32) {
+    // Wider than one 256-bit register, so the row is not a register and this
+    // kernel has nothing to say about the width. No exact width reaches here today
+    // (float k<=7 is 28 bytes, double k<=3 is 24); the scalar kernel stays as the
+    // answer for a width the premise does not cover.
     scorch_spmm_row_narrow_exact<T, K, UNROLL>(A1_crd, A_val, B_val, C_row,
                                                pA_begin, pA_end);
+  } else if constexpr (BYTES > 16) {
+    // Wider than 128 bits, so the row is one 256-bit register: double k=3 (24 bytes),
+    // and float k=5..7 if the exact range is ever widened to them. The same kernel as
+    // below at the next register width -- one masked row load and one FMA per nonzero --
+    // because the scalar kernel's gather emulation is a property of K*sizeof(T) groups,
+    // not of the 128-bit case. Only BYTES == 32 needs no mask, and no exact width has it.
+    using VF = scorch_simd<T>;
+    const typename VF::mask m = VF::lane_mask(K);
+    typename VF::vec acc[UNROLL];
+    #pragma unroll
+    for (int u = 0; u < UNROLL; u++) acc[u] = VF::zero();
+    int pA = pA_begin;
+    for (; pA + UNROLL <= pA_end; pA += UNROLL) {
+      #pragma unroll
+      for (int u = 0; u < UNROLL; u++) {
+        const T* SCORCH_RESTRICT Bp =
+            B_val + (size_t)A1_crd[pA + u] * (size_t)K;
+        acc[u] = VF::fma(VF::splat(A_val[pA + u]),
+                         BYTES == 32 ? VF::load(Bp) : VF::maskload(Bp, m), acc[u]);
+      }
+    }
+    #pragma unroll
+    for (int u = 1; u < UNROLL; u++) acc[0] = VF::add(acc[0], acc[u]);
+    for (; pA < pA_end; pA++) {
+      const T* SCORCH_RESTRICT Bp = B_val + (size_t)A1_crd[pA] * (size_t)K;
+      acc[0] = VF::fma(VF::splat(A_val[pA]),
+                       BYTES == 32 ? VF::load(Bp) : VF::maskload(Bp, m), acc[0]);
+    }
+    if constexpr (BYTES == 32) VF::store(C_row, acc[0]);
+    else VF::maskstore(C_row, m, acc[0]);
   } else {
     const typename VH::mask m = VH::lane_mask(K);
     typename VH::vec acc[UNROLL];

@@ -1544,9 +1544,10 @@ __attribute__((noinline)) inline int scorch_num_procs() {
 #endif
 
 // Route the exact-width narrow-k widths to the row-as-vector kernel instead of the
-// scalar one. 0 = scalar, 1 = row-as-vector (what ships) where the row fits a
-// 128-bit register (float k<=4, double k<=2); wider widths keep the scalar kernel
-// inside the new kernel itself, so this is not a width range chosen by measurement.
+// scalar one. 0 = scalar, 1 = row-as-vector (what ships) where the row fits one
+// vector register -- 128 bits (float k<=4, double k<=2) or 256 bits (double k=3, and float
+// k=5..7 if the exact range is ever widened); a row wider than 256 bits keeps the scalar
+// kernel inside the new kernel itself, so this is not a width range chosen by measurement.
 //
 // WHY THERE IS ANYTHING TO WIN. The scalar kernel's source says K loads and K FMAs
 // per nonzero. The object says otherwise. GCC 13 vectorizes the nonzero loop, has
@@ -1604,6 +1605,13 @@ __attribute__((noinline)) inline int scorch_num_procs() {
 // (17.6M nonzeros) took 1149/1419 us at k=2/3 and 787 at k=4 -- and the row-as-vector kernel
 // takes 665/711, ahead of MKL's 756/932. Confirmed on one x86 host so far; redwood (AVX2 only,
 // a different microarchitecture for the k=3 masked load and store) is still to run it.
+//
+// The 256-bit form (double k=3, 24 bytes) came after, measured the same way against the
+// 128-bit-only build: double k=3 back to back 1.125..1.134 SuiteSparse and 1.233..1.275 DLMC,
+// in a pipeline 1.113..1.223, cold 1.004..1.045; DLMC cells behind MKL 16 -> 1 back to back,
+// 20 -> 2 in a pipeline, 6 -> 0 cold. Identical-source widths (double k=2/4) moved 0.97..1.05,
+// DLMC k=4 with 3-7 cells more than 10% slower in one run order and 2-5 in the other, against
+// 0 in the A/A: code placement, and the one reading here that is not neutral.
 //
 // A NOTE ON SCORCH_SPMM_HALFVEC_F32=2, which looks like it already did this and did
 // not. Its gate is `halfvec_under = (spmm_halfvec >= 2 && B1_size < LH &&
