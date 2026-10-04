@@ -1544,7 +1544,7 @@ __attribute__((noinline)) inline int scorch_num_procs() {
 #endif
 
 // Route the exact-width narrow-k widths to the row-as-vector kernel instead of the
-// scalar one. 0 = scalar (what ships), 1 = row-as-vector where the row fits a
+// scalar one. 0 = scalar, 1 = row-as-vector (what ships) where the row fits a
 // 128-bit register (float k<=4, double k<=2); wider widths keep the scalar kernel
 // inside the new kernel itself, so this is not a width range chosen by measurement.
 //
@@ -1579,6 +1579,32 @@ __attribute__((noinline)) inline int scorch_num_procs() {
 // on uniform-degree synthetic CSR. The end-to-end figure on the real dispatch path
 // against MKL is a separate measurement and the only one that decides the default.
 //
+// THE END-TO-END FIGURE, which is what turned it on. mkt1, the fixed 200-matrix screening
+// sample (100 SuiteSparse, 100 DLMC), today's code against this switch alone in two builds of
+// one tree, both run orders, the production launch path, MKL timed in the same process:
+//
+//   float32       back to back     in a pipeline     cold        (base/rowvec time, gmean)
+//     k=1          1.00 .. 1.04     0.97 .. 1.04     1.02 .. 1.07
+//     k=2          1.10 .. 1.14     1.06 .. 1.13     1.03 .. 1.10
+//     k=3          1.12 .. 1.21     1.08 .. 1.18     1.04 .. 1.11
+//   float64
+//     k=1          1.01 .. 1.12     1.01 .. 1.16     1.00 .. 1.06
+//     k=2          1.07 .. 1.21     1.07 .. 1.22     1.01 .. 1.07
+//
+// with at most one cell in 100 more than 10% slower in any width and regime it changes, where
+// today's code read against itself gives 0 to 5. The widths it cannot change (float k=4/8, double k=3/4: identical source)
+// read 0.97 .. 1.04 back to back -- the code-placement term of a 90 KB .text change, in both
+// directions. Cells behind MKL, of 100, back to back / cold:
+//
+//   float32 SuiteSparse k=2  18 -> 5 / 4 -> 2     k=3  14 -> 3 / 8 -> 1
+//   float32 DLMC        k=2  68 -> 36 / 1 -> 0    k=3  46 -> 18 / 5 -> 0
+//   float64 DLMC        k=1  47 -> 26 / 4 -> 0    k=2  39 -> 9 / 4 -> 0
+//
+// On the largest matrices the scalar kernel was slower at k=2 and k=3 than at k=4 -- af_shell7
+// (17.6M nonzeros) took 1149/1419 us at k=2/3 and 787 at k=4 -- and the row-as-vector kernel
+// takes 665/711, ahead of MKL's 756/932. Confirmed on one x86 host so far; redwood (AVX2 only,
+// a different microarchitecture for the k=3 masked load and store) is still to run it.
+//
 // A NOTE ON SCORCH_SPMM_HALFVEC_F32=2, which looks like it already did this and did
 // not. Its gate is `halfvec_under = (spmm_halfvec >= 2 && B1_size < LH &&
 // B1_size >= 2 && !exact_width)`. With float LH=4 the only widths it can take are
@@ -1588,7 +1614,7 @@ __attribute__((noinline)) inline int scorch_num_procs() {
 // two builds that route identically. That null is vacuous, not a refutation; it is
 // also only vacuous at EXACT_HI=3, so it may have been live when it was taken.
 #ifndef SCORCH_NARROWK_EXACT_ROWVEC
-#  define SCORCH_NARROWK_EXACT_ROWVEC 0
+#  define SCORCH_NARROWK_EXACT_ROWVEC 1
 #endif
 // Per dtype, on the same grounds as SCORCH_SPMM_HALFVEC_F32/_F64 and
 // SCORCH_SPMM_MULTIROW_ROWS_F32/_F64 above: the measurement splits by dtype and one number cannot

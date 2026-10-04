@@ -82,10 +82,12 @@ echo "stage $STAGE  root $ROOT  activate $ACTIVATE"
 echo "host $(hostname)  g++ $(g++ -dumpversion)  nproc $(nproc)  $(date +%H:%M:%S)"
 
 declare -A DEFS
-DEFS[ship]=""
-DEFS[shpb]=""
+# ship/shpb/hi01 name ROWVEC=0 explicitly: the policy default became 1 after this screen, and an
+# empty define would now build the rvec kernel into every arm and read a vacuous null.
+DEFS[ship]="-DSCORCH_NARROWK_EXACT_ROWVEC=0"
+DEFS[shpb]="-DSCORCH_NARROWK_EXACT_ROWVEC=0"
 DEFS[rvec]="-DSCORCH_NARROWK_EXACT_ROWVEC=1"
-DEFS[hi01]="-DSCORCH_NARROWK_EXACT_HI=1"
+DEFS[hi01]="-DSCORCH_NARROWK_EXACT_HI=1 -DSCORCH_NARROWK_EXACT_ROWVEC=0"
 
 for tag in ship shpb rvec hi01; do
   d="$ROOT/$tag"
