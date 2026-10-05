@@ -4172,9 +4172,17 @@ torch::Tensor spmm_csr_v2_core(
   // nthreads_override<=0 => pure policy (the standalone/panel default). The rule
   // itself lives in scorch_policy.h so a harness can ask for the same number
   // instead of recomputing it; see scorch_spmm_nthreads.
+  // Whether a multi-worker call will run on torch's full-width team (the launch below): under
+  // libgomp, exactly when the caller asked for it or the process-wide flag forces it.
+#if SCORCH_SPMM_FULL_TEAM_ROWS != 0 && defined(_LIBGOMP_OMP_LOCK_DEFINED)
+  const int _atpf_team = scorch_flags::atparallel();
+  const bool full_team = _atpf_team >= 0 ? _atpf_team != 0 : atparallel;
+#else
+  const bool full_team = false;
+#endif
   const int nthreads = scorch_spmm_nthreads(work, A0_size, nthreads_override,
                                             (long)total_nnz * (long)B1_size,
-                                            (long)total_nnz);
+                                            (long)total_nnz, full_team);
   const long nnz_total = SCORCH_SPMM_NNZ_TOTAL;
   const int chunk = scorch_spmm_chunk(A0_size, nnz_total, B1_size, nthreads);
   std::atomic<int> next_row{0};

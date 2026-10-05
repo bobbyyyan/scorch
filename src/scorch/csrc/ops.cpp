@@ -709,7 +709,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           "only the one number; nnz defaults to -1, which leaves the row-axis "
           "ceiling stated in rows.",
           py::arg("work"), py::arg("rows"), py::arg("nthreads_override"),
-          py::arg("work_true") = -1, py::arg("nnz") = -1);
+          py::arg("work_true") = -1, py::arg("nnz") = -1, py::arg("full_team") = false);
 
     // Exported so a harness asks for this count instead of recomputing it, for the same reason
     // as the chunk width and the thread count above. It is deliberately NOT a second spelling of

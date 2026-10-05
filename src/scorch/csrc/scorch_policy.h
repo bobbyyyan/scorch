@@ -164,6 +164,45 @@ __attribute__((noinline)) inline int scorch_num_procs() {
 #ifndef SCORCH_SPMM_ROWS_PER_THREAD
 #  define SCORCH_SPMM_ROWS_PER_THREAD 1L
 #endif
+// Whether the composition adoption below may give a call one worker per ROW, rather than one
+// per SCORCH_ROWS_PER_THREAD rows, when the call runs on the caller's full-width team.
+//
+// The 16-rows-per-worker ceiling bounds how wide a team the call opens, because on a private
+// team every worker is a thread to wake and, under libgomp, a pool to resize. Since cc1bef5 a
+// multi-worker drop-in call under libgomp runs on torch's own intra-op team via
+// at::parallel_for, which is always the full width: every pool thread wakes whatever the count,
+// and the count only decides how many of them take rows. On that path the ceiling no longer
+// buys anything it was there to buy, and it still holds a 71-row product with 212536 nonzeros
+// (kl02) to 4 of 24-32 workers. The caller tells the policy which path it is on (`full_team`);
+// the drop-in SpMM passes it under libgomp only, so LLVM's runtime (the M5), whose private teams
+// do pay per worker, keeps the 16-row ceiling. The fused Linear kernel does not pass it yet.
+//
+// It can only change products with fewer than 16 rows per pool thread (under 384 rows at pool 24)
+// that clear the adoption's grain: every GCN and autoencoder layer in the workload harness has
+// 16 or more rows per thread and resolves exactly as before (test_thread_policy_full_team.py).
+//
+// Measured 2026-10-05, float32, release builds of one source with the switch at 0 and 1, the
+// production launch path (atparallel, pool 24), split by whether the resolver's count changes
+// (base/candidate time, geometric mean; >1 means the candidate is faster):
+//
+//   mkt1, 2 processes per build, cells where any pass stalled on the node dropped (MKL's time
+//   moving >2x between passes, or both libraries at 4-6 ms a call):
+//     115 few-row matrices, k=1..32   back to back 1.075 (0 cells >10% slower, 59 faster)
+//                                     in a pipeline 1.116, cold 1.041 (5 slower, 69 faster)
+//                                     behind MKL: 137 -> 101 back to back, 32 -> 3 cold
+//     held-out 128-256-row layers     1.042 / 1.053 / 1.144
+//     cells the switch cannot touch   0.98-1.03 (the node's own drift between passes)
+//   redwood, 4 processes per build, the 84 matrices with a changed cell:
+//     changed cells                   1.012 back to back, 1.009 in a pipeline, 1.003 cold
+//     cells the switch cannot touch   0.986 / 0.941 / 0.982
+//     The 38 smallest DLMC layers read 1.148 in one set of four processes and 0.921 in another,
+//     which is redwood placing the call on fast or slow cores per process, not the switch.
+//
+// A probe that forced the pool on a hooks build had read redwood 13-23% slower back to back on
+// these cells (and 21-31% faster cold); the release builds do not reproduce the loss.
+#ifndef SCORCH_SPMM_FULL_TEAM_ROWS
+#  define SCORCH_SPMM_FULL_TEAM_ROWS 1
+#endif
 // Minimum NONZEROS per worker, as an alternative statement of the same "enough work
 // to be worth waking a worker" requirement that SCORCH_ROWS_PER_THREAD states in
 // rows. 0 keeps the row proxy alone, which is what ships.
@@ -2094,7 +2133,7 @@ inline bool ceil_pool_ok(int nthreads_override, long minthreads, bool rowbind, l
 // because the extra team's ramp is a large fraction of a 30 us kernel. Callers that
 // pass only one number get the old behaviour.
 inline int scorch_spmm_nthreads(long work, long rows, int nthreads_override,
-                                long work_true = -1, long nnz = -1) {
+                                long work_true = -1, long nnz = -1, bool full_team = false) {
   if (work_true < 0) work_true = work;
   long rpt = SCORCH_SPMM_ROWS_PER_THREAD;
 #ifdef SCORCH_TUNE_HOOKS
@@ -2293,7 +2332,9 @@ inline int scorch_spmm_nthreads(long work, long rows, int nthreads_override,
     // 64-row pruned ResNet layers went from 4 workers to 6 on a 20-microsecond kernel
     // and ran 1.5-2x slower, 6.4% of cells more than 10% slower against a 1.4% floor.
     // The ceiling was not choosing 6 workers for those; this line was.
-    const long by_rows = rows / SCORCH_ROWS_PER_THREAD;
+    // On the full-width team (SCORCH_SPMM_FULL_TEAM_ROWS) the ceiling is one worker per row.
+    const long by_rows = (SCORCH_SPMM_FULL_TEAM_ROWS != 0 && full_team)
+                             ? rows : rows / SCORCH_ROWS_PER_THREAD;
     long cand = (long)nthreads_override < by_rows ? (long)nthreads_override : by_rows;
     // Graded adoption: cap the adopted count so each worker gets a grain of REAL
     // arithmetic, rather than switching wholesale between the host count and the
