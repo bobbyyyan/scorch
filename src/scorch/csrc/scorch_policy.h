@@ -641,6 +641,20 @@ __attribute__((noinline)) inline int scorch_num_procs() {
 //
 // A single -DSCORCH_SPMM_MULTIROW_ROWS=N still sets both, so every harness written before the split
 // keeps meaning what it meant.
+//
+// RE-MEASURED once the single-row loops became functions of their own (spmm.h, the outlined row
+// loops before spmm_csr_v2_core), and float32 stays 0 on that evidence. Every gain above was taken
+// against the general row loop, where the register-block kernel took 25-33% longer on SuiteSparse
+// (5-15% on DLMC) at float32 k=8-32 than the same kernel compiled on its own. Against the
+// outlined loop, mkt1, float32,
+// 200-matrix screening sample, both run orders, ROWS=2 -- itself outlined the same way, so the two
+// kernels compiled on equal terms -- read (outlined single-row time / two-row time):
+//   back to back  SuiteSparse k=8 0.967/0.975, k=16 0.974, k=32 0.923/0.900 (63 of 200 cells more
+//                 than 10% slower, 5 of 400 in the A/A); DLMC k=8 1.017/1.032, k=16 1.012/1.016,
+//                 k=32 0.997/1.006
+//   cold          1.006-1.044 on both collections, inside the A/A's drift
+// So the two-row kernel's measured advantage was over a badly compiled loop, not over the kernel,
+// and what is left of it is a 1-3% DLMC gain at k=8-16 against a 3-10% SuiteSparse loss.
 #ifndef SCORCH_SPMM_MULTIROW_ROWS
 #  define SCORCH_SPMM_MULTIROW_ROWS 0
 #endif
