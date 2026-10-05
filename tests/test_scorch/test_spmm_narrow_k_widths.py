@@ -133,3 +133,86 @@ def test_the_widths_either_side_of_every_instantiation_boundary_agree():
         got_narrow = v2(a_st, b_wide[:, :narrow].contiguous(), narrow)
         assert torch.allclose(got_wide[:, :narrow], got_narrow, atol=ATOL, rtol=RTOL)
         assert torch.allclose(got_wide, expected, atol=ATOL, rtol=RTOL)
+
+
+def test_width_one_below_the_exact_kernels_degree_floor():
+    """k=1 at a mean degree under 8: the float32 rows the gather kernel takes.
+
+    On AVX2 the exact-width kernel owns k=1 only from mean degree 8 up, so the matrix
+    above (degree 11) never reaches the gather kernel, nor the row loop specialised to
+    it. This one does: row lengths cycle through every value 0..17, so empty rows, rows
+    shorter than the gather's eight lanes, rows of exactly eight, and rows with a
+    gathered body plus a scalar tail all occur, many times over, across enough rows
+    that several workers each claim several chunks.
+    """
+    rows, cols = 6000, 500
+    generator = torch.Generator().manual_seed(11)
+    lengths = [(r * 7) % 18 for r in range(rows)]
+    lengths = [n if n < 9 or r % 3 else n // 3 for r, n in enumerate(lengths)]
+    assert sum(lengths) / rows < 8, "the point is a mean degree under the floor"
+    crow = torch.tensor([0] + lengths).cumsum(0)
+    col = torch.cat([torch.randperm(cols, generator=generator)[:n] for n in lengths])
+    val = torch.randn(int(crow[-1]), generator=generator)
+    dense = torch.sparse_csr_tensor(crow, col, val, size=(rows, cols)).to_dense()
+    for dtype in (torch.float32, torch.float64):
+        b = torch.randn(cols, 1, generator=generator, dtype=dtype)
+        a_typed = STensor.from_torch(dense.to(dtype).to_sparse_csr())
+        b_st = STensor.from_torch(b)
+        resolved = resolve_prebuilt_matmul(a_typed, b_st, output_format="dd")
+        nthreads, atparallel = ops._composition_hints(resolved)
+        out, _ = execute_prebuilt_binary_kernel(
+            resolved.fn, a_typed, b_st, nthreads=nthreads, atparallel=atparallel
+        )
+        actual = out.storage.value.view(rows)
+        expected = (dense.double() @ b.double()).view(rows).to(dtype)
+        assert torch.allclose(actual, expected, atol=ATOL, rtol=RTOL), dtype
+        empty = torch.tensor([n == 0 for n in lengths])
+        assert (actual[empty] == 0).all() and not actual[empty].signbit().any(), dtype
+
+
+@pytest.mark.parametrize("dtype", [torch.float32, torch.float64])
+@pytest.mark.parametrize("k", [1, 2, 3, 4, 5, 8, 9, 13, 16, 17, 24, 32])
+def test_runs_of_empty_rows_across_claims(k, dtype):
+    """Long runs of empty rows, at every narrow-k kernel family's widths.
+
+    The row loop zeroes a run of consecutive empty rows with one store, bounded by the
+    rows a worker claimed. A run that crosses a claim boundary is zeroed in two pieces
+    by two workers, so a bound off by one leaves a row unwritten (the output is
+    allocated uninitialised) or writes a row another worker owns. Runs here are up to
+    ~700 rows long against claims of tens to hundreds of rows, between rows of 1 to
+    40 nonzeros, so both ends of many runs fall inside claims and some runs span
+    whole claims.
+    """
+    rows, cols = 8000, 600
+    generator = torch.Generator().manual_seed(k)
+    lengths, r = [], 0
+    while r < rows:
+        run = int(torch.randint(0, 700, (1,), generator=generator))
+        lengths += [0] * min(run, rows - r)
+        r += run
+        for _ in range(int(torch.randint(1, 60, (1,), generator=generator))):
+            if r < rows:
+                lengths.append(int(torch.randint(1, 41, (1,), generator=generator)))
+                r += 1
+    crow = torch.tensor([0] + lengths).cumsum(0)
+    col = torch.cat(
+        [torch.randperm(cols, generator=generator)[:n].sort().values for n in lengths]
+    )
+    val = torch.randn(int(crow[-1]), generator=generator, dtype=dtype)
+    a = torch.sparse_csr_tensor(crow, col, val, size=(rows, cols))
+    a_st = STensor.from_torch(a)
+    b = torch.randn(cols, k, generator=generator, dtype=dtype)
+    b_st = STensor.from_torch(b)
+    resolved = resolve_prebuilt_matmul(a_st, b_st, output_format="dd")
+    nthreads, atparallel = ops._composition_hints(resolved)
+    out, _ = execute_prebuilt_binary_kernel(
+        resolved.fn, a_st, b_st, nthreads=nthreads, atparallel=atparallel
+    )
+    actual = out.storage.value.view(rows, k)
+    expected = (a.to_dense().double() @ b.double()).to(dtype)
+    assert torch.allclose(actual, expected, atol=ATOL, rtol=RTOL)
+    empty = torch.tensor([n == 0 for n in lengths])
+    assert (
+        int(empty.sum()) > rows // 2
+    ), "the matrix should be mostly runs of empty rows"
+    assert (actual[empty] == 0).all() and not actual[empty].signbit().any()

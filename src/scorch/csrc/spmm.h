@@ -3721,6 +3721,152 @@ static inline bool scorch_spmm_gen_ready(scorch_spmm_gen_cursor& c, uint64_t cal
   return true;
 }
 
+#if defined(__AVX2__) && defined(__FMA__)
+// Row loops specialised to one narrow-k row kernel, each compiled as its own function.
+//
+// spmm_csr_v2_core decides per CALL which row kernel a narrow width uses (see `unswitch_rows`
+// there), and then a claim's rows can run a loop that does nothing but call that kernel -- the
+// general row loop's per-row tests unswitched. The first version wrote those loops inside the
+// core, as lambdas, and the same kernel then compiled differently in each: on mkt1 the float32
+// exact and register-block loops ran 9-20% faster than the general loop while the float64
+// register-block loop at k=16 ran 8-9% SLOWER (75 of 200 SuiteSparse cells by more than 10%,
+// against 4 of 400 in the A/A) and the float32 half-vector loop at k=4 5-9% slower -- and adding
+// the multi-row kernel to the core, without touching the k=4 path, had already cost k=4 4-5%.
+// One function holding every path, hundreds of live values, and lambdas that capture by
+// reference leave the register allocator and GCC's restrict analysis (which it applies reliably
+// only to function parameters) a different problem every time anything in the core changes.
+//
+// So each loop is a function of its own, never inlined, called once per claimed chunk of rows:
+// its pointers are restrict parameters, its sizes are arguments, and nothing else in the core
+// can change how it compiles. One call per chunk is nothing next to the chunk.
+//
+// Rows are handled exactly as the general loop handles them. A non-empty row makes the call the
+// general loop makes, and a run of empty rows -- bounded by the chunk -- is one memset (the
+// general loop's run merge; storing empty rows one by one cost 7.1 -> 13.1 us on bips07_1693_B,
+// 13275 rows and 4 nonzeros). Output bits can still differ from the general loop's by a rounding:
+// under -ffast-math GCC may associate a kernel's final accumulator adds (plain vector `+` in the
+// intrinsics) differently in each place it is inlined. Both stay inside the usual bound;
+// harnesses/screen/output_error.py measures it.
+
+// One past the last row of the run of empty rows that starts at `i` (A1_pos[i] == A1_pos[i + 1]),
+// bounded by `end`, the chunk's last row. A run of empty rows leaves the position array flat.
+static inline int scorch_spmm_empty_run_end(const int* SCORCH_RESTRICT A1_pos, int i, int end) {
+  const int p = A1_pos[i + 1];
+  int run = i + 1;
+  while (run < end && A1_pos[run + 1] == p) run++;
+  return run;
+}
+
+// Width 1 on the nonzero-axis gather kernel (float32 below the exact kernel's degree floor):
+// the matrices with a few nonzeros per row, graphs and Laplacians with millions of rows. A row of
+// eight or more takes the gather kernel; a shorter one is the kernel's own scalar tail, in the same
+// source order and from the same zero (the fold of an all-zero accumulator is +0.0), without the
+// 256-bit accumulator it would zero and fold for nothing. MKL's k=1 loop is that sum and nothing
+// else, and on Spielman_k200_A_01 (2.69M rows, degree 3) it ran 706 us to the general loop's 1025.
+__attribute__((noinline)) static void scorch_spmm_rows_gather_k1(
+    const int* SCORCH_RESTRICT A1_pos, const int* SCORCH_RESTRICT A1_crd,
+    const float* SCORCH_RESTRICT A_val, const float* SCORCH_RESTRICT B_val,
+    float* SCORCH_RESTRICT C_values, int start, int end) {
+  for (int i = start; i < end; i++) {
+    const int pb = A1_pos[i];
+    const int pe = A1_pos[i + 1];
+    if (pe - pb >= 8) {
+      scorch_spmm_row_gather_f32<1>(A1_crd, A_val, B_val, C_values + i, pb, pe);
+    } else if (pe > pb) {
+      float sum = 0.f;
+      for (int q = pb; q < pe; q++) sum += A_val[q] * B_val[A1_crd[q]];
+      C_values[i] = sum;
+    } else {
+      const int run = scorch_spmm_empty_run_end(A1_pos, i, end);
+      memset(C_values + i, 0, sizeof(float) * (size_t)(run - i));
+      i = run - 1;
+    }
+  }
+}
+
+// The exact-width kernel (k <= 3) at the unroll the call resolved to.
+template <typename T, int KK, int UN>
+__attribute__((noinline)) static void scorch_spmm_rows_exact(
+    const int* SCORCH_RESTRICT A1_pos, const int* SCORCH_RESTRICT A1_crd,
+    const T* SCORCH_RESTRICT A_val, const T* SCORCH_RESTRICT B_val,
+    T* SCORCH_RESTRICT C_values, int start, int end) {
+  for (int i = start; i < end; i++) {
+    const int pb = A1_pos[i];
+    const int pe = A1_pos[i + 1];
+    T* SCORCH_RESTRICT C_row = C_values + (size_t)i * (size_t)KK;
+    if (pe == pb) {
+      const int run = scorch_spmm_empty_run_end(A1_pos, i, end);
+      memset(C_row, 0, sizeof(T) * (size_t)KK * (size_t)(run - i));
+      i = run - 1;
+      continue;
+    }
+#if SCORCH_NARROWK_EXACT_ROWVEC
+    scorch_spmm_row_narrow_rowvec<T, KK, UN>(A1_crd, A_val, B_val, C_row, pb, pe);
+#else
+    scorch_spmm_row_narrow_exact<T, KK, UN>(A1_crd, A_val, B_val, C_row, pb, pe);
+#endif
+  }
+}
+
+// The register-block kernel, NV vectors of V per row: every other narrow width, and with
+// V = the half vector the half-vector kernel at exactly its width. Where the last vector is
+// full the row is exactly NV * V::lanes wide, so the stride of B and C is a compile-time
+// constant there rather than the runtime width.
+template <typename T, int NV, bool FULL, typename V = scorch_simd<T>>
+__attribute__((noinline)) static void scorch_spmm_rows_regblock(
+    const int* SCORCH_RESTRICT A1_pos, const int* SCORCH_RESTRICT A1_crd,
+    const T* SCORCH_RESTRICT A_val, const T* SCORCH_RESTRICT B_val, int B1_size,
+    T* SCORCH_RESTRICT C_values, int start, int end SCORCH_SPMM_PFLIM_PARAM,
+    typename V::mask mask_last) {
+  const int width = FULL ? NV * V::lanes : B1_size;
+  for (int i = start; i < end; i++) {
+    const int pb = A1_pos[i];
+    const int pe = A1_pos[i + 1];
+    T* SCORCH_RESTRICT C_row = C_values + (size_t)i * (size_t)width;
+    if (pe == pb) {
+      const int run = scorch_spmm_empty_run_end(A1_pos, i, end);
+      memset(C_row, 0, sizeof(T) * (size_t)width * (size_t)(run - i));
+      i = run - 1;
+      continue;
+    }
+    scorch_spmm_row_regblock<T, NV, FULL, V>(A1_crd, A_val, B_val, width, C_row, pb, pe
+                                             SCORCH_SPMM_PFLIM(pA_limit), mask_last);
+  }
+}
+
+// The wide-width kernel (more than four vectors per row), on the same terms. Its rows are long
+// enough that the general loop's per-row tests cost little; what this buys is the one thing the
+// narrow loops showed matters as much -- a compilation context nothing else in the core can move --
+// so that every kernel the release build can choose runs from a loop of its own and the general
+// loop below is left to the hooks, the multi-row kernel and the wide-row split.
+//
+// Measured on mkt1 against the build before any loop was outlined: float32 k=64, the one width in
+// the screen where this is the only change, 1.037 back to back and 1.033 cold on SuiteSparse
+// (1.025 and 1.026 on DLMC). Float64 k=32 and k=64 also run this kernel and read +1.2% then -2.0%
+// back to back on DLMC in two jobs, and -1.1% then +1.3% cold: the same two binaries move up to
+// 1.7% each between jobs, in opposite directions, so that width is neutral within what one job
+// can resolve, and a one-job reading of it is not evidence either way.
+template <typename T>
+__attribute__((noinline)) static void scorch_spmm_rows_regtile(
+    const int* SCORCH_RESTRICT A1_pos, const int* SCORCH_RESTRICT A1_crd,
+    const T* SCORCH_RESTRICT A_val, const T* SCORCH_RESTRICT B_val, int B1_size,
+    T* SCORCH_RESTRICT C_values, int start, int end) {
+  for (int i = start; i < end; i++) {
+    const int pb = A1_pos[i];
+    const int pe = A1_pos[i + 1];
+    T* SCORCH_RESTRICT C_row = C_values + (size_t)i * (size_t)B1_size;
+    if (pe == pb) {
+      const int run = scorch_spmm_empty_run_end(A1_pos, i, end);
+      memset(C_row, 0, sizeof(T) * (size_t)B1_size * (size_t)(run - i));
+      i = run - 1;
+      continue;
+    }
+    scorch_spmm_row_regtile<T>(A1_crd, A_val, B_val, B1_size, C_row, pb, pe);
+  }
+}
+
+#endif
+
 // The kernel proper takes plain pointers and sizes. Two callers reach it: the
 // legacy entry below, which unpacks the nested tensor vectors the pybind ABI
 // hands over, and SpmmCsrPlan (plan.h), which already holds the unpacked and
@@ -4656,6 +4802,56 @@ torch::Tensor spmm_csr_v2_core(
          (spmm_halfvec >= 2 && B1_size >= 2 &&
           B1_size < scorch_simd_half<scalar_t>::lanes)));
 #endif
+  // Whether a claim's rows can skip the general row loop below and run a copy of it specialised
+  // to the one kernel the call resolves to -- a narrow-k kernel, or the wide kernel past them: the
+  // loop unswitched on the per-call tests, which the general loop otherwise repeats on every row. Decided here, once per call, from the values the
+  // general loop would test, in the order it tests them. See the specialised loops for why.
+  //
+  // They store an empty row's zeros themselves, so they need the worker to own that store
+  // (zero_in_loop), as it always does in a release build -- the hooks' slice-zeroing modes hand
+  // empty rows to other workers -- and an output row as wide as B's. They also stand aside for
+  // anything that can take a row ahead of the plain kernel: the multi-row kernel, and the hooks'
+  // deep-unroll and prefetch-distance kernels. force_workspace and narrowk_pf exist only under the
+  // hooks, and multirow_ok only where the multi-row kernel is compiled in.
+#if defined(__AVX2__) && defined(__FMA__)
+  const bool unswitch_any = !REDIRECT && zero_in_loop && C1_size == B1_size
+#ifdef SCORCH_TUNE_HOOKS
+                            && !force_workspace
+#endif
+      ;
+  // Wider than the register block: the general loop sends every such row to the wide kernel.
+  const bool regtile_rows = unswitch_any && !narrow_k;
+  const bool unswitch_base = unswitch_any && narrow_k && narrowk_unroll == 0
+#ifdef SCORCH_TUNE_HOOKS
+                             && narrowk_pf == 0
+#endif
+      ;
+#if defined(SCORCH_TUNE_HOOKS) || SCORCH_SPMM_MULTIROW_ANY
+  const bool unswitch_rows = unswitch_base && !multirow_ok;
+#else
+  const bool unswitch_rows = unswitch_base;
+#endif
+  // The half-vector kernel at exactly its width (float k=4; double k=2 when it is on for double).
+  // The general loop tests it first, so it wins over the exact-width kernel where both could serve.
+  const bool halfvec_rows = unswitch_rows && spmm_halfvec > 0 &&
+                            B1_size == scorch_simd_half<scalar_t>::lanes;
+  // Any width the half-vector branch could take, exactly or below its width.
+  const bool halfvec_any = spmm_halfvec > 0 &&
+                           (B1_size == scorch_simd_half<scalar_t>::lanes ||
+                            (spmm_halfvec >= 2 && B1_size < scorch_simd_half<scalar_t>::lanes &&
+                             B1_size >= 2 && !exact_width));
+  // The exact-width kernel at the widths a release build gives it (k <= 3), with the unroll fixed
+  // for the call -- which it is unless a hook adapts it per row.
+  const bool exact_rows = unswitch_rows && !halfvec_any && exact_width >= 1 && exact_width <= 3 &&
+                          narrowk_exact_accum <= 0 && !narrowk_exact_short;
+  // Width 1 on the nonzero-axis gather kernel: float, not the exact-width kernel (which owns k=1
+  // from its degree floor up), the single-stream gather.
+  const bool gather_any = narrowk_gather && nvec == 1 && std::is_same<scalar_t, float>::value;
+  const bool k1_gather_rows = unswitch_rows && !halfvec_any && !exact_width && gather_any &&
+                              B1_size == 1 && narrowk_streams <= 1;
+  // Everything else the general loop sends to the register-block kernel, nvec vectors per row.
+  const bool regblock_rows = unswitch_rows && !halfvec_any && !exact_width && !gather_any;
+#endif
 
   // A register-resident row kernel writes the whole row, so the workspace only
   // exists for architectures that have neither (and for the force_workspace hook).
@@ -4857,6 +5053,70 @@ torch::Tensor spmm_csr_v2_core(
         // extra units, so the nonzero term is only taken where that index means what it says.
         // REDIRECT is false on every shipped path and in every arm that reads this.
         if (!REDIRECT) wstat_nnz += (long)A1_pos[end] - (long)A1_pos[start];
+      }
+#endif
+
+#if defined(__AVX2__) && defined(__FMA__)
+      // The claim's rows on the loop specialised to the kernel this call resolved to, when it
+      // resolved to one (see `unswitch_rows` and the functions before this one); otherwise the
+      // general loop below.
+      if constexpr (!REDIRECT) {
+        if (regtile_rows) {
+          scorch_spmm_rows_regtile<scalar_t>(A1_pos, A1_crd, A_val, B_val, B1_size, C_values,
+                                             start, end);
+          continue;
+        }
+        if (k1_gather_rows) {
+          if constexpr (std::is_same<scalar_t, float>::value)
+            scorch_spmm_rows_gather_k1(A1_pos, A1_crd, (const float*)A_val, (const float*)B_val,
+                                       (float*)C_values, start, end);
+          continue;
+        }
+        if (exact_rows) {
+          #define SCORCH_RX(KK, UN) \
+            scorch_spmm_rows_exact<scalar_t, KK, UN>(A1_pos, A1_crd, A_val, B_val, C_values, \
+                                                     start, end)
+          // The unroll as the general loop maps it: 1, 2, 4, and 8 for anything else.
+          #define SCORCH_RXK(KK) \
+            do { switch (exact_unroll) { \
+              case 1: SCORCH_RX(KK, 1); break; \
+              case 2: SCORCH_RX(KK, 2); break; \
+              case 4: SCORCH_RX(KK, 4); break; \
+              default: SCORCH_RX(KK, 8); break; } } while (0)
+          switch (exact_width) {
+            case 1: SCORCH_RXK(1); break;
+            case 2: SCORCH_RXK(2); break;
+            default: SCORCH_RXK(3); break;
+          }
+          #undef SCORCH_RXK
+          #undef SCORCH_RX
+          continue;
+        }
+        if (halfvec_rows) {
+          using VH = scorch_simd_half<scalar_t>;
+          scorch_spmm_rows_regblock<scalar_t, 1, true, VH>(
+              A1_pos, A1_crd, A_val, B_val, B1_size, C_values, start, end
+              SCORCH_SPMM_PFLIM(nnz_total), VH::lane_mask(VH::lanes));
+          continue;
+        }
+        if (regblock_rows) {
+          #define SCORCH_RR(NV, FULL) \
+            scorch_spmm_rows_regblock<scalar_t, NV, FULL>( \
+                A1_pos, A1_crd, A_val, B_val, B1_size, C_values, start, end \
+                SCORCH_SPMM_PFLIM(nnz_total), mask_last)
+          switch (nvec * 2 + (full_last ? 1 : 0)) {
+            case 2: SCORCH_RR(1, false); break;
+            case 3: SCORCH_RR(1, true); break;
+            case 4: SCORCH_RR(2, false); break;
+            case 5: SCORCH_RR(2, true); break;
+            case 6: SCORCH_RR(3, false); break;
+            case 7: SCORCH_RR(3, true); break;
+            case 8: SCORCH_RR(4, false); break;
+            default: SCORCH_RR(4, true); break;
+          }
+          #undef SCORCH_RR
+          continue;
+        }
       }
 #endif
 
