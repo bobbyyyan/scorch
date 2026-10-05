@@ -1014,6 +1014,30 @@ __attribute__((noinline)) inline int scorch_num_procs() {
 // exclude nvec=1 so the half-vector deep dispatch cannot fire. No instruction on that path changes;
 // the folded-away block moves the inliner's cost model. Do not price a layout control at k=4.
 //
+// 2026-10-04/05, asked again with each kernel compiled on its own. Every reading above ran the deep
+// kernel inside the general row loop, which 4a1203b showed compiles the same kernel 25-33% slower
+// or faster depending on what surrounds it, so the deep kernel was given an outlined row loop of
+// its own (as the two-stream kernel has) and measured against the shipped build:
+//
+//   - Every row on the deep kernel: mean degree under 4 was the one band that lost (0.958-0.972
+//     back to back on mkt1), because a row shorter than the depth never enters the main loop and
+//     still folds four accumulators. Rows shorter than the depth were then sent to the two-stream
+//     kernel, which removed that band's loss.
+//   - With a prefetch of the next group's B rows: 5-13% SLOWER on SuiteSparse (up to 72 of 200
+//     cells by more than 10%), the prefetch's cost as chain197 found for the two-stream kernel.
+//   - At two vectors a row: DLMC gained, SuiteSparse rows of mean degree 4-16 lost up to 8% in one
+//     of two jobs. Two vectors already give four accumulator chains, the FMA latency.
+//   - At one vector a row, the form with a mechanism behind it (two chains against a four-cycle
+//     FMA): mkt1 (Zen4, AVX-512 encodings) gained in two jobs, float32 k=4 and k=8 by 3-9% and
+//     float64 k=4 by 2-3.4%. redwood (i9-14900K, AVX2), on 300 held-out matrices: 12-20% SLOWER,
+//     float32 k=8 0.806 SuiteSparse / 0.874 DLMC and float64 k=4 0.804 / 0.881, with 72-84 of
+//     150 cells more than 10% slower, while the widths it does not touch read 0.98-1.00.
+//
+// The two x86 hosts disagree in sign and nothing measured explains why, so a gate on the host
+// would be fitted to two machines. The outlined loop is not in the tree: it was scorch_spmm_rows_
+// regblock (spmm.h) with its kernel call replaced by scorch_spmm_row_regblock_deep<T, 1, FULL, 4,
+// false, V> for rows of at least four nonzeros, entered from the same two call sites.
+//
 // SCORCH_NARROWK_DEEP_UNROLL 0 disables the kernel, which is what ships. NVEC_HI 0 means "no
 // vector-count restriction", so a hooks arm that sets only the depth behaves exactly as it did
 // before this range existed.
