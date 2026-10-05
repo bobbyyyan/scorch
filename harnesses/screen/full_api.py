@@ -2,7 +2,8 @@
 """One slice of the full-collection board as a user calls it: scorch.matmul(STensor, dense), no
 keyword arguments, served by the operand's plan after its first call, against torch.sparse.mm on
 the same CSR, in the same process. Per cell: warm (best of 5 back-to-back batches) and cold
-(median of REP calls, each after a 256 MB sweep evicts A and B is touched -- as pipe_cold.py).
+(median of REP calls, each after a 256 MB sweep evicts A and B is touched -- as pipe_cold.py),
+each library's cold calls straight after its own warm loop.
 Every cell checks scorch.matmul's answer against MKL's first. Both are rounded, so when they
 differ by more than 1e-4 in relative norm each is compared with the exact product (float64
 arithmetic on the same inputs): scorch.matmul passes if its error is at most twice MKL's, and the
@@ -65,5 +66,14 @@ for key in keys:
             if e_api > 2 * e_mkl:
                 w.writerow([corpus, key, k, M, nnz, "mismatch", 0]); continue
             w.writerow([corpus, key, k, M, nnz, "rounding_vs_mkl", "%.4g" % (e_api / max(e_mkl, 1e-300))])
-        res = {"api": tmin(api), "mkl": tmin(mkl), "api_cold": tcold(api, Bv), "mkl_cold": tcold(mkl, Bv)}
+        # Each library's cold calls follow its own back-to-back loop, the order a program that
+        # uses one of them has. This harness used to run both loops and then both cold runs, so
+        # each library's cold calls followed the OTHER library's loop, and what ran before the
+        # 256 MB sweep still showed through it (cold_order.py, 72 keys, k=1 and 4, both dtypes):
+        # on redwood MKL's cold time on products under 100K nonzeros was 1.65x what it is after
+        # its own loop (ours moved 4-6%); on mkt1 OUR cold time on products over 1M nonzeros was
+        # 1.10x what it is after our own loop (MKL's moved 5%). One host flattered us and the
+        # other penalised us, in different size ranges.
+        res = {"api": tmin(api)}; res["api_cold"] = tcold(api, Bv)
+        res["mkl"] = tmin(mkl); res["mkl_cold"] = tcold(mkl, Bv)
         for a, v in res.items(): w.writerow([corpus, key, k, M, nnz, a, "%.3f" % v])
