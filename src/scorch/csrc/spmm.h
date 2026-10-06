@@ -3900,6 +3900,62 @@ __attribute__((noinline)) static int scorch_spmm_zero_walk(const int* SCORCH_RES
                               });
 }
 
+// The sum of a width-1 row of one to seven nonzeros, in source order: the first product, then one
+// fused multiply-add per further nonzero, each behind a test of the row's length, so a row of L
+// nonzeros falls through L - 1 tests and leaves by the next. There is no loop, and that is the point.
+// A loop over these rows is unrolled by eight (-funroll-loops) and entered through a trip count and
+// a compare against each remainder; on redwood (GCC 11.4) the plain loop's one-nonzero row ran 37
+// instructions with 3 taken jumps, 11 of them computing the trip count and 3 comparing its
+// remainder, all before the row's one FMA. GCC 13.3 (mkt1) also vectorizes
+// the plain loop 16 wide, for rows of 16 or more that this branch never sees, and the vector body's
+// registers push A1_pos and the row's output pointer onto the stack: two loads and a store at the
+// head of every row. Peeling the first product out of a loop of scalar FMA intrinsics took the trip
+// count off the one-nonzero row and kept the vectorizer off the loop, and read 0.874 (float32) and
+// 0.966 (float64) of the plain loop on mkt1's behind-MKL keys over four randomized code layouts --
+// but 1.020 and 1.036 on redwood's. An intrinsic FMA takes its upper lanes from a multiplicand, so
+// GCC 11 cannot accumulate in place: each further nonzero costs a separate load of B's element and
+// a register move on top of the FMA, and rows of two to seven nonzeros pay it.
+//
+// __builtin_fma is a scalar operation: it accumulates in place with B's element as its memory
+// operand, and -ffast-math cannot reassociate one operation, so the bits are the plain loop's (an
+// FMA chain from the first product, which is fma(a, b, 0)). The block is inside __FMA__, so it is
+// the instruction and never a libm call.
+//
+// Against the peeled intrinsic loop, over four randomized code layouts: 0.894 in both dtypes on
+// redwood's width-1 keys behind MKL and 0.969 / 0.985 on mkt1's, with no cell slower in every layout
+// on redwood. Traced in gdb on redwood, a row of one nonzero runs 26 instructions and 1 taken jump (28
+// and 2 before) and a row of five 46 and 1 (74 and 3). On mkt1, six float32 matrices whose rows
+// mostly hold one nonzero (TSOPF_RS_b*, t2dal_E, t2dal_bci_E, M80PI_n_E) read 1.06-1.08 of the
+// peeled loop in every layout while executing the same instruction count with half the taken jumps
+// (one whole call traced in gdb); the peeled loop had read 0.51-0.52 of the plain loop on them.
+static inline float scorch_spmm_fma(float a, float b, float c) { return __builtin_fmaf(a, b, c); }
+static inline double scorch_spmm_fma(double a, double b, double c) { return __builtin_fma(a, b, c); }
+template <typename T>
+__attribute__((always_inline)) static inline T scorch_spmm_short_sum_k1(
+    const int* SCORCH_RESTRICT A1_crd, const T* SCORCH_RESTRICT A_val,
+    const T* SCORCH_RESTRICT B_val, int pb, unsigned len) {
+  const int* SCORCH_RESTRICT c = A1_crd + pb;
+  const T* SCORCH_RESTRICT a = A_val + pb;
+  T s = a[0] * B_val[c[0]];
+  if (len > 1) {
+    s = scorch_spmm_fma(a[1], B_val[c[1]], s);
+    if (len > 2) {
+      s = scorch_spmm_fma(a[2], B_val[c[2]], s);
+      if (len > 3) {
+        s = scorch_spmm_fma(a[3], B_val[c[3]], s);
+        if (len > 4) {
+          s = scorch_spmm_fma(a[4], B_val[c[4]], s);
+          if (len > 5) {
+            s = scorch_spmm_fma(a[5], B_val[c[5]], s);
+            if (len > 6) s = scorch_spmm_fma(a[6], B_val[c[6]], s);
+          }
+        }
+      }
+    }
+  }
+  return s;
+}
+
 // Width 1 on the nonzero-axis gather kernel (float32 below the exact kernel's degree floor):
 // the matrices with a few nonzeros per row, graphs and Laplacians with millions of rows. A row of
 // eight or more takes the gather kernel; a shorter one is the kernel's own scalar tail, in the same
@@ -3920,9 +3976,7 @@ __attribute__((noinline)) static void scorch_spmm_rows_gather_k1(
     // short row read 1.035-1.10x on extr1b_A_30 (2836 rows of 3.2 nonzeros, no empty row; redwood,
     // three replicates, both dtypes) against 0.99-1.00 for a build that only moved the function.
     if (SCORCH_LIKELY(pe > pb && pe - pb < 8)) {
-      float sum = 0.f;
-      for (int q = pb; q < pe; q++) sum += A_val[q] * B_val[A1_crd[q]];
-      C_values[i] = sum;
+      C_values[i] = scorch_spmm_short_sum_k1<float>(A1_crd, A_val, B_val, pb, (unsigned)(pe - pb));
     } else if (pe > pb) {
       scorch_spmm_row_gather_f32<1>(A1_crd, A_val, B_val, C_values + i, pb, pe);
     } else {
@@ -3946,15 +4000,11 @@ __attribute__((noinline)) static void scorch_spmm_rows_gather_k1(
 // read 1.65 and 1.50 and float64 width 2 read 2.04 and 1.74 (pinned, matrices of 100K+ nonzeros).
 // Single-threaded on Hardesty2 (degree 4.3) the tile took 1.77x float32's time, MKL 1.04x.
 //
-// The short sum is written in scalar FMA intrinsics because GCC vectorizes the plain loop: under
-// -ffast-math GCC 13 gives it a 4-wide emulated-gather body for rows of 8 or more -- rows this
-// branch never sees -- and every short row then runs two length tests to route around it. The
-// vectorizer leaves loops over vector types alone, and the chain is the same FMAs from the same
-// zero, so the bits are the plain loop's. Single-threaded on mkt1, rotated order, 4 rounds: 0.67
-// of the plain loop's time back to back on 8081 one-nonzero rows, 0.70-0.93 on Pd_b, m3plates and
-// TSOPF_RS_b162_c3_b (0.77-0.93 cold), 0.96-0.98 on rajat29, Hardesty2 and Spielman_k200_A_01.
-// Float32's loop above keeps the plain form: the same rewrite there read between 0.96 and 1.11 of
-// it, inside what an identical copy of that function read against itself (up to 1.125).
+// The short sum is scorch_spmm_short_sum_k1, as in the float32 loop above. Before it, this loop
+// kept its sum in scalar FMA intrinsics from a zeroed register, because GCC 13 vectorizes the plain
+// loop; single-threaded on mkt1 that read 0.67 of the plain loop's time back to back on 8081
+// one-nonzero rows, 0.70-0.93 on Pd_b, m3plates and TSOPF_RS_b162_c3_b (0.77-0.93 cold), and
+// 0.96-0.98 on rajat29, Hardesty2 and Spielman_k200_A_01 (rotated order, 4 rounds).
 __attribute__((noinline)) static void scorch_spmm_rows_short_k1_f64(
     const int* SCORCH_RESTRICT A1_pos, const int* SCORCH_RESTRICT A1_crd,
     const double* SCORCH_RESTRICT A_val, const double* SCORCH_RESTRICT B_val,
@@ -3964,10 +4014,7 @@ __attribute__((noinline)) static void scorch_spmm_rows_short_k1_f64(
     const int pe = A1_pos[i + 1];
     // Short rows on the straight-line path, as in the float32 loop above.
     if (SCORCH_LIKELY(pe > pb && pe - pb < 8)) {
-      __m128d sum = _mm_setzero_pd();
-      for (int q = pb; q < pe; q++)
-        sum = _mm_fmadd_sd(_mm_load_sd(A_val + q), _mm_load_sd(B_val + A1_crd[q]), sum);
-      _mm_store_sd(C_values + i, sum);
+      C_values[i] = scorch_spmm_short_sum_k1<double>(A1_crd, A_val, B_val, pb, (unsigned)(pe - pb));
     } else if (pe > pb) {
       scorch_spmm_row_narrow_rowvec<double, 1, 4>(A1_crd, A_val, B_val, C_values + i, pb, pe);
     } else {
