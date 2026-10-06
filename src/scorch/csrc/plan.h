@@ -105,7 +105,14 @@ class SpmmCsrPlan {
         source_coordinates_data_(source_coordinates_.data_ptr()),
         source_positions_version_(abi_version_of(source_positions_)),
         source_coordinates_version_(abi_version_of(source_coordinates_)),
-        served_(0) {}
+        served_(0) {
+    // A's wide rows and their segments, built once here rather than on every call: the search is
+    // a few dozen binary searches over the row bounds, which measured as the whole per-call cost
+    // of an earlier split on the matrices it declined, and building the segments per call was the
+    // cost of this one's first version on small matrices. Only the v2 kernels segment them.
+    if (kind_ == SpmmPlanKind::V2 || kind_ == SpmmPlanKind::V2Double)
+      wide_.build(pos_, (long)rows_, (long)free_dim_, kind_ == SpmmPlanKind::V2 ? 4L : 8L);
+  }
 
   int64_t rows() const { return rows_; }
   int64_t cols() const { return cols_; }
@@ -117,6 +124,10 @@ class SpmmCsrPlan {
   // exactly as the legacy kernel entries do not -- so two threads cannot be inside
   // it at once.
   int64_t served() const { return served_; }
+  // The rows the v2 kernels compute in segments, ascending (see ScorchWideRows). What a test
+  // asserts on to show the segmented path is the one that ran.
+  std::vector<int> wide_rows() const { return wide_.rows; }
+  int64_t wide_segments() const { return (int64_t)wide_.seg_row.size(); }
   std::string kind() const {
     switch (kind_) {
       case SpmmPlanKind::V2: return "v2";
@@ -169,13 +180,16 @@ class SpmmCsrPlan {
     const int free_dim = static_cast<int>(free_dim_);
     const int contraction = static_cast<int>(cols_);
     const int nt = static_cast<int>(nthreads);
+    // Taken afresh on every call from the layout this plan owns, so it never outlives it.
+    ScorchWideRows wide;
+    const ScorchWideRows* wide_arg = wide_.view(&wide) ? &wide : nullptr;
     torch::Tensor values;
     switch (kind_) {
       case SpmmPlanKind::V2:
         values = spmm_csr_float_v2_core(
             rows, free_dim, rows, pos_, crd_, a_values.data_ptr<float>(),
             free_dim, b.data_ptr<float>(), static_cast<int>(tile_size_), nt,
-            atparallel);
+            atparallel, wide_arg);
         break;
       case SpmmPlanKind::TileJ:
         values = spmm_csr_float_tilej_core(
@@ -202,7 +216,7 @@ class SpmmCsrPlan {
         values = spmm_csr_double_v2_core(
             rows, free_dim, rows, pos_, crd_, a_values.data_ptr<double>(),
             free_dim, b.data_ptr<double>(), static_cast<int>(tile_size_), nt,
-            atparallel);
+            atparallel, wide_arg);
         break;
       default:
         return c10::nullopt;
@@ -240,6 +254,9 @@ class SpmmCsrPlan {
   uint32_t source_positions_version_;
   uint32_t source_coordinates_version_;
   int64_t served_;
+  // A's wide rows and their segments for this plan's free dimension and dtype, and the scratch the
+  // kernel sums them in (see ScorchWideLayout). Empty when A has no row the v2 kernels split.
+  ScorchWideLayout wide_;
 };
 
 // Builds a plan, or returns nullopt when the configuration is outside what a

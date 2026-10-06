@@ -970,7 +970,9 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
       .def_property_readonly("cols", &scorch_native::SpmmCsrPlan::cols)
       .def_property_readonly("nnz", &scorch_native::SpmmCsrPlan::nnz)
       .def_property_readonly("free_dim", &scorch_native::SpmmCsrPlan::free_dim)
-      .def_property_readonly("served", &scorch_native::SpmmCsrPlan::served);
+      .def_property_readonly("served", &scorch_native::SpmmCsrPlan::served)
+      .def_property_readonly("wide_rows", &scorch_native::SpmmCsrPlan::wide_rows)
+      .def_property_readonly("wide_segments", &scorch_native::SpmmCsrPlan::wide_segments);
     m.def("make_spmm_csr_plan", &scorch_native::make_spmm_csr_plan,
           "Build a CSR x dense plan, or None when one cannot serve this shape",
           py::arg("kind"), py::arg("A_shape"), py::arg("A_mode_indices"),

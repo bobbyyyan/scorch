@@ -3879,7 +3879,10 @@ torch::Tensor spmm_csr_v2_core(
                 const int* SCORCH_RESTRICT A1_crd,
                 const scalar_t* SCORCH_RESTRICT A_val,
                 int B1_size, const scalar_t* SCORCH_RESTRICT B_val,
-                int tile_size, int nthreads_override, bool atparallel
+                int tile_size, int nthreads_override, bool atparallel,
+                // A's wide rows (see ScorchWideRows), from a caller that keeps the matrix across
+                // calls; null where nobody has looked, and then every row is claimed whole.
+                const ScorchWideRows* wide_rows = nullptr
 #if SCORCH_SPMM_SPLIT_ENABLED
                 // Not merely defaulted to nullptr: a twelfth parameter goes on the stack in this
                 // ABI, so a default argument made every call site store a zero there and cost the
@@ -4904,6 +4907,24 @@ torch::Tensor spmm_csr_v2_core(
   constexpr long sp_row_units = 0;
   constexpr long sp_wide_deg  = 0;
 #endif
+#if defined(__AVX2__) && defined(__FMA__)
+  // Whether this call resolved to one of the loops specialised to a kernel (the worker's
+  // scorch_spmm_run_rows): the wide rows' segments run on them, so they need one.
+  const bool rows_unswitched = !REDIRECT && (regtile_rows || k1_gather_rows || exact_rows ||
+                                             halfvec_rows || regblock_rows);
+#else
+  constexpr bool rows_unswitched = false;
+#endif
+  // A's wide rows in segments (see ScorchWideRows), on a call that runs a specialised row loop on
+  // more than one worker: the segments reuse that loop, and on one worker there is nothing to
+  // balance. The caller cut the segments for this free dimension and element size and owns the
+  // scratch, so a call allocates nothing; it only resets the segment counter and each wide row's
+  // count of segments still to finish.
+  const bool wide_on = rows_unswitched && wide_rows != nullptr && wide_rows->nseg > 0 &&
+                       wide_rows->scratch != nullptr && nthreads > 1 && C1_size == B1_size &&
+                       wide_rows->width == (long)C1_size &&
+                       wide_rows->elem == (long)sizeof(scalar_t);
+  if (wide_on) scorch_spmm_wide_reset(wide_rows);
 #ifdef SCORCH_TUNE_HOOKS
   bool wstat_on = false;
   { const char* e = std::getenv("SCORCH_SPMM_WSTAT");
@@ -4921,13 +4942,108 @@ torch::Tensor spmm_csr_v2_core(
   // constant off, which fails this file's own rule that a default-off mechanism must emit exactly
   // what shipped before it. `MR_LIVE` is then a plain `true` and `if constexpr (true)` is
   // transparent, so the emitted code is unchanged.
+  //
+  // Generic, too, in whether A has wide rows in segments this call (wide_on): the instance without
+  // them contains none of their code, so a call on a matrix without wide rows runs the worker it
+  // ran before they existed. Sharing one instance cost those calls about 1% on mkt1.
 #if SCORCH_SPMM_MULTIROW_UNSWITCH && defined(__AVX2__) && defined(__FMA__) && \
     (defined(SCORCH_TUNE_HOOKS) || SCORCH_SPMM_MULTIROW_ANY)
-  auto scorch_spmm_worker_t = [&](int worker_id, int team_size, auto mr_tag) {
+  auto scorch_spmm_worker_t = [&](int worker_id, int team_size, auto mr_tag, auto wide_tag) {
     [[maybe_unused]] constexpr bool MR_LIVE = decltype(mr_tag)::value;
 #else
-  auto scorch_spmm_worker = [&](int worker_id, int team_size) {
+  auto scorch_spmm_worker_t = [&](int worker_id, int team_size, auto wide_tag) {
     [[maybe_unused]] constexpr bool MR_LIVE = true;
+#endif
+    [[maybe_unused]] constexpr bool WIDE = decltype(wide_tag)::value;
+#if defined(__AVX2__) && defined(__FMA__)
+    // Everything the wide rows need lives in this frame, the worker's, not the launching thread's:
+    // the team reads the launching frame, and adding the wide rows' closures and pointers there cost
+    // calls on matrices WITHOUT wide rows 1.2-2.3% warm (mkt1, in-process A/B, float32 DLMC), all of
+    // it on pool calls of 5-20 us. The launching frame keeps only `wide_on`.
+    [[maybe_unused]] std::atomic<int>* const wclaim =
+        WIDE ? reinterpret_cast<std::atomic<int>*>(wide_rows->scratch) : nullptr;
+    [[maybe_unused]] std::atomic<int>* const wleft =
+        WIDE ? reinterpret_cast<std::atomic<int>*>(wide_rows->scratch + 64) : nullptr;
+    [[maybe_unused]] scalar_t* const wscratch =
+        WIDE ? reinterpret_cast<scalar_t*>(wide_rows->scratch + 64 +
+                                           scorch_wide_left_bytes(wide_rows->n))
+             : nullptr;
+    // Rows [rs, re) on the loop specialised to the kernel this call resolved to, reading row bounds
+    // from `pos` and writing row i at `cv` + i * width. The claim loop below runs it on A's own row
+    // bounds and the output; a segment of a wide row runs it on a two-entry bounds array -- the
+    // segment's first and one-past-last nonzero -- and a scratch row, which is the same kernel on
+    // the same nonzeros. Only meaningful where rows_unswitched says the call resolved to one.
+    [[maybe_unused]] auto scorch_spmm_run_rows = [&](const int* SCORCH_RESTRICT pos,
+                                                     scalar_t* SCORCH_RESTRICT cv, int rs, int re) {
+      if (regtile_rows) {
+        scorch_spmm_rows_regtile<scalar_t>(pos, A1_crd, A_val, B_val, B1_size, cv, rs, re);
+        return;
+      }
+      if (k1_gather_rows) {
+        if constexpr (std::is_same<scalar_t, float>::value)
+          scorch_spmm_rows_gather_k1(pos, A1_crd, (const float*)A_val, (const float*)B_val,
+                                     (float*)cv, rs, re);
+        return;
+      }
+      if (exact_rows) {
+      #define SCORCH_RX(KK, UN) \
+          scorch_spmm_rows_exact<scalar_t, KK, UN>(pos, A1_crd, A_val, B_val, cv, rs, re)
+        // The unroll as the general loop maps it: 1, 2, 4, and 8 for anything else.
+      #define SCORCH_RXK(KK) \
+          do { switch (exact_unroll) { \
+            case 1: SCORCH_RX(KK, 1); break; \
+            case 2: SCORCH_RX(KK, 2); break; \
+            case 4: SCORCH_RX(KK, 4); break; \
+            default: SCORCH_RX(KK, 8); break; } } while (0)
+        switch (exact_width) {
+          case 1: SCORCH_RXK(1); break;
+          case 2: SCORCH_RXK(2); break;
+          default: SCORCH_RXK(3); break;
+        }
+      #undef SCORCH_RXK
+      #undef SCORCH_RX
+        return;
+      }
+      if (halfvec_rows) {
+        using VH = scorch_simd_half<scalar_t>;
+        scorch_spmm_rows_regblock<scalar_t, 1, true, VH>(
+            pos, A1_crd, A_val, B_val, B1_size, cv, rs, re
+            SCORCH_SPMM_PFLIM(nnz_total), VH::lane_mask(VH::lanes));
+        return;
+      }
+      if (regblock_rows) {
+      #define SCORCH_RR(NV, FULL) \
+          scorch_spmm_rows_regblock<scalar_t, NV, FULL>( \
+              pos, A1_crd, A_val, B_val, B1_size, cv, rs, re \
+              SCORCH_SPMM_PFLIM(nnz_total), mask_last)
+        switch (nvec * 2 + (full_last ? 1 : 0)) {
+          case 2: SCORCH_RR(1, false); break;
+          case 3: SCORCH_RR(1, true); break;
+          case 4: SCORCH_RR(2, false); break;
+          case 5: SCORCH_RR(2, true); break;
+          case 6: SCORCH_RR(3, false); break;
+          case 7: SCORCH_RR(3, true); break;
+          case 8: SCORCH_RR(4, false); break;
+          default: SCORCH_RR(4, true); break;
+        }
+      #undef SCORCH_RR
+        return;
+      }
+    };
+    // Wide row j is the sum of its segments in segment order, written by whichever worker finishes
+    // its last segment -- so the order of the sum depends on the matrix alone, and no pass runs
+    // after the team.
+    [[maybe_unused]] auto fold_wide_row = [&](int j) {
+      scalar_t* SCORCH_RESTRICT dst = C_values + (size_t)wide_rows->rows[j] * (size_t)C1_size;
+      const int f0 = wide_rows->seg_first[j], f1 = wide_rows->seg_first[j + 1];
+      const size_t stride = (size_t)wide_rows->stride;
+      const scalar_t* SCORCH_RESTRICT src = wscratch + (size_t)f0 * stride;
+      for (int c = 0; c < C1_size; ++c) dst[c] = src[c];
+      for (int sg = f0 + 1; sg < f1; ++sg) {
+        src = wscratch + (size_t)sg * stride;
+        for (int c = 0; c < C1_size; ++c) dst[c] += src[c];
+      }
+    };
 #endif
     // Per-thread workspace for the fallback path (cache-line aligned, lives in
     // L1). On AVX2 the register kernels (regblock k<=32 / regtile k>32) own every
@@ -5000,6 +5116,31 @@ torch::Tensor spmm_csr_v2_core(
     }
 
     // Home-range progress for partition modes 1 and 2 (see the setup above).
+#if defined(__AVX2__) && defined(__FMA__)
+    // The wide rows' segments before any row: the large items first, so the rows fill in at the
+    // end. A segment runs the specialised loop on its own two-entry bounds into its scratch row.
+    if constexpr (WIDE) {
+      const int nseg = wide_rows->nseg;
+      const size_t stride = (size_t)wide_rows->stride;
+      // Several segments a claim, about four claims a worker: one shared counter taken once per
+      // segment was the cost on a matrix of 512 segments (kl02, 71 rows all wide).
+      const int wchunk = std::max(1, nseg / (4 * nthreads));
+      for (;;) {
+        const int s0 = wclaim->fetch_add(wchunk, std::memory_order_relaxed);
+        if (s0 >= nseg) break;
+        const int s1 = std::min(s0 + wchunk, nseg);
+        for (int sg = s0; sg < s1;) {
+          const int j = wide_rows->seg_row[sg];
+          int done = 0;
+          for (; sg < s1 && wide_rows->seg_row[sg] == j; ++sg, ++done)
+            scorch_spmm_run_rows(wide_rows->seg_pos + 2 * (size_t)sg, wscratch + (size_t)sg * stride,
+                                 0, 1);
+          if (wleft[j].fetch_sub(done, std::memory_order_acq_rel) == done) fold_wide_row(j);
+        }
+      }
+    }
+#endif
+
     int own_w = worker_id;   // next own split to try
     int steal_t = 1;         // next victim offset to try
 
@@ -5072,6 +5213,23 @@ torch::Tensor spmm_csr_v2_core(
       // resolved to one (see `unswitch_rows` and the functions before this one); otherwise the
       // general loop below.
       if constexpr (!REDIRECT) {
+        // A claim holding one of A's wide rows: its other rows, on either side of each wide one.
+        // The wide rows are computed in segments at the top of the worker and must not be
+        // computed again whole. Every other claim takes the dispatch below unchanged. Sorted, so
+        // the claim's first wide row is a binary search away.
+        if constexpr (WIDE) {
+          const int* w = std::lower_bound(wide_rows->rows, wide_rows->rows + wide_rows->n, start);
+          const int* const wend = wide_rows->rows + wide_rows->n;
+          if (w != wend && *w < end) {
+            int s0 = start;
+            for (; w != wend && *w < end; ++w) {
+              if (s0 < *w) scorch_spmm_run_rows(A1_pos, C_values, s0, *w);
+              s0 = *w + 1;
+            }
+            if (s0 < end) scorch_spmm_run_rows(A1_pos, C_values, s0, end);
+            continue;
+          }
+        }
         if (regtile_rows) {
           scorch_spmm_rows_regtile<scalar_t>(A1_pos, A1_crd, A_val, B_val, B1_size, C_values,
                                              start, end);
@@ -5790,8 +5948,18 @@ torch::Tensor spmm_csr_v2_core(
 #if SCORCH_SPMM_MULTIROW_UNSWITCH && defined(__AVX2__) && defined(__FMA__) && \
     (defined(SCORCH_TUNE_HOOKS) || SCORCH_SPMM_MULTIROW_ANY)
   auto scorch_spmm_worker = [&](int worker_id, int team_size) {
-    if (multirow_ok) scorch_spmm_worker_t(worker_id, team_size, std::true_type{});
-    else             scorch_spmm_worker_t(worker_id, team_size, std::false_type{});
+    if (multirow_ok) {
+      if (wide_on) scorch_spmm_worker_t(worker_id, team_size, std::true_type{}, std::true_type{});
+      else         scorch_spmm_worker_t(worker_id, team_size, std::true_type{}, std::false_type{});
+    } else {
+      if (wide_on) scorch_spmm_worker_t(worker_id, team_size, std::false_type{}, std::true_type{});
+      else         scorch_spmm_worker_t(worker_id, team_size, std::false_type{}, std::false_type{});
+    }
+  };
+#else
+  auto scorch_spmm_worker = [&](int worker_id, int team_size) {
+    if (wide_on) scorch_spmm_worker_t(worker_id, team_size, std::true_type{});
+    else         scorch_spmm_worker_t(worker_id, team_size, std::false_type{});
   };
 #endif
 
@@ -5922,7 +6090,8 @@ torch::Tensor spmm_csr_v2_rowsplit(
                 const int* SCORCH_RESTRICT A1_crd,
                 const scalar_t* SCORCH_RESTRICT A_val,
                 int B1_size, const scalar_t* SCORCH_RESTRICT B_val,
-                int tile_size, int nthreads_override, bool atparallel) {
+                int tile_size, int nthreads_override, bool atparallel,
+                const ScorchWideRows* wide_rows) {
 #if !SCORCH_SPMM_SPLIT_ENABLED
   // The mechanism is off at compile time, so it is not here: no gate call, no unit arrays, and no
   // REDIRECT=true instantiation of the core to be dead-stripped later. The forwarder below stays the
@@ -5930,7 +6099,8 @@ torch::Tensor spmm_csr_v2_rowsplit(
   // the split existed. Flipping SCORCH_SPMM_SPLIT_MIN_IMBALANCE off zero -- which is the ship
   // decision, taken on measured kernel runtime -- compiles the rest of this function in.
   return spmm_csr_v2_core<scalar_t>(C0_size, C1_size, A0_size, A1_pos, A1_crd, A_val,
-                                    B1_size, B_val, tile_size, nthreads_override, atparallel);
+                                    B1_size, B_val, tile_size, nthreads_override, atparallel,
+                                      wide_rows);
 #else
   // One call, because the gate lives in one place: scorch_spmm_split_seg answers "how wide a segment,
   // or leave the rows whole" and is the same function a harness or a test asks. Splitting this rule
@@ -5941,7 +6111,8 @@ torch::Tensor spmm_csr_v2_rowsplit(
                                          (long)sizeof(scalar_t));
   if (seg <= 0) {
     return spmm_csr_v2_core<scalar_t>(C0_size, C1_size, A0_size, A1_pos, A1_crd, A_val,
-                                      B1_size, B_val, tile_size, nthreads_override, atparallel);
+                                      B1_size, B_val, tile_size, nthreads_override, atparallel,
+                                      wide_rows);
   }
 
   // Which rows are wide enough to matter, and how many extra units they need. Neither step touches
@@ -5983,7 +6154,8 @@ torch::Tensor spmm_csr_v2_rowsplit(
     // honest limit of a CSR index space this narrow; falling back rather than truncating is the only
     // correct answer, and nothing has been allocated yet that the core would have to know about.
     return spmm_csr_v2_core<scalar_t>(C0_size, C1_size, A0_size, A1_pos, A1_crd, A_val,
-                                      B1_size, B_val, tile_size, nthreads_override, atparallel);
+                                      B1_size, B_val, tile_size, nthreads_override, atparallel,
+                                      wide_rows);
   }
 
   // x_owner is the row a slot belongs to, recorded here where the row index is in hand. Recovering
@@ -6021,7 +6193,8 @@ torch::Tensor spmm_csr_v2_rowsplit(
     const long ab = (e && *e) ? std::atol(e) : 0;
     if (ab == 1)
       return spmm_csr_v2_core<scalar_t>(C0_size, C1_size, A0_size, A1_pos, A1_crd, A_val,
-                                        B1_size, B_val, tile_size, nthreads_override, atparallel);
+                                        B1_size, B_val, tile_size, nthreads_override, atparallel,
+                                      wide_rows);
     if (ab == 2) {
       // Mode 2 runs the REDIRECT=true instantiation with NOTHING split: every row is a unit, no row
       // is truncated (wide_deg above any degree), no extra units, no fold, and the output is the
@@ -6037,7 +6210,7 @@ torch::Tensor spmm_csr_v2_rowsplit(
       idle.slot_base = (long)C0_size;
       return spmm_csr_v2_core<scalar_t, /*REDIRECT=*/true>(
           C0_size, C1_size, A0_size, A1_pos, A1_crd, A_val,
-          B1_size, B_val, tile_size, nthreads_override, atparallel, &idle);
+          B1_size, B_val, tile_size, nthreads_override, atparallel, nullptr, &idle);
     } }
 #endif
 
@@ -6045,7 +6218,7 @@ torch::Tensor spmm_csr_v2_rowsplit(
   // that claimed them -- no copy, no second visit.
   torch::Tensor C_values_torch = spmm_csr_v2_core<scalar_t, /*REDIRECT=*/true>(
       (int)buf_rows, C1_size, (int)nunits, A1_pos, A1_crd, A_val,
-      B1_size, B_val, tile_size, nthreads_override, atparallel, &plan);
+      B1_size, B_val, tile_size, nthreads_override, atparallel, nullptr, &plan);
   scalar_t* SCORCH_RESTRICT C_values = C_values_torch.template data_ptr<scalar_t>();
 
   // Rows past A's last one. The core skips these under a redirection, because there A0_size counts
@@ -6095,10 +6268,11 @@ torch::Tensor spmm_csr_float_v2_core(
                 const int* SCORCH_RESTRICT A1_crd,
                 const float* SCORCH_RESTRICT A_val,
                 int B1_size, const float* SCORCH_RESTRICT B_val,
-                int tile_size, int nthreads_override, bool atparallel) {
+                int tile_size, int nthreads_override, bool atparallel,
+                const ScorchWideRows* wide_rows) {
   return spmm_csr_v2_rowsplit<float>(C0_size, C1_size, A0_size, A1_pos, A1_crd, A_val,
                                      B1_size, B_val, tile_size, nthreads_override,
-                                     atparallel);
+                                     atparallel, wide_rows);
 }
 
 Tensor spmm_csr_float_v2(std::vector<int> result_shape, std::vector<int> A_shape,
@@ -6115,7 +6289,7 @@ Tensor spmm_csr_float_v2(std::vector<int> result_shape, std::vector<int> A_shape
       A_mode_indices[1][1].data_ptr<int>(),
       A_values.data_ptr<float>(),
       B_shape[1], B_values.data_ptr<float>(),
-      tile_size, nthreads_override, atparallel);
+      tile_size, nthreads_override, atparallel, nullptr);
   return C;
 }
 
@@ -6178,11 +6352,12 @@ torch::Tensor spmm_csr_double_v2_core(
                 const int* SCORCH_RESTRICT A1_crd,
                 const double* SCORCH_RESTRICT A_val,
                 int B1_size, const double* SCORCH_RESTRICT B_val,
-                int tile_size, int nthreads_override, bool atparallel) {
+                int tile_size, int nthreads_override, bool atparallel,
+                const ScorchWideRows* wide_rows) {
 #if (defined(__AVX2__) && defined(__FMA__)) || defined(__ARM_NEON)
   return spmm_csr_v2_rowsplit<double>(C0_size, C1_size, A0_size, A1_pos, A1_crd, A_val,
                                       B1_size, B_val, tile_size, nthreads_override,
-                                      atparallel);
+                                      atparallel, wide_rows);
 #else
   // The composition hints are accepted and ignored here, so neither the Python side
   // nor plan.h needs a per-platform branch: the reference kernel takes its thread
@@ -6190,6 +6365,7 @@ torch::Tensor spmm_csr_double_v2_core(
   // it directly.
   (void)nthreads_override;
   (void)atparallel;
+  (void)wide_rows;
   return spmm_csr_typed_core<double>(C0_size, C1_size, A0_size, A1_pos, A1_crd, A_val,
                                      B1_size, B_val, tile_size);
 #endif
@@ -6209,7 +6385,7 @@ Tensor spmm_csr_double_v2(std::vector<int> result_shape, std::vector<int> A_shap
       A_mode_indices[1][1].data_ptr<int>(),
       A_values.data_ptr<double>(),
       B_shape[1], B_values.data_ptr<double>(),
-      tile_size, nthreads_override, atparallel);
+      tile_size, nthreads_override, atparallel, nullptr);
   return C;
 }
 

@@ -59,6 +59,9 @@
 #include <cstdio>     // scorch_llc_bytes reads sysfs on Linux
 #include <cstdlib>
 #include <cstring>    // scorch_omp_is_libgomp matches the runtime's file name
+#include <atomic>     // scorch_spmm_wide_reset
+#include <cstdint>    // uintptr_t: ScorchWideLayout aligns its scratch
+#include <vector>     // scorch_spmm_find_wide_rows
 #if defined(__linux__) || defined(__APPLE__)
 #include <dlfcn.h>    // dladdr: which library the OpenMP runtime was loaded from
 #endif
@@ -2784,6 +2787,115 @@ inline long scorch_spmm_split_seg(const int* A1_pos, long rows, long k, long ele
   if ((long)scorch_spmm_row_imbalance(A1_pos, rows, refn) < min_imb) return 0;
   return scorch_spmm_seg_width(nnz, k, elem_size);
 }
+
+// The rows of A a whole-row partition cannot balance, which the drop-in SpMM computes in segments.
+//
+// Every partition mode hands out whole rows, so a row holding more of the nonzeros than a worker's
+// fair share sets the call's time by itself: the worker that claims it is still on it after the
+// rest of the team has finished. 47 SuiteSparse matrices of at least 150K nonzeros have a row
+// holding more than 2/64 of them -- degme's widest row has 624079 of its 8.1M nonzeros, 7.7%,
+// against a fair share of 4.2% on 24 workers. Three of them (ins2, rajat30, ASIC_100k) read
+// 0.88-0.97 of MKL cold at widths 1-2 on mkt1 with every row whole.
+//
+// A row is wide when its degree exceeds nnz/SCORCH_SPMM_SPLIT_REFN: a fixed reference width and
+// not the pool, so which rows are segmented, and so how their sums associate, depends on the
+// matrix alone and never on the thread count. scorch_spmm_wide_rows finds them with the cut
+// search the imbalance probe does, without a pass over the rows; this runs it once per matrix,
+// for whoever keeps the matrix across calls (SpmmCsrPlan). Per call it was the whole cost of the
+// earlier, redirected split on the matrices it declined: 0.95 of the unsplit kernel back to back
+// and 0.83-0.95 cold, on 20 matrices of 150K-1M nonzeros with no wide row.
+struct ScorchWideRows {
+  const int* rows = nullptr;       // ascending
+  int n = 0;
+  // The segments, cut for one free dimension and element size: segment s is nonzeros
+  // [seg_pos[2s], seg_pos[2s+1]) of wide row seg_row[s], and wide row j owns segments
+  // [seg_first[j], seg_first[j+1]).
+  const int* seg_pos = nullptr;
+  const int* seg_row = nullptr;
+  const int* seg_first = nullptr;
+  int nseg = 0;
+  long width = 0;                  // the free dimension the segments were cut for
+  long elem = 0;                   // and the element size
+  long stride = 0;                 // elements between segment rows in the scratch: whole lines
+  // 64-byte aligned, owned by the caller and used by one call at a time: a line holding the
+  // segment counter, scorch_wide_left_bytes(n) of per-row counts of segments still to finish, then
+  // nseg rows of `stride` elements.
+  char* scratch = nullptr;
+};
+
+// Bytes of the per-wide-row counts, rounded up to whole lines so the segment rows start on one.
+inline long scorch_wide_left_bytes(long n) { return ((n * (long)sizeof(int) + 63) / 64) * 64; }
+
+// Before a call that computes wide rows in segments: the shared segment counter to zero and each
+// wide row's count of segments still to finish to its total. Out of line, so the launching thread's
+// frame -- which the team reads -- holds none of it.
+__attribute__((noinline)) inline void scorch_spmm_wide_reset(const ScorchWideRows* w) {
+  std::atomic<int>* claim = reinterpret_cast<std::atomic<int>*>(w->scratch);
+  std::atomic<int>* left = reinterpret_cast<std::atomic<int>*>(w->scratch + 64);
+  claim->store(0, std::memory_order_relaxed);
+  for (int j = 0; j < w->n; ++j)
+    left[j].store(w->seg_first[j + 1] - w->seg_first[j], std::memory_order_relaxed);
+}
+
+// The rows of A over nnz/SCORCH_SPMM_SPLIT_REFN, ascending; empty below SCORCH_SPMM_SPLIT_MIN_NNZ.
+inline std::vector<int> scorch_spmm_find_wide_rows(const int* A1_pos, long rows) {
+  std::vector<int> out;
+  if (!A1_pos || rows <= 1) return out;
+  const long nnz = (long)A1_pos[rows];
+  if (nnz < SCORCH_SPMM_SPLIT_MIN_NNZ) return out;
+  const long refn = SCORCH_SPMM_SPLIT_REFN;
+  int found[SCORCH_SPMM_SPLIT_REFN_MAX];
+  const long n = scorch_spmm_wide_rows(A1_pos, rows, refn, nnz / refn, found,
+                                       (long)SCORCH_SPMM_SPLIT_REFN_MAX);
+  if (n > 0) out.assign(found, found + n);
+  return out;
+}
+
+// Cuts the wide rows into segments for one free dimension and element size, and sizes the
+// scratch. scorch_spmm_seg_width picks the segment length from the matrix and the width alone, so
+// the cut -- and with it the order each wide row is summed in -- never depends on the thread count.
+struct ScorchWideLayout {
+  std::vector<int> rows, seg_pos, seg_row, seg_first;
+  long width = 0, elem = 0, stride = 0;
+  // Never a pointer into this: the plan holding the layout is returned by value, and a copy
+  // would keep pointing at the original's buffer. view() takes every address afresh.
+  std::vector<char> buf;
+
+  void build(const int* A1_pos, long nrows, long free_dim, long elem_size) {
+    rows = scorch_spmm_find_wide_rows(A1_pos, nrows);
+    seg_pos.clear(); seg_row.clear(); seg_first.clear(); buf.clear();
+    width = free_dim; elem = elem_size;
+    if (rows.empty() || free_dim <= 0 || elem_size <= 0) return;
+    const long nnz = (long)A1_pos[nrows];
+    const long seg = scorch_spmm_seg_width(nnz, free_dim, elem_size);
+    for (size_t j = 0; j < rows.size(); ++j) {
+      seg_first.push_back((int)seg_row.size());
+      const long q1 = (long)A1_pos[rows[j] + 1];
+      for (long q = (long)A1_pos[rows[j]]; q < q1; q += seg) {
+        seg_pos.push_back((int)q);
+        seg_pos.push_back((int)std::min(q + seg, q1));
+        seg_row.push_back((int)j);
+      }
+    }
+    seg_first.push_back((int)seg_row.size());
+    // A segment row per line at least: two workers writing one line would share it.
+    stride = ((free_dim * elem_size + 63) / 64) * 64 / elem_size;
+    const long bytes = 64 + scorch_wide_left_bytes((long)rows.size()) +
+                       (long)seg_row.size() * stride * elem_size;
+    buf.assign((size_t)bytes + 64, 0);
+  }
+
+  // False when there is nothing to segment.
+  bool view(ScorchWideRows* out) {
+    if (seg_row.empty() || buf.empty()) return false;
+    out->rows = rows.data(); out->n = (int)rows.size();
+    out->seg_pos = seg_pos.data(); out->seg_row = seg_row.data(); out->seg_first = seg_first.data();
+    out->nseg = (int)seg_row.size();
+    out->width = width; out->elem = elem; out->stride = stride;
+    out->scratch = reinterpret_cast<char*>(((uintptr_t)buf.data() + 63) & ~(uintptr_t)63);
+    return true;
+  }
+};
 
 // The row-handout mode the SpMM will actually run in, for one call's shape.
 //
