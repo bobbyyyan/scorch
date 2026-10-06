@@ -2,8 +2,10 @@
 """One slice of the full-collection board as a user calls it: scorch.matmul(STensor, dense), no
 keyword arguments, served by the operand's plan after its first call, against torch.sparse.mm on
 the same CSR, in the same process. Per cell: warm (best of 5 back-to-back batches) and cold
-(median of REP calls, each after a 256 MB sweep evicts A and B is touched -- as pipe_cold.py),
-each library's cold calls straight after its own warm loop.
+(median of REP calls each, every call after a 256 MB sweep evicts A and B is touched -- as
+pipe_cold.py), the two libraries' cold calls interleaved in ABBA order (see tcold_pair).
+COLD_PROTOCOL=blocks restores the previous order -- each library's REP cold calls straight after its
+own warm loop -- for comparing the two.
 Every cell checks scorch.matmul's answer against MKL's first. Both are rounded, so when they
 differ by more than 1e-4 in relative norm each is compared with the exact product (float64
 arithmetic on the same inputs): scorch.matmul passes if its error is at most twice MKL's, and the
@@ -22,10 +24,13 @@ import numpy as np, torch, scorch
 from scorch import STensor
 sys.path.insert(0, "/matx/u/bobbyy/pfsstage")
 from csrresolve import resolve_all
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from settle import settle
 TDT, NDT = {"float32": (torch.float32, np.float32), "float64": (torch.float64, np.float64)}[
     os.environ.get("SCREEN_DTYPE", "float32")]
 cache, corpus, keysf, out, ks = sys.argv[1:6]; KS = [int(x) for x in ks.split(",")]
-REP = 11; F = torch.rand(256 << 18)
+REP = 12; F = torch.rand(256 << 18)
+BLOCKS = os.environ.get("COLD_PROTOCOL", "interleaved") == "blocks"
 def tmin(fn, reps=5, target=0.004):
     fn(); fn(); c = []
     for _ in range(3):
@@ -42,8 +47,23 @@ def tcold(fn, Bv):
         float(F.sum()); Bv.mul_(1.0)
         t0 = time.perf_counter(); fn(); xs.append(time.perf_counter() - t0)
     return st.median(xs) * 1e6
+def tcold_pair(fa, fb, Bv):
+    # The two libraries' cold calls interleaved A B B A ..., REP each. A cold call reads A from
+    # DRAM, and mkt1 is shared: another job's memory traffic moves a cold reading by tens of
+    # percent from one 100 ms to the next (thread at float32 k=1 read 1.17 to 1.66 of MKL across
+    # four orders in one job; the board read it 0.909). Timing all of one library's calls and then
+    # all of the other's puts them in different traffic; interleaving puts each pair in the same.
+    # ABBA rather than ABAB because what ran before the sweep still shows through it (cold_order.py):
+    # in this order each library follows the other in half its slots and itself in the other half.
+    fa(); fb(); xs = ([], [])
+    for i in range(2 * REP):
+        w = (0, 1, 1, 0)[i % 4]
+        float(F.sum()); Bv.mul_(1.0)
+        t0 = time.perf_counter(); (fa, fb)[w](); xs[w].append(time.perf_counter() - t0)
+    return st.median(xs[0]) * 1e6, st.median(xs[1]) * 1e6
 keys = [l.strip() for l in open(keysf) if l.strip()]
 paths, _, _ = resolve_all(os.path.join(cache, corpus), keys)
+settle()  # the process's first parallel work runs slow; see settle.py
 w = csv.writer(open(out, "w")); w.writerow(["corpus", "key", "k", "rows", "nnz", "arm", "us"])
 for key in keys:
     if key not in paths: w.writerow([corpus, key, 0, 0, 0, "unresolved", 0]); continue
@@ -66,14 +86,23 @@ for key in keys:
             if e_api > 2 * e_mkl:
                 w.writerow([corpus, key, k, M, nnz, "mismatch", 0]); continue
             w.writerow([corpus, key, k, M, nnz, "rounding_vs_mkl", "%.4g" % (e_api / max(e_mkl, 1e-300))])
-        # Each library's cold calls follow its own back-to-back loop, the order a program that
-        # uses one of them has. This harness used to run both loops and then both cold runs, so
+        # Under COLD_PROTOCOL=blocks each library's cold calls follow its own back-to-back loop,
+        # the order a program that uses one of them has. This harness used to run both loops and then both cold runs, so
         # each library's cold calls followed the OTHER library's loop, and what ran before the
         # 256 MB sweep still showed through it (cold_order.py, 72 keys, k=1 and 4, both dtypes):
         # on redwood MKL's cold time on products under 100K nonzeros was 1.65x what it is after
         # its own loop (ours moved 4-6%); on mkt1 OUR cold time on products over 1M nonzeros was
         # 1.10x what it is after our own loop (MKL's moved 5%). One host flattered us and the
         # other penalised us, in different size ranges.
-        res = {"api": tmin(api)}; res["api_cold"] = tcold(api, Bv)
-        res["mkl"] = tmin(mkl); res["mkl_cold"] = tcold(mkl, Bv)
+        #
+        # That order (COLD_PROTOCOL=blocks) still times one library's cold calls in a different
+        # stretch of the node's memory traffic than the other's, and on a shared node that is the
+        # larger effect: see tcold_pair, which is now the default. Only each library's first cold
+        # call can follow the other's LOOP there; the rest follow a single call and a sweep.
+        if BLOCKS:
+            res = {"api": tmin(api)}; res["api_cold"] = tcold(api, Bv)
+            res["mkl"] = tmin(mkl); res["mkl_cold"] = tcold(mkl, Bv)
+        else:
+            res = {"api": tmin(api), "mkl": tmin(mkl)}
+            res["api_cold"], res["mkl_cold"] = tcold_pair(api, mkl, Bv)
         for a, v in res.items(): w.writerow([corpus, key, k, M, nnz, a, "%.3f" % v])

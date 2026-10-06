@@ -22,6 +22,8 @@ SCREEN_DTYPE=float64 runs double.
 import csv, os, sys, time, zlib, numpy as np, torch, scorch_ops as so
 sys.path.insert(0, "/matx/u/bobbyy/pfsstage")
 from csrresolve import resolve_all
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from settle import settle
 DT = {"float32": (torch.float32, np.float32, so.spmm_csr_float_v2),
       "float64": (torch.float64, np.float64, so.spmm_csr_double_v2)}[os.environ.get("SCREEN_DTYPE", "float32")]
 cache, sdir, out = sys.argv[1:4]; KS = [int(x) for x in (sys.argv[4] if len(sys.argv) > 4 else "1,2,4,8,16,32").split(",")]
@@ -44,6 +46,7 @@ def tcold(fn, Bv):
         t0 = time.perf_counter(); fn(); xs.append(time.perf_counter() - t0)
     xs.sort(); return xs[REP // 2] * 1e6
 ARMS = {"pol": "0", "pool": str(P)}
+settle()  # the process's first parallel work runs slow; see settle.py
 w = csv.writer(open(out, "w")); w.writerow(["corpus", "key", "k", "rows", "nnz", "arm", "us"])
 for corpus in ("ss", "dlmc"):
     keys = [l.strip() for l in open(os.path.join(sdir, "screen_%s.txt" % corpus)) if l.strip()]

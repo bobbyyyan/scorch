@@ -20,6 +20,8 @@ import numpy as np, torch, scorch
 from scorch import STensor
 sys.path.insert(0, "/matx/u/bobbyy/pfsstage")
 from csrresolve import resolve_all
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from settle import settle
 TDT, NDT = {"float32": (torch.float32, np.float32), "float64": (torch.float64, np.float64)}[
     os.environ.get("SCREEN_DTYPE", "float32")]
 cache, corpus, keysf, out, ks = sys.argv[1:6]; KS = [int(x) for x in ks.split(",")]
@@ -34,6 +36,7 @@ def cold(fn, Bv):
     return st.median(xs) * 1e6
 keys = [l.strip() for l in open(keysf) if l.strip()]
 paths, _, _ = resolve_all(os.path.join(cache, corpus), keys)
+settle()  # the process's first parallel work runs slow; see settle.py
 w = csv.writer(open(out, "w")); w.writerow(["corpus", "key", "k", "rows", "nnz", "arm", "us"])
 for key in keys:
     if key not in paths: continue
