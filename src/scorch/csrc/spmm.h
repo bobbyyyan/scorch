@@ -3815,6 +3815,91 @@ static inline int scorch_spmm_empty_run_end(const int* SCORCH_RESTRICT A1_pos, i
   return run;
 }
 
+// One past the last row of a run of empty rows that is known to continue at row i, bounded by `end`:
+// the first row from i on whose upper bound is not the run's `p`. Eight bounds a step under AVX2.
+static inline int scorch_spmm_flat_end(const int* SCORCH_RESTRICT A1_pos, int i, int end, int p) {
+#if defined(__AVX2__)
+  const __m256i pv = _mm256_set1_epi32(p);
+  for (; i + 8 <= end; i += 8) {
+    const __m256i b = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(A1_pos + i + 1));
+    const unsigned eq =
+        (unsigned)_mm256_movemask_ps(_mm256_castsi256_ps(_mm256_cmpeq_epi32(b, pv)));
+    if (eq != 0xFFu) return i + __builtin_ctz(~eq);
+  }
+#endif
+  while (i < end && A1_pos[i + 1] == p) i++;
+  return i;
+}
+
+// Zeroes the run of empty rows that starts at empty row i and returns the run's last row. A run's
+// rows are written with the stores that write a computed row (`zero_row`), by the walk that finds
+// the run's end -- the walk the memset version also made -- until the run has covered
+// SCORCH_SPMM_ZERO_RUN_BYTES; the rest of a longer run has its end found eight bounds at a time and
+// is zeroed by one memset. A memset call per run is the cost on matrices that are mostly empty
+// rows, where runs of a few rows alternate with single short rows (Rommes bips07/juba40k/bauru:
+// 15K-40K rows, 2K-6K nonzeros), and its fixed cost buys a few dozen bytes.
+//
+// Where to switch is the break-even of the two, which is a number of BYTES: a row of stores costs
+// about the same at every width up to a vector, and the scan and the call cost a fixed ~4.5 ns
+// (redwood, layout/zrun.cpp: runs of R empty rows, each followed by one non-empty row). Store and
+// memset broke even at about 56 rows of 4 bytes, 64 of 8, 28 of 16 and 22 of 32 -- 220 to 700
+// bytes -- and switching at 256 keeps every run within twice the cheaper of the two, since a run that
+// switches has paid stores worth about one call before it does. Switching after a fixed eight rows
+// instead, as this walk first did, made every run of 9 to ~50 rows at width 1 pay the call to
+// clear 4-8 bytes a row: 7.3 ns against 2.9 for the stores at nine rows of 4 bytes, and in four
+// randomized code layouts float64 width 1 read 1.03 of the store-only walk on the board's
+// behind-MKL keys, as-735 (runs of 4.5 rows, up to 75) and Reuters911 (8.7, up to 147) 1.05-1.14.
+//
+// The eight steps are peeled. Rolled, -funroll-loops unrolled the walk by eight with a remainder
+// dispatch keyed on the chunk's last row, which says nothing about the run's length, so every run
+// paid up to seven compares whose outcome was close to random (redwood, 2026-10-06: 1.07-1.13x on
+// bips07/juba40k at width 1 when that dispatch came before the first store).
+// The rows past the first eight are a plain loop, not more peeled steps: peeled with a test each,
+// rows 9-64 of 4 bytes cost 0.20 ns a row against the loop's 0.12.
+#ifndef SCORCH_SPMM_ZERO_RUN_BYTES
+#define SCORCH_SPMM_ZERO_RUN_BYTES 256
+#endif
+template <size_t ROW_BYTES, typename ZeroRow>
+__attribute__((always_inline)) static inline int scorch_spmm_zero_run(
+    const int* SCORCH_RESTRICT A1_pos, int i, int end, char* C_base, size_t row_bytes,
+    ZeroRow zero_row) {
+  // ROW_BYTES bounds row_bytes from above, so a run never stores past the switch in bytes.
+  constexpr int ROWS = SCORCH_SPMM_ZERO_RUN_BYTES / ROW_BYTES > 8
+                           ? (int)(SCORCH_SPMM_ZERO_RUN_BYTES / ROW_BYTES) : 8;
+  const int p = A1_pos[i + 1];
+#pragma GCC unroll 8
+  for (int s = 0; s < 8; s++) {
+    zero_row(i);
+    if (i + 1 >= end || A1_pos[i + 2] != p) return i;
+    ++i;
+  }
+  if constexpr (ROWS > 8) {
+    // Row i is empty and not yet written.
+    const int lim = end - i > ROWS - 8 ? i + (ROWS - 8) : end;
+    zero_row(i);
+    while (i + 1 < lim && A1_pos[i + 2] == p) zero_row(++i);
+    if (i + 1 >= end || A1_pos[i + 2] != p) return i;
+    ++i;
+  }
+  const int run = scorch_spmm_flat_end(A1_pos, i, end, p);
+  memset(C_base + (size_t)i * row_bytes, 0, (size_t)(run - i) * row_bytes);
+  return run - 1;
+}
+
+// The scalar row loops' form, KK elements a row (KK <= 3). Out of line, so a row loop sees one call
+// per run, as it did with memset, and allocates its registers for the non-empty rows as before.
+// Inlined at width 1, the float64 loop spilled two values and read 1.10-1.34x on case39_A_06 and
+// 1.06-1.09x on extr1b_A_30 (redwood, three replicates each), matrices with no empty row at all.
+template <typename T, int KK>
+__attribute__((noinline)) static int scorch_spmm_zero_walk(const int* SCORCH_RESTRICT A1_pos,
+                                                           T* SCORCH_RESTRICT C_values, int i,
+                                                           int end) {
+  return scorch_spmm_zero_run<sizeof(T) * KK>(A1_pos, i, end, reinterpret_cast<char*>(C_values),
+                              sizeof(T) * KK, [&](int r) {
+                                for (int c = 0; c < KK; c++) C_values[(size_t)r * KK + c] = T(0);
+                              });
+}
+
 // Width 1 on the nonzero-axis gather kernel (float32 below the exact kernel's degree floor):
 // the matrices with a few nonzeros per row, graphs and Laplacians with millions of rows. A row of
 // eight or more takes the gather kernel; a shorter one is the kernel's own scalar tail, in the same
@@ -3828,16 +3913,22 @@ __attribute__((noinline)) static void scorch_spmm_rows_gather_k1(
   for (int i = start; i < end; i++) {
     const int pb = A1_pos[i];
     const int pe = A1_pos[i + 1];
-    if (pe - pb >= 8) {
-      scorch_spmm_row_gather_f32<1>(A1_crd, A_val, B_val, C_values + i, pb, pe);
-    } else if (pe > pb) {
+    // A row of one to seven nonzeros is the straight-line path. Its whole cost is a few
+    // instructions, so a jump to reach its sum and one to return would be a visible share of it; a
+    // long row and a run of empty rows each enter their branch once for eight or more nonzeros or a
+    // whole run. Left to itself GCC laid the long-row branch out first, and the two extra jumps per
+    // short row read 1.035-1.10x on extr1b_A_30 (2836 rows of 3.2 nonzeros, no empty row; redwood,
+    // three replicates, both dtypes) against 0.99-1.00 for a build that only moved the function.
+    if (SCORCH_LIKELY(pe > pb && pe - pb < 8)) {
       float sum = 0.f;
       for (int q = pb; q < pe; q++) sum += A_val[q] * B_val[A1_crd[q]];
       C_values[i] = sum;
+    } else if (pe > pb) {
+      scorch_spmm_row_gather_f32<1>(A1_crd, A_val, B_val, C_values + i, pb, pe);
     } else {
-      const int run = scorch_spmm_empty_run_end(A1_pos, i, end);
-      memset(C_values + i, 0, sizeof(float) * (size_t)(run - i));
-      i = run - 1;
+      // A run of empty rows, zeroed by the walk that finds its end: one store per row (see
+      // scorch_spmm_zero_walk).
+      i = scorch_spmm_zero_walk<float, 1>(A1_pos, C_values, i, end);
     }
   }
 }
@@ -3871,17 +3962,16 @@ __attribute__((noinline)) static void scorch_spmm_rows_short_k1_f64(
   for (int i = start; i < end; i++) {
     const int pb = A1_pos[i];
     const int pe = A1_pos[i + 1];
-    if (pe - pb >= 8) {
-      scorch_spmm_row_narrow_rowvec<double, 1, 4>(A1_crd, A_val, B_val, C_values + i, pb, pe);
-    } else if (pe > pb) {
+    // Short rows on the straight-line path, as in the float32 loop above.
+    if (SCORCH_LIKELY(pe > pb && pe - pb < 8)) {
       __m128d sum = _mm_setzero_pd();
       for (int q = pb; q < pe; q++)
         sum = _mm_fmadd_sd(_mm_load_sd(A_val + q), _mm_load_sd(B_val + A1_crd[q]), sum);
       _mm_store_sd(C_values + i, sum);
+    } else if (pe > pb) {
+      scorch_spmm_row_narrow_rowvec<double, 1, 4>(A1_crd, A_val, B_val, C_values + i, pb, pe);
     } else {
-      const int run = scorch_spmm_empty_run_end(A1_pos, i, end);
-      memset(C_values + i, 0, sizeof(double) * (size_t)(run - i));
-      i = run - 1;
+      i = scorch_spmm_zero_walk<double, 1>(A1_pos, C_values, i, end);
     }
   }
 }
@@ -3892,21 +3982,24 @@ __attribute__((noinline)) static void scorch_spmm_rows_exact(
     const int* SCORCH_RESTRICT A1_pos, const int* SCORCH_RESTRICT A1_crd,
     const T* SCORCH_RESTRICT A_val, const T* SCORCH_RESTRICT B_val,
     T* SCORCH_RESTRICT C_values, int start, int end) {
-  for (int i = start; i < end; i++) {
-    const int pb = A1_pos[i];
-    const int pe = A1_pos[i + 1];
-    T* SCORCH_RESTRICT C_row = C_values + (size_t)i * (size_t)KK;
-    if (pe == pb) {
-      const int run = scorch_spmm_empty_run_end(A1_pos, i, end);
-      memset(C_row, 0, sizeof(T) * (size_t)KK * (size_t)(run - i));
-      i = run - 1;
-      continue;
-    }
+  // Rows alternate between runs that hold nonzeros and runs that do not. The inner loop computes a
+  // run of the first kind and leaves at the first empty row, which is the loop's exit. Traced in gdb
+  // on uniform 3-nonzero rows at float32 k=2, a computed row runs 49 instructions and 2 taken jumps
+  // this way, against 51 and 2 for one loop with the empty-row test first.
+  int i = start;
+  while (i < end) {
+    for (; i < end; i++) {
+      const int pb = A1_pos[i];
+      const int pe = A1_pos[i + 1];
+      if (pe == pb) break;
+      T* SCORCH_RESTRICT C_row = C_values + (size_t)i * (size_t)KK;
 #if SCORCH_NARROWK_EXACT_ROWVEC
-    scorch_spmm_row_narrow_rowvec<T, KK, UN>(A1_crd, A_val, B_val, C_row, pb, pe);
+      scorch_spmm_row_narrow_rowvec<T, KK, UN>(A1_crd, A_val, B_val, C_row, pb, pe);
 #else
-    scorch_spmm_row_narrow_exact<T, KK, UN>(A1_crd, A_val, B_val, C_row, pb, pe);
+      scorch_spmm_row_narrow_exact<T, KK, UN>(A1_crd, A_val, B_val, C_row, pb, pe);
 #endif
+    }
+    if (i < end) i = scorch_spmm_zero_walk<T, KK>(A1_pos, C_values, i, end) + 1;
   }
 }
 
@@ -3931,6 +4024,28 @@ static inline bool scorch_rows_reach(const int* SCORCH_RESTRICT A1_pos, int star
   return false;
 }
 
+// The empty-run walk (scorch_spmm_zero_walk) in the register-block loop's form: each of a run's
+// first rows written by the stores the kernel writes a row's result with -- NV vectors of V, the
+// last one masked when the width is not a whole number of vectors (the mask is rebuilt here from
+// the width, so the call takes no vector argument).
+template <typename T, int NV, bool FULL, typename V>
+__attribute__((noinline)) static int scorch_spmm_zero_walk_vec(const int* SCORCH_RESTRICT A1_pos,
+                                                               T* SCORCH_RESTRICT C_values,
+                                                               int width, int i, int end) {
+  const typename V::vec z = V::zero();
+  const typename V::mask mask_last = V::lane_mask(FULL ? V::lanes : width - (NV - 1) * V::lanes);
+  return scorch_spmm_zero_run<sizeof(T) * NV * V::lanes>(
+      A1_pos, i, end, reinterpret_cast<char*>(C_values), sizeof(T) * (size_t)width, [&](int r) {
+                                T* SCORCH_RESTRICT C_row = C_values + (size_t)r * (size_t)width;
+                                for (int v = 0; v < NV; v++) {
+                                  if (v == NV - 1 && !FULL)
+                                    V::maskstore(C_row + V::lanes * v, mask_last, z);
+                                  else
+                                    V::store(C_row + V::lanes * v, z);
+                                }
+                              });
+}
+
 // The register-block kernel, NV vectors of V per row: every other narrow width, and with
 // V = the half vector the half-vector kernel at exactly its width. Where the last vector is
 // full the row is exactly NV * V::lanes wide, so the stride of B and C is a compile-time
@@ -3945,14 +4060,28 @@ __attribute__((noinline)) static void scorch_spmm_rows_regblock(
     T* SCORCH_RESTRICT C_values, int start, int end SCORCH_SPMM_PFLIM_PARAM,
     typename V::mask mask_last) {
   const int width = FULL ? NV * V::lanes : B1_size;
+  // The walk against one memset per run, over four randomized code layouts per host: memset read
+  // 1.13-1.46 on the mostly-empty matrices that trail MKL (bips07, Pd, m3plates, TSOPF_RS, higgs) on
+  // both hosts, and up to 2.2 on t2dal_E and M80PI_n_E at widths 8-16 on redwood. On mkt1 at 32-byte
+  // rows (float32 width 8, float64 width 4) the walk instead cost 3.4-6.9% on matrices with no empty
+  // row at all (minsurfo, n3c6-b5, dwt_878, adder_dcop; at one thread and at 24), and memset read
+  // 0.974-0.975 on the keys outside the behind-MKL set there. gdb counts the same instructions for
+  // the whole call either way (111709 on dwt_878, 105796 of them in this loop), and those matrices
+  // run 1.27x MKL's speed or more on the last full board, so the walk stays.
+  //
+  // One loop with the empty-row test first, not the runs form of scorch_spmm_rows_exact. The runs
+  // form (no call inside the loop over computed rows) recovered those mkt1 cells (0.955 of this
+  // form on matrices with no empty row, 0.96-0.99 on the screens) but read 1.013 on redwood's float64
+  // screens, 1.05-1.06 on Pd at float32 width 8 there, and 1.086 on m3plates at float32 width 4 on
+  // mkt1; a variant testing both exits at the bottom of its inner loop lost 12-20% on Pd and bips07
+  // on redwood. Traced in gdb on redwood at a uniform eight nonzeros a row this form runs 109
+  // instructions and 4 taken jumps a row, the runs form 104 and 4.
   for (int i = start; i < end; i++) {
     const int pb = A1_pos[i];
     const int pe = A1_pos[i + 1];
     T* SCORCH_RESTRICT C_row = C_values + (size_t)i * (size_t)width;
     if (pe == pb) {
-      const int run = scorch_spmm_empty_run_end(A1_pos, i, end);
-      memset(C_row, 0, sizeof(T) * (size_t)width * (size_t)(run - i));
-      i = run - 1;
+      i = scorch_spmm_zero_walk_vec<T, NV, FULL, V>(A1_pos, C_values, width, i, end);
       continue;
     }
     scorch_spmm_row_regblock<T, NV, FULL, V, LONG>(A1_crd, A_val, B_val, width, C_row, pb, pe
@@ -4026,6 +4155,8 @@ __attribute__((noinline)) static void scorch_spmm_rows_regtile(
     const int pb = A1_pos[i];
     const int pe = A1_pos[i + 1];
     T* SCORCH_RESTRICT C_row = C_values + (size_t)i * (size_t)B1_size;
+    // memset per run, not the store walk the narrower loops use: a row here is five vectors or
+    // more, so even a one-row run gives the call 160 bytes or more to write.
     if (pe == pb) {
       const int run = scorch_spmm_empty_run_end(A1_pos, i, end);
       memset(C_row, 0, sizeof(T) * (size_t)B1_size * (size_t)(run - i));
