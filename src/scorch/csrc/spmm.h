@@ -4946,12 +4946,31 @@ torch::Tensor spmm_csr_v2_core(
   // Generic, too, in whether A has wide rows in segments this call (wide_on): the instance without
   // them contains none of their code, so a call on a matrix without wide rows runs the worker it
   // ran before they existed. Sharing one instance cost those calls about 1% on mkt1.
+  //
+  // The team reads what it needs from ONE place: this closure, which holds a COPY of every value
+  // the worker uses (288 bytes, four and a half lines, for the float AVX2 instance). Captured by
+  // reference instead, each worker loaded a pointer per value from the closure and then the value
+  // from wherever the launching thread's frame had put it -- a line transfer per scattered line,
+  // to every worker, on every call, and a layout that moved with any unrelated local added to
+  // this function. By reference only what the team shares and writes (the row counters), and
+  // what is assigned after this point or cannot be copied (hooks builds' stamp and workspaces).
+  // Nothing captured by copy is assigned between here and the launch.
+#if defined(SCORCH_TUNE_HOOKS)
+#  define SCORCH_SPMM_WORKER_CAPTURE \
+    =, &next_row, &next_zero_row, &worker_workspaces, &wstat_region_t0
+#elif SCORCH_SPMM_NEEDS_WORKSPACE
+#  define SCORCH_SPMM_WORKER_CAPTURE =, &next_row, &next_zero_row, &worker_workspaces
+#else
+#  define SCORCH_SPMM_WORKER_CAPTURE =, &next_row, &next_zero_row
+#endif
 #if SCORCH_SPMM_MULTIROW_UNSWITCH && defined(__AVX2__) && defined(__FMA__) && \
     (defined(SCORCH_TUNE_HOOKS) || SCORCH_SPMM_MULTIROW_ANY)
-  auto scorch_spmm_worker_t = [&](int worker_id, int team_size, auto mr_tag, auto wide_tag) {
+  auto scorch_spmm_worker_t = [SCORCH_SPMM_WORKER_CAPTURE](int worker_id, int team_size,
+                                                           auto mr_tag, auto wide_tag) {
     [[maybe_unused]] constexpr bool MR_LIVE = decltype(mr_tag)::value;
 #else
-  auto scorch_spmm_worker_t = [&](int worker_id, int team_size, auto wide_tag) {
+  auto scorch_spmm_worker_t = [SCORCH_SPMM_WORKER_CAPTURE](int worker_id, int team_size,
+                                                           auto wide_tag) {
     [[maybe_unused]] constexpr bool MR_LIVE = true;
 #endif
     [[maybe_unused]] constexpr bool WIDE = decltype(wide_tag)::value;
@@ -6049,6 +6068,7 @@ torch::Tensor spmm_csr_v2_core(
 #endif
 
   return C_values_torch;
+#undef SCORCH_SPMM_WORKER_CAPTURE
 #undef SCORCH_SPMM_NNZ_TOTAL
 #undef SCORCH_SPMM_ROW_UNITS
 }
