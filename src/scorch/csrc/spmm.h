@@ -3784,6 +3784,50 @@ __attribute__((noinline)) static void scorch_spmm_rows_gather_k1(
   }
 }
 
+// Width 1 in float64 below the exact-width kernel's degree floor: the loop above, with the
+// exact-width kernel at unroll 4 standing in for the gather on long rows (there is no double gather
+// kernel; see scorch_spmm_row_gather_f32). Eight is two unrolls of four, the same requirement
+// SCORCH_NARROWK_EXACT_DEGUNROLL_MULT=2 states for a whole matrix: below it the kernel's setup
+// (four zeroed accumulators, three adds to fold them) is not paid back. A shorter row is the plain
+// sum, one chain per row, and independent rows overlap in the out-of-order window.
+//
+// What this replaces is the one-lane register-block tile: a full 256-bit masked load and FMA per
+// nonzero to produce one double, plus a masked store per row. On mkt1 that put float64 width 1 at
+// mean degree 2-8 at 0.98 and 0.95 of MKL, where float32 width 1 -- which runs the loop above --
+// read 1.65 and 1.50 and float64 width 2 read 2.04 and 1.74 (pinned, matrices of 100K+ nonzeros).
+// Single-threaded on Hardesty2 (degree 4.3) the tile took 1.77x float32's time, MKL 1.04x.
+//
+// The short sum is written in scalar FMA intrinsics because GCC vectorizes the plain loop: under
+// -ffast-math GCC 13 gives it a 4-wide emulated-gather body for rows of 8 or more -- rows this
+// branch never sees -- and every short row then runs two length tests to route around it. The
+// vectorizer leaves loops over vector types alone, and the chain is the same FMAs from the same
+// zero, so the bits are the plain loop's. Single-threaded on mkt1, rotated order, 4 rounds: 0.67
+// of the plain loop's time back to back on 8081 one-nonzero rows, 0.70-0.93 on Pd_b, m3plates and
+// TSOPF_RS_b162_c3_b (0.77-0.93 cold), 0.96-0.98 on rajat29, Hardesty2 and Spielman_k200_A_01.
+// Float32's loop above keeps the plain form: the same rewrite there read between 0.96 and 1.11 of
+// it, inside what an identical copy of that function read against itself (up to 1.125).
+__attribute__((noinline)) static void scorch_spmm_rows_short_k1_f64(
+    const int* SCORCH_RESTRICT A1_pos, const int* SCORCH_RESTRICT A1_crd,
+    const double* SCORCH_RESTRICT A_val, const double* SCORCH_RESTRICT B_val,
+    double* SCORCH_RESTRICT C_values, int start, int end) {
+  for (int i = start; i < end; i++) {
+    const int pb = A1_pos[i];
+    const int pe = A1_pos[i + 1];
+    if (pe - pb >= 8) {
+      scorch_spmm_row_narrow_rowvec<double, 1, 4>(A1_crd, A_val, B_val, C_values + i, pb, pe);
+    } else if (pe > pb) {
+      __m128d sum = _mm_setzero_pd();
+      for (int q = pb; q < pe; q++)
+        sum = _mm_fmadd_sd(_mm_load_sd(A_val + q), _mm_load_sd(B_val + A1_crd[q]), sum);
+      _mm_store_sd(C_values + i, sum);
+    } else {
+      const int run = scorch_spmm_empty_run_end(A1_pos, i, end);
+      memset(C_values + i, 0, sizeof(double) * (size_t)(run - i));
+      i = run - 1;
+    }
+  }
+}
+
 // The exact-width kernel (k <= 3) at the unroll the call resolved to.
 template <typename T, int KK, int UN>
 __attribute__((noinline)) static void scorch_spmm_rows_exact(
@@ -4863,8 +4907,13 @@ torch::Tensor spmm_csr_v2_core(
   const bool gather_any = narrowk_gather && nvec == 1 && std::is_same<scalar_t, float>::value;
   const bool k1_gather_rows = unswitch_rows && !halfvec_any && !exact_width && gather_any &&
                               B1_size == 1 && narrowk_streams <= 1;
+  // Width 1 in double below the exact-width kernel's floor: the same loop's double counterpart, which
+  // takes these rows from the one-lane register-block tile (see scorch_spmm_rows_short_k1_f64).
+  const bool k1_short_rows_f64 = unswitch_rows && !halfvec_any && !exact_width &&
+                                 std::is_same<scalar_t, double>::value && B1_size == 1;
   // Everything else the general loop sends to the register-block kernel, nvec vectors per row.
-  const bool regblock_rows = unswitch_rows && !halfvec_any && !exact_width && !gather_any;
+  const bool regblock_rows = unswitch_rows && !halfvec_any && !exact_width && !gather_any &&
+                             !k1_short_rows_f64;
 #endif
 
   // A register-resident row kernel writes the whole row, so the workspace only
@@ -4910,8 +4959,8 @@ torch::Tensor spmm_csr_v2_core(
 #if defined(__AVX2__) && defined(__FMA__)
   // Whether this call resolved to one of the loops specialised to a kernel (the worker's
   // scorch_spmm_run_rows): the wide rows' segments run on them, so they need one.
-  const bool rows_unswitched = !REDIRECT && (regtile_rows || k1_gather_rows || exact_rows ||
-                                             halfvec_rows || regblock_rows);
+  const bool rows_unswitched = !REDIRECT && (regtile_rows || k1_gather_rows || k1_short_rows_f64 ||
+                                             exact_rows || halfvec_rows || regblock_rows);
 #else
   constexpr bool rows_unswitched = false;
 #endif
@@ -5002,6 +5051,12 @@ torch::Tensor spmm_csr_v2_core(
         if constexpr (std::is_same<scalar_t, float>::value)
           scorch_spmm_rows_gather_k1(pos, A1_crd, (const float*)A_val, (const float*)B_val,
                                      (float*)cv, rs, re);
+        return;
+      }
+      if (k1_short_rows_f64) {
+        if constexpr (std::is_same<scalar_t, double>::value)
+          scorch_spmm_rows_short_k1_f64(pos, A1_crd, (const double*)A_val,
+                                        (const double*)B_val, (double*)cv, rs, re);
         return;
       }
       if (exact_rows) {
@@ -5258,6 +5313,12 @@ torch::Tensor spmm_csr_v2_core(
           if constexpr (std::is_same<scalar_t, float>::value)
             scorch_spmm_rows_gather_k1(A1_pos, A1_crd, (const float*)A_val, (const float*)B_val,
                                        (float*)C_values, start, end);
+          continue;
+        }
+        if (k1_short_rows_f64) {
+          if constexpr (std::is_same<scalar_t, double>::value)
+            scorch_spmm_rows_short_k1_f64(A1_pos, A1_crd, (const double*)A_val,
+                                          (const double*)B_val, (double*)C_values, start, end);
           continue;
         }
         if (exact_rows) {
