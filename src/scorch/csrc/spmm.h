@@ -4032,14 +4032,14 @@ torch::Tensor spmm_csr_v2_core(
     // it costs O(rows) while the parallel work is O(nnz*k), so its share grows as k
     // shrinks.
     //
-    // In the shipped mode the count has exactly one consumer -- the zero_work term
-    // in the thread policy below -- so it is only worth paying for when it can
-    // change the thread count, and that is decidable in O(1) without counting
-    // anything. Ask the policy for the count at the two extremes: no empty row, and
-    // every row empty. The count is monotone non-decreasing in work, so if the
-    // extremes agree then every value between them agrees and the scan cannot affect
-    // any decision. (total_nnz and k_eff are declared further down, next to the
-    // policy call itself; recomputing them here is two loads.)
+    // In the shipped mode the count has exactly one consumer -- the empty rows' term
+    // in the work the thread policy below is told -- so it is only worth paying for
+    // when it can change the thread count, and that is decidable in O(1) without
+    // counting anything. Ask the policy for the count at the two extremes: no empty
+    // row, and every row empty. The count is monotone non-decreasing in work, so if
+    // the extremes agree then every value between them agrees and the scan cannot
+    // affect any decision. Both extremes come from scorch_spmm_work, the function the
+    // policy call further down states its work with, so the two cannot disagree.
     //
     // Measured worth: 1.0 to 2.2% at k<=2, rising with rows-per-nonzero exactly as
     // an O(rows) term against an O(nnz*k) loop should -- 1.0025, 1.0124, 1.0218
@@ -4054,9 +4054,9 @@ torch::Tensor spmm_csr_v2_core(
     bool do_scan = true;
     if (zero_mode == 2 || zero_mode == 3) {
       const long nnz_all = SCORCH_SPMM_NNZ_TOTAL;
-      const long keff = B1_size < 16 ? 16L : (long)B1_size;
-      const long w_lo = nnz_all * keff;                            // no empty row
-      const long w_hi = w_lo + (long)A0_size * (long)C1_size;      // every row empty
+      const long w_lo = scorch_spmm_work(nnz_all, 0L, B1_size, C1_size);   // no empty row
+      const long w_hi = scorch_spmm_work(nnz_all, (long)SCORCH_SPMM_ROW_UNITS, B1_size,
+                                         C1_size);                         // every row empty
       const long w_true = nnz_all * (long)B1_size;
       // nnz has to be passed here too: it can widen the row-axis ceiling, and a
       // skip decision taken under a different ceiling than the real call's would
@@ -4073,9 +4073,10 @@ torch::Tensor spmm_csr_v2_core(
       if (e && *e) { const long v = std::atol(e);
         if (v == 1) do_scan = false; else if (v == 2) do_scan = true; } }
 #endif
-    if (do_scan)
+    if (do_scan) {
       for (int i = 0; i < SCORCH_SPMM_ROW_UNITS; i++)
         empty_rows += (A1_pos[i] == A1_pos[i + 1]) ? 1 : 0;
+    }
     if (empty_rows != 0 && zero_mode <= 1) {
       const int64_t empty_elems = empty_rows * (int64_t)C1_size;
       if (zero_mode == 1 && empty_elems >= SCORCH_SPMM_ZERO_SPAN_ELEMS &&
@@ -4144,20 +4145,20 @@ torch::Tensor spmm_csr_v2_core(
   // throttled such shapes to near-serial (a 19.7K-row k=3 GCN layer capped to 2
   // threads despite abundant row-parallelism). Floor the k term at the line
   // width so row-parallelism isn't starved; k>=16 behavior is unchanged.
-  const long k_eff = B1_size < 16 ? 16L : (long)B1_size;
-  // The empty rows are output-writing work the nnz*k term cannot see. A
-  // 200000-row k=256 output with 40 nonzeros credits 10240 units against a
-  // 150000 grain, so scorch_nthreads gave the whole call ONE thread -- and in
-  // mode 2 that one thread would also own 200000 row zeros. Credit the span the
-  // workers actually zero, at one unit per element. That over-credits a pure
-  // store stream against a gather-and-FMA on purpose: the zero is
-  // bandwidth-bound, so more workers help it. The term is exactly zero when no
-  // row is empty, which is 72% of the corpus, so no shape without an empty row
-  // moves its thread count.
-  const long work_nnz = (long)total_nnz * k_eff;
-  const long zero_work = (zero_in_loop || zero_static_slice || zero_stolen_slice)
-      ? (long)(empty_rows * (int64_t)C1_size) : 0L;
-  const long work = work_nnz + zero_work;
+  // scorch_spmm_work applies the floor.
+  //
+  // The empty rows are output-writing work the nnz*k term cannot see, credited by
+  // scorch_spmm_work at their output width. A 200000-row k=256 output with 40 nonzeros
+  // credits 10240 units of nonzeros against a 150000 grain, so without them
+  // scorch_nthreads gave the whole call ONE thread -- and in mode 2 that one thread
+  // would also own 200000 row zeros. Where the scan was skipped empty_rows is 0: the
+  // skip is taken only when no empty row and every row empty give the same count.
+  const long work = scorch_spmm_work(
+      total_nnz,
+      (zero_in_loop || zero_static_slice || zero_stolen_slice) ? (long)empty_rows : 0L,
+      B1_size, C1_size);
+  // The nonzeros' share alone, which the LLVM-runtime launch gate below reads.
+  const long work_nnz = scorch_spmm_work(total_nnz, 0L, B1_size, C1_size);
   // Composition override: when this drop-in SpMM runs inside a host (torch)
   // pipeline, the surrounding dense ops use the host thread count (e.g. 16); the
   // throttled policy count (e.g. 11 for a narrow-k GCN layer) then forces a

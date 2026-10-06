@@ -710,6 +710,13 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           "ceiling stated in rows.",
           py::arg("work"), py::arg("rows"), py::arg("nthreads_override"),
           py::arg("work_true") = -1, py::arg("nnz") = -1, py::arg("full_team") = false);
+    // ... and the work it is asked about, which the kernel computes from the operands, its
+    // non-empty rows and the empty rows it zeroes. A harness that needs the count for a product
+    // asks for both.
+    m.def("scorch_spmm_work", &scorch_spmm_work,
+        "The work the drop-in SpMM states to scorch_spmm_nthreads for (nnz, empty rows it "
+        "zeroes, width, output width)",
+        py::arg("nnz"), py::arg("empty_rows"), py::arg("width"), py::arg("out_width"));
 
     // Exported so a harness asks for this count instead of recomputing it, for the same reason
     // as the chunk width and the thread count above. It is deliberately NOT a second spelling of

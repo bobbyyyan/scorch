@@ -263,6 +263,16 @@ __attribute__((noinline)) inline bool scorch_omp_is_libgomp() {
 #ifndef SCORCH_SPMM_FULL_TEAM_ROWS
 #  define SCORCH_SPMM_FULL_TEAM_ROWS 1
 #endif
+
+// Calibration builds only; 0 ships, and then both uses fold away. 1 makes every drop-in SpMM call
+// run on one worker; 2 makes every call from a caller with a pool adopt it as a product past the
+// grain does (min(pool, row ceiling)). Two builds differing only in this constant time the same
+// products on one worker and on the pool with every other decision -- chunk width, partition mode,
+// the stealing grain -- left as production makes it, which changing SCORCH_GRAIN_SPMM would not.
+#ifndef SCORCH_SPMM_FORCE_TEAM
+#  define SCORCH_SPMM_FORCE_TEAM 0
+#endif
+
 // Minimum NONZEROS per worker, as an alternative statement of the same "enough work
 // to be worth waking a worker" requirement that SCORCH_ROWS_PER_THREAD states in
 // rows. 0 keeps the row proxy alone, which is what ships.
@@ -2169,6 +2179,23 @@ inline bool ceil_pool_ok(int nthreads_override, long minthreads, bool rowbind, l
   return true;
 }
 
+// The work the drop-in SpMM states to scorch_spmm_nthreads for one call, in the units
+// SCORCH_GRAIN_SPMM is stated in. A nonzero is credited its output width, floored at 16: gathering
+// its B row touches a whole 64-byte line however narrow the row is. An empty row whose zeros the
+// workers store (`empty_rows`, 0 when they do not) is credited its output width.
+//
+// Rows themselves are not credited, and that was measured rather than overlooked (2026-10).
+// Crediting each non-empty row one nonzero, or each empty row sixteen, put every k=1 matrix of
+// short rows that trailed MKL on the pool -- and also moved products whose one worker was faster
+// back to back (k=2 0.79-0.84, DLMC k=1-4 0.61-0.77 where it fired). The per-row cost is real: it
+// is the term a model of one worker's time is missing without it. But the grain is a work floor,
+// and the decision it stands for is a time break-even against the pool's own floor, which these
+// credits do not state.
+inline long scorch_spmm_work(long nnz, long empty_rows, long width, long out_width) {
+  const long w = width < 16 ? 16L : width;
+  return nnz * w + empty_rows * out_width;
+}
+
 // The thread count the drop-in SpMM actually runs on, given the caller's override.
 //
 // Extracted so there is ONE implementation. The SpMM used to compute this inline
@@ -2380,7 +2407,7 @@ inline int scorch_spmm_nthreads(long work, long rows, int nthreads_override,
   { const char* e = std::getenv("SCORCH_SPMM_OVERRIDE_GATE_TRUE");
     if (e && *e && std::atol(e) != 0) gate_work = work_true; }
 #endif
-  if (nthreads_override > 0 && gate_work >= grain) {
+  if (nthreads_override > 0 && (SCORCH_SPMM_FORCE_TEAM == 2 || gate_work >= grain)) {
     // Deliberately the 16-rows-per-worker ceiling, not rpt. This is the composition
     // path -- adopt the host team so a pipeline does not reshape at every op
     // boundary -- and widening it too would raise the count on the very k=1 cells
@@ -2560,6 +2587,9 @@ inline int scorch_spmm_nthreads(long work, long rows, int nthreads_override,
     }
     if (nt_cap > 0 && (long)nthreads > nt_cap) nthreads = (int)nt_cap;
   }
+#endif
+#if SCORCH_SPMM_FORCE_TEAM == 1
+  nthreads = 1;
 #endif
   return nthreads;
 }
