@@ -58,6 +58,10 @@
 // the helpers are pure computation (zero getenv overhead).
 #include <cstdio>     // scorch_llc_bytes reads sysfs on Linux
 #include <cstdlib>
+#include <cstring>    // scorch_omp_is_libgomp matches the runtime's file name
+#if defined(__linux__) || defined(__APPLE__)
+#include <dlfcn.h>    // dladdr: which library the OpenMP runtime was loaded from
+#endif
 #if defined(__APPLE__)
 #include <sys/sysctl.h>
 #endif
@@ -88,6 +92,57 @@
 __attribute__((noinline)) inline int scorch_num_procs() {
   static const int n = omp_get_num_procs();
   return n;
+}
+
+// Which OpenMP runtime runs this module's parallel regions, asked of the process once at run
+// time: true when it is GNU libgomp.
+//
+// It matters because the two runtimes treat a team narrower than the last one differently.
+// libgomp releases the surplus threads of its pool and creates them again when the next region
+// is wider, so a SpMM on a team of its own width beside a full-width torch op pays a resize on
+// every call; LLVM's libomp keeps its threads. spmm_csr_v2_core launches differently on each.
+//
+// The answer used to be the OpenMP HEADER's: libgomp's omp.h defines _LIBGOMP_OMP_LOCK_DEFINED,
+// LLVM's and Intel's define KMP_VERSION_MAJOR. The header is whichever omp.h comes first on the
+// include path, which need not belong to the runtime the process loads. A conda environment
+// that holds MKL ships intel-openmp's omp.h in $PREFIX/include, and Python's build flags pass
+// that directory as -isystem, ahead of GCC's own omp.h. redwood's build compiled against it
+// (KMP_VERSION_MAJOR 5) while the process ran conda's libgomp.so.1, so every product under
+// pool * 16 rows launched a private team of its own width: gdb on GOMP_parallel showed an 8-wide
+// region for a 128-row layer, strace 16 thread creations (clone3 + sched_setaffinity) per call,
+// and the torch op after it took 186 us instead of 16.6.
+//
+// So the answer is the library that the address of omp_get_thread_num, as this module binds
+// it, lives in: the dynamic linker resolves this module's GOMP_parallel and omp_get_thread_num
+// through the same lookup, so that library runs our regions. Read once; noinline for the same
+// reason as scorch_num_procs. If the address names no library (a static link), the header
+// answers, as before.
+__attribute__((noinline)) inline const char* scorch_omp_runtime_path() {
+  static const char* const path = [] {
+    const char* p = nullptr;
+#if defined(__linux__) || defined(__APPLE__)
+    Dl_info info;
+    if (dladdr(reinterpret_cast<void*>(&omp_get_thread_num), &info) != 0 && info.dli_fname)
+      p = info.dli_fname;
+#endif
+    return p;
+  }();
+  return path;
+}
+__attribute__((noinline)) inline bool scorch_omp_is_libgomp() {
+  static const bool v = [] {
+    const char* p = scorch_omp_runtime_path();
+    if (p == nullptr) {
+#if defined(_LIBGOMP_OMP_LOCK_DEFINED)
+      return true;
+#else
+      return false;
+#endif
+    }
+    const char* base = std::strrchr(p, '/');
+    return std::strstr(base ? base + 1 : p, "libgomp") != nullptr;
+  }();
+  return v;
 }
 
 // --- Per-host autotune overrides (optional, generated, gitignored) -----------
@@ -192,14 +247,19 @@ __attribute__((noinline)) inline int scorch_num_procs() {
 //                                     behind MKL: 137 -> 101 back to back, 32 -> 3 cold
 //     held-out 128-256-row layers     1.042 / 1.053 / 1.144
 //     cells the switch cannot touch   0.98-1.03 (the node's own drift between passes)
-//   redwood, 4 processes per build, the 84 matrices with a changed cell:
-//     changed cells                   1.012 back to back, 1.009 in a pipeline, 1.003 cold
-//     cells the switch cannot touch   0.986 / 0.941 / 0.982
-//     The 38 smallest DLMC layers read 1.148 in one set of four processes and 0.921 in another,
-//     which is redwood placing the call on fast or slow cores per process, not the switch.
-//
-// A probe that forced the pool on a hooks build had read redwood 13-23% slower back to back on
-// these cells (and 21-31% faster cold); the release builds do not reproduce the loss.
+//   redwood: an earlier version of this comment reported 1.012 / 1.009 / 1.003 there. That build
+//     chose its launch from the OpenMP header, which on redwood was intel-openmp's while the process
+//     ran libgomp (see scorch_omp_is_libgomp), so `full_team` was never passed and the switch could
+//     not fire: those numbers were an A/A of identical code. Measured again once the runtime is
+//     asked, release builds with the switch at 0 and 1, 2 processes per build per protocol, pinned,
+//     1590 cells of which the switch changes the count in 381 (mostly 4, 8 or 16 workers -> 24):
+//     changed cells                   1.193 back to back, 1.206 in a pipeline, 0.582 COLD
+//                                     cold against MKL: 2.324 -> 1.484, behind MKL 9 -> 14
+//     cells the switch cannot touch   0.999 / 1.002 / 1.000
+//     The cold loss is the wake: after the eviction sweep the pool is asleep, and waking 24 workers
+//     costs redwood about 200 us (a 4-worker call read 31-34 us cold, the same call on 24 workers
+//     218-250 us, MKL 280-310 us). mkt1 does not pay it (cold 1.041 above): on cold calls the two
+//     hosts disagree, and the switch is on here as it was before this was measured.
 #ifndef SCORCH_SPMM_FULL_TEAM_ROWS
 #  define SCORCH_SPMM_FULL_TEAM_ROWS 1
 #endif

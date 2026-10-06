@@ -4173,10 +4173,12 @@ torch::Tensor spmm_csr_v2_core(
   // itself lives in scorch_policy.h so a harness can ask for the same number
   // instead of recomputing it; see scorch_spmm_nthreads.
   // Whether a multi-worker call will run on torch's full-width team (the launch below): under
-  // libgomp, exactly when the caller asked for it or the process-wide flag forces it.
-#if SCORCH_SPMM_FULL_TEAM_ROWS != 0 && defined(_LIBGOMP_OMP_LOCK_DEFINED)
+  // libgomp, exactly when the caller asked for it or the process-wide flag forces it. The
+  // runtime is the one the process loaded (scorch_omp_is_libgomp), not the header's.
+#if SCORCH_SPMM_FULL_TEAM_ROWS != 0
   const int _atpf_team = scorch_flags::atparallel();
-  const bool full_team = _atpf_team >= 0 ? _atpf_team != 0 : atparallel;
+  const bool full_team =
+      scorch_omp_is_libgomp() && (_atpf_team >= 0 ? _atpf_team != 0 : atparallel);
 #else
   const bool full_team = false;
 #endif
@@ -5816,18 +5818,16 @@ torch::Tensor spmm_csr_v2_core(
   //
   // GNU libgomp only. LLVM's libomp (the M5) keeps its threads when a team narrows:
   // alternating 6/18-wide regions there cost 37.1 us against 35.2 us for the mean of the
-  // two constant widths, so the old gate stays where the resize does not exist. The
-  // marker is the OpenMP header's own: libgomp's omp.h defines _LIBGOMP_OMP_LOCK_DEFINED,
-  // LLVM's defines KMP_VERSION_MAJOR instead.
+  // two constant widths, so the old gate stays where the resize does not exist. Which
+  // runtime this is gets asked of the loaded process (scorch_omp_is_libgomp), not of the
+  // OpenMP header the build happened to find; see that function for the build that had them
+  // disagree.
   // Env SCORCH_SPMM_ATPARALLEL forces the choice for A/B (1/0).
-#if defined(_LIBGOMP_OMP_LOCK_DEFINED)
-  (void)work_nnz;
-  bool use_atparallel = atparallel && nthreads_override > 0 && nthreads > 1;
-#else
-  bool use_atparallel = atparallel && nthreads_override > 0
-      && work_nnz >= SCORCH_GRAIN_SPMM
-      && (long)A0_size >= (long)nthreads_override * SCORCH_ROWS_PER_THREAD;
-#endif
+  bool use_atparallel = scorch_omp_is_libgomp()
+      ? atparallel && nthreads_override > 0 && nthreads > 1
+      : atparallel && nthreads_override > 0
+            && work_nnz >= SCORCH_GRAIN_SPMM
+            && (long)A0_size >= (long)nthreads_override * SCORCH_ROWS_PER_THREAD;
   { const int _atpf = scorch_flags::atparallel();     // cached per process; see scorch_policy.h
     if (_atpf >= 0) use_atparallel = (_atpf != 0); }
 #ifdef SCORCH_TUNE_HOOKS

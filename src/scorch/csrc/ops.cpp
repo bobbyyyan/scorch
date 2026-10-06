@@ -757,6 +757,17 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           "Distinct physical cores in this process's CPU affinity mask. Falls back to "
           "omp_get_num_procs() where the topology cannot be read.");
 
+    m.def("scorch_omp_runtime_path",
+          []() -> py::object {
+            const char* p = scorch_omp_runtime_path();
+            return p ? py::object(py::str(p)) : py::object(py::none());
+          },
+          "The file of the OpenMP runtime this module's parallel regions run on, as the "
+          "loaded process resolved it (None if it cannot be named).");
+    m.def("scorch_omp_is_libgomp", &scorch_omp_is_libgomp,
+          "Whether that runtime is GNU libgomp: the answer the drop-in SpMM's launch "
+          "decisions use.");
+
     // The two escape-hatch flags that survive into a release object, as explicit process-level
     // policy rather than as an environment read on every call. See the comment above
     // scorch_flags in scorch_policy.h for why the read was moved: std::getenv is a linear scan
