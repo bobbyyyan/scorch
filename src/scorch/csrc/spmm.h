@@ -2402,7 +2402,7 @@ static inline void scorch_spmm_row_narrow_rowvec(
 #  define SCORCH_SPMM_PFLIM_PARAM
 #  define SCORCH_SPMM_PFLIM(x)
 #endif
-template <typename T, int NVEC, bool FULL_LAST, typename V = scorch_simd<T>>
+template <typename T, int NVEC, bool FULL_LAST, typename V = scorch_simd<T>, bool LONG = false>
 static inline void scorch_spmm_row_regblock(
     const int* SCORCH_RESTRICT A1_crd, const T* SCORCH_RESTRICT A_val,
     const T* SCORCH_RESTRICT B_val, int B1_size,
@@ -2416,6 +2416,64 @@ static inline void scorch_spmm_row_regblock(
     acc1[v] = V::zero();
   }
   int pA = pA_begin;
+#if SCORCH_SPMM_REGBLOCK_LONGROW > 0
+  // LONG: a long row runs four independent nonzero streams first, then finishes in the two-stream
+  // loop below. LONG is false at every call site but one copy of the outlined row loop, which a
+  // chunk runs only when one of its rows reaches the length (scorch_spmm_rows_regblock), so every
+  // other caller -- and every chunk of short rows -- compiles and runs the loop as it was. Each vector accumulator takes one FMA per iteration, so with two streams a row costs at
+  // least one FMA latency (4 cycles) per two nonzeros whatever NVEC is, while the FMA ports need
+  // only NVEC/2 cycles per nonzero: at NVEC 1 and 2 the accumulator chain, not the arithmetic, is
+  // the bound. Across rows that does not matter -- the next row's chains are independent and the
+  // out-of-order core starts them while this row finishes -- unless the row is too long for the
+  // reorder buffer to reach past it. That is what the length test asks: 64 nonzeros is about 400
+  // uops of this loop, the size of the reorder buffer on current x86 cores (256 Gracemont, 320
+  // Zen 4, 512 Golden Cove). A shorter row in a LONG chunk runs the loop below plus this compare.
+  // See SCORCH_SPMM_REGBLOCK_LONGROW in scorch_policy.h for the measurements.
+  //
+  // No prefetch here: one core, the shipped run-ahead was slower on all 27 matrices measured at
+  // both widths and on both core types, with B anywhere from L1 to past L3.
+  if constexpr (LONG && NVEC <= 2) {
+    if (pA_end - pA_begin >= SCORCH_SPMM_REGBLOCK_LONGROW) {
+      typename V::vec acc2[NVEC], acc3[NVEC];
+      #pragma unroll
+      for (int v = 0; v < NVEC; v++) {
+        acc2[v] = V::zero();
+        acc3[v] = V::zero();
+      }
+      for (; pA + 3 < pA_end; pA += 4) {
+        const T* SCORCH_RESTRICT B0 = B_val + (size_t)A1_crd[pA] * (size_t)B1_size;
+        const T* SCORCH_RESTRICT B1 = B_val + (size_t)A1_crd[pA + 1] * (size_t)B1_size;
+        const T* SCORCH_RESTRICT B2 = B_val + (size_t)A1_crd[pA + 2] * (size_t)B1_size;
+        const T* SCORCH_RESTRICT B3 = B_val + (size_t)A1_crd[pA + 3] * (size_t)B1_size;
+        const typename V::vec a0 = V::splat(A_val[pA]);
+        const typename V::vec a1 = V::splat(A_val[pA + 1]);
+        const typename V::vec a2 = V::splat(A_val[pA + 2]);
+        const typename V::vec a3 = V::splat(A_val[pA + 3]);
+        #pragma unroll
+        for (int v = 0; v < NVEC; v++) {
+          const bool masked = (v == NVEC - 1) && !FULL_LAST;   // compile-time
+          const typename V::vec b0 = masked ? V::maskload(B0 + L * v, mask_last)
+                                            : V::load(B0 + L * v);
+          const typename V::vec b1 = masked ? V::maskload(B1 + L * v, mask_last)
+                                            : V::load(B1 + L * v);
+          const typename V::vec b2 = masked ? V::maskload(B2 + L * v, mask_last)
+                                            : V::load(B2 + L * v);
+          const typename V::vec b3 = masked ? V::maskload(B3 + L * v, mask_last)
+                                            : V::load(B3 + L * v);
+          acc0[v] = V::fma(a0, b0, acc0[v]);
+          acc1[v] = V::fma(a1, b1, acc1[v]);
+          acc2[v] = V::fma(a2, b2, acc2[v]);
+          acc3[v] = V::fma(a3, b3, acc3[v]);
+        }
+      }
+      #pragma unroll
+      for (int v = 0; v < NVEC; v++) {
+        acc0[v] = V::add(acc0[v], acc2[v]);
+        acc1[v] = V::add(acc1[v], acc3[v]);
+      }
+    }
+  }
+#endif
   for (; pA + 1 < pA_end; pA += 2) {
     const T* SCORCH_RESTRICT B0 = B_val + (size_t)A1_crd[pA] * (size_t)B1_size;
     const T* SCORCH_RESTRICT B1 = B_val + (size_t)A1_crd[pA + 1] * (size_t)B1_size;
@@ -3852,11 +3910,35 @@ __attribute__((noinline)) static void scorch_spmm_rows_exact(
   }
 }
 
+// Whether any row in [start, end) holds at least `len` nonzeros. A chunk holding fewer than `len`
+// nonzeros in all cannot, and that is answered from its two end bounds: without it the scan cost
+// 4-8% on rail_5177_B (5177 rows, mostly empty, a 2-3 us call), where it reads as many bounds as the
+// row loop it precedes. Otherwise eight row lengths per step, the answer taken at the first hit.
+static inline bool scorch_rows_reach(const int* SCORCH_RESTRICT A1_pos, int start, int end,
+                                     int len) {
+  if (A1_pos[end] - A1_pos[start] < len) return false;
+  int i = start;
+#if defined(__AVX2__)
+  const __m256i below = _mm256_set1_epi32(len - 1);
+  for (; i + 8 <= end; i += 8) {
+    const __m256i lo = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(A1_pos + i));
+    const __m256i hi = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(A1_pos + i + 1));
+    if (_mm256_movemask_epi8(_mm256_cmpgt_epi32(_mm256_sub_epi32(hi, lo), below))) return true;
+  }
+#endif
+  for (; i < end; i++)
+    if (A1_pos[i + 1] - A1_pos[i] >= len) return true;
+  return false;
+}
+
 // The register-block kernel, NV vectors of V per row: every other narrow width, and with
 // V = the half vector the half-vector kernel at exactly its width. Where the last vector is
 // full the row is exactly NV * V::lanes wide, so the stride of B and C is a compile-time
 // constant there rather than the runtime width.
-template <typename T, int NV, bool FULL, typename V = scorch_simd<T>>
+// LONG is the copy whose kernel runs four nonzero streams on rows of at least
+// SCORCH_SPMM_REGBLOCK_LONGROW nonzeros (see scorch_spmm_row_regblock); the callers reach it only
+// through scorch_spmm_rows_regblock_any below.
+template <typename T, int NV, bool FULL, typename V = scorch_simd<T>, bool LONG = false>
 __attribute__((noinline)) static void scorch_spmm_rows_regblock(
     const int* SCORCH_RESTRICT A1_pos, const int* SCORCH_RESTRICT A1_crd,
     const T* SCORCH_RESTRICT A_val, const T* SCORCH_RESTRICT B_val, int B1_size,
@@ -3873,9 +3955,54 @@ __attribute__((noinline)) static void scorch_spmm_rows_regblock(
       i = run - 1;
       continue;
     }
-    scorch_spmm_row_regblock<T, NV, FULL, V>(A1_crd, A_val, B_val, width, C_row, pb, pe
-                                             SCORCH_SPMM_PFLIM(pA_limit), mask_last);
+    scorch_spmm_row_regblock<T, NV, FULL, V, LONG>(A1_crd, A_val, B_val, width, C_row, pb, pe
+                                                   SCORCH_SPMM_PFLIM(pA_limit), mask_last);
   }
+}
+
+// Which copy of the register-block row loop a chunk runs. A chunk holding a row of at least
+// SCORCH_SPMM_REGBLOCK_LONGROW nonzeros runs the LONG copy; any other chunk runs the plain one,
+// which is the loop exactly as it was, without a per-row test. Measured on redwood, the test made
+// per row inside the kernel cost 4-9% on matrices whose rows all hold 3 to 56 nonzeros (lns_511,
+// scrs8-2c, uni_chimera_i3, extr1b) against an A/A of the same cells inside 1%.
+//
+// The scan is a function of its own rather than the top of the row loop: put there, the loop kept
+// B's base pointer on a realigned stack frame and reloaded it every iteration. Here it reads the
+// chunk's row bounds -- the ones the loop reads next -- and tail-calls one copy, so neither copy's
+// emission changes and the call sites change only their target. Past two vectors a row the kernel
+// has no LONG form and the plain loop is called directly, as before.
+template <typename T, int NV, bool FULL, typename V>
+__attribute__((noinline)) static void scorch_spmm_rows_regblock_scan(
+    const int* SCORCH_RESTRICT A1_pos, const int* SCORCH_RESTRICT A1_crd,
+    const T* SCORCH_RESTRICT A_val, const T* SCORCH_RESTRICT B_val, int B1_size,
+    T* SCORCH_RESTRICT C_values, int start, int end SCORCH_SPMM_PFLIM_PARAM,
+    typename V::mask mask_last) {
+  if (scorch_rows_reach(A1_pos, start, end, SCORCH_SPMM_REGBLOCK_LONGROW))
+    scorch_spmm_rows_regblock<T, NV, FULL, V, true>(A1_pos, A1_crd, A_val, B_val, B1_size,
+                                                    C_values, start, end
+                                                    SCORCH_SPMM_PFLIM(pA_limit), mask_last);
+  else
+    scorch_spmm_rows_regblock<T, NV, FULL, V, false>(A1_pos, A1_crd, A_val, B_val, B1_size,
+                                                     C_values, start, end
+                                                     SCORCH_SPMM_PFLIM(pA_limit), mask_last);
+}
+
+template <typename T, int NV, bool FULL, typename V = scorch_simd<T>>
+static inline void scorch_spmm_rows_regblock_any(
+    const int* SCORCH_RESTRICT A1_pos, const int* SCORCH_RESTRICT A1_crd,
+    const T* SCORCH_RESTRICT A_val, const T* SCORCH_RESTRICT B_val, int B1_size,
+    T* SCORCH_RESTRICT C_values, int start, int end SCORCH_SPMM_PFLIM_PARAM,
+    typename V::mask mask_last) {
+#if SCORCH_SPMM_REGBLOCK_LONGROW > 0
+  if constexpr (NV <= 2) {
+    scorch_spmm_rows_regblock_scan<T, NV, FULL, V>(A1_pos, A1_crd, A_val, B_val, B1_size,
+                                                   C_values, start, end
+                                                   SCORCH_SPMM_PFLIM(pA_limit), mask_last);
+    return;
+  }
+#endif
+  scorch_spmm_rows_regblock<T, NV, FULL, V>(A1_pos, A1_crd, A_val, B_val, B1_size, C_values,
+                                            start, end SCORCH_SPMM_PFLIM(pA_limit), mask_last);
 }
 
 // The wide-width kernel (more than four vectors per row), on the same terms. Its rows are long
@@ -5080,14 +5207,14 @@ torch::Tensor spmm_csr_v2_core(
       }
       if (halfvec_rows) {
         using VH = scorch_simd_half<scalar_t>;
-        scorch_spmm_rows_regblock<scalar_t, 1, true, VH>(
+        scorch_spmm_rows_regblock_any<scalar_t, 1, true, VH>(
             pos, A1_crd, A_val, B_val, B1_size, cv, rs, re
             SCORCH_SPMM_PFLIM(nnz_total), VH::lane_mask(VH::lanes));
         return;
       }
       if (regblock_rows) {
       #define SCORCH_RR(NV, FULL) \
-          scorch_spmm_rows_regblock<scalar_t, NV, FULL>( \
+          scorch_spmm_rows_regblock_any<scalar_t, NV, FULL>( \
               pos, A1_crd, A_val, B_val, B1_size, cv, rs, re \
               SCORCH_SPMM_PFLIM(nnz_total), mask_last)
         switch (nvec * 2 + (full_last ? 1 : 0)) {
@@ -5343,14 +5470,14 @@ torch::Tensor spmm_csr_v2_core(
         }
         if (halfvec_rows) {
           using VH = scorch_simd_half<scalar_t>;
-          scorch_spmm_rows_regblock<scalar_t, 1, true, VH>(
+          scorch_spmm_rows_regblock_any<scalar_t, 1, true, VH>(
               A1_pos, A1_crd, A_val, B_val, B1_size, C_values, start, end
               SCORCH_SPMM_PFLIM(nnz_total), VH::lane_mask(VH::lanes));
           continue;
         }
         if (regblock_rows) {
           #define SCORCH_RR(NV, FULL) \
-            scorch_spmm_rows_regblock<scalar_t, NV, FULL>( \
+            scorch_spmm_rows_regblock_any<scalar_t, NV, FULL>( \
                 A1_pos, A1_crd, A_val, B_val, B1_size, C_values, start, end \
                 SCORCH_SPMM_PFLIM(nnz_total), mask_last)
           switch (nvec * 2 + (full_last ? 1 : 0)) {

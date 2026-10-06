@@ -856,6 +856,35 @@ __attribute__((noinline)) inline bool scorch_omp_is_libgomp() {
 #  define SCORCH_SPMM_REGBLOCK_PFD 2
 #endif
 
+// The minimum row length, in nonzeros, at which the register block runs four nonzero streams
+// instead of two (NVEC 1 and 2 only: float32 k <= 16, float64 k <= 8). 0 compiles the loop out.
+//
+// Mechanism (spmm.h, at the loop): two streams give each vector accumulator one FMA per two
+// nonzeros, so a row cannot run faster than one FMA latency per two nonzeros; at NVEC 1 and 2 the
+// ports could do better. Consecutive rows overlap in the out-of-order window, so only a row longer
+// than the reorder buffer can reach past is bound by its own chains. 64 nonzeros is about 400
+// uops of the loop, the scale of that buffer on current x86 cores.
+//
+// Measured 2026-10-05 on one redwood core (i9-14900K), a standalone copy of the loop, 27 matrices
+// chosen one per (mean degree band x B footprint band) from the SuiteSparse and DLMC dims, B from
+// 1 KB to 3 MB at k=4; four streams on rows of >= 64 nonzeros against two, time ratio:
+//   mean degree >= 100   k=4: 1.08-1.62 P-core, 1.09-1.84 E-core;  k=8: 1.00-1.49 / 0.97-1.42
+//                        (k=8 gains only where B fits in L1; elsewhere 0.97-1.05)
+//   mean degree 56-98    k=4: 0.99-1.20 / 0.99-1.17
+//   mean degree < 56     rows mostly below the length test; the standalone copy compiled its
+//                        two-stream loop differently from the kernel's own (-funroll-loops gave it a
+//                        trip-count prologue), so its 0.71-1.03 there is a statement about that copy
+// On the same matrices MKL's one-core time was 1.30-1.44x ours at k=4 before this change.
+//
+// Where the length is tested. Per row, inside the kernel, it cost 4-9% on matrices with no row this
+// long (redwood, in one process: lns_511, scrs8-2c, uni_chimera_i3, extr1b, rows of 3-56 nonzeros, a
+// short row being about 20 cycles), against an A/A of the same cells inside 1%. So the outlined row
+// loop asks once per stolen chunk, from the row bounds it is about to read, and a chunk without such
+// a row runs the loop exactly as before; only the general loop and the fused Linear never take it.
+#ifndef SCORCH_SPMM_REGBLOCK_LONGROW
+#  define SCORCH_SPMM_REGBLOCK_LONGROW 64
+#endif
+
 // Whether that run-ahead walks the NONZERO STREAM or stops at the row boundary. Ships at 0, which is
 // the row-clipped form the loop has always had.
 //
