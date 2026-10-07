@@ -1174,3 +1174,341 @@ def test_degenerate_shapes_agree_with_the_ordinary_path(rows, cols, n, descripti
     ), f"{description}: {ordinary[:2]} vs {planned[:2]}"
     if ordinary[0] == "value":
         torch.testing.assert_close(planned[2], ordinary[2], atol=0, rtol=0)
+
+
+# --------------------------------------------------------------------------- #
+# A torch sparse CSR tensor as the operand
+#
+# A caller who holds a torch.sparse_csr tensor -- the drop-in case -- used to get
+# no plan: every call converted the operand afresh, copying its index arrays and
+# walking them twice, which made the call 2-4x slower than MKL's on mkt1 although
+# the kernel was faster. Its plans live in plan.TORCH_OPERANDS, because anything
+# stored on a torch tensor is written out by torch.save with it.
+# --------------------------------------------------------------------------- #
+
+
+def torch_csr(rows, cols, density, dtype=torch.float32, seed=0, index_dtype=None):
+    """A torch sparse CSR tensor and the dense tensor it came from."""
+    generator = torch.Generator().manual_seed(seed)
+    mask = torch.rand((rows, cols), generator=generator) < density
+    dense = (torch.rand((rows, cols), generator=generator) * mask).to(dtype)
+    a = dense.to_sparse_csr()
+    if index_dtype is not None:
+        a = torch.sparse_csr_tensor(
+            a.crow_indices().to(index_dtype),
+            a.col_indices().to(index_dtype),
+            a.values(),
+            a.shape,
+        )
+    return a, dense
+
+
+def unplanned(a, b):
+    """The product through the ordinary path, plans off, leaving `a`'s plans alone."""
+    was_enabled = plan_mod.enabled()
+    plan_mod.set_enabled(False)
+    try:
+        return scorch.matmul(a, b)
+    finally:
+        plan_mod.set_enabled(was_enabled)
+
+
+def test_torch_operand_gets_a_plan_after_two_calls_and_is_served_after():
+    a, _ = torch_csr(64, 64, 0.05)
+    b = dense_rhs(64, 8)
+    scorch.matmul(a, b)
+    assert plans_of(a) == {}, "a plan was installed on first sight of the operand"
+    scorch.matmul(a, b)
+    (plan,) = plans_of(a).values()
+    for _ in range(3):
+        scorch.matmul(a, b)
+    assert plan.served == 3, f"plan served {plan.served} of the last 3 calls"
+
+
+@pytest.mark.parametrize(
+    "rows,cols,density,n,dtype,index_dtype",
+    [
+        (64, 64, 0.05, 8, torch.float32, None),
+        (300, 200, 0.02, 33, torch.float32, None),
+        (128, 128, 0.0, 4, torch.float32, None),  # every row empty
+        (500, 500, 0.01, 1, torch.float32, torch.int32),
+        (96, 80, 0.1, 16, torch.float64, None),
+        (96, 80, 0.1, 5, torch.float64, torch.int32),
+    ],
+)
+def test_torch_operand_planned_output_is_bit_identical(
+    rows, cols, density, n, dtype, index_dtype
+):
+    a, dense = torch_csr(rows, cols, density, dtype, index_dtype=index_dtype)
+    b = dense_rhs(cols, n, dtype)
+    reference = unplanned(a, b)
+    outs = [scorch.matmul(a, b) for _ in range(4)]
+    assert sum(p.served for p in plans_of(a).values()) == 2, "the plan did not serve"
+    for out in outs:
+        torch.testing.assert_close(out, reference, atol=0, rtol=0)
+    torch.testing.assert_close(outs[-1], dense @ b, atol=1e-3, rtol=1e-3)
+
+
+def test_python_probe_serves_a_torch_operand_too():
+    """The probe in the Python function, which a build without the C entry point uses,
+    must serve the same plan."""
+    from scorch import ops
+
+    a, _ = torch_csr(64, 64, 0.05)
+    b = dense_rhs(64, 8)
+    ops._matmul_python(a, b)
+    ops._matmul_python(a, b)
+    (plan,) = plans_of(a).values()
+    out = ops._matmul_python(a, b)
+    assert plan.served == 1
+    torch.testing.assert_close(out, unplanned(a, b), atol=0, rtol=0)
+
+
+def test_planning_leaves_nothing_on_the_callers_tensor(tmp_path):
+    a, _ = torch_csr(64, 64, 0.05)
+    b = dense_rhs(64, 8)
+    for _ in range(3):
+        scorch.matmul(a, b)
+    assert plans_of(a), "precondition: the operand has a plan"
+    assert a.__dict__ == {}, f"attributes were left on the caller's tensor: {a.__dict__}"
+    path = tmp_path / "a.pt"
+    torch.save(a, path)
+    loaded = torch.load(path)
+    assert torch.equal(loaded.to_dense(), a.to_dense())
+    assert torch.equal(pickle.loads(pickle.dumps(a)).to_dense(), a.to_dense())
+
+
+def test_a_torch_operands_plans_die_with_it():
+    import gc
+
+    a, _ = torch_csr(64, 64, 0.05)
+    b = dense_rhs(64, 8)
+    for _ in range(3):
+        scorch.matmul(a, b)
+    key = id(a)
+    assert key in plan_mod.TORCH_OPERANDS
+    del a
+    gc.collect()
+    assert key not in plan_mod.TORCH_OPERANDS, "the entry outlived its operand"
+
+
+def test_torch_operand_values_written_between_calls_are_picked_up():
+    a, dense = torch_csr(64, 64, 0.05)
+    b = dense_rhs(64, 8)
+    for _ in range(3):
+        scorch.matmul(a, b)
+    a.values().mul_(3.0)
+    torch.testing.assert_close(scorch.matmul(a, b), (3.0 * dense) @ b, atol=1e-4, rtol=1e-4)
+
+
+def test_torch_operand_index_written_in_place_is_not_served():
+    """A write through an alias of the index arrays moves the version counter they
+    share with the plan's sources, so the plan must decline."""
+    dense = torch.zeros(4, 4)
+    dense[0, 0] = dense[1, 1] = dense[2, 2] = dense[3, 3] = 1.0
+    a = dense.to_sparse_csr()
+    b = dense_rhs(4, 3)
+    for _ in range(3):
+        scorch.matmul(a, b)
+    (plan,) = plans_of(a).values()
+    served = plan.served
+    a.col_indices().copy_(torch.tensor([3, 2, 1, 0]))  # the anti-diagonal
+    out = scorch.matmul(a, b)
+    assert plan.served == served, "a plan served a structure written since it was built"
+    torch.testing.assert_close(out, dense.flip(1) @ b, atol=0, rtol=0)
+
+
+def test_torch_operand_with_its_index_arrays_replaced_is_not_served():
+    """resize_as_sparse_ to a different number of nonzeros reallocates the operand's
+    column array; resized back and refilled, the values fit the plan again. The plan
+    must not serve: the version counter its sources share with the operand's members
+    has moved, and the operand's current column array is no longer the plan's."""
+    a = torch.eye(4).to_sparse_csr()
+    b = dense_rhs(4, 3)
+    for _ in range(3):
+        scorch.matmul(a, b)
+    (plan,) = plans_of(a).values()
+    served = plan.served
+    target = torch.eye(4).flip(1).to_sparse_csr()
+    old_col_ptr = a.col_indices().data_ptr()
+    a.resize_as_sparse_(torch.ones(4, 4).to_sparse_csr())
+    a.resize_as_sparse_(target)
+    a.copy_(target)
+    assert a._nnz() == 4, "precondition: the values fit the plan again"
+    assert a.col_indices().data_ptr() != old_col_ptr, "precondition: array replaced"
+    out = scorch.matmul(a, b)
+    assert plan.served == served, "a plan served after the operand's arrays were replaced"
+    torch.testing.assert_close(out, torch.eye(4).flip(1) @ b, atol=0, rtol=0)
+
+
+def test_run_csr_declines_index_arrays_it_was_not_built_from():
+    """The check no version counter can make: index arrays with the same contents in
+    different buffers, whose counters have never moved. Only `built_from` declines."""
+    a = torch.eye(4).to_sparse_csr()
+    crow, col, values = a.crow_indices(), a.col_indices(), a.values()
+    b = dense_rhs(4, 3)
+    plan = scorch_ops.make_spmm_csr_plan("v2", [4, 4], [[], [crow, col]], values, 3)
+    assert plan is not None
+    assert plan.run_csr(crow.clone(), col.clone(), values, b) is None
+    assert plan.run_csr(crow, col.clone(), values, b) is None
+    assert plan.run_csr(crow[:-1], col, values, b) is None
+    served = plan.run_csr(crow, col, values, b)
+    assert served is not None
+    torch.testing.assert_close(served, torch.eye(4) @ b, atol=0, rtol=0)
+
+
+def test_torch_operand_inside_inference_mode():
+    with torch.inference_mode():
+        a, dense = torch_csr(64, 64, 0.05)
+        b = dense_rhs(64, 8)
+        outs = [scorch.matmul(a, b) for _ in range(4)]
+    for out in outs:
+        torch.testing.assert_close(out, dense @ b, atol=1e-4, rtol=1e-4)
+
+
+def test_torch_operand_alternating_free_dimensions_each_get_a_plan():
+    a, dense = torch_csr(64, 64, 0.05)
+    b8, b16 = dense_rhs(64, 8), dense_rhs(64, 16)
+    for _ in range(3):
+        o8, o16 = scorch.matmul(a, b8), scorch.matmul(a, b16)
+    assert len(plans_of(a)) == 2
+    torch.testing.assert_close(o8, dense @ b8, atol=1e-4, rtol=1e-4)
+    torch.testing.assert_close(o16, dense @ b16, atol=1e-4, rtol=1e-4)
+
+
+def test_two_torch_operands_never_share_a_plan():
+    a1, d1 = torch_csr(64, 64, 0.05, seed=1)
+    a2, d2 = torch_csr(64, 64, 0.05, seed=2)
+    b = dense_rhs(64, 8)
+    for _ in range(3):
+        o1, o2 = scorch.matmul(a1, b), scorch.matmul(a2, b)
+    torch.testing.assert_close(o1, d1 @ b, atol=1e-4, rtol=1e-4)
+    torch.testing.assert_close(o2, d2 @ b, atol=1e-4, rtol=1e-4)
+
+
+def test_dense_operands_are_untouched_by_the_torch_operand_path():
+    x, y = torch.rand(8, 5), torch.rand(5, 3)
+    for _ in range(3):
+        out = scorch.matmul(x, y)
+    torch.testing.assert_close(out, x @ y, atol=0, rtol=0)
+    assert id(x) not in plan_mod.TORCH_OPERANDS
+
+
+# The C entry point records a torch operand's first sighting itself, after the ordinary
+# path returns, and calls the installer only when it has something to do. A call site
+# that builds a new CSR tensor for every call is only ever sighted, never planned, and a
+# Python installer call at the end of each of those calls cost 2 us on mkt1.
+needs_c_entry = pytest.mark.skipif(
+    not hasattr(scorch_ops, "install_planned_matmul"),
+    reason="the C entry point is not built",
+)
+
+
+@pytest.fixture
+def installer_keys(monkeypatch):
+    """The key of every call that reaches plan.install from ops.matmul."""
+    from scorch import ops
+
+    keys = []
+    real = ops._plan_install
+
+    def counting(a, b, key, *args, **kwargs):
+        keys.append(key)
+        return real(a, b, key, *args, **kwargs)
+
+    monkeypatch.setattr(ops, "_plan_install", counting)
+    return keys
+
+
+@needs_c_entry
+def test_first_sighting_of_a_torch_operand_is_recorded_without_the_installer(
+    installer_keys,
+):
+    a, dense = torch_csr(64, 64, 0.05)
+    b = dense_rhs(64, 8)
+    out = scorch.matmul(a, b)
+    assert installer_keys == [], "the first sighting reached the Python installer"
+    state = plan_mod.torch_operand_state(a)
+    assert state is not None and len(state[plan_mod.SEEN_ATTR]) == 1
+    scorch.matmul(a, b)
+    assert len(installer_keys) == 1 and len(plans_of(a)) == 1
+    scorch.matmul(a, b)
+    assert len(installer_keys) == 1, "a served call reached the installer"
+    torch.testing.assert_close(out, dense @ b, atol=1e-4, rtol=1e-4)
+
+
+@needs_c_entry
+def test_a_new_csr_tensor_every_call_never_reaches_the_installer(installer_keys):
+    a, dense = torch_csr(64, 64, 0.05)
+    crow, col, values = a.crow_indices(), a.col_indices(), a.values()
+    b = dense_rhs(64, 8)
+    before = len(plan_mod.TORCH_OPERANDS)
+    for _ in range(6):
+        fresh = torch.sparse_csr_tensor(crow, col, values, size=a.shape)
+        out = scorch.matmul(fresh, b)
+        del fresh
+    assert installer_keys == []
+    assert len(plan_mod.TORCH_OPERANDS) <= before, "entries outlived their operands"
+    torch.testing.assert_close(out, dense @ b, atol=1e-4, rtol=1e-4)
+
+
+@needs_c_entry
+def test_the_entry_c_records_is_the_one_python_makes():
+    import gc
+
+    a, _ = torch_csr(64, 64, 0.05)
+    scorch.matmul(a, dense_rhs(64, 8))
+    key = id(a)
+    ref, state = plan_mod.TORCH_OPERANDS[key]
+    assert type(ref) is plan_mod._OperandRef and ref.key == key and ref() is a
+    assert plan_mod.torch_operand_state(a) is state
+    del a, ref, state
+    gc.collect()
+    assert key not in plan_mod.TORCH_OPERANDS, "the entry outlived its operand"
+
+
+@needs_c_entry
+def test_a_call_that_raises_records_no_sighting():
+    a, _ = torch_csr(64, 64, 0.05)
+    with pytest.raises(Exception):
+        scorch.matmul(a, dense_rhs(65, 8))
+    assert plan_mod.torch_operand_state(a) is None
+
+
+@needs_c_entry
+def test_a_withdrawn_torch_operand_product_stops_reaching_the_installer(
+    installer_keys,
+):
+    a, dense = torch_csr(64, 64, 0.05)
+    b = dense_rhs(64, 8)
+    scorch.matmul(a, b)
+    scorch.matmul(a, b)
+    assert len(plans_of(a)) == 1
+    a.col_indices().mul_(1)  # same structure, new version: the plan declines from now on
+    for _ in range(MAX_FRUITLESS_DECLINES):
+        scorch.matmul(a, b)
+    assert len(refused_of(a)) == 1, "precondition: the plan was withdrawn"
+    reached = len(installer_keys)
+    for _ in range(3):
+        out = scorch.matmul(a, b)
+    assert len(installer_keys) == reached, "a withdrawn product reached the installer"
+    torch.testing.assert_close(out, dense @ b, atol=1e-4, rtol=1e-4)
+
+
+@needs_c_entry
+def test_a_torch_operand_with_a_full_cache_stops_reaching_the_installer(
+    installer_keys,
+):
+    a, dense = torch_csr(64, 64, 0.05)
+    for n in range(1, MAX_PLANS_PER_OPERAND + 1):
+        b = dense_rhs(64, n)
+        scorch.matmul(a, b)
+        scorch.matmul(a, b)
+    assert len(plans_of(a)) == MAX_PLANS_PER_OPERAND
+    reached = len(installer_keys)
+    b = dense_rhs(64, MAX_PLANS_PER_OPERAND + 1)
+    for _ in range(3):
+        out = scorch.matmul(a, b)
+    assert len(installer_keys) == reached
+    torch.testing.assert_close(out, dense @ b, atol=1e-4, rtol=1e-4)
+

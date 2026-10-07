@@ -34,6 +34,7 @@ in sole charge -- the same binary, so it is the control arm for measuring this.
 from __future__ import annotations
 
 import os
+import weakref
 from typing import Any, Dict, Optional, Tuple
 
 import torch
@@ -48,6 +49,68 @@ PLANS_ATTR = "_scorch_spmm_plans"
 SEEN_ATTR = "_scorch_spmm_seen"
 # Created only if a plan ever declines, so the ordinary path never touches it.
 DECLINES_ATTR = "_scorch_spmm_declines"
+
+# The same three entries for an operand that is a torch sparse CSR tensor, which cannot
+# carry them itself. torch.save and pickle write a tensor's __dict__ along with it, so a
+# native plan stored there makes the caller's own tensor unsaveable (both fail on the
+# plan object), and anything importable stored instead would make the saved file
+# unloadable wherever scorch is not installed. So these live here, keyed on the
+# operand's id() and checked against a weak reference to it -- an id is only unique
+# among live objects -- and the weak reference's callback drops the entry when the
+# operand dies, which keeps the property the STensor attributes have: the plans die with
+# the operand, and nothing here keeps a graph-scale index array alive.
+#
+# A plain dict probed with id() rather than a weak-keyed mapping, because the probe is
+# on the path a planned call takes and must cost what the STensor probe costs: one dict
+# lookup and one dereference. planned_matmul.h reads this dict directly.
+TORCH_OPERANDS: Dict[int, Tuple["_OperandRef", Dict[str, Any]]] = {}
+
+
+class _OperandRef(weakref.ref):
+    """A weak reference to a torch operand that carries its TORCH_OPERANDS key, so one
+    module-level callback serves every entry instead of a closure made per entry."""
+
+    __slots__ = ("key",)
+    key: int
+
+
+def _drop_torch_operand(ref: "_OperandRef") -> None:
+    held = TORCH_OPERANDS.get(ref.key)
+    if held is not None and held[0] is ref:
+        del TORCH_OPERANDS[ref.key]
+
+
+def torch_operand_state(tensor: torch.Tensor, create: bool = False):
+    """The plan state of a torch sparse CSR operand: its dict in TORCH_OPERANDS.
+
+    None when there is none and ``create`` is false. An entry whose weak reference no
+    longer names ``tensor`` belongs to an earlier object with the same id that has not
+    been collected yet, and is replaced.
+    """
+    key = id(tensor)
+    held = TORCH_OPERANDS.get(key)
+    if held is not None and held[0]() is tensor:
+        return held[1]
+    if not create:
+        return None
+    state: Dict[str, Any] = {}
+    ref = _OperandRef(tensor, _drop_torch_operand)
+    ref.key = key
+    TORCH_OPERANDS[key] = (ref, state)
+    return state
+
+
+def _is_torch_operand(a: Any) -> bool:
+    return type(a) is torch.Tensor and a.layout is torch.sparse_csr
+
+
+def _state_of(a: Any):
+    """Where an operand's plans live, if it has any: an STensor's own __dict__, or for a
+    torch sparse CSR operand, its entry in TORCH_OPERANDS."""
+    if _is_torch_operand(a):
+        return torch_operand_state(a)
+    return getattr(a, "__dict__", None)
+
 
 # One operand is realistically multiplied by a handful of distinct free
 # dimensions (a GCN layer stack: 128, 64, 16). The bound exists so that sweeping
@@ -153,7 +216,7 @@ def forget(tensor: Any) -> None:
     records the index arrays' identity and version counters. This is the belt to
     that suspenders -- it also releases the narrowed index copy.)
     """
-    state = getattr(tensor, "__dict__", None)
+    state = _state_of(tensor)
     if state is None:
         return
     state.pop(PLANS_ATTR, None)
@@ -220,7 +283,14 @@ def install(
     probed, including ones whose gate later rejected tiling, so consulting it from
     here would let a plan run tile-j against an ordinary path running v2.
     """
-    state = a.__dict__
+    # An STensor keeps its plans in its own __dict__; a torch sparse CSR operand keeps
+    # them in TORCH_OPERANDS (see there). ops.matmul passes a torch.Tensor here only when
+    # it is a 2-D sparse CSR operand, so the type is the whole test. `create` because the
+    # first sighting is recorded below, and a torch operand has no entry until then.
+    if type(a) is torch.Tensor:
+        state = torch_operand_state(a, create=True)
+    else:
+        state = a.__dict__
     # Products this operand already holds something for come first, because they are
     # the ones that reach here repeatedly: an installed plan that declined this call,
     # or a withdrawn one. Both are settled without touching the seen set.
@@ -235,6 +305,12 @@ def install(
     # keys, not the last one, because a layer stack alternates free dimensions --
     # 64, 16, 4, 64, 16, 4 -- and a single slot would never see a repeat. Bounded
     # for the same reason the plans themselves are.
+    #
+    # For a torch operand that came through the C entry point this branch is never
+    # reached: planned_matmul.h records first sightings itself, by this same rule, and
+    # calls the installer only for a product it has seen before or holds a plan for. A
+    # call site that builds a new CSR tensor for every call only ever has first
+    # sightings, and this function cost it 2 us a call on mkt1.
     seen = state.get(SEEN_ATTR)
     if seen is None:
         state[SEEN_ATTR] = {key}
@@ -256,12 +332,21 @@ def install(
         plan_kind = kind
     panel_free, panel_contraction = _panels(plan_kind, param)
 
+    if _is_torch_operand(a):
+        # The operand's own arrays: the plan pins what it was built from, and `run_csr`
+        # compares it against the operand's members on every call. The factory
+        # validates them itself (plan.h).
+        mode_indices = [[], [a.crow_indices(), a.col_indices()]]
+        values = a.values()
+    else:
+        mode_indices = a._native_mode_indices()
+        values = a._raw_values
     try:
         plan = _native.make_spmm_csr_plan(
             plan_kind,
             tuple(a.shape),
-            a._native_mode_indices(),
-            a._raw_values,
+            mode_indices,
+            values,
             int(b.shape[1]),
             panel_free,
             panel_contraction,
@@ -285,11 +370,11 @@ def plans_of(tensor: Any) -> Dict[Any, Any]:
     Withdrawn products are held as ``None`` (see :func:`_account_for_a_decline`) and
     are not plans, so they are not reported here; :func:`refused_of` has them.
     """
-    held = getattr(tensor, "__dict__", {}).get(PLANS_ATTR) or {}
+    held = (_state_of(tensor) or {}).get(PLANS_ATTR) or {}
     return {key: plan for key, plan in held.items() if plan is not None}
 
 
 def refused_of(tensor: Any) -> set:
     """The products this operand has been refused a plan for. For tests."""
-    held = getattr(tensor, "__dict__", {}).get(PLANS_ATTR) or {}
+    held = (_state_of(tensor) or {}).get(PLANS_ATTR) or {}
     return {key for key, plan in held.items() if plan is None}

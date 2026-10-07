@@ -229,6 +229,32 @@ class SpmmCsrPlan {
     return values.view({rows_, free_dim_});
   }
 
+  // `run` for an operand that is a torch sparse CSR tensor rather than an STensor, given
+  // the operand's index arrays as they are NOW. An STensor's index arrays never change
+  // under its plans -- a structural change goes through _set_state, which drops them -- so
+  // `run` rechecks only the arrays the plan holds. A torch CSR tensor can have its member
+  // arrays replaced in place (copy_ from a matrix with a different number of nonzeros
+  // swaps them), and then the held arrays are untouched while describing a structure the
+  // operand no longer has. So the current arrays must be the held ones: the same buffer
+  // and the same length. The plan's strong reference to its sources keeps their storage
+  // alive, so no other buffer can occupy the recorded address, and the version counter,
+  // which a member shares with every alias of it, is rechecked by `run`.
+  bool built_from(const torch::Tensor& positions, const torch::Tensor& coordinates) const {
+    return positions.defined() && coordinates.defined() &&
+           positions.data_ptr() == source_positions_data_ &&
+           coordinates.data_ptr() == source_coordinates_data_ &&
+           positions.numel() == rows_ + 1 && coordinates.numel() == nnz_;
+  }
+
+  c10::optional<torch::Tensor> run_csr(const torch::Tensor& positions,
+                                       const torch::Tensor& coordinates,
+                                       const torch::Tensor& a_values,
+                                       const torch::Tensor& b, int64_t nthreads,
+                                       bool atparallel) {
+    if (!built_from(positions, coordinates)) return c10::nullopt;
+    return run(a_values, b, nthreads, atparallel);
+  }
+
  private:
   SpmmPlanKind kind_;
   torch::ScalarType dtype_;

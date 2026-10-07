@@ -2,7 +2,7 @@ import copy
 import os
 import sys
 import time
-from typing import Any, Dict, Union, Sequence, Optional, List, Tuple
+from typing import Any, Dict, Union, Sequence, Optional, List, Tuple, cast
 
 import scorch_ops as _scorch_ops
 import torch
@@ -35,6 +35,11 @@ from .layout import TensorLayout, TensorSpec
 from .plan import ENABLED_CELL as _PLAN_ENABLED
 from .plan import GENERATION as _PLAN_GENERATION
 from .plan import PLANS_ATTR as _PLANS_ATTR
+from .plan import MAX_PLANS_PER_OPERAND as _PLAN_MAX_PER_OPERAND
+from .plan import SEEN_ATTR as _PLAN_SEEN_ATTR
+from .plan import TORCH_OPERANDS as _PLAN_TORCH_OPERANDS
+from .plan import _drop_torch_operand as _plan_drop_torch_operand
+from .plan import _OperandRef as _PlanOperandRef
 from .plan import install as _plan_install
 from .prebuilt_kernels import execute_prebuilt_binary_kernel, resolve_prebuilt_matmul
 from .tiling import maybe_dispatch as _tiling_maybe_dispatch
@@ -291,6 +296,7 @@ _PLAN_ATPARALLEL = _ATPARALLEL_PIPELINE and _MATCH_HOST_THREADS
 # `torch.Tensor`, bound once. The plan probe tests it on every matmul, and reading
 # it through the module is a global lookup plus an attribute lookup each time.
 _TENSOR = torch.Tensor
+_SPARSE_CSR = torch.sparse_csr
 
 # start_time = time.time()
 # # Register custom classes
@@ -761,6 +767,64 @@ def dispatch_tiled_fused(
     )
 
 
+# The keyword the C entry point passes the plan key under when it hands a torch operand's
+# call to `matmul` (see there). Private: no caller is meant to pass it.
+_C_PROBED_KW = "_scorch_plan_probed"
+
+
+# What _c_probed returns: no probe made anywhere yet, or the C entry point's probe found
+# nothing for the installer to do. Equal values, distinct objects: `matmul` tells them
+# apart by identity.
+_NOT_PROBED: Tuple[None, None, None] = (None, None, None)
+_PROBED_NOTHING = cast(Tuple[None, None, None], tuple([None, None, None]))
+
+
+def _c_probed(a: Any, b: Any, kwargs: Dict[str, Any]) -> Tuple[Any, Any, Any]:
+    """(plan_a, plan_b, key) for a call the C entry point (planned_matmul.h) handed over.
+
+    That is a torch sparse CSR operand its plan did not serve: it has done the probe, and
+    it records a first sighting itself once this call returns, so the key comes only when
+    the installer has something to do (install on a repeat, account for a decline). The
+    keyword is popped so nothing below sees it. A call with only ordinary keywords gets
+    `_NOT_PROBED`.
+    """
+    if _C_PROBED_KW not in kwargs:
+        return _NOT_PROBED
+    key = kwargs.pop(_C_PROBED_KW)
+    return _PROBED_NOTHING if key is None else (a, b, key)
+
+
+def _run_torch_operand_plan(a: torch.Tensor, b: torch.Tensor, key: Any) -> Any:
+    """The planned call for a torch sparse CSR operand, or None to take the ordinary path.
+
+    Its plans live in plan.TORCH_OPERANDS because a torch tensor cannot carry them (see
+    there). Without them every call converted the operand afresh -- two copies of its
+    index arrays and two O(nnz) walks -- which made the whole call 2-4x slower than
+    torch.sparse.mm's on mkt1 although the kernel was faster. `run_csr` is given the
+    operand's arrays as they are now and declines unless they are the plan's own.
+
+    Not inline in `matmul` like the STensor probe: the C entry point (planned_matmul.h)
+    serves these calls, and passes the ones it does not serve back with `_C_PROBED_KW`,
+    which skips this. So it runs only in a build without that entry point, or when
+    `_matmul_python` is called directly.
+    """
+    held = _PLAN_TORCH_OPERANDS.get(id(a))
+    if held is None or held[0]() is not a:
+        return None
+    plans = held[1].get(_PLANS_ATTR)
+    plan = plans.get(key) if plans is not None else None
+    if plan is None:
+        return None
+    return plan.run_csr(
+        a.crow_indices(),
+        a.col_indices(),
+        a.values(),
+        b,
+        _PLAN_NTHREADS(),
+        _PLAN_ATPARALLEL,
+    )
+
+
 def matmul(
     a: Union[torch.Tensor, STensor],
     b: Union[torch.Tensor, STensor],
@@ -884,25 +948,39 @@ def matmul(
     # control arm for measuring the on state rather than a different code path with
     # its own overhead. Measured: with the probe ungated, the off state ran 2-4%
     # slower than the tree before plans on the small cells of both hosts.
-    plan_a = plan_b = plan_key = None
-    if _PLAN_ENABLED[0] and not kwargs and type(a) is STensor and type(b) is _TENSOR:
-        plan_a, plan_b = a, b
-        # Built once and handed to the installer below, because every call that gets
-        # here needs it and it used to be built twice: hashing it means hashing a
-        # torch.Size and a dtype, which is most of what the probe costs on a call that
-        # has no plan to find.
-        plan_key = (b.shape, b.dtype, _PLAN_GENERATION[0])
-        plans = a.__dict__.get(_PLANS_ATTR)
-        if plans is not None:
-            plan = plans.get(plan_key)
-            # A miss means no plan for this free dimension; None back from `run`
-            # means a plan that declined (see plan.py). Both fall through.
-            if plan is not None:
-                served = plan.run(
-                    a._storage._value, b, _PLAN_NTHREADS(), _PLAN_ATPARALLEL
-                )
-                if served is not None:
-                    return served
+    # The caller's left operand: an STensor, or a torch sparse CSR tensor.
+    plan_a: Optional[Union[STensor, torch.Tensor]]
+    probed = _c_probed(a, b, kwargs) if kwargs else _NOT_PROBED
+    plan_a, plan_b, plan_key = probed
+    plan_via = None
+    # `probed is _NOT_PROBED` as well as `not kwargs`: _c_probed pops the C entry point's
+    # keyword, so a call it handed over has no keywords left by now.
+    if _PLAN_ENABLED[0] and probed is _NOT_PROBED and not kwargs and type(b) is _TENSOR:
+        if type(a) is STensor:
+            plan_a, plan_b = a, b
+            # Built once and handed to the installer below, because every call that
+            # gets here needs it and it used to be built twice: hashing it means
+            # hashing a torch.Size and a dtype, which is most of what the probe costs
+            # on a call that has no plan to find.
+            plan_key = (b.shape, b.dtype, _PLAN_GENERATION[0])
+            plans = a.__dict__.get(_PLANS_ATTR)
+            if plans is not None:
+                plan = plans.get(plan_key)
+                # A miss means no plan for this free dimension; None back from `run`
+                # means a plan that declined (see plan.py). Both fall through.
+                if plan is not None:
+                    served = plan.run(
+                        a._storage._value, b, _PLAN_NTHREADS(), _PLAN_ATPARALLEL
+                    )
+                    if served is not None:
+                        return served
+        elif type(a) is _TENSOR and a.layout is _SPARSE_CSR:
+            # The same for a torch sparse CSR operand (see _run_torch_operand_plan).
+            plan_a, plan_b = a, b
+            plan_key = (b.shape, b.dtype, _PLAN_GENERATION[0])
+            served = _run_torch_operand_plan(a, b, plan_key)
+            if served is not None:
+                return served
 
     # ``scorch.compile`` traces user functions with torch.fx.  Keep the leaf
     # behavior on the function itself so tracing never has to replace the
@@ -929,6 +1007,11 @@ def matmul(
         if a.is_sparse or a.is_sparse_csr or b.is_sparse or b.is_sparse_csr:
             a = STensor.from_torch(a)
             b = STensor.from_torch(b)
+            # The STensor a plan for the caller's torch operand may be installed from:
+            # this one, provided nothing below relays it out into a copy. (Installation
+            # also needs `plan_b`, which is set only when the probe above saw a torch
+            # sparse CSR operand.)
+            plan_via = a
         else:
             if effective_schedule is not None:
                 raise NotImplementedError(
@@ -1058,13 +1141,15 @@ def matmul(
                 # the free dimension, so a second call with the same pair need not
                 # repeat it: hand the resolution and the kernel that actually ran to
                 # a plan the next call can invoke directly (plan.py). `plan_b` is
-                # None unless plans are on and the caller passed a sparse STensor and
-                # a dense torch.Tensor with no keywords; `a is plan_a` fails when the
-                # operand was relaid out into a copy above, and a plan must describe
-                # the operand the caller holds, not one this function made.
-                if plan_b is not None and a is plan_a:
+                # None unless plans are on and the caller passed a sparse STensor or
+                # torch sparse CSR tensor and a dense torch.Tensor with no keywords;
+                # `a is plan_a` (or, for a torch operand, `a is plan_via`) fails when
+                # the operand was relaid out into a copy above, and a plan must
+                # describe the operand the caller holds, not one this function made.
+                # The installer builds a torch operand's plan from its own arrays.
+                if plan_b is not None and (a is plan_a or a is plan_via):
                     _plan_install(
-                        a,
+                        plan_a,
                         plan_b,
                         plan_key,
                         resolved.symbol_name,
@@ -1089,10 +1174,11 @@ def matmul(
 
 
 # The planned fast path in C (csrc/planned_matmul.h). It serves exactly the calls the probe at
-# the top of `matmul` serves -- two positional operands, no keywords, `type(a) is STensor`,
-# `type(b) is torch.Tensor`, plans enabled, a plan under the same key -- and passes every other
-# call, arguments untouched, to the Python function above, which still carries the probe for a
-# build without this entry point. A cold planned call through the Python probe cost 1.2-1.5 us
+# the top of `matmul` serves -- two positional operands, no keywords, `type(a) is STensor` or a
+# 2-D torch sparse CSR tensor, `type(b) is torch.Tensor`, plans enabled, a plan under the same
+# key -- and passes every other call, arguments untouched, to the Python function above, which
+# still carries the probe for a build without this entry point. The one exception is a torch
+# operand it does not serve, which arrives with `_C_PROBED_KW` (see the top of `matmul`). A cold planned call through the Python probe cost 1.2-1.5 us
 # more than the legacy entry point on mkt1, which is what this removes.
 #
 # Rebinding the module global is what keeps tracing whole: a Proxy is never served here, so it
@@ -1109,6 +1195,12 @@ if _install_planned_matmul is not None:
         _PLAN_GENERATION,
         _PLAN_ENABLED,
         _PLANS_ATTR,
+        _PLAN_TORCH_OPERANDS,
+        _PlanOperandRef,
+        _plan_drop_torch_operand,
+        _PLAN_SEEN_ATTR,
+        _PLAN_MAX_PER_OPERAND,
+        _C_PROBED_KW,
         _MATCH_HOST_THREADS,
         _PLAN_ATPARALLEL,
         sys.modules[__name__],

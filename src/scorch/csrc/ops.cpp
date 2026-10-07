@@ -965,6 +965,11 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
            "Serve this product, or return None to defer to the ordinary path",
            py::arg("a_values"), py::arg("b"), py::arg("nthreads") = -1,
            py::arg("atparallel") = false)
+      .def("run_csr", &scorch_native::SpmmCsrPlan::run_csr,
+           "run, for a torch sparse CSR operand: its current index arrays must be the "
+           "ones the plan was built from, or the plan declines",
+           py::arg("positions"), py::arg("coordinates"), py::arg("a_values"),
+           py::arg("b"), py::arg("nthreads") = -1, py::arg("atparallel") = false)
       .def_property_readonly("kind", &scorch_native::SpmmCsrPlan::kind)
       .def_property_readonly("rows", &scorch_native::SpmmCsrPlan::rows)
       .def_property_readonly("cols", &scorch_native::SpmmCsrPlan::cols)
@@ -984,6 +989,8 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           "Build the C callable ops.py binds as matmul",
           py::arg("ordinary"), py::arg("stensor_type"), py::arg("tensor_type"),
           py::arg("generation"), py::arg("enabled"), py::arg("plans_attr"),
+          py::arg("torch_operands"), py::arg("operand_ref_type"), py::arg("operand_died"),
+          py::arg("seen_attr"), py::arg("max_plans"), py::arg("probed_kw"),
           py::arg("match_host_threads"), py::arg("atparallel"), py::arg("module"),
           py::arg("doc"));
 
