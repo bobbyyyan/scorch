@@ -1512,3 +1512,32 @@ def test_a_torch_operand_with_a_full_cache_stops_reaching_the_installer(
     assert len(installer_keys) == reached
     torch.testing.assert_close(out, dense @ b, atol=1e-4, rtol=1e-4)
 
+
+@needs_c_entry
+def test_a_product_no_plan_kind_serves_is_refused_once(installer_keys, monkeypatch):
+    """A kernel no plan kind serves is refused on the first repeat, and from then on
+    the C entry point settles the product without reaching the installer."""
+    monkeypatch.setattr(plan_mod, "_SYMBOL_KINDS", {})
+    a, dense = torch_csr(64, 64, 0.05)
+    b = dense_rhs(64, 8)
+    for _ in range(5):
+        out = scorch.matmul(a, b)
+    assert len(installer_keys) == 1, f"installer reached {len(installer_keys)} times"
+    assert len(refused_of(a)) == 1 and plans_of(a) == {}
+    torch.testing.assert_close(out, dense @ b, atol=1e-4, rtol=1e-4)
+
+
+def test_a_factory_refusal_is_recorded_not_retried(monkeypatch):
+    calls = []
+
+    def refusing(*args, **kwargs):
+        calls.append(args[0])
+        raise RuntimeError("refused")
+
+    monkeypatch.setattr(plan_mod._native, "make_spmm_csr_plan", refusing)
+    a, _ = random_csr(64, 64, 0.05)
+    b = dense_rhs(64, 8)
+    for _ in range(5):
+        scorch.matmul(a, b)
+    assert len(calls) == 1, f"the factory was called {len(calls)} times"
+    assert len(refused_of(a)) == 1

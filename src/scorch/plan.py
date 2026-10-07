@@ -322,6 +322,10 @@ def install(
 
     plan_kind = _SYMBOL_KINDS.get(symbol_name)
     if plan_kind is None:
+        # No plan kind serves this kernel (an SpMV, say), now or on any later call: refuse
+        # the product, as a withdrawal does, so later calls settle it with one dict probe
+        # -- and for a torch operand, in C without reaching this function at all.
+        _refuse(state, plans, key)
         return None
     if kind in ("tilej", "tileijk"):
         # A tiled kernel is only ever chosen in place of v2 at float32 -- the tiled
@@ -354,14 +358,27 @@ def install(
     except Exception:
         # Nothing a plan does is load-bearing, so a refusal from the factory --
         # an extent the legacy int32 ABI cannot express, an index structure it
-        # will not vouch for -- must not turn a working matmul into an error.
+        # will not vouch for -- must not turn a working matmul into an error. Both are
+        # properties of the operand, so the refusal is recorded rather than retried on
+        # every call (each retry rebuilt the plan's inputs and called the factory).
+        _refuse(state, plans, key)
         return None
     if plan is None:
+        _refuse(state, plans, key)
         return None
     if plans is None:
         plans = state[PLANS_ATTR] = {}
     plans[key] = plan
     return plan
+
+
+def _refuse(state: Dict[str, Any], plans: Optional[Dict[Any, Any]], key: Any) -> None:
+    """Record that ``key`` will never get a plan on this operand: stored as None, the
+    form a withdrawal takes (see `_account_for_a_decline`), which every probe already
+    reads as "no plan" and the installer as "settled"."""
+    if plans is None:
+        plans = state[PLANS_ATTR] = {}
+    plans[key] = None
 
 
 def plans_of(tensor: Any) -> Dict[Any, Any]:
