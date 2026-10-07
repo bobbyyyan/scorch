@@ -646,6 +646,7 @@ class STensor:
                         f"shape {storage.layout.physical_shape}"
                     )
             runtime_storage = storage
+            fresh_storage = False
         else:
             missing = [
                 field
@@ -671,6 +672,7 @@ class STensor:
                 shape, index.format, index.mode_order, index.index_dtype
             )
             runtime_storage = SparseStorage(layout, value, index=index)
+            fresh_storage = True
         metadata = TensorMetadata(
             tensor_name,
             runtime_storage.value.dtype,
@@ -678,7 +680,7 @@ class STensor:
             runtime_storage.layout,
             requires_grad,
         )
-        self._set_state(metadata, runtime_storage)
+        self._set_state(metadata, runtime_storage, fresh_storage=fresh_storage)
 
     @classmethod
     def _from_validated(
@@ -695,6 +697,7 @@ class STensor:
         storage: SparseStorage,
         *,
         recheck_storage: bool = False,
+        fresh_storage: bool = False,
     ) -> None:
         """Adopt ``metadata``/``storage`` after checking they agree and are sound.
 
@@ -703,6 +706,10 @@ class STensor:
         :meth:`validate` sets it: every other caller is handing over a storage that
         ``SparseStorage.__init__`` validated moments earlier, and walking it again is
         pure duplicated work (see ``validate_unless_already_checked``).
+
+        ``fresh_storage`` says the caller built ``storage`` itself a moment ago, so the
+        verdict it carries is about the arrays as they are: comparing stamps could
+        only confirm it, and computing one is 0.6 us of a 12 us conversion.
         """
         if not isinstance(metadata, TensorMetadata):
             raise TensorTypeError("metadata must be TensorMetadata")
@@ -724,7 +731,7 @@ class STensor:
             )
         if recheck_storage:
             storage.validate()
-        else:
+        elif not fresh_storage:
             storage.validate_unless_already_checked()
         self._metadata = metadata
         self._storage = storage
@@ -1237,9 +1244,10 @@ class STensor:
         Wraps a 2-D ``torch.sparse_csr`` tensor as a Scorch tensor with the
         canonical CSR layout: format ``"d,s"`` (dense rows, compressed cols),
         ``mode_indices = [[], [crow_indices, col_indices]]``, and the CSR values
-        as the flat payload. Structural index arrays are copied into immutable
-        storage; the values buffer remains an isolated tensor view of the input
-        payload and is not silently cast.
+        as the flat payload. The index arrays and the values are the input's own,
+        not copies, exactly as torch's sparse constructors share the arrays they are
+        given: a later write to the input's indices is a write to this tensor's.
+        Nothing is silently cast.
 
         Parameters
         ----------
@@ -1300,6 +1308,7 @@ class STensor:
             index=TensorIndex(
                 tensor_format="ds",
                 mode_indices=[[], [crow_indices, col_indices]],
+                _adopt=True,  # shared with `csr_matrix`, as torch shares them
             ),
             value=values,
         )
@@ -1451,6 +1460,7 @@ class STensor:
             index=TensorIndex(
                 tensor_format="o" * len(shape),
                 mode_indices=mode_indices,
+                _adopt=True,  # the coalesced tensor's own, as torch shares them
             ),
             value=values,
         )
@@ -1567,6 +1577,7 @@ class STensor:
                         tensor_format="o" * rank,
                         mode_indices=mode_indices,
                         mode_order=mode_order,
+                        _adopt=True,  # shared with `tensor`, as torch shares them
                     ),
                     value=tensor.values().resolve_conj().resolve_neg(),
                 )
@@ -1584,6 +1595,7 @@ class STensor:
                         tensor_format="ds",
                         mode_indices=[[], [crow_indices, col_indices]],
                         mode_order=mode_order,
+                        _adopt=True,  # shared with `tensor`, as torch shares them
                     ),
                     value=values.resolve_conj().resolve_neg(),
                 )

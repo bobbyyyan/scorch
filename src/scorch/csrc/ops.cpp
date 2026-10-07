@@ -828,7 +828,10 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     // kernel's result -- and its bounds and sortedness checks are separate whole-array
     // torch operations: about five passes over the index arrays plus a bool temporary,
     // which measured 304 us of the 385 us it took to wrap a 640k-nonzero result. This
-    // screen does the same work in ONE pass with no allocation.
+    // screen does the same work in ONE pass with no allocation. A clean verdict also
+    // covers the two endpoint checks (positions[0] == 0, positions[last] == nnz), and is
+    // kept per array identity and version in the call boundary's verdict memo, so a
+    // level built again around arrays that already passed is not scanned again.
     //
     // Same contract as every screen here: `true` means "this may be malformed, go and
     // find out", `false` means "no violation exists". Conservative in that exact
@@ -852,18 +855,34 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
               if (count < 1) return true;
               const int64_t parents = count - 1;
               const int64_t nnz = coordinates.numel();
-              if (positions.dtype() == torch::kInt32) {
-                if (nnz > (int64_t)std::numeric_limits<int32_t>::max()) return true;
-                return scorch_native::abi_screen_compressed_typed<int32_t>(
-                    positions.data_ptr<int32_t>(), coordinates.data_ptr<int32_t>(),
-                    parents, nnz, extent, require_sorted, grain);
-              }
-              if (positions.dtype() == torch::kInt64) {
+              if (positions.dtype() == torch::kInt32 &&
+                  nnz > (int64_t)std::numeric_limits<int32_t>::max())
+                return true;
+              if (positions.dtype() != torch::kInt32 && positions.dtype() != torch::kInt64)
+                return true;
+              // The two endpoint checks storage.py would otherwise make with an
+              // indexing op and a sync each: a clean verdict now covers them too.
+              const bool ends_ok = positions.dtype() == torch::kInt32
+                  ? positions.data_ptr<int32_t>()[0] == 0 &&
+                        positions.data_ptr<int32_t>()[parents] == nnz
+                  : positions.data_ptr<int64_t>()[0] == 0 &&
+                        positions.data_ptr<int64_t>()[parents] == nnz;
+              if (!ends_ok) return true;
+              // The parameter layout of the call boundary's CSR check (checked_csr_view).
+              scorch_native::AbiStructEntry want;
+              want.add(coordinates);
+              want.add(positions);
+              want.params = {scorch_native::AbiCheckCompressed, parents, extent, nnz,
+                             require_sorted ? 1 : 0};
+              return scorch_native::abi_screen_through_memo(std::move(want), [&] {
+                if (positions.dtype() == torch::kInt32)
+                  return scorch_native::abi_screen_compressed_typed<int32_t>(
+                      positions.data_ptr<int32_t>(), coordinates.data_ptr<int32_t>(),
+                      parents, nnz, extent, require_sorted, grain);
                 return scorch_native::abi_screen_compressed_typed<int64_t>(
                     positions.data_ptr<int64_t>(), coordinates.data_ptr<int64_t>(),
                     parents, nnz, extent, require_sorted, grain);
-              }
-              return true;
+              });
             } catch (...) {
               return true;  // never turn a validation into a crash
             }
@@ -888,15 +907,20 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
               if (!coordinates.is_contiguous()) return true;
               const int64_t n = coordinates.numel();
               if (n == 0) return false;  // nothing to violate; matches storage.py
-              if (coordinates.dtype() == torch::kInt32) {
-                return scorch_native::abi_screen_bounds_typed<int32_t>(
-                    coordinates.data_ptr<int32_t>(), n, extent, grain);
-              }
-              if (coordinates.dtype() == torch::kInt64) {
+              if (coordinates.dtype() != torch::kInt32 &&
+                  coordinates.dtype() != torch::kInt64)
+                return true;
+              // The parameter layout of the call boundary's per-level COO check.
+              scorch_native::AbiStructEntry want;
+              want.add(coordinates);
+              want.params = {scorch_native::AbiCheckBounds, extent, n};
+              return scorch_native::abi_screen_through_memo(std::move(want), [&] {
+                if (coordinates.dtype() == torch::kInt32)
+                  return scorch_native::abi_screen_bounds_typed<int32_t>(
+                      coordinates.data_ptr<int32_t>(), n, extent, grain);
                 return scorch_native::abi_screen_bounds_typed<int64_t>(
                     coordinates.data_ptr<int64_t>(), n, extent, grain);
-              }
-              return true;
+              });
             } catch (...) {
               return true;
             }
@@ -931,21 +955,25 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
                 if (level.dtype() != width) return true;
                 if (level.numel() < n) return true;  // never read past an array
               }
-              if (width == torch::kInt32) {
-                std::vector<const int32_t*> data;
-                data.reserve(levels.size());
-                for (const auto& level : levels)
-                  data.push_back(level.data_ptr<int32_t>());
-                return scorch_native::abi_screen_lex_typed<int32_t>(data, n, grain);
-              }
-              if (width == torch::kInt64) {
+              if (width != torch::kInt32 && width != torch::kInt64) return true;
+              // The parameter layout of the call boundary's COO order check.
+              scorch_native::AbiStructEntry want;
+              for (const auto& level : levels) want.add(level);
+              want.params = {scorch_native::AbiCheckLex, n};
+              return scorch_native::abi_screen_through_memo(std::move(want), [&] {
+                if (width == torch::kInt32) {
+                  std::vector<const int32_t*> data;
+                  data.reserve(levels.size());
+                  for (const auto& level : levels)
+                    data.push_back(level.data_ptr<int32_t>());
+                  return scorch_native::abi_screen_lex_typed<int32_t>(data, n, grain);
+                }
                 std::vector<const int64_t*> data;
                 data.reserve(levels.size());
                 for (const auto& level : levels)
                   data.push_back(level.data_ptr<int64_t>());
                 return scorch_native::abi_screen_lex_typed<int64_t>(data, n, grain);
-              }
-              return true;
+              });
             } catch (...) {
               return true;
             }

@@ -43,8 +43,7 @@ def validate_runtime_contract(tensor_format: TensorFormat, dtype: torch.dtype) -
     if dtype not in SUPPORTED_VALUE_DTYPES:
         raise TensorValidationError(f"Scorch tensor dtype {dtype} is not supported")
     if any(
-        level_type == LevelType.SINGLETON
-        for level_type in tensor_format.get_level_types()
+        level_type == LevelType.SINGLETON for level_type in tensor_format.level_types
     ):
         raise TensorLayoutError(
             "singleton levels are not supported by the Scorch runtime"

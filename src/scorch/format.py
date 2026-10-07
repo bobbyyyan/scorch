@@ -316,7 +316,22 @@ class TensorFormat:
             The bare level type of each mode, e.g. ``[LevelType.DENSE,
             LevelType.COMPRESSED]`` for CSR.
         """
-        return [level_format.get_level_type() for level_format in self._level_formats]
+        return list(self.level_types)
+
+    @property
+    def level_types(self) -> Tuple[LevelType, ...]:
+        """The per-mode level types as a tuple, derived once (see ``is_dense``).
+
+        For the construction paths, which ask for them several times per tensor;
+        ``get_level_types`` returns a fresh list for callers that may modify it.
+        """
+        cached = self.__dict__.get("_level_types")
+        if cached is None:
+            cached = tuple(
+                level_format.get_level_type() for level_format in self._level_formats
+            )
+            object.__setattr__(self, "_level_types", cached)
+        return cached
 
     def get_order(self) -> int:
         """Return the tensor's order (rank) -- the number of modes.

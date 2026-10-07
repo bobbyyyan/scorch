@@ -125,10 +125,9 @@ def _normalize_mode_indices(
 ) -> IndexModes:
     """Validate one index array per level and return them as nested tuples.
 
-    ``copy=False`` adopts the caller's arrays instead of copying them, and is only for
-    arrays this process just produced and holds the sole reference to -- a kernel's
-    freshly allocated output. Every structural check still runs; the only thing that
-    changes is who owns the buffer. See ``TensorIndex.__init__``'s ``_adopt``.
+    ``copy=False`` adopts the caller's arrays instead of copying them. Every structural
+    check still runs; the only thing that changes is who owns the buffer. See
+    ``TensorIndex.__init__``'s ``_adopt`` for when that is allowed.
     """
     if isinstance(mode_indices, (str, bytes)) or not isinstance(mode_indices, Sequence):
         raise TensorTypeError("mode_indices must be a sequence with one entry per mode")
@@ -140,7 +139,7 @@ def _normalize_mode_indices(
 
     normalized = []
     for mode, (arrays, level_type) in enumerate(
-        zip(mode_indices, tensor_format.get_level_types())
+        zip(mode_indices, tensor_format.level_types)
     ):
         if isinstance(arrays, (str, bytes)) or not isinstance(arrays, Sequence):
             raise TensorTypeError(f"mode_indices[{mode}] must be a sequence")
@@ -177,9 +176,9 @@ def _normalize_mode_indices(
                 raise TensorIndexError(
                     f"mode_indices[{mode}][{slot}] must be contiguous"
                 )
-            # Index coordinates are structural data.  Own an independent copy so
+            # Index coordinates are structural data. Own an independent copy so
             # caller mutation cannot invalidate a previously validated object -- unless
-            # the caller has handed over ownership outright (see `copy`).
+            # the arrays are being adopted (see `copy`).
             normalized_arrays.append(
                 index.detach() if not copy else index.detach().clone()
             )
@@ -226,7 +225,10 @@ class TensorIndex:
     Shape-dependent checks are completed when the descriptor is combined with a
     :class:`TensorLayout` in :class:`SparseStorage`. Caller containers and index
     tensors are copied, so later caller mutation cannot invalidate the descriptor;
-    they are never silently cast or replaced in the caller.
+    they are never silently cast or replaced in the caller. The exception is the
+    conversion of a torch sparse tensor (``STensor.from_torch`` / ``from_csr`` /
+    ``from_coo``), which shares that tensor's arrays the way torch itself does (see
+    ``_adopt``).
     """
 
     _format: TensorFormat
@@ -246,11 +248,28 @@ class TensorIndex:
         """Describe a format and its index arrays, copying the arrays.
 
         ``_adopt`` is internal and takes the arrays as they are instead of copying
-        them. It is for one situation: arrays a kernel just allocated for its own
-        result, which nothing else references. Every validation below still runs.
-        Passing it for arrays a caller might still mutate, or that another tensor
-        shares, breaks this class's immutability -- which is why it is keyword-only,
-        underscored, and used in exactly one helper (`_wrap_generated_result`).
+        them. Every validation below still runs. It is for two situations:
+
+        * Arrays a kernel just allocated for its own result, which nothing else
+          references (`_wrap_generated_result`).
+        * The arrays of a torch sparse tensor being converted (`STensor.from_torch`,
+          `from_csr`, `from_coo`). torch does not copy them either:
+          ``torch.sparse_csr_tensor(crow, col, values)`` keeps the caller's own
+          ``crow`` and ``col``, and a later write to them shows up in the tensor. So
+          the STensor shares them with the torch tensor, and a write the caller makes
+          through torch reaches both -- which is what the caller of a torch tensor
+          already has. Copying them cost two O(nnz) copies per conversion and, because
+          the copies were new arrays every time, defeated every verdict and narrowed
+          copy the native call boundary keeps per array (`native_abi.h`), so each call
+          also re-walked and re-narrowed them: a drop-in caller's matmul ran 2-4x slower
+          than MKL's on mkt1 although the kernel was faster.
+
+        Safety does not rest on nobody writing: the native call boundary re-checks
+        every index array per call, keyed on the array's identity and version counter,
+        so a write made through torch is re-validated at the next kernel call, and so
+        is a cached plan's (plan.h). What sharing gives up is what torch gives up: a
+        write through a raw pointer or a numpy view bumps no version counter. Nothing
+        in Scorch writes into an index array it was given.
         """
         if tensor_format is None:
             raise TensorIndexError(
@@ -526,7 +545,7 @@ def _validate_index_storage(
     layout: TensorLayout, mode_indices: IndexModes, values: torch.Tensor
 ) -> None:
     nnz = values.numel()
-    level_types = layout.format.get_level_types()
+    level_types = layout.format.level_types
 
     for mode, arrays in enumerate(mode_indices):
         for slot, index in enumerate(arrays):
@@ -603,19 +622,21 @@ def _validate_index_storage(
                     f"compressed mode {mode} position array has {positions.numel()} "
                     f"elements, expected {expected_positions}"
                 )
-            if positions.numel() == 0 or int(positions[0].item()) != 0:
+            # One native pass stands in for every check below -- the first position
+            # is zero, positions nondecreasing, the last position equals the
+            # coordinate count, coordinates in range, coordinates ascending inside
+            # each parent. It reports "no violation exists" or "go and look", never
+            # "this is fine" about something that is not, so when it clears the level
+            # the checks below cannot fail and are skipped; when it does not, they run
+            # exactly as they always did, in the same order, and remain the only thing
+            # that reports. Diagnostics are therefore unchanged either way. Its verdict
+            # is kept per array identity and version (csrc/native_abi.h), so a level
+            # built again around arrays that already passed is not rescanned.
+            suspect = _screen_compressed_level(positions, coordinates, extent)
+            if suspect and (positions.numel() == 0 or int(positions[0].item()) != 0):
                 raise TensorIndexError(
                     f"compressed mode {mode} position array must start at zero"
                 )
-            # One native pass stands in for the three whole-array torch checks
-            # below -- positions nondecreasing, coordinates in range, coordinates
-            # ascending inside each parent. It reports "no violation exists" or "go
-            # and look", never "this is fine" about something that is not, so when it
-            # clears the level the three checks below cannot fail and are skipped;
-            # when it does not, they run exactly as they always did and remain the
-            # only thing that reports. Diagnostics, and the order they fire in, are
-            # therefore unchanged either way. See csrc/native_abi.h.
-            suspect = _screen_compressed_level(positions, coordinates, extent)
             if suspect and (
                 positions.numel() > 1
                 and bool(torch.any(positions[1:] < positions[:-1]).item())
@@ -623,12 +644,13 @@ def _validate_index_storage(
                 raise TensorIndexError(
                     f"compressed mode {mode} position array must be nondecreasing"
                 )
-            terminal = int(positions[-1].item())
-            if terminal != coordinates.numel():
-                raise TensorIndexError(
-                    f"compressed mode {mode} terminal position {terminal} does not "
-                    f"match coordinate count {coordinates.numel()}"
-                )
+            if suspect:
+                terminal = int(positions[-1].item())
+                if terminal != coordinates.numel():
+                    raise TensorIndexError(
+                        f"compressed mode {mode} terminal position {terminal} does "
+                        f"not match coordinate count {coordinates.numel()}"
+                    )
             if suspect:
                 _check_coordinate_bounds(coordinates, extent, f"compressed mode {mode}")
                 _check_sorted_within_parents(positions, coordinates, mode)

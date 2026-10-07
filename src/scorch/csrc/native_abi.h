@@ -452,8 +452,31 @@ inline std::unordered_map<const void*, AbiNarrowEntry>& abi_narrow_map() {
   return m;
 }
 
-inline std::unordered_map<const void*, AbiStructEntry>& abi_struct_map() {
-  static std::unordered_map<const void*, AbiStructEntry> m;
+// Verdicts are keyed on the first array's address AND the check family. With the address
+// alone, two families whose first array is the same buffer evicted each other on every
+// call: a COO operand's level-0 bounds verdict and its lexicographic verdict are both
+// keyed on level 0's coordinates, so each store overwrote the other and both scans ran
+// on every call.
+struct AbiStructKey {
+  const void* data;
+  int64_t kind;
+  bool operator==(const AbiStructKey& other) const {
+    return data == other.data && kind == other.kind;
+  }
+};
+
+struct AbiStructKeyHash {
+  size_t operator()(const AbiStructKey& key) const {
+    return std::hash<const void*>()(key.data) ^ (std::hash<int64_t>()(key.kind) << 1);
+  }
+};
+
+inline AbiStructKey abi_struct_key(const AbiStructEntry& entry) {
+  return {entry.arrays[0].data, entry.params.empty() ? 0 : entry.params[0]};
+}
+
+inline std::unordered_map<AbiStructKey, AbiStructEntry, AbiStructKeyHash>& abi_struct_map() {
+  static std::unordered_map<AbiStructKey, AbiStructEntry, AbiStructKeyHash> m;
   return m;
 }
 
@@ -464,8 +487,8 @@ inline std::unordered_map<const void*, AbiStructEntry>& abi_struct_map() {
 // insert only happens on a miss — once per newly seen array — so an O(entries)
 // weak-pointer sweep there is not on any hot path. Wholesale clearing is the backstop
 // for a program holding more live arrays than the bound allows.
-template <typename Entry>
-inline void abi_bound_map(std::unordered_map<const void*, Entry>& map) {
+template <typename Map>
+inline void abi_bound_map(Map& map) {
   for (auto it = map.begin(); it != map.end();) {
     if (!it->second.live()) it = map.erase(it);
     else ++it;
@@ -508,7 +531,7 @@ inline bool abi_struct_hit(const AbiStructEntry& want) {
   if (!abi_memo_enabled() || want.arrays.empty()) return false;
   std::lock_guard<std::mutex> guard(abi_memo_mutex());
   auto& map = abi_struct_map();
-  auto it = map.find(want.arrays[0].data);
+  auto it = map.find(abi_struct_key(want));
   if (it == map.end()) return false;
   if (!it->second.live()) {  // stale: that storage is gone
     map.erase(it);
@@ -522,7 +545,7 @@ inline void abi_struct_store(AbiStructEntry entry) {
   std::lock_guard<std::mutex> guard(abi_memo_mutex());
   auto& map = abi_struct_map();
   abi_bound_map(map);
-  const void* key = entry.arrays[0].data;
+  const AbiStructKey key = abi_struct_key(entry);
   map.insert_or_assign(key, std::move(entry));
 }
 
@@ -536,6 +559,21 @@ inline void abi_memo_clear() {
   std::lock_guard<std::mutex> guard(abi_memo_mutex());
   abi_narrow_map().clear();
   abi_struct_map().clear();
+}
+
+// A construction-time screen (storage.py) consulted through the same verdicts as the
+// native call boundary. `want` names the arrays and parameters in the layout the boundary
+// uses for that check family, so a verdict reached at either place serves the other, and
+// a structure rebuilt around index arrays already validated at their current version --
+// a torch CSR tensor made afresh each call from the same arrays, say -- is not rescanned.
+// `screen` returns true when it found something or cannot tell; only a clean result is
+// stored.
+template <typename Screen>
+inline bool abi_screen_through_memo(AbiStructEntry want, Screen&& screen) {
+  if (abi_struct_hit(want)) return false;
+  if (screen()) return true;
+  abi_struct_store(std::move(want));
+  return false;
 }
 
 inline size_t abi_memo_size() {
