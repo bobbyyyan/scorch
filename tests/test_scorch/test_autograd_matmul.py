@@ -411,6 +411,279 @@ def test_the_python_path_keeps_what_the_c_entry_does_not_record():
 
 
 # --------------------------------------------------------------------------- #
+# x @ A served, and recorded, by the C entry (csrc/planned_matmul.h)
+# --------------------------------------------------------------------------- #
+
+C_NODE_T = "torch::autograd::CppNode<scorch_native::PlannedMatmulGradT>"
+
+
+def _right_node(out):
+    """The node that recorded x @ A: the caller receives the transpose of the product the
+    Function returns, so the output's own node is torch's transpose and the product's is next."""
+    assert out.grad_fn.name().startswith("TBackward")
+    return out.grad_fn.next_functions[0][0].name()
+
+
+def _served(a):
+    return sum(tp.served for tp in plan_mod.transposed_plans_of(a).values())
+
+
+def _restore_right():
+    scorch_ops.set_planned_matmul_right(
+        grad_mod.planned_mm_t_backward, plan_mod.TRANSPOSED_PLANS_ATTR
+    )
+
+
+def _planned_right(a, rows):
+    """`a` whose x @ A the C entry serves for an x of `rows` rows: two calls give the
+    transpose's carrier a plan (plan.install), and the next records it in `a`'s state."""
+    x = rand(rows, a.shape[0], dtype=a.dtype, seed=9)
+    with torch.no_grad():
+        for _ in range(3):
+            scorch.matmul(x, a)
+    assert plan_mod.transposed_plans_of(a), "precondition: the operand records its x @ A"
+    return a
+
+
+@pytest.mark.parametrize("dtype", [torch.float32, torch.float64])
+@pytest.mark.parametrize("rows", [1, 2, 4])
+@pytest.mark.parametrize("wants", ["x", "a", "both"])
+def test_the_c_entry_records_x_times_a(dtype, rows, wants):
+    d = dense_matrix(dtype=dtype)
+    a = _planned_right(d.to_sparse_csr(), rows)
+    x = rand(rows, 7, dtype=dtype).requires_grad_(wants in ("x", "both"))
+    a.requires_grad_(wants in ("a", "both"))
+    before = _served(a)
+    out = scorch.matmul(x, a)
+    assert _right_node(out) == C_NODE_T and _served(a) == before + 1
+    assert out.shape == (rows, 5) and out.is_contiguous()
+    g = rand(rows, 5, dtype=dtype, seed=5)
+    out.backward(g)
+    d_ref = d.clone().requires_grad_(a.requires_grad)
+    x_ref = x.detach().clone().requires_grad_(x.requires_grad)
+    ref = x_ref @ d_ref
+    ref.backward(g)
+    tol = tolerance(dtype)
+    torch.testing.assert_close(out.detach(), ref.detach(), **tol)
+    if x.requires_grad:
+        torch.testing.assert_close(x.grad, x_ref.grad, **tol)
+    else:
+        assert x.grad is None
+    if a.requires_grad:
+        assert a.grad.layout == torch.sparse_csr
+        torch.testing.assert_close(a.grad.to_dense(), d_ref.grad * (d != 0), **tol)
+    else:
+        assert a.grad is None
+
+
+@pytest.mark.parametrize("dtype", [torch.float32, torch.float64])
+@pytest.mark.parametrize("rows", [1, 3, 16])
+def test_the_c_entry_s_x_times_a_is_the_python_function_s_bit_for_bit(dtype, rows):
+    """The same kernels on the same arrays: the product and both gradients equal the Python
+    function's exactly, recorded, unrecorded, and under inference_mode."""
+    d = dense_matrix(rows=40, cols=30, density=0.2, dtype=dtype)
+    a = _planned_right(d.to_sparse_csr(), rows).requires_grad_()
+    x = rand(rows, 40, dtype=dtype).requires_grad_()
+    g = rand(rows, 30, dtype=dtype, seed=4)
+
+    def run():
+        x.grad = a.grad = None
+        out = scorch.matmul(x, a)
+        out.backward(g)
+        with torch.no_grad():
+            plain = scorch.matmul(x, a)
+        with torch.inference_mode():
+            inference = scorch.matmul(x.detach(), a)
+        return [out.detach(), x.grad, a.grad.values(), plain, inference], _right_node(out)
+
+    before = _served(a)
+    served, node = run()
+    assert node == C_NODE_T and _served(a) == before + 3
+    scorch_ops.set_planned_matmul_right(None)
+    try:
+        python, python_node = run()
+    finally:
+        _restore_right()
+    assert python_node != C_NODE_T and _served(a) == before + 3
+    for got, want in zip(served, python):
+        assert torch.equal(got, want)
+
+
+def test_x_times_a_goes_to_the_python_function_where_the_c_entry_does_not_serve_it():
+    """A transposed view, a vector, a Parameter, a forward-mode tangent and a withdrawn entry
+    are each computed by the Python function, correctly, without touching the record."""
+    d = dense_matrix()
+    a = _planned_right(d.to_sparse_csr(), 4)
+    served = _served(a)
+    tol = tolerance(d.dtype)
+    base = rand(7, 4).requires_grad_()
+    out = scorch.matmul(base.t(), a)
+    assert _right_node(out) != C_NODE_T
+    out.sum().backward()
+    torch.testing.assert_close(out.detach(), base.detach().t() @ d, **tol)
+    torch.testing.assert_close(base.grad, (torch.ones(4, 5, dtype=d.dtype) @ d.t()).t(), **tol)
+    v = rand(7).requires_grad_()
+    torch.testing.assert_close(scorch.matmul(v, a).detach(), v.detach() @ d, **tol)
+    p = torch.nn.Parameter(rand(4, 7))
+    out = scorch.matmul(p, a)
+    assert _right_node(out) != C_NODE_T
+    out.sum().backward()
+    torch.testing.assert_close(p.grad, torch.ones(4, 5, dtype=d.dtype) @ d.t(), **tol)
+    x = rand(4, 7).requires_grad_()
+    tangent = rand(4, 7, seed=3)
+    with fwAD.dual_level():
+        out = scorch.matmul(fwAD.make_dual(x, tangent), a)
+        torch.testing.assert_close(fwAD.unpack_dual(out).tangent, tangent @ d, **tol)
+    assert _served(a) == served
+    assert _right_node(scorch.matmul(x, a)) == C_NODE_T
+    assert _served(a) == served + 1
+
+
+@pytest.mark.parametrize("write", ["col_indices", "crow_indices", "values"])
+def test_x_times_a_is_not_served_from_an_operand_written_in_place(write):
+    """One nonzero per row, then a write through one of the operand's aliases. Every alias
+    shares the operand's version counter, so the record no longer describes the operand: the
+    next x @ A goes to the Python function, which computes the new product, and the stale
+    record is dropped. A later served product records afresh."""
+    rows, cols = 6, 5
+    crow = torch.arange(rows + 1)
+    col = torch.tensor([0, 1, 2, 3, 4, 0])
+    a = torch.sparse_csr_tensor(crow, col, rand(rows), (rows, cols))
+    a = _planned_right(a, 3)
+    x = rand(3, rows).requires_grad_()
+    assert _right_node(scorch.matmul(x, a)) == C_NODE_T
+    with torch.no_grad():
+        if write == "col_indices":
+            a.col_indices().copy_(torch.tensor([4, 3, 2, 1, 0, 4]))
+        elif write == "crow_indices":  # rows 0 and 1 swap their one nonzero for two and none
+            a.crow_indices()[1] = 2
+        else:
+            a.values().mul_(3.0)
+    out = scorch.matmul(x, a)
+    assert _right_node(out) != C_NODE_T
+    assert not plan_mod.transposed_plans_of(a), "the stale record was dropped"
+    torch.testing.assert_close(out.detach(), x.detach() @ a.to_dense(), **tolerance(x.dtype))
+    _planned_right(a, 3)
+    out = scorch.matmul(x, a)
+    assert _right_node(out) == C_NODE_T
+    torch.testing.assert_close(out.detach(), x.detach() @ a.to_dense(), **tolerance(x.dtype))
+
+
+def test_the_c_entry_s_x_times_a_checks_saved_tensors_like_torch():
+    """x^T is saved for A's gradient and A's values for x's, so writing either in place
+    between the forward and the backward is an error, as on the Python path. (With A
+    requiring grad too, a write to its values fails the backward with a different message,
+    on every path; see test_a_values_write_fails_the_backward_on_every_path.)"""
+    a = _planned_right(dense_matrix().to_sparse_csr(), 4).requires_grad_()
+    x = rand(4, 7).requires_grad_()
+    out = scorch.matmul(x, a)
+    assert _right_node(out) == C_NODE_T
+    with torch.no_grad():
+        x.mul_(2.0)
+    with pytest.raises(RuntimeError, match="modified by an inplace operation"):
+        out.sum().backward()
+    a.requires_grad_(False)
+    out = scorch.matmul(x, a)
+    assert _right_node(out) == C_NODE_T
+    with torch.no_grad():
+        a.values().mul_(2.0)
+    with pytest.raises(RuntimeError, match="modified by an inplace operation"):
+        out.sum().backward()
+
+
+@pytest.mark.parametrize("path", ["c entry", "python"])
+@pytest.mark.parametrize("side", ["A @ B", "x @ A"])
+def test_a_values_write_fails_the_backward_on_every_path(path, side):
+    """A requiring grad, its values written in place between the forward and the backward:
+    the backward fails, on every path. torch.sparse.mm reports "modified by an inplace
+    operation"; scorch's paths save A.values(), a view of A, and torch fails regenerating
+    that view's history instead ("Sparse CSR tensors do not have strides"). The message
+    differs from torch's; what matters here is that no gradient is computed."""
+    d = dense_matrix()
+    if side == "A @ B":
+        a = _planned(d.to_sparse_csr(), rand(5, 3))
+        dense = rand(5, 3).requires_grad_()
+        run = lambda: scorch.matmul(a, dense)  # noqa: E731
+    else:
+        a = _planned_right(d.to_sparse_csr(), 4)
+        dense = rand(4, 7).requires_grad_()
+        run = lambda: scorch.matmul(dense, a)  # noqa: E731
+    a.requires_grad_()
+    if path == "python":
+        scorch_ops.set_planned_matmul_backward(None)
+        scorch_ops.set_planned_matmul_right(None)
+    try:
+        out = run()
+        node = out.grad_fn.name() if side == "A @ B" else _right_node(out)
+        assert ("PlannedMatmulGrad" in node) == (path == "c entry")
+        with torch.no_grad():
+            a.values().mul_(2.0)
+        with pytest.raises(RuntimeError):
+            out.sum().backward()
+        assert dense.grad is None
+    finally:
+        scorch_ops.set_planned_matmul_backward(grad_mod.planned_mm_backward)
+        _restore_right()
+
+
+def test_the_c_entry_s_x_times_a_differentiates_twice():
+    a = _planned_right(dense_matrix().to_sparse_csr(), 3)
+    x = rand(3, 7).requires_grad_()
+    assert _right_node(scorch.matmul(x, a)) == C_NODE_T
+    served = _served(a)
+    assert torch.autograd.gradcheck(lambda x_: scorch.matmul(x_, a), (x,))
+    assert torch.autograd.gradgradcheck(lambda x_: scorch.matmul(x_, a) ** 2, (x,))
+    assert _served(a) > served, "gradcheck went through the C entry"
+
+
+def test_the_c_entry_s_x_times_a_leaves_the_shared_transpose_s_buffer_alone():
+    """Operands over the same index arrays share autograd.py's transpose, and with it the
+    values buffer of its carrier, whose writers serialize on the structure's lock (held across
+    gather_values, which releases the GIL). The C entry does not take that lock: it gathers
+    into its record's own buffer, so an x @ A it serves leaves the carrier's as the last
+    product through it left it."""
+    d = dense_matrix(rows=40, cols=30, density=0.2)
+    base = d.to_sparse_csr()
+    crow, col = base.crow_indices(), base.col_indices()
+    a1 = torch.sparse_csr_tensor(crow, col, base.values().clone(), d.shape)
+    a1 = _planned_right(a1, 3)
+    a2 = torch.sparse_csr_tensor(crow, col, base.values() * 2.0, d.shape)
+    x = rand(3, 40)
+    torch.testing.assert_close(scorch.matmul(x, a2), x @ (2.0 * d), **tolerance(d.dtype))
+    structure, _ = grad_mod._torch_operand(a2)[0].stored.transpose()
+    assert structure is grad_mod._torch_operand(a1)[0].stored.transpose()[0]
+    carrier_buffer = structure._carriers[d.dtype][1]
+    snapshot = carrier_buffer.clone()
+    before = _served(a1)
+    out = scorch.matmul(x, a1)
+    assert _served(a1) == before + 1
+    torch.testing.assert_close(out, x @ d, **tolerance(d.dtype))
+    assert torch.equal(carrier_buffer, snapshot)
+    for tp in plan_mod.transposed_plans_of(a1).values():
+        assert tp.buffer.data_ptr() != carrier_buffer.data_ptr()
+
+
+def test_an_operand_s_records_of_one_transpose_share_one_buffer():
+    a = dense_matrix(rows=40, cols=30, density=0.2).to_sparse_csr()
+    _planned_right(a, 3)
+    _planned_right(a, 5)
+    first, second = plan_mod.transposed_plans_of(a).values()
+    assert {first.free_dim, second.free_dim} == {3, 5}
+    assert first.buffer.data_ptr() == second.buffer.data_ptr()
+
+
+def test_x_times_a_s_record_lives_with_its_operand():
+    a = _planned_right(dense_matrix().to_sparse_csr(), 2)
+    plan_mod.forget(a)
+    assert not plan_mod.transposed_plans_of(a)
+    a = _planned_right(a, 2)
+    key = id(a)
+    del a
+    gc.collect()
+    assert key not in plan_mod.TORCH_OPERANDS
+
+
+# --------------------------------------------------------------------------- #
 # The cached structure
 # --------------------------------------------------------------------------- #
 
@@ -837,8 +1110,9 @@ def test_gathered_run_declines_what_run_declines(kind, dtype, panels):
 @pytest.mark.parametrize("kind", ["csr", "stensor"])
 def test_the_planned_transpose_gathers_values_written_through_data(kind, monkeypatch):
     """x @ A once A's transpose carries a plan: the plan gathers A's values on every call
-    (planned_matmul_gathered serves it), so a write through .data -- which moves no version
-    counter -- reaches the next product."""
+    (planned_matmul_gathered serves it, and for a torch CSR operand, once that has recorded
+    itself, the C entry), so a write through .data -- which moves no version counter --
+    reaches the next product."""
     served = []
     real = scorch_ops.planned_matmul_gathered
 
@@ -862,4 +1136,9 @@ def test_the_planned_transpose_gathers_values_written_through_data(kind, monkeyp
             ).to_dense()
         )
         torch.testing.assert_close(got, want, **tolerance(torch.float32))
-    assert served[-3:] == [True, True, True]
+    if kind == "csr":
+        # Sighted, planned, served by the carrier's plan (which records itself), then
+        # served by the C entry from that record.
+        assert served == [False, False, True] and _served(a) == 3
+    else:
+        assert served[-3:] == [True, True, True]

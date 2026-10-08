@@ -208,8 +208,13 @@ class _Structure:
         values: torch.Tensor,
         b: torch.Tensor,
         perm: Optional[torch.Tensor] = None,
+        owner: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """This structure with ``values`` (or ``values[perm]``) times ``b``.
+
+        ``owner``, with ``perm``, is the torch CSR operand this structure is the transpose of,
+        when the product is its ``x @ A``: a planned product then records itself in the
+        operand's state, from which the C entry serves the operand's next ``x @ A``.
 
         Runs on an STensor this structure keeps for the dtype, so the call is planned
         like any repeated product. Its values buffer is refilled on every call: a write
@@ -246,7 +251,7 @@ class _Structure:
             # until then, gather_values fills the buffer and the ordinary path plans the
             # product.
             values = values.contiguous()
-            served = _native.planned_matmul_gathered(carrier, b, values, perm)
+            served = _native.planned_matmul_gathered(carrier, b, values, perm, owner)
             if served is not None:
                 return cast(torch.Tensor, served)
             _native.gather_values(values, perm, buffer, _nthreads())
@@ -368,12 +373,17 @@ class _Operand:
             return structure.mm(values, b, perm)
         return self.stored.mm(values, b)
 
-    def mm_t(self, values: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
-        """``A^T @ b``."""
+    def mm_t(
+        self, values: torch.Tensor, b: torch.Tensor, right: bool = False
+    ) -> torch.Tensor:
+        """``A^T @ b``. ``right`` when it is computed as ``x @ A`` with ``b = x^T``: for a torch
+        CSR operand the product then records itself for the C entry (``_Structure.mm``).
+        """
         if self.transposed:
             return self.stored.mm(values, b)
         structure, perm = self.stored.transpose()
-        return structure.mm(values, b, perm)
+        owner = self.owner if right and type(self.owner) is torch.Tensor else None
+        return structure.mm(values, b, perm, owner)
 
     def sddmm(self, x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
         """``x[i, :] . y[j, :]`` for each stored ``A[i, j]``, in storage order."""
@@ -473,6 +483,33 @@ def _mm_backward(
     return gv, gb
 
 
+def _mm_t_backward(
+    op: _Operand,
+    values: Optional[torch.Tensor],
+    b: Optional[torch.Tensor],
+    g: torch.Tensor,
+    want_values: bool,
+    want_b: bool,
+    b_transposed: bool,
+) -> Tuple[Optional[torch.Tensor], Optional[torch.Tensor]]:
+    """The gradients of ``A(values)^T @ b`` given the output's gradient ``g``: of the values,
+    ``SDDMM(b, g)``, and of ``b``, ``A @ g``; recorded under grad mode, as in
+    :func:`_mm_backward`."""
+    graph = torch.is_grad_enabled()
+    gv = gb = None
+    if want_values:
+        assert b is not None
+        # d/dA[i, j] of sum_j (A^T b)[j, :] . g[j, :] is b[i, :] . g[j, :].
+        gv = _SparseSDDMM.apply(op, b, g) if graph else op.sddmm(b, g)
+    if want_b:
+        assert values is not None
+        if graph:
+            gb = _SparseMM.apply(op, values, g)
+        else:
+            gb = _in_layout(op.mm(values, g), b_transposed)
+    return gv, gb
+
+
 def planned_mm_backward(
     a: torch.Tensor,
     values: Optional[torch.Tensor],
@@ -498,6 +535,27 @@ def planned_mm_backward(
     return _mm_backward(held[0], values, b, g, want_values, want_b, False)
 
 
+def planned_mm_t_backward(
+    a: torch.Tensor,
+    values: Optional[torch.Tensor],
+    b: Optional[torch.Tensor],
+    g: torch.Tensor,
+    want_values: bool,
+    want_b: bool,
+    b_transposed: bool,
+) -> Tuple[Optional[torch.Tensor], Optional[torch.Tensor]]:
+    """The backward of ``x @ A`` for a torch CSR ``a`` whose product the C entry point served
+    and recorded itself (csrc/planned_matmul.h, PlannedMatmulGradT): :class:`_SparseMMT`'s
+    gradients by the same code. ``b`` is ``x^T``, and ``b_transposed`` whether it is laid out
+    as the transpose of a contiguous matrix, as ``_SparseMMT`` records it."""
+    held = _torch_operand(a)
+    if held is None:  # unreachable: the C entry serves only 2-D torch CSR operands
+        raise RuntimeError(
+            "scorch: a planned product's operand is no longer sparse CSR"
+        )
+    return _mm_t_backward(held[0], values, b, g, want_values, want_b, b_transposed)
+
+
 class _SparseMMT(torch.autograd.Function):
     """``A(values)^T @ b``."""
 
@@ -506,23 +564,15 @@ class _SparseMMT(torch.autograd.Function):
         ctx: Any, op: _Operand, values: torch.Tensor, b: torch.Tensor
     ) -> torch.Tensor:
         _record(ctx, op, values, b)
-        return _in_layout(op.mm_t(values, b), ctx.b_transposed)
+        return _in_layout(op.mm_t(values, b, right=True), ctx.b_transposed)
 
     @staticmethod
     def backward(ctx: Any, g: torch.Tensor):
         values, b = ctx.saved_tensors
-        op = ctx.op
-        graph = torch.is_grad_enabled()
-        gv = gb = None
-        if ctx.needs_input_grad[1]:
-            # d/dA[i, j] of sum_j (A^T b)[j, :] . g[j, :] is b[i, :] . g[j, :].
-            gv = _SparseSDDMM.apply(op, b, g) if graph else op.sddmm(b, g)
-        if ctx.needs_input_grad[2]:
-            if graph:
-                gb = _SparseMM.apply(op, values, g)
-            else:
-                gb = _in_layout(op.mm(values, g), ctx.b_transposed)
-        return None, gv, gb
+        need = ctx.needs_input_grad
+        return (None,) + _mm_t_backward(
+            ctx.op, values, b, g, need[1], need[2], ctx.b_transposed
+        )
 
     @staticmethod
     def jvp(ctx: Any, _op: Any, dv: Optional[torch.Tensor], db: Optional[torch.Tensor]):
@@ -832,7 +882,7 @@ def right_product(a: Any, b: Any) -> Optional[torch.Tensor]:
     if x.dim() == 1:
         return op.mm_t(values, x.unsqueeze(1)).squeeze(1)
     xt = x.t()
-    return _in_layout(op.mm_t(values, xt), _transposed_layout(xt)).t()
+    return _in_layout(op.mm_t(values, xt, right=True), _transposed_layout(xt)).t()
 
 
 class _NotDifferentiable(torch.autograd.Function):

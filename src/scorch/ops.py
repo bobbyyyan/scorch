@@ -38,6 +38,7 @@ from .plan import PLANS_ATTR as _PLANS_ATTR
 from .plan import MAX_PLANS_PER_OPERAND as _PLAN_MAX_PER_OPERAND
 from .plan import SEEN_ATTR as _PLAN_SEEN_ATTR
 from .plan import TORCH_OPERANDS as _PLAN_TORCH_OPERANDS
+from .plan import TRANSPOSED_PLANS_ATTR as _PLAN_TRANSPOSED_ATTR
 from .plan import _drop_torch_operand as _plan_drop_torch_operand
 from .plan import _OperandRef as _PlanOperandRef
 from .plan import install as _plan_install
@@ -1233,6 +1234,11 @@ if _install_planned_matmul is not None:
     _set_mm_backward = getattr(_scorch_ops, "set_planned_matmul_backward", None)
     if _set_mm_backward is not None:
         _set_mm_backward(_autograd.planned_mm_backward)
+    # And x @ A for a torch CSR A, once its transposed product has a plan (planned_matmul.h,
+    # PlannedMatmulGradT), with this as its backward.
+    _set_right = getattr(_scorch_ops, "set_planned_matmul_right", None)
+    if _set_right is not None:
+        _set_right(_autograd.planned_mm_t_backward, _PLAN_TRANSPOSED_ATTR)
 
 
 # Activation codes for the fused Linear kernel (must match spmm.h

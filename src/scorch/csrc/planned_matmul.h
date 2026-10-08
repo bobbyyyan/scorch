@@ -86,6 +86,12 @@ struct PlannedMatmul {
   // autograd.planned_mm_backward: the backward of a product PlannedMatmulGrad recorded. Unset,
   // every product autograd must record goes to the Python function.
   PyObject* mm_backward = nullptr;
+  // x @ A for a torch CSR A (see planned_matmul_torch_right): autograd.planned_mm_t_backward, the
+  // backward of a product PlannedMatmulGradT recorded, and the interned name under which an
+  // operand's state holds its TransposedProductPlans (plan.TRANSPOSED_PLANS_ATTR). Unset, every
+  // x @ A goes to the Python function.
+  PyObject* mm_t_backward = nullptr;
+  PyObject* tplans_attr = nullptr;
 };
 
 inline PlannedMatmul& planned_matmul_state() {
@@ -93,28 +99,34 @@ inline PlannedMatmul& planned_matmul_state() {
   return state;
 }
 
-// The key a plan is stored under, ((b rows, b cols), b dtype, generation), as a new reference;
-// nullptr with an error set if it cannot be built.
-inline PyObject* planned_matmul_key(const PlannedMatmul& s, const at::Tensor& bt) {
+// The key a plan for a dense operand of these sizes and dtype is stored under, (sizes, dtype,
+// generation), as a new reference; nullptr with an error set if it cannot be built.
+inline PyObject* planned_matmul_key_sizes(const PlannedMatmul& s, c10::IntArrayRef sizes,
+                                          at::ScalarType dtype) {
   if (!PyList_CheckExact(s.generation) || PyList_GET_SIZE(s.generation) < 1) {
     PyErr_SetString(PyExc_RuntimeError, "plan generation cell is malformed");
     return nullptr;
   }
-  const int64_t dim = bt.dim();
+  const int64_t dim = (int64_t)sizes.size();
   PyObject* shape = PyTuple_New(dim);
   if (shape == nullptr) return nullptr;
   for (int64_t d = 0; d < dim; ++d) {
-    PyObject* extent = PyLong_FromLongLong(bt.size(d));
+    PyObject* extent = PyLong_FromLongLong(sizes[d]);
     if (extent == nullptr) {
       Py_DECREF(shape);
       return nullptr;
     }
     PyTuple_SET_ITEM(shape, d, extent);
   }
-  PyObject* key = PyTuple_Pack(3, shape, reinterpret_cast<PyObject*>(torch::getTHPDtype(bt.scalar_type())),
+  PyObject* key = PyTuple_Pack(3, shape, reinterpret_cast<PyObject*>(torch::getTHPDtype(dtype)),
                                PyList_GET_ITEM(s.generation, 0));
   Py_DECREF(shape);
   return key;
+}
+
+// The key a plan for `a @ bt` is stored under, ((b rows, b cols), b dtype, generation).
+inline PyObject* planned_matmul_key(const PlannedMatmul& s, const at::Tensor& bt) {
+  return planned_matmul_key_sizes(s, bt.sizes(), bt.scalar_type());
 }
 
 inline SpmmCsrPlan* planned_matmul_cast(PyObject* plan_obj) {
@@ -135,6 +147,120 @@ inline SpmmCsrPlan* planned_matmul_find(PyObject* plans, PyObject* key) {
   }
   return planned_matmul_cast(plan_obj);
 }
+
+// ---------------------------------------------------------------------------
+// x @ A for a torch CSR A
+//
+// autograd.py computes x @ A as (A^T @ x^T)^T on A's transposed structure, whose product is planned
+// like any other: an STensor over the transpose's index arrays (the carrier), whose values are A's,
+// carried across by a permutation and refilled on every call. Through the Python function that is
+// the whole path on every call, and where a gradient is wanted a Python autograd Function records
+// it. On an M5, a cold training step through x @ A on a matrix of under 600 nonzeros took a median
+// 34.8 us more than one through A @ B, which this file records (36 cells; torch's two differ by
+// 3.1 us), and was slower than torch.mm's in 52 of 1200 cold readings, where A @ B was in none.
+//
+// So once the transposed product has a plan, x @ A is served, and recorded, here. The plan is found
+// through the operand's own state: whenever planned_matmul_gathered serves the transposed product
+// of a torch CSR operand (its `owner`), it records in that operand's state a TransposedProductPlan
+// for it -- the carrier's plan, the permutation, and the operand's index arrays the transpose was
+// built from -- under the key that product's plan is stored under. A call is served only while
+// the operand is as it was then: the same index buffers and lengths, and the same version. The
+// version is the operand's own counter, which torch shares with every alias its crow_indices(),
+// col_indices() and values() return, so a write through any of them moves it, while the member
+// arrays read here keep counters of their own that such a write does not move. It is the counter
+// autograd.py's structure cache compares (through the aliases), so a call this declines is one
+// whose structure and transpose that cache rebuilds.
+//
+// The transposed values are gathered into a buffer of the record's own, not the carrier's. The
+// carrier's buffer belongs to autograd.py's structure, shared by every operand over the same index
+// arrays, and its writers serialize on that structure's lock, which they hold across gather_values
+// with the GIL released; a writer here holds only the GIL. So the record's buffer is written only
+// here, with the GIL held from the fill to the end of the product (plan runs do not release it),
+// and an operand's records of one transpose share one buffer.
+struct TransposedProductPlan {
+  TransposedProductPlan(py::object plan, SpmmCsrPlan* product, torch::Tensor buffer,
+                        torch::Tensor perm, torch::Tensor positions, torch::Tensor coordinates,
+                        uint32_t operand_version)
+      : plan_(std::move(plan)),
+        product_(product),
+        buffer_(std::move(buffer)),
+        perm_(std::move(perm)),
+        positions_(std::move(positions)),
+        coordinates_(std::move(coordinates)),
+        positions_data_(positions_.data_ptr()),
+        coordinates_data_(coordinates_.data_ptr()),
+        operand_version_(operand_version) {}
+
+  // Whether an operand whose members are these index arrays, at this version, is the one this
+  // was recorded from, unchanged since. It holds the arrays it was recorded from, so no other
+  // buffer can occupy the recorded addresses.
+  bool built_from(const at::Tensor& positions, const at::Tensor& coordinates,
+                  uint32_t operand_version) const {
+    return positions.defined() && coordinates.defined() &&
+           positions.data_ptr() == positions_data_ &&
+           coordinates.data_ptr() == coordinates_data_ &&
+           positions.numel() == positions_.numel() &&
+           coordinates.numel() == coordinates_.numel() && operand_version == operand_version_;
+  }
+
+  // Whether this records exactly this carrier plan and permutation.
+  bool records(const SpmmCsrPlan* product, const at::Tensor& perm) const {
+    return product == product_ && perm.is_same(perm_);
+  }
+
+  // The buffer this gathers into, for another record of the same transpose (same permutation)
+  // and dtype to share; undefined otherwise.
+  torch::Tensor buffer_for(const at::Tensor& perm, at::ScalarType dtype) const {
+    return perm.is_same(perm_) && buffer_.scalar_type() == dtype ? buffer_ : torch::Tensor();
+  }
+
+  // A^T @ m, A's values being `values`: SpmmCsrPlan::run_gathered on the transpose's plan, which
+  // leaves this record's buffer holding A^T's values. nullopt where that declines.
+  c10::optional<torch::Tensor> run(const at::Tensor& values, const at::Tensor& m,
+                                   int64_t nthreads, bool atparallel) {
+    c10::optional<torch::Tensor> out =
+        product_->run_gathered(buffer_, values, perm_, m, nthreads, atparallel);
+    if (out.has_value()) ++served_;
+    return out;
+  }
+
+  int64_t served() const { return served_; }
+  int64_t free_dim() const { return product_->free_dim(); }
+  torch::Tensor buffer() const { return buffer_; }  // for tests
+
+ private:
+  py::object plan_;  // the carrier's plan object, which product_ points into: kept alive here
+  SpmmCsrPlan* product_;
+  torch::Tensor buffer_;
+  torch::Tensor perm_;
+  torch::Tensor positions_;
+  torch::Tensor coordinates_;
+  const void* positions_data_;
+  const void* coordinates_data_;
+  uint32_t operand_version_;
+  int64_t served_ = 0;
+};
+
+// The TransposedProductPlan stored in `held` under `key`, or nullptr with no error set.
+inline TransposedProductPlan* planned_matmul_find_transposed(PyObject* held, PyObject* key) {
+  if (held == nullptr || !PyDict_CheckExact(held)) return nullptr;
+  PyObject* obj = PyDict_GetItemWithError(held, key);  // borrowed
+  if (obj == nullptr) {
+    PyErr_Clear();
+    return nullptr;
+  }
+  try {
+    return py::handle(obj).cast<TransposedProductPlan*>();
+  } catch (const py::cast_error&) {
+    return nullptr;
+  }
+}
+
+// Defined with the torch operands below; called by planned_matmul_gathered.
+inline void planned_matmul_record_transposed(const PlannedMatmul& s, py::handle owner,
+                                             PyObject* key, PyObject* plan_obj,
+                                             SpmmCsrPlan* plan, const torch::Tensor& buffer,
+                                             const torch::Tensor& perm);
 
 inline int64_t planned_matmul_nthreads(const PlannedMatmul& s) {
   return s.match_host_threads ? (int64_t)at::get_num_threads() : -1;
@@ -200,9 +326,11 @@ inline PyObject* planned_matmul_try(const PlannedMatmul& s, PyObject* a, PyObjec
 // transpose -- with `b`, by the plan `a` holds for `b`: SpmmCsrPlan::run_gathered, which leaves
 // `a`'s values filled. None when no plan serves it (none yet for this `b`, plans disabled, or a
 // decline); the caller then fills the values itself and runs the ordinary path, which plans a
-// product it sees again.
+// product it sees again. `owner`, when it is the torch CSR operand whose transpose `a` carries,
+// is given a TransposedProductPlan for a served product, so that its x @ A is served here next.
 inline py::object planned_matmul_gathered(py::handle a, const torch::Tensor& b,
-                                          const torch::Tensor& src, const torch::Tensor& perm) {
+                                          const torch::Tensor& src, const torch::Tensor& perm,
+                                          py::handle owner) {
   const PlannedMatmul& s = planned_matmul_state();
   if (s.plans_attr == nullptr || s.storage_attr == nullptr || s.value_attr == nullptr ||
       !PyList_CheckExact(s.enabled) || PyList_GET_SIZE(s.enabled) < 1 ||
@@ -223,10 +351,13 @@ inline py::object planned_matmul_gathered(py::handle a, const torch::Tensor& b,
       storage ? PyObject_GetAttr(storage.ptr(), s.value_attr) : nullptr);
   PyErr_Clear();
   if (!values || !THPVariable_Check(values.ptr())) return py::none();
+  const torch::Tensor& buffer = THPVariable_Unpack(values.ptr());
   c10::optional<torch::Tensor> served =
-      plan->run_gathered(THPVariable_Unpack(values.ptr()), src, perm, b,
-                         planned_matmul_nthreads(s), s.atparallel);
+      plan->run_gathered(buffer, src, perm, b, planned_matmul_nthreads(s), s.atparallel);
   if (!served.has_value()) return py::none();
+  if (!owner.is_none())
+    planned_matmul_record_transposed(s, owner, key.ptr(),
+                                     PyDict_GetItemWithError(plans, key.ptr()), plan, buffer, perm);
   return py::reinterpret_steal<py::object>(THPVariable_Wrap(std::move(*served)));
 }
 
@@ -305,6 +436,81 @@ inline void planned_matmul_record_sighting(const PlannedMatmul& s, PyObject* a, 
   Py_XDECREF(fresh_state);
   Py_XDECREF(seen);
   Py_DECREF(ref);
+}
+
+// Records in torch CSR `owner`'s state that its transposed product under `key` is served by the
+// carrier plan `plan_obj` (`plan`) with this permutation, unless that is what it already holds.
+// `buffer` is the carrier's values buffer: the record gathers into one of its own, of the same
+// dtype and length (see TransposedProductPlan). Bounded like its plans
+// (plan.MAX_PLANS_PER_OPERAND keys). Never fails the call it follows: any error is cleared. Only
+// an operand with an entry in plan.TORCH_OPERANDS has a state to record in, and autograd.py makes
+// that entry before it computes the product.
+inline void planned_matmul_record_transposed(const PlannedMatmul& s, py::handle owner,
+                                             PyObject* key, PyObject* plan_obj,
+                                             SpmmCsrPlan* plan, const torch::Tensor& buffer,
+                                             const torch::Tensor& perm) {
+  if (s.tplans_attr == nullptr || plan_obj == nullptr ||
+      !planned_matmul_torch_csr(s, owner.ptr())) {
+    PyErr_Clear();
+    return;
+  }
+  py::object id = py::reinterpret_steal<py::object>(PyLong_FromVoidPtr(owner.ptr()));
+  PyObject* state = id ? planned_matmul_torch_state(s, owner.ptr(), id.ptr()) : nullptr;
+  if (state == nullptr) {
+    PyErr_Clear();
+    return;
+  }
+  PyObject* held = PyDict_GetItemWithError(state, s.tplans_attr);  // borrowed
+  if (held == nullptr) {
+    if (PyErr_Occurred()) {
+      PyErr_Clear();
+      return;
+    }
+    py::object fresh = py::reinterpret_steal<py::object>(PyDict_New());
+    if (!fresh || PyDict_SetItem(state, s.tplans_attr, fresh.ptr()) < 0) {
+      PyErr_Clear();
+      return;
+    }
+    held = fresh.ptr();  // the state holds it now
+  }
+  if (!PyDict_CheckExact(held)) return;
+  const at::Tensor& operand = THPVariable_Unpack(owner.ptr());
+  auto* impl = at::sparse_csr::get_sparse_csr_impl(operand);
+  const at::Tensor& positions = impl->compressed_indices();
+  const at::Tensor& coordinates = impl->plain_indices();
+  const uint32_t version = abi_version_of(operand);
+  if (PyDict_Contains(held, key) == 1) {
+    TransposedProductPlan* current = planned_matmul_find_transposed(held, key);
+    if (current != nullptr && current->records(plan, perm) &&
+        current->built_from(positions, coordinates, version))
+      return;
+  } else if (PyDict_GET_SIZE(held) >= s.max_plans) {
+    PyErr_Clear();
+    return;
+  }
+  PyErr_Clear();
+  try {
+    // Another record of this transpose (another free dimension) lends its buffer.
+    torch::Tensor own;
+    PyObject* other_key;
+    PyObject* other;
+    Py_ssize_t pos = 0;
+    while (!own.defined() && PyDict_Next(held, &pos, &other_key, &other)) {
+      TransposedProductPlan* tp = planned_matmul_find_transposed(held, other_key);
+      if (tp != nullptr) own = tp->buffer_for(perm, buffer.scalar_type());
+    }
+    if (!own.defined()) {
+      // An ordinary tensor even under inference_mode, as autograd.py makes the carrier's.
+      c10::InferenceMode not_inference(false);
+      own = at::empty_like(buffer, at::MemoryFormat::Contiguous);
+    }
+    py::object fresh = py::cast(TransposedProductPlan(py::reinterpret_borrow<py::object>(plan_obj),
+                                                      plan, std::move(own), perm, positions,
+                                                      coordinates, version));
+    if (PyDict_SetItem(held, key, fresh.ptr()) < 0) PyErr_Clear();
+  } catch (const std::exception&) {
+    PyErr_Clear();
+  }
 }
 
 // What the ordinary path has to do about plans for a torch operand's call this path did not
@@ -489,6 +695,135 @@ inline PyObject* planned_matmul_torch_grad(const PlannedMatmul& s, PyObject* a, 
       PlannedMatmulGrad::apply(values, bt, PlannedMatmulProduct{at_a, std::move(*served)}));
 }
 
+// x @ A's recorded product, as autograd._SparseMMT records it: A(values)^T @ b with b = x^T, whose
+// output the caller receives transposed. Its backward is autograd.planned_mm_t_backward, the same
+// gradients by the same code as _SparseMMT's.
+struct PlannedMatmulGradT : public torch::autograd::Function<PlannedMatmulGradT> {
+  static at::Tensor forward(torch::autograd::AutogradContext* ctx, const at::Tensor& values,
+                            const at::Tensor& b, PlannedMatmulProduct product, bool b_transposed) {
+    ctx->saved_data["a"] = std::move(product.a);
+    ctx->saved_data["b_transposed"] = b_transposed;
+    // As autograd._record saves them: b's gradient reads the values, the values' gradient reads b.
+    ctx->save_for_backward({b.requires_grad() ? values : at::Tensor(),
+                            values.requires_grad() ? b : at::Tensor()});
+    return std::move(product.out);
+  }
+
+  static torch::autograd::variable_list backward(torch::autograd::AutogradContext* ctx,
+                                                 torch::autograd::variable_list grads) {
+    const bool want_values = ctx->needs_input_grad(0), want_b = ctx->needs_input_grad(1);
+    torch::autograd::variable_list out(4);  // values, b, the product and the layout flag
+    if (!grads[0].defined() || !(want_values || want_b)) return out;
+    torch::autograd::variable_list saved = ctx->get_saved_variables();  // checks versions
+    pybind11::gil_scoped_acquire gil;
+    PyObject* fn = planned_matmul_state().mm_t_backward;
+    TORCH_CHECK(fn != nullptr, "scorch: x @ A's planned backward is no longer installed");
+    THPObjectPtr a(THPVariable_Wrap(ctx->saved_data["a"].toTensor()));
+    THPObjectPtr values(THPVariable_Wrap(saved[0]));
+    THPObjectPtr b(THPVariable_Wrap(saved[1]));
+    THPObjectPtr g(THPVariable_Wrap(grads[0]));
+    const bool b_transposed = ctx->saved_data["b_transposed"].toBool();
+    THPObjectPtr result;
+    if (a && values && b && g)
+      result = PyObject_CallFunctionObjArgs(fn, a.get(), values.get(), b.get(), g.get(),
+                                            want_values ? Py_True : Py_False,
+                                            want_b ? Py_True : Py_False,
+                                            b_transposed ? Py_True : Py_False, nullptr);
+    if (!result) {
+      python_error err;
+      err.persist();
+      throw std::move(err);
+    }
+    TORCH_CHECK(PyTuple_Check(result.get()) && PyTuple_GET_SIZE(result.get()) == 2,
+                "scorch: planned_mm_t_backward must return (values' gradient, b's gradient)");
+    for (Py_ssize_t i = 0; i < 2; ++i) {
+      PyObject* item = PyTuple_GET_ITEM(result.get(), i);
+      if (item == Py_None) continue;
+      TORCH_CHECK(THPVariable_Check(item), "scorch: planned_mm_t_backward returned a non-tensor");
+      out[i] = THPVariable_Unpack(item);
+    }
+    return out;
+  }
+};
+
+// t's transpose, contiguous, as autograd._transpose makes it: scorch's blocked transpose for
+// float32 (ops.fast_transpose, on the same thread count), torch's copy otherwise.
+inline at::Tensor planned_matmul_dense_transpose(const PlannedMatmul& s, const at::Tensor& t) {
+  if (t.scalar_type() == at::kFloat)
+    return scorch_transpose_2d_float(t, static_cast<int>(planned_matmul_nthreads(s)));
+  return t.t().contiguous();
+}
+
+// x @ A for a dense `x` and a torch CSR `a` whose transposed product holds a TransposedProductPlan
+// (see above), computed as autograd.py computes it and, when `grad`, recorded as it records it:
+// _SparseMMT.apply(op, values, x.t()).t(), or right_product's unrecorded (A^T @ x^T)^T. The result
+// as a new reference, or nullptr with no error set when the Python function is to compute it.
+//
+// Served only for a contiguous float32 or float64 CPU x of A's dtype whose columns are A's rows,
+// exactly torch.Tensor (a Parameter goes to the Python function, as for A @ B), with no
+// forward-mode tangent and no functorch transform; anything else, including a shape error to raise,
+// goes there.
+inline PyObject* planned_matmul_torch_right(const PlannedMatmul& s, PyObject* x, PyObject* a,
+                                            bool grad) {
+  if (s.tplans_attr == nullptr || (grad && s.mm_t_backward == nullptr)) return nullptr;
+  const at::Tensor& xt = THPVariable_Unpack(x);
+  const at::Tensor& at_a = THPVariable_Unpack(a);
+  const at::ScalarType dtype = xt.scalar_type();
+  if (xt.layout() != c10::kStrided || xt.dim() != 2 || !xt.is_contiguous() || xt.is_neg() ||
+      xt.is_conj() || !xt.device().is_cpu() || !at_a.device().is_cpu() ||
+      (dtype != at::kFloat && dtype != at::kDouble) || at_a.scalar_type() != dtype ||
+      xt.size(1) != at_a.size(0))
+    return nullptr;
+  if (at::functorch::functorchTLSAccessor() ||
+      (grad && (xt._fw_grad(/*level=*/0).defined() || at_a._fw_grad(/*level=*/0).defined())))
+    return nullptr;
+  // b = x^T, the dense operand of A^T @ b, keyed by its shape as the carrier's plan is.
+  const int64_t sizes[2] = {xt.size(1), xt.size(0)};
+  py::object key = py::reinterpret_steal<py::object>(planned_matmul_key_sizes(s, sizes, dtype));
+  py::object id = py::reinterpret_steal<py::object>(key ? PyLong_FromVoidPtr(a) : nullptr);
+  TransposedProductPlan* tp = nullptr;
+  PyObject* held = nullptr;  // borrowed from the operand's state
+  if (key && id) {
+    if (PyObject* state = planned_matmul_torch_state(s, a, id.ptr())) {
+      held = PyDict_GetItemWithError(state, s.tplans_attr);
+      tp = planned_matmul_find_transposed(held, key.ptr());
+    }
+  }
+  PyErr_Clear();
+  if (tp == nullptr) return nullptr;
+  auto* impl = at::sparse_csr::get_sparse_csr_impl(at_a);
+  if (!tp->built_from(impl->compressed_indices(), impl->plain_indices(), abi_version_of(at_a))) {
+    // Recorded before a write to the operand: it can never serve again, and it holds the plan of a
+    // transpose autograd.py is about to rebuild. The product that next serves records afresh.
+    if (PyDict_DelItem(held, key.ptr()) < 0) PyErr_Clear();
+    return nullptr;
+  }
+  // autograd._transposed_layout(b): b = x^T is the transpose of a contiguous matrix unless it is
+  // contiguous itself, which it is when x has one row or one column.
+  at::Tensor b = xt.t();
+  const bool b_transposed = !b.is_contiguous();
+  at::Tensor out;
+  {
+    at::AutoGradMode no_grad(false);  // recorded below, once
+    c10::optional<torch::Tensor> served;
+    {
+      // autograd._plain(b): b's transpose's transpose, made contiguous by scorch's transpose.
+      // Released before the result's transpose is allocated, as the Python function releases it.
+      at::Tensor m = b_transposed ? planned_matmul_dense_transpose(s, xt) : b;
+      served = tp->run(impl->values().contiguous(), m, planned_matmul_nthreads(s), s.atparallel);
+    }
+    if (!served.has_value()) return nullptr;
+    // autograd._in_layout(result, b_transposed)
+    out = b_transposed ? planned_matmul_dense_transpose(s, *served).t() : std::move(*served);
+  }
+  if (!grad) return THPVariable_Wrap(out.t());
+  // torch's values(), sharing `a`'s version counter, as PlannedMatmulGrad saves it.
+  at::Tensor values = at_a.values();
+  at::Tensor recorded = PlannedMatmulGradT::apply(
+      values, b, PlannedMatmulProduct{at_a, std::move(out)}, b_transposed);
+  return THPVariable_Wrap(recorded.t());
+}
+
 inline PyObject* planned_matmul_call(PyObject* /*module*/, PyObject* const* args,
                                      Py_ssize_t nargsf, PyObject* kwnames) {
   HANDLE_TH_ERRORS
@@ -507,6 +842,11 @@ inline PyObject* planned_matmul_call(PyObject* /*module*/, PyObject* const* args
       if (!b_grad && !planned_matmul_wants_grad(THPVariable_Unpack(args[0])))
         return planned_matmul_torch_call(s, args[0], args[1], args, nargsf);
       PyObject* served = planned_matmul_torch_grad(s, args[0], args[1]);
+      if (served != nullptr || PyErr_Occurred()) return served;
+    } else if (reinterpret_cast<PyObject*>(Py_TYPE(args[0])) == s.tensor_type &&
+               planned_matmul_torch_csr(s, args[1])) {
+      const bool grad = b_grad || planned_matmul_wants_grad(THPVariable_Unpack(args[0]));
+      PyObject* served = planned_matmul_torch_right(s, args[0], args[1], grad);
       if (served != nullptr || PyErr_Occurred()) return served;
     }
   }

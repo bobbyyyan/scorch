@@ -53,6 +53,10 @@ DECLINES_ATTR = "_scorch_spmm_declines"
 # transpose, and the STensors its products run on). Kept and dropped with the plans, for
 # the same reasons: it is only valid for this structure and it must die with the operand.
 GRAD_ATTR = "_scorch_grad_structure"
+# A torch CSR operand's TransposedProductPlans: for each key its transposed product A^T @ M has a
+# plan under, the record the C entry serves x @ A from (csrc/planned_matmul.h). Made in C when that
+# product is served for the operand; kept and dropped with its plans.
+TRANSPOSED_PLANS_ATTR = "_scorch_transposed_plans"
 
 # The same three entries for an operand that is a torch sparse CSR tensor, which cannot
 # carry them itself. torch.save and pickle write a tensor's __dict__ along with it, so a
@@ -227,6 +231,7 @@ def forget(tensor: Any) -> None:
     state.pop(SEEN_ATTR, None)
     state.pop(DECLINES_ATTR, None)
     state.pop(GRAD_ATTR, None)
+    state.pop(TRANSPOSED_PLANS_ATTR, None)
 
 
 def _panels(kind: str, param: Any) -> Tuple[int, int]:
@@ -394,6 +399,12 @@ def plans_of(tensor: Any) -> Dict[Any, Any]:
     """
     held = (_state_of(tensor) or {}).get(PLANS_ATTR) or {}
     return {key: plan for key, plan in held.items() if plan is not None}
+
+
+def transposed_plans_of(tensor: Any) -> Dict[Any, Any]:
+    """The TransposedProductPlans a torch CSR operand holds, by key (empty dict if none). For
+    tests."""
+    return dict((_state_of(tensor) or {}).get(TRANSPOSED_PLANS_ATTR) or {})
 
 
 def refused_of(tensor: Any) -> set:

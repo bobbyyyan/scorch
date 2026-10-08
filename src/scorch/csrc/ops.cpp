@@ -1022,6 +1022,12 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
       .def_property_readonly("team_fills", &scorch_native::SpmmCsrPlan::team_fills)
       .def_property_readonly("wide_rows", &scorch_native::SpmmCsrPlan::wide_rows)
       .def_property_readonly("wide_segments", &scorch_native::SpmmCsrPlan::wide_segments);
+    // A torch CSR operand's record that its transposed product A^T @ M is served by a carrier's
+    // plan (planned_matmul.h): what the C entry serves x @ A from. Made by planned_matmul_gathered.
+    py::class_<scorch_native::TransposedProductPlan>(m, "TransposedProductPlan")
+      .def_property_readonly("served", &scorch_native::TransposedProductPlan::served)
+      .def_property_readonly("free_dim", &scorch_native::TransposedProductPlan::free_dim)
+      .def_property_readonly("buffer", &scorch_native::TransposedProductPlan::buffer);
     // The kernels the gradient of a sparse x dense product needs beyond the SpMM itself
     // (sparse_grad.h, used by scorch/autograd.py). They trust index arrays the caller has
     // screened, and gather_values a permutation csr_transpose produced.
@@ -1037,8 +1043,10 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           py::arg("atparallel") = false);
     m.def("planned_matmul_gathered", &scorch_native::planned_matmul_gathered,
           "a @ b by a's plan, a's values first set to src[perm[q]] (SpmmCsrPlan::run_gathered); "
-          "None when no plan serves it",
-          py::arg("a"), py::arg("b"), py::arg("src"), py::arg("perm"));
+          "None when no plan serves it. A torch CSR `owner` whose transpose `a` carries is given "
+          "a TransposedProductPlan for a served product",
+          py::arg("a"), py::arg("b"), py::arg("src"), py::arg("perm"),
+          py::arg("owner") = py::none());
     m.def("gather_values", &scorch_native::gather_values,
           "out[q] = values[perm[q]]: the values of a CSR transpose, with csr_transpose's perm",
           py::call_guard<py::gil_scoped_release>(), py::arg("values"), py::arg("perm"),
@@ -1069,6 +1077,28 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           },
           "Install autograd.planned_mm_backward for the C entry's recorded products",
           py::arg("fn"));
+    // x @ A for a torch CSR A (planned_matmul.h, planned_matmul_torch_right): the backward of the
+    // product PlannedMatmulGradT records, and the state key an operand's TransposedProductPlans
+    // live under. None withdraws both, and every x @ A goes to the Python function.
+    m.def("set_planned_matmul_right",
+          [](py::object fn, py::object tplans_attr) {
+            scorch_native::PlannedMatmul& s = scorch_native::planned_matmul_state();
+            if (fn.is_none()) {
+              scorch_native::planned_matmul_set(s.mm_t_backward, nullptr);
+              Py_CLEAR(s.tplans_attr);
+              return;
+            }
+            if (!PyCallable_Check(fn.ptr())) throw py::type_error("fn must be callable or None");
+            if (!PyUnicode_Check(tplans_attr.ptr())) throw py::type_error("tplans_attr must be a str");
+            PyObject* name = tplans_attr.ptr();
+            Py_INCREF(name);
+            PyUnicode_InternInPlace(&name);
+            Py_XSETREF(s.tplans_attr, name);
+            scorch_native::planned_matmul_set(s.mm_t_backward, fn.ptr());
+          },
+          "Install autograd.planned_mm_t_backward and plan.TRANSPOSED_PLANS_ATTR, so the C entry "
+          "serves x @ A for a torch CSR A whose transposed product has a plan",
+          py::arg("fn"), py::arg("tplans_attr") = py::none());
 
     py::class_<Tensor>(m, "Tensor")
       .def_readonly("storage", &Tensor::storage);
