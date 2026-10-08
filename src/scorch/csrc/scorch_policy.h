@@ -3159,3 +3159,10 @@ inline bool scorch_spmm_on_torch_pool(bool atparallel, int nthreads_override, in
   if (forced >= 0) on_pool = (forced != 0);
   return on_pool;
 }
+
+// The fewest elements of streaming work -- a copy, a transpose, a gather -- for which waking
+// torch's whole intra-op team to split it is sure to pay: the M5's wake (~19 us at six threads)
+// at the fastest serial rate either host measured, 0.048 ns per element for a one-column copy.
+// Work costlier per element than a copy repays the wake sooner. The sweep behind it is at its
+// first user, scorch_transpose_2d_float.
+constexpr int64_t SCORCH_POOL_SPLIT_MIN_ELEMS = 393216;

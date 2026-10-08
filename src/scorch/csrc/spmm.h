@@ -7744,7 +7744,41 @@ torch::Tensor scorch_transpose_2d_float(torch::Tensor src,
       std::max<int64_t>(32768, 4096 * (int64_t)at::get_num_threads());
   const int64_t grain_blocks = std::max<int64_t>(
       1, SCORCH_TRANSPOSE_PARALLEL_ELEMS / std::max<int64_t>(1, R * BS));
-  if (nthreads_override > 0) {
+  // Column blocks are the only unit of work above, so a matrix with fewer of them than the pool
+  // has threads -- every n x k operand with k <= 64, which is what x @ A transposes on its way in
+  // and out -- ran on ceil(C / 64) workers: an 82670 x 32 transpose ran serially, 402 us on an M5
+  // against 100 us for its 32 x 82670 transpose, the same data. Such a matrix is cut into row
+  // bands of whole 64-row tiles instead, one or more per worker of the pool.
+  //
+  // All or nothing, and only above a size. at::parallel_for wakes torch's whole team whatever the
+  // number of tasks, so a split pays that wake in full and fewer workers only waste woken threads
+  // -- on MKT under close pinning consecutive threads are SMT siblings, and two workers ran a
+  // 33 us transpose in 65 us. The wake costs ~4 us there and ~19 us on an M5 (six threads), and a
+  // split cannot repay it until the serial transpose takes longer than that. That size,
+  // SCORCH_POOL_SPLIT_MIN_ELEMS (393216 elements), is the M5's wake at the fastest serial rate
+  // either host measured (0.048 ns per element, a one-column copy). Tall shapes 784..262144 x 1..64 swept at every worker count on both hosts:
+  // from there up a full-width split beat serial on all of them (geomean 0.72 M5, 0.54 MKT), and
+  // below it some shape lost on the M5 at every lower threshold tried (32768 x 4, 1.83x at
+  // 131072). The general threshold still applies where it is larger (pools above 96 threads).
+  const int64_t pool = at::get_num_threads();
+  const int64_t elems = R * C;
+  const int64_t nrblk = (R + BS - 1) / BS;
+  const bool banded = nthreads_override > 0 && pool > 1 && ncblk < pool && nrblk > 1 &&
+                      elems >= std::max<int64_t>(SCORCH_POOL_SPLIT_MIN_ELEMS,
+                                                SCORCH_TRANSPOSE_PARALLEL_ELEMS);
+  if (banded) {
+    const int64_t bands = std::min(nrblk, (pool + ncblk - 1) / ncblk);
+    const int64_t band_rows = (nrblk + bands - 1) / bands * BS;
+    const int64_t nbands = (R + band_rows - 1) / band_rows;
+    at::parallel_for(0, ncblk * nbands, 1, [&](int64_t t0, int64_t t1) {
+      for (int64_t t = t0; t < t1; ++t) {
+        const int64_t cB0 = t / nbands * BS, cB1 = std::min(cB0 + BS, C);
+        const int64_t r0 = t % nbands * band_rows, r1 = std::min(r0 + band_rows, R);
+        for (int64_t rB0 = r0; rB0 < r1; rB0 += BS)
+          scorch_transpose_block(S, D, R, C, rB0, std::min(rB0 + BS, r1), cB0, cB1);
+      }
+    });
+  } else if (nthreads_override > 0) {
     at::parallel_for(0, ncblk, grain_blocks,
                      [&](int64_t b0, int64_t b1) { do_cblks(b0, b1); });
   } else {
