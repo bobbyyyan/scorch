@@ -35,6 +35,7 @@ from .plan import (
     PLANS_ATTR as _PLANS_ATTR,
     SEEN_ATTR as _PLAN_SEEN_ATTR,
     DECLINES_ATTR as _PLAN_DECLINES_ATTR,
+    GRAD_ATTR as _PLAN_GRAD_ATTR,
 )
 from .storage import SparseStorage, TensorIndex, tensor_version
 from .utils import (
@@ -745,6 +746,7 @@ class STensor:
             state.pop(_PLANS_ATTR, None)
             state.pop(_PLAN_SEEN_ATTR, None)
             state.pop(_PLAN_DECLINES_ATTR, None)
+        state.pop(_PLAN_GRAD_ATTR, None)
 
     def __getstate__(self) -> dict:
         """The state to copy or serialize: everything except the plan cache.
@@ -762,6 +764,9 @@ class STensor:
         state.pop(_PLANS_ATTR, None)
         state.pop(_PLAN_SEEN_ATTR, None)
         state.pop(_PLAN_DECLINES_ATTR, None)
+        # autograd.py's structure for this operand: memoized work like a plan, and it
+        # holds a lock, which cannot be pickled.
+        state.pop(_PLAN_GRAD_ATTR, None)
         return state
 
     def insert(self, indices, values):

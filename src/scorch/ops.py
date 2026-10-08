@@ -47,6 +47,7 @@ from .tiling import is_candidate as _tiling_is_candidate
 from .tiling import decided as _tiling_decided
 from .tiling import _current_level as _tiling_current_level
 from .stensor import STensor, _wrap_generated_result
+from . import autograd as _autograd
 from .utils import (
     parse_format,
     topo_sort_characters,
@@ -952,7 +953,44 @@ def matmul(
     plan_a: Optional[Union[STensor, torch.Tensor]]
     probed = _c_probed(a, b, kwargs) if kwargs else _NOT_PROBED
     plan_a, plan_b, plan_key = probed
+    # Tier 1 first: two dense torch tensors are torch's product. Testing for them before
+    # anything else keeps every test below off the path of a dense model's products, all
+    # of which `import scorch as torch` sends here.
+    if (
+        isinstance(a, torch.Tensor)
+        and isinstance(b, torch.Tensor)
+        and not (a.is_sparse or a.is_sparse_csr or b.is_sparse or b.is_sparse_csr)
+    ):
+        if _effective_schedule(kwargs) is not None:
+            raise NotImplementedError(
+                "Explicit compiler schedules currently require a sparse operand"
+            )
+        return torch.matmul(a, b)
+    # ``scorch.compile`` traces user functions with torch.fx.  Keep the leaf
+    # behavior on the function itself so tracing never has to replace the
+    # public ``scorch.matmul`` binding (or aliases in user globals).  A Proxy
+    # carries its tracer, which can record this exact call without descending
+    # into the eager dispatch below, autograd.py's included.
+    proxy = a if isinstance(a, Proxy) else b if isinstance(b, Proxy) else None
+    if proxy is not None:
+        return proxy.tracer.create_proxy(
+            "call_function", matmul, (a, b), kwargs
+        )  # type: ignore[return-value]
+
     plan_via = None
+    # autograd.py next (autograd.serve): a product a gradient is wanted through is recorded
+    # there, which has to come before the plan probe, since a plan would serve the product
+    # and drop the gradient; and a dense x times a sparse A is computed there whether or
+    # not a gradient is wanted, so that product has one type and one value in every grad
+    # mode. The C entry point hands calls that want a gradient straight here. A call it
+    # probed is one with a sparse left operand it found no gradient wanted through
+    # (planned_matmul.h, planned_matmul_wants_grad), so autograd.py is skipped for it:
+    # that is every call with a torch CSR operand made afresh each time.
+    if (
+        probed is _NOT_PROBED
+        and (served := _autograd.serve(a, b, matmul, kwargs)) is not None
+    ):
+        return served
     # `probed is _NOT_PROBED` as well as `not kwargs`: _c_probed pops the C entry point's
     # keyword, so a call it handed over has no keywords left by now.
     if _PLAN_ENABLED[0] and probed is _NOT_PROBED and not kwargs and type(b) is _TENSOR:
@@ -982,17 +1020,6 @@ def matmul(
             if served is not None:
                 return served
 
-    # ``scorch.compile`` traces user functions with torch.fx.  Keep the leaf
-    # behavior on the function itself so tracing never has to replace the
-    # public ``scorch.matmul`` binding (or aliases in user globals).  A Proxy
-    # carries its tracer, which can record this exact call without descending
-    # into the eager dispatch below.
-    proxy = a if isinstance(a, Proxy) else b if isinstance(b, Proxy) else None
-    if proxy is not None:
-        return proxy.tracer.create_proxy(
-            "call_function", matmul, (a, b), kwargs
-        )  # type: ignore[return-value]
-
     effective_schedule = _effective_schedule(kwargs)
 
     if isinstance(a, torch.Tensor) and isinstance(b, torch.Tensor):
@@ -1004,20 +1031,14 @@ def matmul(
         ):
             a = a.to_sparse_csr()
             b = b.to_sparse_csr()
-        if a.is_sparse or a.is_sparse_csr or b.is_sparse or b.is_sparse_csr:
-            a = STensor.from_torch(a)
-            b = STensor.from_torch(b)
-            # The STensor a plan for the caller's torch operand may be installed from:
-            # this one, provided nothing below relays it out into a copy. (Installation
-            # also needs `plan_b`, which is set only when the probe above saw a torch
-            # sparse CSR operand.)
-            plan_via = a
-        else:
-            if effective_schedule is not None:
-                raise NotImplementedError(
-                    "Explicit compiler schedules currently require a sparse operand"
-                )
-            return torch.matmul(a, b)
+        # One of the two is sparse: two dense ones were returned at the top.
+        a = STensor.from_torch(a)
+        b = STensor.from_torch(b)
+        # The STensor a plan for the caller's torch operand may be installed from:
+        # this one, provided nothing below relays it out into a copy. (Installation
+        # also needs `plan_b`, which is set only when the probe above saw a torch
+        # sparse CSR operand.)
+        plan_via = a
 
     if isinstance(a, torch.Tensor):
         a = STensor.from_torch(a)
@@ -1206,6 +1227,12 @@ if _install_planned_matmul is not None:
         sys.modules[__name__],
         _matmul_python.__doc__ or "",
     )
+    # A torch CSR operand's product that autograd must record is then recorded by the C
+    # entry itself when the operand has a plan (planned_matmul.h, PlannedMatmulGrad), with
+    # this as its backward; a build without the setter sends such products here instead.
+    _set_mm_backward = getattr(_scorch_ops, "set_planned_matmul_backward", None)
+    if _set_mm_backward is not None:
+        _set_mm_backward(_autograd.planned_mm_backward)
 
 
 # Activation codes for the fused Linear kernel (must match spmm.h

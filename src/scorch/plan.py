@@ -49,6 +49,10 @@ PLANS_ATTR = "_scorch_spmm_plans"
 SEEN_ATTR = "_scorch_spmm_seen"
 # Created only if a plan ever declines, so the ordinary path never touches it.
 DECLINES_ATTR = "_scorch_spmm_declines"
+# The CSR structure autograd.py builds for an operand a gradient flows through (its
+# transpose, and the STensors its products run on). Kept and dropped with the plans, for
+# the same reasons: it is only valid for this structure and it must die with the operand.
+GRAD_ATTR = "_scorch_grad_structure"
 
 # The same three entries for an operand that is a torch sparse CSR tensor, which cannot
 # carry them itself. torch.save and pickle write a tensor's __dict__ along with it, so a
@@ -222,6 +226,7 @@ def forget(tensor: Any) -> None:
     state.pop(PLANS_ATTR, None)
     state.pop(SEEN_ATTR, None)
     state.pop(DECLINES_ATTR, None)
+    state.pop(GRAD_ATTR, None)
 
 
 def _panels(kind: str, param: Any) -> Tuple[int, int]:

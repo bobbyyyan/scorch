@@ -8,6 +8,7 @@
 #include "kernels.h"
 #include "plan.h"
 #include "planned_matmul.h"
+#include "sparse_grad.h"
 
 namespace scorch {
 namespace py = pybind11;
@@ -1006,6 +1007,23 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
       .def_property_readonly("served", &scorch_native::SpmmCsrPlan::served)
       .def_property_readonly("wide_rows", &scorch_native::SpmmCsrPlan::wide_rows)
       .def_property_readonly("wide_segments", &scorch_native::SpmmCsrPlan::wide_segments);
+    // The kernels the gradient of a sparse x dense product needs beyond the SpMM itself
+    // (sparse_grad.h, used by scorch/autograd.py). They trust index arrays the caller has
+    // screened, and gather_values a permutation csr_transpose produced.
+    m.def("csr_transpose", &scorch_native::csr_transpose,
+          "The CSR transpose of an m x n CSR structure: (positions, coordinates, perm), where "
+          "nonzero q of the transpose is nonzero perm[q] of the original",
+          py::call_guard<py::gil_scoped_release>(), py::arg("positions"),
+          py::arg("coordinates"), py::arg("cols"));
+    m.def("sddmm_csr", &scorch_native::sddmm_csr,
+          "out[q] = x[i, :] . y[coordinates[q], :] for every stored q of row i (SDDMM)",
+          py::call_guard<py::gil_scoped_release>(), py::arg("positions"),
+          py::arg("coordinates"), py::arg("x"), py::arg("y"), py::arg("nthreads") = -1,
+          py::arg("atparallel") = false);
+    m.def("gather_values", &scorch_native::gather_values,
+          "out[q] = values[perm[q]]: the values of a CSR transpose, with csr_transpose's perm",
+          py::call_guard<py::gil_scoped_release>(), py::arg("values"), py::arg("perm"),
+          py::arg("out"), py::arg("nthreads") = -1);
     m.def("make_spmm_csr_plan", &scorch_native::make_spmm_csr_plan,
           "Build a CSR x dense plan, or None when one cannot serve this shape",
           py::arg("kind"), py::arg("A_shape"), py::arg("A_mode_indices"),
@@ -1021,6 +1039,17 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           py::arg("seen_attr"), py::arg("max_plans"), py::arg("probed_kw"),
           py::arg("match_host_threads"), py::arg("atparallel"), py::arg("module"),
           py::arg("doc"));
+    // The backward of a planned product the C entry records for autograd (planned_matmul.h,
+    // PlannedMatmulGrad); None withdraws it, and such products go to the Python function.
+    m.def("set_planned_matmul_backward",
+          [](py::object fn) {
+            if (!fn.is_none() && !PyCallable_Check(fn.ptr()))
+              throw py::type_error("fn must be callable or None");
+            scorch_native::planned_matmul_set(scorch_native::planned_matmul_state().mm_backward,
+                                              fn.is_none() ? nullptr : fn.ptr());
+          },
+          "Install autograd.planned_mm_backward for the C entry's recorded products",
+          py::arg("fn"));
 
     py::class_<Tensor>(m, "Tensor")
       .def_readonly("storage", &Tensor::storage);

@@ -1,0 +1,660 @@
+"""Gradients through scorch.matmul's sparse x dense products (scorch/autograd.py).
+
+Every product is checked against torch's own: the forward value, the dense operand's
+gradient and, for a torch sparse operand that requires grad, A.grad (a sparse tensor with
+A's structure, as torch.sparse.mm gives). gradcheck and gradgradcheck cover the
+derivatives numerically, first and second order, and forward-mode AD.
+"""
+
+import gc
+import pickle
+
+import pytest
+import torch
+import torch.autograd.forward_ad as fwAD
+
+import scorch
+import scorch_ops
+from scorch import STensor
+from scorch.exceptions import TensorIndexError
+from scorch import autograd as grad_mod
+from scorch import plan as plan_mod
+from scorch.plan import plans_of
+
+pytestmark = pytest.mark.skipif(
+    not hasattr(scorch_ops, "sddmm_csr"), reason="the gradient kernels are not built"
+)
+
+
+def dense_matrix(rows=7, cols=5, density=0.5, dtype=torch.float64, seed=0):
+    generator = torch.Generator().manual_seed(seed)
+    mask = torch.rand((rows, cols), generator=generator) < density
+    return (torch.rand((rows, cols), generator=generator) * mask).to(dtype)
+
+
+def rand(*shape, dtype=torch.float64, seed=1):
+    return torch.rand(shape, generator=torch.Generator().manual_seed(seed)).to(dtype)
+
+
+def tolerance(dtype):
+    return (
+        dict(atol=1e-5, rtol=1e-5)
+        if dtype == torch.float32
+        else dict(atol=1e-10, rtol=1e-10)
+    )
+
+
+# How each kind of sparse operand is built from a dense matrix, and whether a gradient can
+# be asked of the operand itself (an STensor stores its values detached).
+OPERANDS = {
+    "torch_csr": (lambda d: d.to_sparse_csr(), True),
+    "torch_csr_int32": (
+        lambda d: torch.sparse_csr_tensor(
+            d.to_sparse_csr().crow_indices().int(),
+            d.to_sparse_csr().col_indices().int(),
+            d.to_sparse_csr().values(),
+            d.shape,
+        ),
+        True,
+    ),
+    "torch_coo": (lambda d: d.to_sparse_coo(), True),
+    "torch_coo_uncoalesced": (
+        lambda d: torch.sparse_coo_tensor(
+            d.to_sparse_coo().indices().flip(1),
+            d.to_sparse_coo().values().flip(0),
+            d.shape,
+        ),
+        True,
+    ),
+    "stensor_csr": (lambda d: STensor.from_torch(d.to_sparse_csr()), False),
+    "stensor_csc": (
+        lambda d: STensor.from_torch(d, mode_order=[1, 0]).to_sparse("ds"),
+        False,
+    ),
+    "stensor_coo": (lambda d: STensor.from_torch(d.to_sparse_coo()), False),
+    "stensor_dcsr": (lambda d: STensor.from_torch(d).to_sparse("ss"), False),
+}
+
+
+def check_against_torch(kind, dtype, side, dense_shape, sparse_grad):
+    build, can_grad = OPERANDS[kind]
+    if sparse_grad and not can_grad:
+        pytest.skip("an STensor carries no gradient of its own")
+    d = dense_matrix(dtype=dtype)
+    a = build(d)
+    if sparse_grad:
+        a.requires_grad_()
+    w = rand(*dense_shape, dtype=dtype).requires_grad_()
+    out = scorch.matmul(a, w) if side == "left" else scorch.matmul(w, a)
+
+    d_ref = d.clone().requires_grad_(sparse_grad)
+    w_ref = w.detach().clone().requires_grad_()
+    ref = d_ref @ w_ref if side == "left" else w_ref @ d_ref
+    g = rand(*ref.shape, dtype=dtype, seed=2)
+    (out * g).sum().backward()
+    (ref * g).sum().backward()
+
+    tol = tolerance(dtype)
+    assert type(out) is torch.Tensor and out.grad_fn is not None
+    torch.testing.assert_close(out, ref, **tol)
+    torch.testing.assert_close(w.grad, w_ref.grad, **tol)
+    if sparse_grad:
+        assert a.grad.layout == a.layout
+        torch.testing.assert_close(a.grad.to_dense(), d_ref.grad * (d != 0), **tol)
+        if a.layout is torch.sparse_csr:
+            assert torch.equal(a.grad.crow_indices(), a.crow_indices())
+            assert torch.equal(a.grad.col_indices(), a.col_indices())
+
+
+@pytest.mark.parametrize("kind", sorted(OPERANDS))
+@pytest.mark.parametrize("dtype", [torch.float32, torch.float64])
+@pytest.mark.parametrize(
+    "side,dense_shape",
+    [("left", (5, 3)), ("left", (5,)), ("right", (4, 7)), ("right", (7,))],
+)
+def test_dense_gradient_matches_torch(kind, dtype, side, dense_shape):
+    check_against_torch(kind, dtype, side, dense_shape, sparse_grad=False)
+
+
+@pytest.mark.parametrize("kind", [k for k, (_, can) in sorted(OPERANDS.items()) if can])
+@pytest.mark.parametrize("dtype", [torch.float32, torch.float64])
+@pytest.mark.parametrize(
+    "side,dense_shape",
+    [("left", (5, 3)), ("left", (5,)), ("right", (4, 7)), ("right", (7,))],
+)
+def test_sparse_gradient_matches_torch(kind, dtype, side, dense_shape):
+    check_against_torch(kind, dtype, side, dense_shape, sparse_grad=True)
+
+
+# --------------------------------------------------------------------------- #
+# Numerical checks: first and second derivatives, forward mode
+# --------------------------------------------------------------------------- #
+
+
+def _csr_parts():
+    a = dense_matrix(6, 5).to_sparse_csr()
+    return a.crow_indices(), a.col_indices(), a.values().clone()
+
+
+def test_gradcheck_and_gradgradcheck():
+    crow, col, values = _csr_parts()
+
+    def left(v, w):
+        return scorch.matmul(torch.sparse_csr_tensor(crow, col, v, (6, 5)), w)
+
+    def right(v, x):
+        return scorch.matmul(x, torch.sparse_csr_tensor(crow, col, v, (6, 5)))
+
+    v = values.requires_grad_()
+    w = rand(5, 3).requires_grad_()
+    x = rand(4, 6).requires_grad_()
+    assert torch.autograd.gradcheck(left, (v, w))
+    assert torch.autograd.gradcheck(right, (v, x))
+    assert torch.autograd.gradgradcheck(left, (v, w))
+    assert torch.autograd.gradgradcheck(right, (v, x))
+
+
+def test_forward_mode_ad():
+    a = dense_matrix(6, 5).to_sparse_csr()
+    w = rand(5, 3).requires_grad_()
+    x = rand(4, 6).requires_grad_()
+    assert torch.autograd.gradcheck(
+        lambda w_: scorch.matmul(a, w_), (w,), check_forward_ad=True
+    )
+    assert torch.autograd.gradcheck(
+        lambda x_: scorch.matmul(x_, a), (x,), check_forward_ad=True
+    )
+
+
+def test_forward_mode_ad_runs_under_no_grad():
+    """Forward-mode AD does not depend on grad mode, so a tangent must survive a call made
+    under no_grad -- and the C entry point must not serve such a call from a plan."""
+    d = dense_matrix(6, 5)
+    a = d.to_sparse_csr()
+    w = rand(5, 3)
+    for _ in range(3):
+        scorch.matmul(a, w)  # a plan for this product
+    assert plans_of(a)
+    tangent = rand(5, 3, seed=3)
+    with fwAD.dual_level(), torch.no_grad():
+        out = scorch.matmul(a, fwAD.make_dual(w, tangent))
+        torch.testing.assert_close(fwAD.unpack_dual(out).tangent, d @ tangent)
+
+
+# --------------------------------------------------------------------------- #
+# Dispatch: plans, grad mode, parameters
+# --------------------------------------------------------------------------- #
+
+
+@pytest.mark.parametrize("kind", ["torch_csr", "stensor_csr"])
+def test_a_planned_operand_still_records_the_gradient(kind):
+    """Once the operand has a plan, the C entry point serves no-grad calls from it. A call
+    that needs a gradient must not be: the plan's result carries no grad_fn."""
+    d = dense_matrix()
+    a = OPERANDS[kind][0](d)
+    w = rand(5, 3)
+    for _ in range(3):
+        scorch.matmul(a, w)
+    assert plans_of(a), "precondition: the operand has a plan"
+    w.requires_grad_()
+    out = scorch.matmul(a, w)
+    assert out.grad_fn is not None
+    out.sum().backward()
+    torch.testing.assert_close(w.grad, d.t() @ torch.ones(7, 3, dtype=d.dtype))
+
+
+def test_no_grad_and_inference_mode_record_nothing_and_still_plan():
+    a = dense_matrix().to_sparse_csr()
+    w = rand(5, 3).requires_grad_()
+    with torch.no_grad():
+        for _ in range(3):
+            assert scorch.matmul(a, w).grad_fn is None
+    assert plans_of(a), "a no-grad call must still reach the planned path"
+    with torch.inference_mode():
+        assert scorch.matmul(a, w).grad_fn is None
+
+
+@pytest.mark.parametrize("kind", sorted(OPERANDS))
+@pytest.mark.parametrize("dtype", [torch.float32, torch.float64])
+@pytest.mark.parametrize("x_shape", ["matrix", "vector", "transposed view"])
+def test_dense_times_sparse_is_one_function_in_every_grad_mode(kind, dtype, x_shape):
+    """x @ A has the same type and the same values whether a gradient is wanted through it
+    (model.train()), not wanted (model.eval()), or switched off by no_grad or
+    inference_mode: a dense torch.Tensor every time, as torch.mm returns. It used to be an
+    STensor whenever autograd was not involved."""
+    d = dense_matrix(dtype=dtype)
+    a = OPERANDS[kind][0](d)
+    x = {
+        "matrix": lambda: rand(4, 7, dtype=dtype),
+        "vector": lambda: rand(7, dtype=dtype),
+        "transposed view": lambda: rand(7, 4, dtype=dtype).t(),
+    }[x_shape]()
+    plain = scorch.matmul(x, a)
+    xg = x.detach().clone().requires_grad_()
+    if x_shape == "transposed view":
+        xg = x.t().detach().clone().t().requires_grad_()
+    recorded = scorch.matmul(xg, a)
+    with torch.no_grad():
+        no_grad = scorch.matmul(xg, a)
+    with torch.inference_mode():
+        inference = scorch.matmul(x, a)
+    for out in (plain, recorded, no_grad, inference):
+        assert type(out) is torch.Tensor and out.layout is torch.strided
+    assert recorded.grad_fn is not None and no_grad.grad_fn is None
+    for out in (recorded.detach(), no_grad, inference):
+        assert torch.equal(out, plain)
+    torch.testing.assert_close(plain, x @ d, **tolerance(dtype))
+
+
+@pytest.mark.parametrize("kind", sorted(OPERANDS))
+def test_an_operand_made_under_inference_mode(kind):
+    """Inference tensors have no version counter, and reading one raises: the cached
+    structure's stamp reads it as 0 (storage.tensor_version), so x @ A runs under
+    inference_mode on an operand made there, and outside it when no gradient is wanted.
+    Asking a gradient through such an operand raises torch's own error, as torch.mm does.
+    """
+    d = dense_matrix()
+    with torch.inference_mode():
+        a = OPERANDS[kind][0](d)
+        x = rand(4, 7)
+        for _ in range(2):
+            torch.testing.assert_close(scorch.matmul(x, a), x @ d)
+    x = rand(4, 7)
+    torch.testing.assert_close(scorch.matmul(x, a), x @ d)  # outside, as torch.mm runs
+    with pytest.raises(RuntimeError, match="Inference tensors cannot be saved"):
+        scorch.matmul(rand(4, 7).requires_grad_(), a)
+
+
+def test_a_parameter_gets_its_gradient():
+    d = dense_matrix()
+    a = d.to_sparse_csr()
+    w = torch.nn.Parameter(rand(5, 3))
+    scorch.matmul(a, w).sum().backward()
+    torch.testing.assert_close(w.grad, d.t() @ torch.ones(7, 3, dtype=d.dtype))
+
+
+# --------------------------------------------------------------------------- #
+# The C entry's own record of a planned product (csrc/planned_matmul.h)
+# --------------------------------------------------------------------------- #
+
+C_NODE = "PlannedMatmulGrad"
+
+
+def _planned(a, w):
+    """`a` with a plan for products with `w`'s shape: two calls make one (plan.install)."""
+    with torch.no_grad():
+        for _ in range(3):
+            scorch.matmul(a, w)
+    assert plans_of(a), "precondition: the operand has a plan"
+    return a
+
+
+@pytest.mark.parametrize("dtype", [torch.float32, torch.float64])
+@pytest.mark.parametrize("wants", ["a", "w", "both"])
+def test_the_c_entry_records_a_planned_product(dtype, wants):
+    d = dense_matrix(dtype=dtype)
+    a = _planned(d.to_sparse_csr(), rand(5, 3, dtype=dtype))
+    w = rand(5, 3, dtype=dtype)
+    a.requires_grad_(wants in ("a", "both"))
+    w.requires_grad_(wants in ("w", "both"))
+    out = scorch.matmul(a, w)
+    assert C_NODE in out.grad_fn.name()
+    g = rand(7, 3, dtype=dtype, seed=5)
+    out.backward(g)
+    ref_a = d.to_sparse_csr().requires_grad_(a.requires_grad)
+    ref_w = w.detach().clone().requires_grad_(w.requires_grad)
+    ref = torch.sparse.mm(ref_a, ref_w)
+    torch.testing.assert_close(out.detach(), ref.detach(), **tolerance(dtype))
+    ref.backward(g)
+    if w.requires_grad:
+        torch.testing.assert_close(w.grad, ref_w.grad, **tolerance(dtype))
+    else:
+        assert w.grad is None
+    if a.requires_grad:
+        assert a.grad.layout == torch.sparse_csr
+        assert torch.equal(a.grad.crow_indices(), ref_a.grad.crow_indices())
+        assert torch.equal(a.grad.col_indices(), ref_a.grad.col_indices())
+        torch.testing.assert_close(
+            a.grad.values(), ref_a.grad.values(), **tolerance(dtype)
+        )
+    else:
+        assert a.grad is None
+
+
+def test_the_c_entry_s_product_differentiates_twice():
+    """Its backward records its gradients when asked to build a graph, so the second
+    derivative is the Python path's: gradcheck and gradgradcheck through a planned operand.
+    """
+    a = _planned(dense_matrix().to_sparse_csr(), rand(5, 3))
+    w = rand(5, 3).requires_grad_()
+    assert C_NODE in scorch.matmul(a, w).grad_fn.name()
+    assert torch.autograd.gradcheck(lambda w_: scorch.matmul(a, w_), (w,))
+    assert torch.autograd.gradgradcheck(lambda w_: scorch.matmul(a, w_) ** 2, (w,))
+    # Across operands: d/dA of a gradient taken with respect to w, against dense autograd
+    # masked to A's pattern (A's gradient is masked; torch.sparse.mm's second one is not).
+    a.requires_grad_()
+    (gw,) = torch.autograd.grad(
+        scorch.matmul(a, w).pow(2).sum(), (w,), create_graph=True
+    )
+    (second,) = torch.autograd.grad(gw.sum(), (a,))
+    dense = a.detach().to_dense().requires_grad_()
+    (ref_gw,) = torch.autograd.grad((dense @ w).pow(2).sum(), (w,), create_graph=True)
+    (ref_second,) = torch.autograd.grad(ref_gw.sum(), (dense,))
+    torch.testing.assert_close(second.to_dense(), ref_second * (dense != 0))
+
+
+def test_the_c_entry_checks_saved_values_like_torch():
+    """A's values are saved for b's gradient, so writing them in place between the forward
+    and the backward is an error, as it is for torch.sparse.mm and the Python path."""
+    a = _planned(dense_matrix().to_sparse_csr(), rand(5, 3))
+    w = rand(5, 3).requires_grad_()
+    out = scorch.matmul(a, w)
+    assert C_NODE in out.grad_fn.name()
+    with torch.no_grad():
+        a.values().mul_(2.0)
+    with pytest.raises(RuntimeError, match="modified by an inplace operation"):
+        out.sum().backward()
+
+
+def test_an_error_in_the_c_entry_s_backward_arrives_as_itself(monkeypatch):
+    class Marker(Exception):
+        pass
+
+    def fail(*args):
+        raise Marker("from the backward")
+
+    a = _planned(dense_matrix().to_sparse_csr(), rand(5, 3))
+    out = scorch.matmul(a, rand(5, 3).requires_grad_())
+    assert C_NODE in out.grad_fn.name()
+    monkeypatch.setattr(grad_mod, "_mm_backward", fail)
+    with pytest.raises(Marker, match="from the backward"):
+        out.sum().backward()
+
+
+def test_the_c_entry_s_record_holds_its_operand_only_as_long_as_the_graph():
+    a = _planned(dense_matrix().to_sparse_csr(), rand(5, 3)).requires_grad_()
+    w = rand(5, 3).requires_grad_()
+    out = scorch.matmul(a, w)
+    assert C_NODE in out.grad_fn.name()
+    key = id(a)
+    del a
+    assert key in plan_mod.TORCH_OPERANDS, "the graph still holds the operand"
+    out.sum().backward()
+    del out
+    assert key not in plan_mod.TORCH_OPERANDS
+
+
+def test_the_python_path_keeps_what_the_c_entry_does_not_record():
+    """A transposed dense operand, a forward-mode tangent, and a withdrawn backward each
+    go to the Python function, which records them as before."""
+    d = dense_matrix()
+    a = _planned(d.to_sparse_csr(), rand(5, 3))
+    w_t = rand(3, 5).requires_grad_()
+    out = scorch.matmul(a, w_t.t())
+    assert C_NODE not in out.grad_fn.name()
+    out.sum().backward()
+    torch.testing.assert_close(w_t.grad, (d.t() @ torch.ones(7, 3, dtype=d.dtype)).t())
+
+    w = rand(5, 3).requires_grad_()
+    tangent = rand(5, 3, seed=3)
+    with fwAD.dual_level():
+        out = scorch.matmul(a, fwAD.make_dual(w, tangent))
+        assert C_NODE not in out.grad_fn.name()
+        torch.testing.assert_close(fwAD.unpack_dual(out).tangent, d @ tangent)
+
+    scorch_ops.set_planned_matmul_backward(None)
+    try:
+        assert C_NODE not in scorch.matmul(a, w).grad_fn.name()
+    finally:
+        scorch_ops.set_planned_matmul_backward(grad_mod.planned_mm_backward)
+    assert C_NODE in scorch.matmul(a, w).grad_fn.name()
+
+
+# --------------------------------------------------------------------------- #
+# The cached structure
+# --------------------------------------------------------------------------- #
+
+
+def test_the_transpose_is_built_once_per_structure(monkeypatch):
+    calls = []
+    real = grad_mod._native.csr_transpose
+
+    class Counting:
+        def __getattr__(self, name):
+            return getattr(scorch_ops, name)
+
+        @staticmethod
+        def csr_transpose(*args):
+            calls.append(1)
+            return real(*args)
+
+    monkeypatch.setattr(grad_mod, "_native", Counting())
+    a = dense_matrix().to_sparse_csr()
+    w = rand(5, 3).requires_grad_()
+    for _ in range(4):
+        scorch.matmul(a, w).sum().backward()
+    assert len(calls) == 1
+
+
+def test_values_changed_in_place_reach_the_transposed_product():
+    """A training step changes A's values in place: the next backward pass must see the
+    new values, not the ones the transpose's buffer was last filled with."""
+    d = dense_matrix()
+    a = d.to_sparse_csr().requires_grad_()
+    w = rand(5, 3).requires_grad_()
+    for scale in (1.0, 3.0, -2.0):
+        with torch.no_grad():
+            a.values().copy_(d.to_sparse_csr().values() * scale)
+        w.grad = None
+        a.grad = None
+        scorch.matmul(a, w).sum().backward()
+        torch.testing.assert_close(
+            w.grad, (d * scale).t() @ torch.ones(7, 3, dtype=d.dtype)
+        )
+
+
+@pytest.mark.parametrize("fresh", [False, True], ids=["one operand", "fresh operands"])
+def test_values_written_through_data_reach_the_product(fresh):
+    """A write through .data does not move the version counter -- gradcheck perturbs its
+    inputs that way, and older optimizers step that way -- so the copy of the values the
+    transposed product runs on is refilled on every call rather than when a stamp moves.
+    """
+    d = dense_matrix()
+    crow, col = d.to_sparse_csr().crow_indices(), d.to_sparse_csr().col_indices()
+    values = d.to_sparse_csr().values().clone()
+    a = torch.sparse_csr_tensor(crow, col, values, d.shape)
+    x = rand(4, 7)
+    for scale in (1.0, 3.0, -2.0):
+        values.data.copy_(d.to_sparse_csr().values() * scale)
+        if fresh:
+            a = torch.sparse_csr_tensor(crow, col, values, d.shape)
+        torch.testing.assert_close(scorch.matmul(x, a), x @ (d * scale))
+
+
+def _transposes_over(*arrays):
+    ids = {id(t.untyped_storage()) for t in arrays}
+    return [k for k in grad_mod._TRANSPOSES if any(part[0] in ids for part in k[2:])]
+
+
+def test_fresh_operands_over_the_same_arrays_share_one_transpose(monkeypatch):
+    """A new operand around the same index arrays on every call -- values that change, say
+    -- finds the transpose built for an earlier one."""
+    calls = []
+    real = grad_mod._native.csr_transpose
+
+    class Counting:
+        def __getattr__(self, name):
+            return getattr(scorch_ops, name)
+
+        @staticmethod
+        def csr_transpose(*args):
+            calls.append(1)
+            return real(*args)
+
+    monkeypatch.setattr(grad_mod, "_native", Counting())
+    d = dense_matrix()
+    crow, col = d.to_sparse_csr().crow_indices(), d.to_sparse_csr().col_indices()
+    values = d.to_sparse_csr().values()
+    x = rand(4, 7)
+    for scale in (1.0, 2.0, 3.0):
+        a = torch.sparse_csr_tensor(crow, col, values * scale, d.shape)
+        torch.testing.assert_close(scorch.matmul(x, a), x @ (d * scale))
+    assert len(calls) == 1
+
+
+def test_the_shared_transpose_lives_as_long_as_its_arrays():
+    """An entry is dropped when the arrays it describes die, and an array changed in place
+    replaces its entry rather than adding one."""
+    d = dense_matrix()
+    crow = d.to_sparse_csr().crow_indices().clone()
+    col = d.to_sparse_csr().col_indices().clone()
+    x = rand(4, 7)
+    a = torch.sparse_csr_tensor(crow, col, d.to_sparse_csr().values(), d.shape)
+    scorch.matmul(x, a)
+    assert len(_transposes_over(crow, col)) == 1
+    with torch.no_grad():
+        col.copy_(col)  # moves the version counter, contents unchanged
+    a = torch.sparse_csr_tensor(crow, col, d.to_sparse_csr().values(), d.shape)
+    torch.testing.assert_close(scorch.matmul(x, a), x @ d)
+    assert len(_transposes_over(crow, col)) == 1
+    before = len(grad_mod._TRANSPOSES)
+    del a, crow, col
+    gc.collect()
+    assert len(grad_mod._TRANSPOSES) == before - 1
+
+
+def test_an_operand_whose_index_arrays_were_replaced_gets_a_new_structure():
+    a = torch.eye(4, dtype=torch.float64).to_sparse_csr()
+    w = rand(4, 3).requires_grad_()
+    scorch.matmul(a, w).sum().backward()
+    target = torch.eye(4, dtype=torch.float64).flip(1).to_sparse_csr()
+    a.resize_as_sparse_(torch.ones(4, 4, dtype=torch.float64).to_sparse_csr())
+    a.resize_as_sparse_(target)
+    a.copy_(target)
+    w.grad = None
+    g = rand(4, 3, seed=4)
+    (scorch.matmul(a, w) * g).sum().backward()
+    torch.testing.assert_close(w.grad, target.to_dense().t() @ g)
+
+
+@pytest.mark.parametrize("layout", ["csr", "coo"])
+@pytest.mark.parametrize("sparse_grad", [False, True])
+def test_the_structure_dies_with_its_torch_operand(layout, sparse_grad):
+    """The structure lives in the operand's own registry entry, so nothing it holds may
+    refer back to the operand: values() of a CSR tensor and indices() of a COO tensor are
+    views whose base is the tensor, and holding either kept every trained matrix alive.
+    """
+    d = dense_matrix()
+    a = d.to_sparse_csr() if layout == "csr" else d.to_sparse_coo()
+    a.requires_grad_(sparse_grad)
+    w = rand(5, 3).requires_grad_()
+    for _ in range(2):
+        # Reset before each backward pass: accumulating a second sparse CSR gradient
+        # needs a torch built with MKL, which the ARM host's is not.
+        a.grad = None
+        scorch.matmul(a, w).sum().backward()
+        a.grad = None
+        scorch.matmul(rand(4, 7).requires_grad_(), a).sum().backward()  # x @ A
+    key = id(a)
+    assert plan_mod.GRAD_ATTR in plan_mod.TORCH_OPERANDS[key][1]
+    del a
+    assert key not in plan_mod.TORCH_OPERANDS
+
+
+def test_an_stensor_with_a_structure_still_pickles():
+    s = STensor.from_torch(dense_matrix().to_sparse_csr())
+    w = rand(5, 3).requires_grad_()
+    scorch.matmul(s, w).sum().backward()
+    assert plan_mod.GRAD_ATTR in s.__dict__
+    clone = pickle.loads(pickle.dumps(s))
+    assert plan_mod.GRAD_ATTR not in clone.__dict__
+
+
+@pytest.mark.parametrize("side", ["left", "right"])
+def test_invalid_index_arrays_fail_closed(side):
+    """torch checks nothing about a CSR tensor's arrays by default; the structure the
+    gradient kernels read must be screened before they index with it. x @ A runs its
+    forward pass on the transpose, so there nothing else would have looked first."""
+    crow = torch.tensor([0, 1, 2])
+    col = torch.tensor([0, 9])  # column 9 of a 2 x 3 matrix
+    a = torch.sparse_csr_tensor(crow, col, torch.ones(2, dtype=torch.float64), (2, 3))
+    with pytest.raises(TensorIndexError):
+        if side == "left":
+            scorch.matmul(a, rand(3, 2).requires_grad_())
+        else:
+            scorch.matmul(rand(4, 2).requires_grad_(), a)
+
+
+# --------------------------------------------------------------------------- #
+# Products autograd does not cover
+# --------------------------------------------------------------------------- #
+
+
+def test_an_uncovered_product_computes_and_raises_only_when_differentiated():
+    """torch's convention for an operation with no derivative: the forward pass works
+    (inference with parameters that require grad keeps working) and the backward pass
+    raises, naming what it was asked to differentiate."""
+    d = dense_matrix()
+    a = d.to_sparse_csr()
+    w = rand(5, 3).requires_grad_()
+    out = scorch.matmul(a, w, use_cache=True)
+    torch.testing.assert_close(out, d @ w.detach())
+    assert out.grad_fn is not None
+    with pytest.raises(NotImplementedError, match="use_cache"):
+        out.sum().backward()
+
+
+def test_sparse_times_sparse_is_unchanged():
+    d = dense_matrix(5, 5)
+    a = d.to_sparse_csr().requires_grad_()
+    b = d.t().contiguous().to_sparse_csr()
+    out = scorch.matmul(a, b)
+    assert type(out) is STensor  # no autograd for an STensor result
+
+
+# --------------------------------------------------------------------------- #
+# The kernels
+# --------------------------------------------------------------------------- #
+
+
+@pytest.mark.parametrize("index_dtype", [torch.int32, torch.int64])
+@pytest.mark.parametrize("dtype", [torch.float32, torch.float64])
+@pytest.mark.parametrize(
+    "rows,cols,density,k",
+    [(9, 6, 0.4, 5), (5, 8, 0.0, 3), (1, 1, 1.0, 1), (40, 30, 0.2, 33)],
+)
+def test_sddmm_and_transpose_kernels(index_dtype, dtype, rows, cols, density, k):
+    d = dense_matrix(rows, cols, density, dtype=dtype)
+    csr = d.to_sparse_csr()
+    crow = csr.crow_indices().to(index_dtype)
+    col = csr.col_indices().to(index_dtype)
+    x = rand(rows, k, dtype=dtype)
+    y = rand(cols, k, dtype=dtype, seed=5)
+    row_of = torch.repeat_interleave(torch.arange(rows), crow.diff().long())
+    expected = (x[row_of] * y[col.long()]).sum(1)
+    torch.testing.assert_close(
+        scorch_ops.sddmm_csr(crow, col, x, y), expected, **tolerance(dtype)
+    )
+
+    t_crow, t_col, perm = scorch_ops.csr_transpose(crow, col, cols)
+    assert t_crow.dtype == torch.int32
+    t = torch.sparse_csr_tensor(
+        t_crow.long(), t_col.long(), csr.values()[perm], (cols, rows)
+    )
+    assert torch.equal(t.to_dense(), d.t())
+    for r in range(cols):  # each row of the transpose is sorted
+        seg = t_col[t_crow[r] : t_crow[r + 1]]
+        assert torch.all(seg[1:] > seg[:-1])
+
+
+@pytest.mark.parametrize("dtype", [torch.float32, torch.float64])
+@pytest.mark.parametrize("n", [0, 1, 1000, 400_000], ids=lambda n: f"n{n}")
+@pytest.mark.parametrize("nthreads", [-1, 4])
+def test_gather_values_kernel(dtype, n, nthreads):
+    """out[q] = values[perm[q]], serially and (from 393216 elements, with threads) split
+    across torch's pool."""
+    values = torch.rand(n, dtype=dtype)
+    perm = torch.randperm(n)
+    out = torch.empty_like(values)
+    scorch_ops.gather_values(values, perm, out, nthreads)
+    assert torch.equal(out, values[perm])

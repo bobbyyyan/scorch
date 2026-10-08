@@ -52,9 +52,13 @@
 #include "plan.h"
 
 #include <ATen/SparseCsrTensorUtils.h>
+#include <ATen/FuncTorchTLS.h>
+#include <ATen/core/grad_mode.h>
 #include <torch/csrc/DynamicTypes.h>
 #include <torch/csrc/Exceptions.h>
+#include <torch/csrc/autograd/custom_function.h>
 #include <torch/csrc/autograd/python_variable.h>
+#include <torch/csrc/utils/object_ptr.h>
 
 #include <string>
 
@@ -79,6 +83,9 @@ struct PlannedMatmul {
   Py_ssize_t max_plans = 0;              // plan.MAX_PLANS_PER_OPERAND
   bool match_host_threads = false;       // ops._MATCH_HOST_THREADS
   bool atparallel = false;               // ops._PLAN_ATPARALLEL
+  // autograd.planned_mm_backward: the backward of a product PlannedMatmulGrad recorded. Unset,
+  // every product autograd must record goes to the Python function.
+  PyObject* mm_backward = nullptr;
 };
 
 inline PlannedMatmul& planned_matmul_state() {
@@ -326,6 +333,128 @@ inline PyObject* planned_matmul_torch_call(const PlannedMatmul& s, PyObject* a, 
   return result;
 }
 
+// Whether a gradient is wanted through `t`: grad mode is on and it requires grad, or
+// forward-mode AD has given it a tangent (torch supports one forward-AD level, level 0). A
+// call with such an input is the Python function's, which records it for autograd
+// (scorch/autograd.py); a plan would serve it and the result would carry no gradient.
+//
+// A tensor without autograd metadata can do neither, and that is every tensor of a call made
+// without gradients, so the metadata pointer is asked first. Each of these accessors is a call
+// into libc10 (torch 2.13 defines none of them inline), and on a cold call each is a cache miss
+// in front of the kernel: asking requires_grad and _fw_grad of a tensor without metadata cost a
+// cold planned call 1.0-1.4 us on MKT against the tree before autograd; asking for the pointer
+// alone, 0.3-0.7 us.
+inline bool planned_matmul_wants_grad(const at::Tensor& t) {
+  if (t.unsafeGetTensorImpl()->autograd_meta() == nullptr) return false;
+  return (t.requires_grad() && at::GradMode::is_enabled()) || t._fw_grad(/*level=*/0).defined();
+}
+
+// ---------------------------------------------------------------------------
+// A planned product that autograd records
+//
+// A training step through a small matrix spent its cold time in front of the kernel, not in it.
+// On an M5, one cold forward of a 112 x 112 CSR operand with 72 nonzeros times an 8-column dense
+// matrix took 49 us through scorch/autograd.py: the kernel call was 18 us of it, and the bare
+// machinery of a Python torch.autograd.Function 23 us -- more than torch's whole cold forward of
+// the same product (19 us). So the reverse-mode product of a torch CSR operand that has a plan is
+// recorded here, by a C++ autograd Function whose forward is the plan's kernel. Its backward is
+// the Python function autograd.planned_mm_backward: the same gradients by the same code as the
+// Python path's, recorded in turn when the backward is asked to build a graph. The backward was
+// never the cold cost.
+//
+// It serves only products the Python path computes identically: a contiguous two-dimensional
+// dense operand (the Python path lays the product out like a transposed one), no forward-mode
+// tangent on either operand (a C++ Function has no forward derivative), no functorch transform.
+// Every other product, and every operand without a plan yet, goes to the Python function.
+struct PlannedMatmulProduct {
+  at::Tensor a;    // the operand: the backward finds the structure its gradients run on
+  at::Tensor out;  // the product, computed by the plan before the Function records it
+};
+
+struct PlannedMatmulGrad : public torch::autograd::Function<PlannedMatmulGrad> {
+  static at::Tensor forward(torch::autograd::AutogradContext* ctx, const at::Tensor& values,
+                            const at::Tensor& b, PlannedMatmulProduct product) {
+    ctx->saved_data["a"] = std::move(product.a);
+    // Only what a requested gradient reads, as autograd._record saves it: b's gradient reads the
+    // values, the values' gradient reads b, and b can be a large activation.
+    ctx->save_for_backward({b.requires_grad() ? values : at::Tensor(),
+                            values.requires_grad() ? b : at::Tensor()});
+    return std::move(product.out);
+  }
+
+  static torch::autograd::variable_list backward(torch::autograd::AutogradContext* ctx,
+                                                 torch::autograd::variable_list grads) {
+    const bool want_values = ctx->needs_input_grad(0), want_b = ctx->needs_input_grad(1);
+    torch::autograd::variable_list out(3);  // values, b, and the product (not a tensor)
+    if (!grads[0].defined() || !(want_values || want_b)) return out;
+    torch::autograd::variable_list saved = ctx->get_saved_variables();  // checks versions
+    pybind11::gil_scoped_acquire gil;
+    PyObject* fn = planned_matmul_state().mm_backward;
+    TORCH_CHECK(fn != nullptr, "scorch: the planned product's backward is no longer installed");
+    THPObjectPtr a(THPVariable_Wrap(ctx->saved_data["a"].toTensor()));
+    THPObjectPtr values(THPVariable_Wrap(saved[0]));
+    THPObjectPtr b(THPVariable_Wrap(saved[1]));
+    THPObjectPtr g(THPVariable_Wrap(grads[0]));
+    THPObjectPtr result;
+    if (a && values && b && g)
+      result = PyObject_CallFunctionObjArgs(fn, a.get(), values.get(), b.get(), g.get(),
+                                            want_values ? Py_True : Py_False,
+                                            want_b ? Py_True : Py_False, nullptr);
+    if (!result) {
+      // Raised again, as itself, by the Python call that ran the backward.
+      python_error err;
+      err.persist();
+      throw std::move(err);
+    }
+    TORCH_CHECK(PyTuple_Check(result.get()) && PyTuple_GET_SIZE(result.get()) == 2,
+                "scorch: planned_mm_backward must return (values' gradient, b's gradient)");
+    for (Py_ssize_t i = 0; i < 2; ++i) {
+      PyObject* item = PyTuple_GET_ITEM(result.get(), i);
+      if (item == Py_None) continue;
+      TORCH_CHECK(THPVariable_Check(item), "scorch: planned_mm_backward returned a non-tensor");
+      out[i] = THPVariable_Unpack(item);
+    }
+    return out;
+  }
+};
+
+// A torch CSR operand's product that autograd must record, served from its plan: the result as a
+// new reference, or nullptr with no error set when the Python function is to compute it instead.
+inline PyObject* planned_matmul_torch_grad(const PlannedMatmul& s, PyObject* a, PyObject* b) {
+  const at::Tensor& at_a = THPVariable_Unpack(a);
+  const at::Tensor& bt = THPVariable_Unpack(b);
+  if (s.mm_backward == nullptr || bt.layout() != c10::kStrided || bt.dim() != 2 ||
+      !bt.is_contiguous() ||
+      at_a._fw_grad(/*level=*/0).defined() || bt._fw_grad(/*level=*/0).defined() ||
+      at::functorch::functorchTLSAccessor())
+    return nullptr;
+  py::object key = py::reinterpret_steal<py::object>(planned_matmul_key(s, bt));
+  py::object id = py::reinterpret_steal<py::object>(key ? PyLong_FromVoidPtr(a) : nullptr);
+  SpmmCsrPlan* plan = nullptr;
+  if (key && id) {
+    if (PyObject* state = planned_matmul_torch_state(s, a, id.ptr()))
+      plan = planned_matmul_find(PyDict_GetItemWithError(state, s.plans_attr), key.ptr());
+  }
+  PyErr_Clear();
+  if (plan == nullptr) return nullptr;
+  auto* impl = at::sparse_csr::get_sparse_csr_impl(at_a);
+  c10::optional<torch::Tensor> served;
+  {
+    at::AutoGradMode no_grad(false);  // the product is recorded below, once
+    served = plan->run_csr(impl->compressed_indices(), impl->plain_indices(), impl->values(), bt,
+                           planned_matmul_nthreads(s), s.atparallel);
+  }
+  if (!served.has_value()) return nullptr;
+  // torch's values(), not the member the plan read: it is a view of `a` that shares `a`'s version
+  // counter, so a write through any alias of the values between this forward and its backward is
+  // caught there, as torch.sparse.mm and the Python path catch it (the member's counter is its
+  // own, and saving it let the backward read the new values silently); and when `a` requires grad
+  // the values' gradient reaches `a` by torch's own values() backward.
+  at::Tensor values = at_a.values();
+  return THPVariable_Wrap(
+      PlannedMatmulGrad::apply(values, bt, PlannedMatmulProduct{at_a, std::move(*served)}));
+}
+
 inline PyObject* planned_matmul_call(PyObject* /*module*/, PyObject* const* args,
                                      Py_ssize_t nargsf, PyObject* kwnames) {
   HANDLE_TH_ERRORS
@@ -334,11 +463,17 @@ inline PyObject* planned_matmul_call(PyObject* /*module*/, PyObject* const* args
       reinterpret_cast<PyObject*>(Py_TYPE(args[1])) == s.tensor_type &&
       PyList_CheckExact(s.enabled) && PyList_GET_SIZE(s.enabled) >= 1 &&
       PyList_GET_ITEM(s.enabled, 0) == Py_True) {
+    const bool b_grad = planned_matmul_wants_grad(THPVariable_Unpack(args[1]));
     if (reinterpret_cast<PyObject*>(Py_TYPE(args[0])) == s.stensor_type) {
-      PyObject* served = planned_matmul_try(s, args[0], args[1]);
-      if (served != nullptr || PyErr_Occurred()) return served;
+      if (!b_grad) {
+        PyObject* served = planned_matmul_try(s, args[0], args[1]);
+        if (served != nullptr || PyErr_Occurred()) return served;
+      }
     } else if (planned_matmul_torch_csr(s, args[0])) {
-      return planned_matmul_torch_call(s, args[0], args[1], args, nargsf);
+      if (!b_grad && !planned_matmul_wants_grad(THPVariable_Unpack(args[0])))
+        return planned_matmul_torch_call(s, args[0], args[1], args, nargsf);
+      PyObject* served = planned_matmul_torch_grad(s, args[0], args[1]);
+      if (served != nullptr || PyErr_Occurred()) return served;
     }
   }
   return PyObject_Vectorcall(s.ordinary, args, nargsf, kwnames);
