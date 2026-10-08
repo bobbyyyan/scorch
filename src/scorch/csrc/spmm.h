@@ -4528,13 +4528,7 @@ torch::Tensor spmm_csr_v2_core(
   // Whether a multi-worker call will run on torch's full-width team (the launch below): under
   // libgomp, exactly when the caller asked for it or the process-wide flag forces it. The
   // runtime is the one the process loaded (scorch_omp_is_libgomp), not the header's.
-#if SCORCH_SPMM_FULL_TEAM_ROWS != 0
-  const int _atpf_team = scorch_flags::atparallel();
-  const bool full_team =
-      scorch_omp_is_libgomp() && (_atpf_team >= 0 ? _atpf_team != 0 : atparallel);
-#else
-  const bool full_team = false;
-#endif
+  const bool full_team = scorch_spmm_full_team(atparallel);
   const int nthreads = scorch_spmm_nthreads(work, A0_size, nthreads_override,
                                             (long)total_nnz * (long)B1_size,
                                             (long)total_nnz, full_team);
@@ -6377,13 +6371,8 @@ torch::Tensor spmm_csr_v2_core(
   // OpenMP header the build happened to find; see that function for the build that had them
   // disagree.
   // Env SCORCH_SPMM_ATPARALLEL forces the choice for A/B (1/0).
-  bool use_atparallel = scorch_omp_is_libgomp()
-      ? atparallel && nthreads_override > 0 && nthreads > 1
-      : atparallel && nthreads_override > 0
-            && work_nnz >= SCORCH_GRAIN_SPMM
-            && (long)A0_size >= (long)nthreads_override * SCORCH_ROWS_PER_THREAD;
-  { const int _atpf = scorch_flags::atparallel();     // cached per process; see scorch_policy.h
-    if (_atpf >= 0) use_atparallel = (_atpf != 0); }
+  const bool use_atparallel = scorch_spmm_on_torch_pool(atparallel, nthreads_override, nthreads,
+                                                        work_nnz, (long)A0_size);
 #ifdef SCORCH_TUNE_HOOKS
   const double wstat_wall_t0 = wstat_on ? scorch_spmm_now_ns() : 0.0;
   wstat_region_t0 = wstat_wall_t0;

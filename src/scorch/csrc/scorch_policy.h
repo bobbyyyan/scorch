@@ -3123,3 +3123,39 @@ inline int neon_regtile()   { SCORCH_FLAG_BODY("SCORCH_NEON_REGTILE",     neon_r
 #undef SCORCH_FLAG_BODY
 
 }  // namespace scorch_flags
+
+// --- How a drop-in op launches its workers ---------------------------------------------------
+//
+// The two decisions spmm_csr_v2_core launches by, stated once so that every kernel running in the
+// same pipeline as the drop-in SpMM -- the SDDMM of its gradient (sparse_grad.h) is the other --
+// launches by the same rule. A second kernel launching its own way is not merely slower in
+// isolation: under libgomp a parallel region of a different width than torch's pool releases or
+// re-creates pool threads, 300 us per alternation on MKT (see the launch in spmm_csr_v2_core for
+// the measurements behind both rules).
+
+// Whether a multi-worker call will run on torch's full-width team (scorch_spmm_nthreads'
+// `full_team`): under libgomp, exactly when the caller asked for it or the process-wide flag
+// forces it. The runtime is the one the process loaded (scorch_omp_is_libgomp).
+inline bool scorch_spmm_full_team(bool atparallel) {
+#if SCORCH_SPMM_FULL_TEAM_ROWS != 0
+  const int forced = scorch_flags::atparallel();
+  return scorch_omp_is_libgomp() && (forced >= 0 ? forced != 0 : atparallel);
+#else
+  (void)atparallel;
+  return false;
+#endif
+}
+
+// Whether a call runs its `nthreads` workers on torch's intra-op pool (at::parallel_for) rather
+// than a private OpenMP team. SCORCH_SPMM_ATPARALLEL forces the choice for A/B (1/0).
+inline bool scorch_spmm_on_torch_pool(bool atparallel, int nthreads_override, int nthreads,
+                                      long work_nnz, long rows) {
+  bool on_pool = scorch_omp_is_libgomp()
+      ? atparallel && nthreads_override > 0 && nthreads > 1
+      : atparallel && nthreads_override > 0
+            && work_nnz >= SCORCH_GRAIN_SPMM
+            && rows >= (long)nthreads_override * SCORCH_ROWS_PER_THREAD;
+  const int forced = scorch_flags::atparallel();     // cached per process
+  if (forced >= 0) on_pool = (forced != 0);
+  return on_pool;
+}
