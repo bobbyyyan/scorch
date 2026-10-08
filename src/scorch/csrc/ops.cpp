@@ -718,6 +718,14 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         "The work the drop-in SpMM states to scorch_spmm_nthreads for (nnz, empty rows it "
         "zeroes, width, output width)",
         py::arg("nnz"), py::arg("empty_rows"), py::arg("width"), py::arg("out_width"));
+    // ... and the two composed as the kernel composes them, which is what a plan asks before a
+    // gathered call (SpmmCsrPlan::run_gathered).
+    m.def("scorch_spmm_v2_workers", &scorch_spmm_v2_workers,
+        "The workers the drop-in SpMM runs a call on: scorch_spmm_nthreads over scorch_spmm_work "
+        "for (nnz, empty rows it zeroes, width, output width, rows, nthreads_override, "
+        "full_team)",
+        py::arg("nnz"), py::arg("empty_rows"), py::arg("width"), py::arg("out_width"),
+        py::arg("rows"), py::arg("nthreads_override"), py::arg("full_team") = false);
 
     // Exported so a harness asks for this count instead of recomputing it, for the same reason
     // as the chunk width and the thread count above. It is deliberately NOT a second spelling of
@@ -999,12 +1007,19 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
            "ones the plan was built from, or the plan declines",
            py::arg("positions"), py::arg("coordinates"), py::arg("a_values"),
            py::arg("b"), py::arg("nthreads") = -1, py::arg("atparallel") = false)
+      .def("run_gathered", &scorch_native::SpmmCsrPlan::run_gathered,
+           "run, with a_values first set to src[perm[q]] for every nonzero q (by the "
+           "product's team, where a v2 product has one); None where `run` would decline",
+           py::arg("a_values"), py::arg("src"), py::arg("perm"), py::arg("b"),
+           py::arg("nthreads") = -1, py::arg("atparallel") = false)
       .def_property_readonly("kind", &scorch_native::SpmmCsrPlan::kind)
       .def_property_readonly("rows", &scorch_native::SpmmCsrPlan::rows)
       .def_property_readonly("cols", &scorch_native::SpmmCsrPlan::cols)
       .def_property_readonly("nnz", &scorch_native::SpmmCsrPlan::nnz)
       .def_property_readonly("free_dim", &scorch_native::SpmmCsrPlan::free_dim)
       .def_property_readonly("served", &scorch_native::SpmmCsrPlan::served)
+      .def_property_readonly("empty_rows", &scorch_native::SpmmCsrPlan::empty_rows)
+      .def_property_readonly("team_fills", &scorch_native::SpmmCsrPlan::team_fills)
       .def_property_readonly("wide_rows", &scorch_native::SpmmCsrPlan::wide_rows)
       .def_property_readonly("wide_segments", &scorch_native::SpmmCsrPlan::wide_segments);
     // The kernels the gradient of a sparse x dense product needs beyond the SpMM itself
@@ -1020,6 +1035,10 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           py::call_guard<py::gil_scoped_release>(), py::arg("positions"),
           py::arg("coordinates"), py::arg("x"), py::arg("y"), py::arg("nthreads") = -1,
           py::arg("atparallel") = false);
+    m.def("planned_matmul_gathered", &scorch_native::planned_matmul_gathered,
+          "a @ b by a's plan, a's values first set to src[perm[q]] (SpmmCsrPlan::run_gathered); "
+          "None when no plan serves it",
+          py::arg("a"), py::arg("b"), py::arg("src"), py::arg("perm"));
     m.def("gather_values", &scorch_native::gather_values,
           "out[q] = values[perm[q]]: the values of a CSR transpose, with csr_transpose's perm",
           py::call_guard<py::gil_scoped_release>(), py::arg("values"), py::arg("perm"),

@@ -2626,6 +2626,17 @@ inline int scorch_spmm_nthreads(long work, long rows, int nthreads_override,
   return nthreads;
 }
 
+// The worker count spmm_csr_v2_core resolves for a call: `nnz` nonzeros in `rows` rows at width
+// `width` into rows of `out_width`, `empty_rows` of them empty rows whose zeros its workers store
+// (0 when they do not). It is scorch_spmm_nthreads over the work scorch_spmm_work states for that.
+// The core asks it, and so does SpmmCsrPlan::run_gathered, which has to know before the call
+// whether the product will run on a team.
+inline int scorch_spmm_v2_workers(long nnz, long empty_rows, long width, long out_width, long rows,
+                                  int nthreads_override, bool full_team) {
+  return scorch_spmm_nthreads(scorch_spmm_work(nnz, empty_rows, width, out_width), rows,
+                              nthreads_override, nnz * width, nnz, full_team);
+}
+
 
 // ---------------------------------------------------------------------------------------------
 // ROW-SPLIT PARTITION: the load-balance ceiling, and how to tell when it binds.
@@ -2850,6 +2861,16 @@ struct ScorchWideRows {
   // segment counter, scorch_wide_left_bytes(n) of per-row counts of segments still to finish, then
   // nseg rows of `stride` elements.
   char* scratch = nullptr;
+};
+
+// A call whose values are another array's, permuted: before the product, A's values are filled
+// with src[perm[q]] for every nonzero q, on the team that then computes it (spmm_csr_v2_core's
+// GATHER instance). That is a CSR transpose's values, perm from csr_transpose, which autograd.py
+// reads afresh on every call. The wide rows are the call's as usual; nseg 0 when it has none.
+template <typename T>
+struct ScorchGatherCall : ScorchWideRows {
+  const T* src = nullptr;
+  const int64_t* perm = nullptr;
 };
 
 // Bytes of the per-wide-row counts, rounded up to whole lines so the segment rows start on one.

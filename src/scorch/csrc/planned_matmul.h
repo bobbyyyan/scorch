@@ -196,6 +196,40 @@ inline PyObject* planned_matmul_try(const PlannedMatmul& s, PyObject* a, PyObjec
   return THPVariable_Wrap(std::move(*served));
 }
 
+// The product of an STensor `a` whose values are src[perm[q]] -- autograd.py's carrier for a CSR
+// transpose -- with `b`, by the plan `a` holds for `b`: SpmmCsrPlan::run_gathered, which leaves
+// `a`'s values filled. None when no plan serves it (none yet for this `b`, plans disabled, or a
+// decline); the caller then fills the values itself and runs the ordinary path, which plans a
+// product it sees again.
+inline py::object planned_matmul_gathered(py::handle a, const torch::Tensor& b,
+                                          const torch::Tensor& src, const torch::Tensor& perm) {
+  const PlannedMatmul& s = planned_matmul_state();
+  if (s.plans_attr == nullptr || s.storage_attr == nullptr || s.value_attr == nullptr ||
+      !PyList_CheckExact(s.enabled) || PyList_GET_SIZE(s.enabled) < 1 ||
+      PyList_GET_ITEM(s.enabled, 0) != Py_True)
+    return py::none();
+  py::object dict = py::reinterpret_steal<py::object>(PyObject_GenericGetDict(a.ptr(), nullptr));
+  if (!dict) {
+    PyErr_Clear();
+    return py::none();
+  }
+  PyObject* plans = PyDict_GetItemWithError(dict.ptr(), s.plans_attr);  // borrowed
+  py::object key = py::reinterpret_steal<py::object>(
+      plans != nullptr ? planned_matmul_key(s, b) : nullptr);
+  SpmmCsrPlan* plan = key ? planned_matmul_find(plans, key.ptr()) : nullptr;
+  py::object storage = py::reinterpret_steal<py::object>(
+      plan != nullptr ? PyObject_GetAttr(a.ptr(), s.storage_attr) : nullptr);
+  py::object values = py::reinterpret_steal<py::object>(
+      storage ? PyObject_GetAttr(storage.ptr(), s.value_attr) : nullptr);
+  PyErr_Clear();
+  if (!values || !THPVariable_Check(values.ptr())) return py::none();
+  c10::optional<torch::Tensor> served =
+      plan->run_gathered(THPVariable_Unpack(values.ptr()), src, perm, b,
+                         planned_matmul_nthreads(s), s.atparallel);
+  if (!served.has_value()) return py::none();
+  return py::reinterpret_steal<py::object>(THPVariable_Wrap(std::move(*served)));
+}
+
 // ---------------------------------------------------------------------------
 // Torch sparse CSR operands
 //

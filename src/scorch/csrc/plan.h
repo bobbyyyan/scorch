@@ -38,6 +38,8 @@
 #include <algorithm>
 #include <limits>
 #include <string>
+
+#include "sparse_grad.h"
 #include <utility>
 #include <vector>
 
@@ -105,19 +107,27 @@ class SpmmCsrPlan {
         source_coordinates_data_(source_coordinates_.data_ptr()),
         source_positions_version_(abi_version_of(source_positions_)),
         source_coordinates_version_(abi_version_of(source_coordinates_)),
-        served_(0) {
+        served_(0),
+        team_fills_(0),
+        empty_rows_(0) {
     // A's wide rows and their segments, built once here rather than on every call: the search is
     // a few dozen binary searches over the row bounds, which measured as the whole per-call cost
     // of an earlier split on the matrices it declined, and building the segments per call was the
     // cost of this one's first version on small matrices. Only the v2 kernels segment them.
-    if (kind_ == SpmmPlanKind::V2 || kind_ == SpmmPlanKind::V2Double)
+    if (kind_ == SpmmPlanKind::V2 || kind_ == SpmmPlanKind::V2Double) {
       wide_.build(pos_, (long)rows_, (long)free_dim_, kind_ == SpmmPlanKind::V2 ? 4L : 8L);
+      for (int64_t i = 0; i < rows_; ++i) empty_rows_ += pos_[i] == pos_[i + 1] ? 1 : 0;
+    }
   }
 
   int64_t rows() const { return rows_; }
   int64_t cols() const { return cols_; }
   int64_t nnz() const { return nnz_; }
   int64_t free_dim() const { return free_dim_; }
+  int64_t empty_rows() const { return empty_rows_; }
+  // How many run_gathered calls the product's team filled the values of. Diagnostic, like
+  // `served`: the two fills compute the same bits, so this is what shows which one ran.
+  int64_t team_fills() const { return team_fills_; }
   // How many calls this plan has served. Diagnostic, and what the tests assert on
   // to prove the fast path actually fired. A plain counter rather than an atomic
   // because `run` is invoked from Python holding the GIL and does not release it --
@@ -255,7 +265,119 @@ class SpmmCsrPlan {
     return run(a_values, b, nthreads, atparallel);
   }
 
+  // `run` for values that are another array's, permuted: the product with A's values set to
+  // src[perm[q]] for every nonzero q, which `values`, the caller's buffer, is left holding. That is
+  // a CSR transpose's values (perm from csr_transpose), which autograd.py reads afresh on every
+  // call, since a write through .data or a numpy view moves no version counter. nullopt for a call
+  // `run` would decline.
+  //
+  // Where a v2 product runs on a team, the workers fill the buffer, each with the values of the
+  // nonzeros it is about to compute, inside the product's own region (ScorchGatherCall): the fill
+  // is shared, and each value is written on the core that reads it. Filled beforehand, the buffer
+  // is written on the caller's thread alone and then read on the team's cores; in a training step
+  // that cost 11 us at 10k nonzeros and 40 us at 30k on MKT, 1 and 6-7 us on the M5.
+  //
+  // Where it runs on one worker, that worker is the caller's thread, and filling first is the same
+  // work, so the buffer is filled first and `run` computes the product on the kernel instance the
+  // operand's other products run. In a training step the gathered instance cost 0.5-1.3 us more
+  // there on MKT, at 30 to 3000 nonzeros, and 0.4-0.7 us at 3000 on the M5. On MKT that cost is
+  // the step's: in a loop of the products alone the gathered instance was 0.1 us cheaper. Whether
+  // the product has a team is the core's own decision, asked before the call
+  // (scorch_spmm_v2_workers). The tiled and reference kinds always fill first.
+  c10::optional<torch::Tensor> run_gathered(const torch::Tensor& values, const torch::Tensor& src,
+                                            const torch::Tensor& perm, const torch::Tensor& b,
+                                            int64_t nthreads, bool atparallel) {
+    if (!accepts(values, b, nthreads)) return c10::nullopt;
+    if (!src.defined() || !perm.defined()) return c10::nullopt;
+    if (src.scalar_type() != dtype_ || perm.scalar_type() != torch::kInt64) return c10::nullopt;
+    if (!src.device().is_cpu() || !perm.device().is_cpu()) return c10::nullopt;
+    if (src.layout() != torch::kStrided || perm.layout() != torch::kStrided) {
+      return c10::nullopt;
+    }
+    if (src.dim() != 1 || src.numel() != nnz_ || perm.dim() != 1 || perm.numel() != nnz_) {
+      return c10::nullopt;
+    }
+    if (!src.is_contiguous() || !perm.is_contiguous()) return c10::nullopt;
+    if (src.is_conj() || src.is_neg()) return c10::nullopt;
+    // The buffer is written while src is read.
+    if (at::get_overlap_status(values, src) != at::MemOverlapStatus::No) return c10::nullopt;
+
+    const int rows = static_cast<int>(rows_);
+    const int free_dim = static_cast<int>(free_dim_);
+    const int nt = static_cast<int>(nthreads);
+    // The tiled kernels re-read A once per panel, and the reference kernel has no workers of its
+    // own; a v2 product on one worker runs on the caller's thread.
+    const bool v2 = kind_ == SpmmPlanKind::V2 || kind_ == SpmmPlanKind::V2Double;
+    if (!v2 || scorch_spmm_v2_workers(nnz_, empty_rows_, free_dim_, free_dim_, rows_, nt,
+                                      scorch_spmm_full_team(atparallel)) <= 1) {
+      torch::Tensor filled = values;
+      gather_values(src, perm, filled, nthreads);
+      return run(values, b, nthreads, atparallel);
+    }
+    torch::Tensor out;
+    if (kind_ == SpmmPlanKind::V2) {
+      ScorchGatherCall<float> g;
+      wide_.view(&g);
+      g.src = src.data_ptr<float>();
+      g.perm = perm.data_ptr<int64_t>();
+      out = spmm_csr_float_v2_gathered_core(rows, free_dim, rows, pos_, crd_,
+                                            values.data_ptr<float>(), free_dim,
+                                            b.data_ptr<float>(), static_cast<int>(tile_size_), nt,
+                                            atparallel, &g);
+    } else {
+      ScorchGatherCall<double> g;
+      wide_.view(&g);
+      g.src = src.data_ptr<double>();
+      g.perm = perm.data_ptr<int64_t>();
+      out = spmm_csr_double_v2_gathered_core(rows, free_dim, rows, pos_, crd_,
+                                             values.data_ptr<double>(), free_dim,
+                                             b.data_ptr<double>(), static_cast<int>(tile_size_),
+                                             nt, atparallel, &g);
+    }
+    ++served_;
+    ++team_fills_;
+    return out.view({rows_, free_dim_});
+  }
+
  private:
+  // Whether `run` would serve this call: `run`'s own checks, for run_gathered. `run` keeps them
+  // written out in its body, which is the code it was compiled to before run_gathered existed;
+  // test_gathered_run_declines_what_run_declines holds the two to the same calls.
+  bool accepts(const torch::Tensor& a_values, const torch::Tensor& b, int64_t nthreads) const {
+    // -- the operands must be exactly the shape of call this plan was built for
+    if (!a_values.defined() || !b.defined()) return false;
+    if (a_values.scalar_type() != dtype_ || b.scalar_type() != dtype_) {
+      return false;
+    }
+    if (!a_values.device().is_cpu() || !b.device().is_cpu()) return false;
+    if (a_values.layout() != torch::kStrided || b.layout() != torch::kStrided) {
+      return false;
+    }
+    if (a_values.dim() != 1 || a_values.numel() != nnz_) return false;
+    if (b.dim() != 2 || b.size(0) != cols_ || b.size(1) != free_dim_) {
+      return false;
+    }
+    if (!a_values.is_contiguous() || !b.is_contiguous()) return false;
+    // Lazy views the legacy boundary materializes before reading raw memory.
+    if (a_values.is_conj() || a_values.is_neg() || b.is_conj() || b.is_neg()) {
+      return false;
+    }
+    if (nthreads < -1 || nthreads > std::numeric_limits<int>::max()) {
+      return false;
+    }
+
+    // -- the structure must still be the structure that was validated
+    if (source_positions_.data_ptr() != source_positions_data_ ||
+        source_coordinates_.data_ptr() != source_coordinates_data_) {
+      return false;
+    }
+    if (abi_version_of(source_positions_) != source_positions_version_ ||
+        abi_version_of(source_coordinates_) != source_coordinates_version_) {
+      return false;
+    }
+    return true;
+  }
+
   SpmmPlanKind kind_;
   torch::ScalarType dtype_;
   int64_t rows_;
@@ -280,6 +402,10 @@ class SpmmCsrPlan {
   uint32_t source_positions_version_;
   uint32_t source_coordinates_version_;
   int64_t served_;
+  int64_t team_fills_;
+  // A's empty rows, for the v2 kinds: the output rows the core's workers zero, which the shipped
+  // zeroing (in the row loop) credits to the work its worker count reads (scorch_spmm_v2_workers).
+  int64_t empty_rows_;
   // A's wide rows and their segments for this plan's free dimension and dtype, and the scratch the
   // kernel sums them in (see ScorchWideLayout). Empty when A has no row the v2 kernels split.
   ScorchWideLayout wide_;

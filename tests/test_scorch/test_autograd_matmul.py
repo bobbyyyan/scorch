@@ -658,3 +658,208 @@ def test_gather_values_kernel(dtype, n, nthreads):
     out = torch.empty_like(values)
     scorch_ops.gather_values(values, perm, out, nthreads)
     assert torch.equal(out, values[perm])
+
+
+# --------------------------------------------------------------------------- #
+# A transpose's values, gathered by the product's team where it has one
+# --------------------------------------------------------------------------- #
+
+
+def _wide_csr(dtype):
+    """3000 x 60000 with rows of 0-60 nonzeros and three rows widened past 1/64 of the
+    nonzeros, so a plan computes them in segments (test_spmm_wide_rows.py's matrix)."""
+    g = torch.Generator().manual_seed(0)
+    rows, cols = 3000, 60000
+    lengths = torch.randint(0, 61, (rows,), generator=g)
+    lengths[0], lengths[1500], lengths[2999] = 40000, 30000, 12000
+    crow = torch.zeros(rows + 1, dtype=torch.long)
+    crow[1:] = torch.cumsum(lengths, 0)
+    col = torch.cat(
+        [torch.randperm(cols, generator=g)[: int(n)].sort().values for n in lengths]
+    )
+    vals = torch.randn(int(crow[-1]), generator=g, dtype=dtype)
+    return torch.sparse_csr_tensor(crow, col, vals, size=(rows, cols))
+
+
+def _plan(a, kind, width, panels=(0, 0)):
+    rows, cols = a.shape
+    indices = [[], [a.crow_indices().to(torch.int32), a.col_indices().to(torch.int32)]]
+    return scorch_ops.make_spmm_csr_plan(
+        kind, [rows, cols], indices, a.values(), width, *panels
+    )
+
+
+GATHERED_CASES = [
+    ("v2", torch.float32, (0, 0)),
+    ("v2_double", torch.float64, (0, 0)),
+    ("tilej", torch.float32, (0, 64)),
+    ("tileijk", torch.float32, (8, 32)),
+    ("reference", torch.float64, (0, 0)),
+]
+
+
+@pytest.mark.parametrize("kind,dtype,panels", GATHERED_CASES, ids=lambda c: str(c))
+@pytest.mark.parametrize("width", [1, 2, 3, 4, 8, 16, 33, 64])
+@pytest.mark.parametrize(
+    "nthreads,atparallel", [(-1, False), (1, False), (4, False), (4, True)]
+)
+@pytest.mark.parametrize("wide", [False, True], ids=["plain", "wide_rows"])
+def test_gathered_run_is_run_on_the_gathered_values(
+    kind, dtype, panels, width, nthreads, atparallel, wide
+):
+    """run_gathered(buffer, src, perm) is run(src[perm]) bit for bit, and leaves the buffer
+    holding src[perm]: on every v2 row kernel (widths 1-64 cover the exact, half-vector,
+    register-block and register-tile loops), with and without wide rows in segments, on
+    one worker and on a team, on torch's pool and on a private one; and on the kernels
+    that take the buffer filled beforehand (tile-j, tile-ijk, reference)."""
+    if wide and kind not in ("v2", "v2_double"):
+        pytest.skip("wide rows are the v2 kernels'")
+    if wide:
+        a = _wide_csr(dtype)
+    else:
+        a = dense_matrix(300, 500, 0.05, dtype=dtype).to_sparse_csr()
+    plan = _plan(a, kind, width, panels)
+    assert plan is not None and plan.kind == kind
+    if wide and kind.startswith("v2"):
+        assert plan.wide_segments > 0
+    nnz = a._nnz()
+    g = torch.Generator().manual_seed(width)
+    src = torch.randn(nnz, generator=g, dtype=dtype)
+    perm = torch.randperm(nnz, generator=g)
+    b = torch.randn(a.shape[1], width, generator=g, dtype=dtype)
+    want = plan.run(src[perm], b, nthreads, atparallel)
+    buffer = torch.full((nnz,), float("nan"), dtype=dtype)
+    fills = plan.team_fills
+    got = plan.run_gathered(buffer, src, perm, b, nthreads, atparallel)
+    assert torch.equal(buffer, src[perm])
+    assert torch.equal(got, want)
+    # The team filled the values exactly when the product has one. Where the count depends
+    # on whether the call runs on torch's full-width team, which the test cannot see, the
+    # fill is left unasserted.
+    team = {_workers(plan, width, nthreads, ft) > 1 for ft in (False, True)}
+    if not kind.startswith("v2"):
+        assert plan.team_fills == fills
+    elif len(team) == 1:
+        assert plan.team_fills == fills + (1 if team.pop() else 0)
+
+
+def _workers(plan, width, nthreads, full_team):
+    return scorch_ops.scorch_spmm_v2_workers(
+        plan.nnz, plan.empty_rows, width, width, plan.rows, nthreads, full_team
+    )
+
+
+@pytest.mark.parametrize("dtype", [torch.float32, torch.float64])
+def test_gathered_cases_run_both_fills(dtype):
+    """run_gathered fills on the product's team where a v2 product has one and before the
+    call where it runs on one worker (scorch_spmm_v2_workers decides). The grid of
+    test_gathered_run_is_run_on_the_gathered_values holds both fills to `run` bit for bit
+    only if it reaches both: here, whichever team width torch's pool resolves to, it has
+    calls of each."""
+    kind = "v2" if dtype == torch.float32 else "v2_double"
+    matrices = [dense_matrix(300, 500, 0.05, dtype=dtype).to_sparse_csr(), _wide_csr(dtype)]
+    for full_team in (False, True):
+        counts = [
+            _workers(_plan(a, kind, width), width, nthreads, full_team)
+            for a in matrices
+            for width in [1, 2, 3, 4, 8, 16, 33, 64]
+            for nthreads in (-1, 1, 4)
+        ]
+        assert min(counts) == 1 and max(counts) > 1, (full_team, counts)
+
+
+@pytest.mark.parametrize("kind,dtype,panels", GATHERED_CASES, ids=lambda c: str(c))
+def test_plan_counts_its_empty_rows(kind, dtype, panels):
+    """A v2 plan's empty rows are A's (what scorch_spmm_v2_workers credits); the other kinds
+    never ask, and hold none."""
+    a = dense_matrix(300, 500, 0.002, dtype=dtype).to_sparse_csr()
+    empty = int((a.crow_indices().diff() == 0).sum())
+    assert empty > 0
+    plan = _plan(a, kind, 8, panels)
+    assert plan.empty_rows == (empty if kind.startswith("v2") else 0)
+
+
+def test_gathered_run_declines_what_it_cannot_serve():
+    a = dense_matrix(40, 30, 0.2, dtype=torch.float32).to_sparse_csr()
+    plan = _plan(a, "v2", 8)
+    nnz = a._nnz()
+    src, perm, b = torch.rand(nnz), torch.randperm(nnz), torch.rand(30, 8)
+    assert plan.run_gathered(torch.empty(nnz), src, perm.int(), b) is None
+    assert plan.run_gathered(torch.empty(nnz), src[1:], perm, b) is None
+    assert plan.run_gathered(torch.empty(nnz), src.double(), perm, b) is None
+    assert plan.run_gathered(src, src, perm, b) is None  # the buffer is src
+    assert plan.run_gathered(torch.empty(nnz), src, perm, torch.rand(30, 9)) is None
+    assert plan.run_gathered(torch.empty(nnz), src, perm, b) is not None
+
+
+@pytest.mark.parametrize("kind,dtype,panels", GATHERED_CASES, ids=lambda c: str(c))
+def test_gathered_run_declines_what_run_declines(kind, dtype, panels):
+    """run_gathered checks its buffer and `b` with a copy of run's checks (SpmmCsrPlan::accepts),
+    so that run's own code is unchanged; this holds the two to the same calls, each operand
+    perturbed one way at a time, and the structure changed under the plan."""
+    a = dense_matrix(40, 30, 0.2, dtype=dtype).to_sparse_csr()
+    pos, crd = a.crow_indices().to(torch.int32), a.col_indices().to(torch.int32)
+    plan = scorch_ops.make_spmm_csr_plan(kind, [40, 30], [[], [pos, crd]], a.values(), 8, *panels)
+    assert plan is not None and plan.kind == kind
+    nnz = a._nnz()
+    other = torch.float64 if dtype == torch.float32 else torch.float32
+    src, perm = torch.rand(nnz, dtype=dtype), torch.randperm(nnz)
+    v, b = torch.rand(nnz, dtype=dtype), torch.rand(30, 8, dtype=dtype)
+    calls = {
+        "served": (v, b, -1),
+        "served, 4 threads": (v, b, 4),
+        "values dtype": (v.to(other), b, -1),
+        "b dtype": (v, b.to(other), -1),
+        "values length": (torch.rand(nnz + 1, dtype=dtype), b, -1),
+        "values 2-D": (v.view(1, nnz), b, -1),
+        "b rows": (v, torch.rand(31, 8, dtype=dtype), -1),
+        "b width": (v, torch.rand(30, 9, dtype=dtype), -1),
+        "b 1-D": (v, torch.rand(30, dtype=dtype), -1),
+        "values strided": (torch.rand(2 * nnz, dtype=dtype)[::2], b, -1),
+        "b transposed": (v, torch.rand(8, 30, dtype=dtype).t(), -1),
+        "values negative view": (torch._neg_view(v), b, -1),
+        "b negative view": (v, torch._neg_view(b), -1),
+        "b sparse": (v, b.to_sparse(), -1),
+        "nthreads -2": (v, b, -2),
+        "nthreads past int": (v, b, 2**31),
+    }
+    for name, (values, operand, nthreads) in calls.items():
+        ran = plan.run(values, operand, nthreads) is not None
+        # `values` is the buffer: run_gathered checks it where run checks A's values
+        gathered = plan.run_gathered(values, src, perm, operand, nthreads) is not None
+        assert ran == gathered, name
+        assert ran == name.startswith("served"), name
+    pos.add_(0)  # a write moves the version counter: the structure is no longer the validated one
+    assert plan.run(v, b) is None
+    assert plan.run_gathered(torch.empty(nnz, dtype=dtype), src, perm, b) is None
+
+
+@pytest.mark.parametrize("kind", ["csr", "stensor"])
+def test_the_planned_transpose_gathers_values_written_through_data(kind, monkeypatch):
+    """x @ A once A's transpose carries a plan: the plan gathers A's values on every call
+    (planned_matmul_gathered serves it), so a write through .data -- which moves no version
+    counter -- reaches the next product."""
+    served = []
+    real = scorch_ops.planned_matmul_gathered
+
+    def spy(*args):
+        out = real(*args)
+        served.append(out is not None)
+        return out
+
+    monkeypatch.setattr(scorch_ops, "planned_matmul_gathered", spy)
+    a = dense_matrix(200, 150, 0.05, dtype=torch.float32).to_sparse_csr()
+    x = rand(4, 200, dtype=torch.float32)
+    operand = a if kind == "csr" else STensor.from_torch(a)
+    values = a.values() if kind == "csr" else operand._storage._value
+    for step in range(6):
+        values.data.mul_(1.5)
+        got = scorch.matmul(x, operand)
+        want = (
+            x
+            @ torch.sparse_csr_tensor(
+                a.crow_indices(), a.col_indices(), values.detach().clone(), a.shape
+            ).to_dense()
+        )
+        torch.testing.assert_close(got, want, **tolerance(torch.float32))
+    assert served[-3:] == [True, True, True]

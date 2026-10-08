@@ -85,6 +85,10 @@ inline double scorch_spmm_now_ns() {
 // Global constants for optimization
 const int kUnrollFactor = 16;
 
+// Everything from here to the v2 row kernels, and from the v2 entry points to the end, is the
+// entry points ops.cpp binds: non-template definitions, so a second translation unit cannot
+// include them. spmm_gathered.cpp defines SCORCH_SPMM_KERNELS_ONLY and takes the kernels alone.
+#ifndef SCORCH_SPMM_KERNELS_ONLY
 // ---------------------------------------------------------------------------
 // Fused SpMM + bias + ReLU:  C[i,k] = max(0, sum_j A[i,j]*B[j,k] + bias[k])
 // ---------------------------------------------------------------------------
@@ -2046,6 +2050,7 @@ Tensor spmm_csr_float_neon4(std::vector<int> result_shape, std::vector<int> A_sh
   C.storage.value = C_values_torch;
   return C;
 }
+#endif  // SCORCH_SPMM_KERNELS_ONLY
 
 
 // ---------------------------------------------------------------------------
@@ -4221,7 +4226,24 @@ __attribute__((noinline)) static void scorch_spmm_rows_regtile(
 // hands over, and SpmmCsrPlan (plan.h), which already holds the unpacked and
 // validated structure and so pays none of that per call. Splitting them is what
 // lets a warm dispatch be a single Python->C++ hop; the body is unchanged.
-template <typename scalar_t, bool REDIRECT = false>
+// A gathered call's values for nonzeros [q0, q1): A_val[q] = src[perm[q]] (ScorchGatherCall). The
+// overload for an ordinary call does nothing, so the worker can name this in a branch that only
+// the gathered instance keeps.
+template <typename T>
+inline void scorch_spmm_gather(const ScorchWideRows*, T*, long, long) {}
+
+template <typename T>
+inline void scorch_spmm_gather(const ScorchGatherCall<T>* g, T* SCORCH_RESTRICT fill, long q0,
+                               long q1) {
+  const T* SCORCH_RESTRICT src = g->src;
+  const int64_t* SCORCH_RESTRICT perm = g->perm;
+  for (long q = q0; q < q1; ++q) fill[q] = src[perm[q]];
+}
+
+// WideT is ScorchWideRows except for a gathered call, whose ScorchGatherCall also carries the
+// values A_val is to hold. That instance alone contains the fill (GATHERED below), so every other
+// call runs exactly the code it ran before.
+template <typename scalar_t, bool REDIRECT = false, typename WideT = ScorchWideRows>
 torch::Tensor spmm_csr_v2_core(
                 int C0_size, int C1_size, int A0_size,
                 const int* SCORCH_RESTRICT A1_pos,
@@ -4231,7 +4253,7 @@ torch::Tensor spmm_csr_v2_core(
                 int tile_size, int nthreads_override, bool atparallel,
                 // A's wide rows (see ScorchWideRows), from a caller that keeps the matrix across
                 // calls; null where nobody has looked, and then every row is claimed whole.
-                const ScorchWideRows* wide_rows = nullptr
+                const WideT* wide_rows = nullptr
 #if SCORCH_SPMM_SPLIT_ENABLED
                 // Not merely defaulted to nullptr: a twelfth parameter goes on the stack in this
                 // ABI, so a default argument made every call site store a zero there and cost the
@@ -4240,6 +4262,13 @@ torch::Tensor spmm_csr_v2_core(
                 , const ScorchSplitPlan* split = nullptr
 #endif
                 ) {
+  // A gathered call: A_val is the caller's buffer, and each worker fills the values of the nonzeros
+  // it is about to compute -- a claimed range of rows, or a wide row's segment -- immediately
+  // before computing them, inside the product's own region. Nothing is written by one worker and
+  // read by another, the values are in the core that reads them, and the fill costs no region of
+  // its own (a second region costs ~15 us on an M5 even right after the first).
+  constexpr bool GATHERED = !std::is_same<WideT, ScorchWideRows>::value;
+  static_assert(!(GATHERED && REDIRECT), "a gathered call claims whole rows");
   // REDIRECT breaks the assumption that the i-th claimed thing is the i-th output row. With it
   // A0_size counts UNITS: the first `split->n_row_units` of them are the rows, each truncated to
   // its first segment if it is wider than one, and the rest are the later segments of those wide
@@ -4505,10 +4534,8 @@ torch::Tensor spmm_csr_v2_core(
   // scorch_nthreads gave the whole call ONE thread -- and in mode 2 that one thread
   // would also own 200000 row zeros. Where the scan was skipped empty_rows is 0: the
   // skip is taken only when no empty row and every row empty give the same count.
-  const long work = scorch_spmm_work(
-      total_nnz,
-      (zero_in_loop || zero_static_slice || zero_stolen_slice) ? (long)empty_rows : 0L,
-      B1_size, C1_size);
+  const long credited_empty =
+      (zero_in_loop || zero_static_slice || zero_stolen_slice) ? (long)empty_rows : 0L;
   // The nonzeros' share alone, which the LLVM-runtime launch gate below reads.
   const long work_nnz = scorch_spmm_work(total_nnz, 0L, B1_size, C1_size);
   // Composition override: when this drop-in SpMM runs inside a host (torch)
@@ -4529,9 +4556,8 @@ torch::Tensor spmm_csr_v2_core(
   // libgomp, exactly when the caller asked for it or the process-wide flag forces it. The
   // runtime is the one the process loaded (scorch_omp_is_libgomp), not the header's.
   const bool full_team = scorch_spmm_full_team(atparallel);
-  const int nthreads = scorch_spmm_nthreads(work, A0_size, nthreads_override,
-                                            (long)total_nnz * (long)B1_size,
-                                            (long)total_nnz, full_team);
+  const int nthreads = scorch_spmm_v2_workers(total_nnz, credited_empty, B1_size, C1_size,
+                                              A0_size, nthreads_override, full_team);
   const long nnz_total = SCORCH_SPMM_NNZ_TOTAL;
   const int chunk = scorch_spmm_chunk(A0_size, nnz_total, B1_size, nthreads);
   std::atomic<int> next_row{0};
@@ -5505,9 +5531,14 @@ torch::Tensor spmm_csr_v2_core(
         for (int sg = s0; sg < s1;) {
           const int j = wide_rows->seg_row[sg];
           int done = 0;
-          for (; sg < s1 && wide_rows->seg_row[sg] == j; ++sg, ++done)
+          for (; sg < s1 && wide_rows->seg_row[sg] == j; ++sg, ++done) {
+            if constexpr (GATHERED)
+              scorch_spmm_gather(wide_rows, const_cast<scalar_t*>(A_val),
+                                 (long)wide_rows->seg_pos[2 * (size_t)sg],
+                                 (long)wide_rows->seg_pos[2 * (size_t)sg + 1]);
             scorch_spmm_run_rows(wide_rows->seg_pos + 2 * (size_t)sg, wscratch + (size_t)sg * stride,
                                  0, 1);
+          }
           if (wleft[j].fetch_sub(done, std::memory_order_acq_rel) == done) fold_wide_row(j);
         }
       }
@@ -5580,6 +5611,22 @@ torch::Tensor spmm_csr_v2_core(
         if (!REDIRECT) wstat_nnz += (long)A1_pos[end] - (long)A1_pos[start];
       }
 #endif
+
+      // A gathered call's values for this claim, but for a wide row's, which its segments fill.
+      if constexpr (GATHERED) {
+        scalar_t* const fill = const_cast<scalar_t*>(A_val);
+        int g0 = start;
+#if defined(__AVX2__) && defined(__FMA__)
+        if constexpr (WIDE) {
+          const int* w = std::lower_bound(wide_rows->rows, wide_rows->rows + wide_rows->n, start);
+          for (; w != wide_rows->rows + wide_rows->n && *w < end; ++w) {
+            scorch_spmm_gather(wide_rows, fill, (long)A1_pos[g0], (long)A1_pos[*w]);
+            g0 = *w + 1;
+          }
+        }
+#endif
+        if (g0 < end) scorch_spmm_gather(wide_rows, fill, (long)A1_pos[g0], (long)A1_pos[end]);
+      }
 
 #if defined(__AVX2__) && defined(__FMA__)
       // The claim's rows on the loop specialised to the kernel this call resolved to, when it
@@ -6458,7 +6505,7 @@ torch::Tensor spmm_csr_v2_core(
 // under one segment produces exactly its own rows and is bit-identical to today.
 //
 // Off by default: SCORCH_SPMM_SPLIT_MIN_IMBALANCE is 0 until the grid says what it should be.
-template <typename scalar_t>
+template <typename scalar_t, typename WideT = ScorchWideRows>
 torch::Tensor spmm_csr_v2_rowsplit(
                 int C0_size, int C1_size, int A0_size,
                 const int* SCORCH_RESTRICT A1_pos,
@@ -6466,7 +6513,13 @@ torch::Tensor spmm_csr_v2_rowsplit(
                 const scalar_t* SCORCH_RESTRICT A_val,
                 int B1_size, const scalar_t* SCORCH_RESTRICT B_val,
                 int tile_size, int nthreads_override, bool atparallel,
-                const ScorchWideRows* wide_rows) {
+                const WideT* wide_rows) {
+  if constexpr (!std::is_same<WideT, ScorchWideRows>::value) {
+    // A gathered call claims whole rows (see spmm_csr_v2_core): never the redirected split.
+    return spmm_csr_v2_core<scalar_t, false, WideT>(C0_size, C1_size, A0_size, A1_pos, A1_crd,
+                                                    A_val, B1_size, B_val, tile_size,
+                                                    nthreads_override, atparallel, wide_rows);
+  }
 #if !SCORCH_SPMM_SPLIT_ENABLED
   // The mechanism is off at compile time, so it is not here: no gate call, no unit arrays, and no
   // REDIRECT=true instantiation of the core to be dead-stripped later. The forwarder below stays the
@@ -6583,7 +6636,9 @@ torch::Tensor spmm_csr_v2_rowsplit(
       idle.seg = seg;
       idle.wide_deg = std::numeric_limits<long>::max();   // so no row is truncated
       idle.slot_base = (long)C0_size;
-      return spmm_csr_v2_core<scalar_t, /*REDIRECT=*/true>(
+      // ScorchWideRows named here and below: a redirected call has no wide rows, and the nullptr
+      // passed for them names no type the third parameter could be deduced from.
+      return spmm_csr_v2_core<scalar_t, /*REDIRECT=*/true, ScorchWideRows>(
           C0_size, C1_size, A0_size, A1_pos, A1_crd, A_val,
           B1_size, B_val, tile_size, nthreads_override, atparallel, nullptr, &idle);
     } }
@@ -6591,7 +6646,7 @@ torch::Tensor spmm_csr_v2_rowsplit(
 
   // One team, one pass, and the output rows that were not split are written in place by the worker
   // that claimed them -- no copy, no second visit.
-  torch::Tensor C_values_torch = spmm_csr_v2_core<scalar_t, /*REDIRECT=*/true>(
+  torch::Tensor C_values_torch = spmm_csr_v2_core<scalar_t, /*REDIRECT=*/true, ScorchWideRows>(
       (int)buf_rows, C1_size, (int)nunits, A1_pos, A1_crd, A_val,
       B1_size, B_val, tile_size, nthreads_override, atparallel, nullptr, &plan);
   scalar_t* SCORCH_RESTRICT C_values = C_values_torch.template data_ptr<scalar_t>();
@@ -6634,6 +6689,60 @@ torch::Tensor spmm_csr_v2_rowsplit(
 #endif
 }
 
+// The entry points plan.h dispatches to, declared here as well so plan.h compiles where they are
+// not defined (spmm_gathered.cpp).
+template <typename scalar_t>
+torch::Tensor spmm_csr_typed_core(int C0_size, int C1_size, int A0_size,
+                                  const int* SCORCH_RESTRICT A1_pos,
+                                  const int* SCORCH_RESTRICT A1_crd,
+                                  const scalar_t* SCORCH_RESTRICT A_val, int B1_size,
+                                  const scalar_t* SCORCH_RESTRICT B_val, int tile_size);
+torch::Tensor spmm_csr_float_v2_core(int C0_size, int C1_size, int A0_size,
+                                     const int* SCORCH_RESTRICT A1_pos,
+                                     const int* SCORCH_RESTRICT A1_crd,
+                                     const float* SCORCH_RESTRICT A_val, int B1_size,
+                                     const float* SCORCH_RESTRICT B_val, int tile_size,
+                                     int nthreads_override, bool atparallel,
+                                     const ScorchWideRows* wide_rows);
+torch::Tensor spmm_csr_double_v2_core(int C0_size, int C1_size, int A0_size,
+                                      const int* SCORCH_RESTRICT A1_pos,
+                                      const int* SCORCH_RESTRICT A1_crd,
+                                      const double* SCORCH_RESTRICT A_val, int B1_size,
+                                      const double* SCORCH_RESTRICT B_val, int tile_size,
+                                      int nthreads_override, bool atparallel,
+                                      const ScorchWideRows* wide_rows);
+torch::Tensor spmm_csr_float_tilej_core(int C0_size, int C1_size, int A0_size,
+                                        const int* SCORCH_RESTRICT A1_pos,
+                                        const int* SCORCH_RESTRICT A1_crd,
+                                        const float* SCORCH_RESTRICT A_val, int J, int N,
+                                        const float* SCORCH_RESTRICT B_val, int Jc,
+                                        int nthreads_override);
+torch::Tensor spmm_csr_float_tileijk_core(int C0_size, int N, int A0_size,
+                                          const int* SCORCH_RESTRICT A1_pos,
+                                          const int* SCORCH_RESTRICT A1_crd,
+                                          const float* SCORCH_RESTRICT A_val, int J,
+                                          const float* SCORCH_RESTRICT B_val, int Nc, int Jc,
+                                          int nthreads_override);
+
+// The v2 SpMM for a gathered call (ScorchGatherCall): A_val is the caller's buffer, which the
+// product's own workers fill with g->src[g->perm[q]], each just before computing those nonzeros.
+// Defined in spmm_gathered.cpp, a translation unit of its own, as is everything that calls it:
+// instantiated here, the gathered worker would be a second caller of every row kernel, and a
+// kernel the compiler inlined into the ordinary worker only because it had one caller would become
+// an out-of-line call there (17 narrow-k and 67 NEON row kernels did, on the M5). The same holds
+// one level up for SpmmCsrPlan::run and the helpers it shares with run_gathered.
+torch::Tensor spmm_csr_float_v2_gathered_core(
+    int C0_size, int C1_size, int A0_size, const int* SCORCH_RESTRICT A1_pos,
+    const int* SCORCH_RESTRICT A1_crd, float* SCORCH_RESTRICT A_val, int B1_size,
+    const float* SCORCH_RESTRICT B_val, int tile_size, int nthreads_override, bool atparallel,
+    const ScorchGatherCall<float>* g);
+torch::Tensor spmm_csr_double_v2_gathered_core(
+    int C0_size, int C1_size, int A0_size, const int* SCORCH_RESTRICT A1_pos,
+    const int* SCORCH_RESTRICT A1_crd, double* SCORCH_RESTRICT A_val, int B1_size,
+    const double* SCORCH_RESTRICT B_val, int tile_size, int nthreads_override, bool atparallel,
+    const ScorchGatherCall<double>* g);
+
+#ifndef SCORCH_SPMM_KERNELS_ONLY
 // The float32 entry every existing caller uses. A one-line forwarder, so plan.h and
 // spmm_csr_float_v2 are unchanged and the float32 instantiation is the same code the
 // hand-written kernel was.
@@ -8102,3 +8211,4 @@ Tensor spmm_csr_float_tiled_neon(std::vector<int> result_shape, std::vector<int>
   C.storage.value = C_values_torch;
   return C;
 }
+#endif  // SCORCH_SPMM_KERNELS_ONLY

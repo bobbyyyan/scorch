@@ -239,8 +239,17 @@ class _Structure:
             carrier, buffer = held
             if perm is None:
                 buffer.copy_(values)
-            else:
-                _native.gather_values(values.contiguous(), perm, buffer, _nthreads())
+                return _matmul(carrier, b)
+            # A transpose's values are a gather through perm. Where the carrier holds a plan
+            # for this product, the plan does the gather (SpmmCsrPlan::run_gathered: on the
+            # product's team, where it has one, each worker right before it reads them);
+            # until then, gather_values fills the buffer and the ordinary path plans the
+            # product.
+            values = values.contiguous()
+            served = _native.planned_matmul_gathered(carrier, b, values, perm)
+            if served is not None:
+                return cast(torch.Tensor, served)
+            _native.gather_values(values, perm, buffer, _nthreads())
             return _matmul(carrier, b)
 
 
