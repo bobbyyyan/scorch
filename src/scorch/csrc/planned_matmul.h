@@ -52,6 +52,7 @@
 #include "plan.h"
 
 #include <ATen/SparseCsrTensorUtils.h>
+#include <ATen/SparseTensorImpl.h>
 #include <ATen/FuncTorchTLS.h>
 #include <ATen/core/grad_mode.h>
 #include <torch/csrc/DynamicTypes.h>
@@ -97,6 +98,37 @@ struct PlannedMatmul {
 inline PlannedMatmul& planned_matmul_state() {
   static PlannedMatmul state;
   return state;
+}
+
+// The index arrays of a torch sparse operand as every cache must read them, recording `a` as a
+// witness of their storages (native_abi.h, Write witnesses).
+//
+// Not crow_indices()/col_indices()/indices(): those return aliases that share `a`'s version
+// counter, so a cache keyed on them saw writes through `a`'s accessors and missed every write
+// through the caller's own arrays -- a product after `col.copy_(...)` came back computed from the
+// old columns wherever an int32 copy or a transpose of them was cached. These are the members,
+// which ARE the caller's arrays (torch keeps the TensorImpls it was given), detached: a new
+// TensorImpl over the same storage, sharing their version counter, so writes through the caller's
+// arrays and every view of them move it. Writes through `a`'s accessors move `a`'s counter, which
+// the witness registered here puts into the storages' epochs.
+//
+// A CSR operand gives (crow, col), a COO operand (indices,). Anything else is a TypeError.
+inline py::tuple torch_sparse_index_members(const at::Tensor& a) {
+  if (a.layout() == c10::kSparseCsr) {
+    auto* impl = at::sparse_csr::get_sparse_csr_impl(a);
+    const at::Tensor& positions = impl->compressed_indices();
+    const at::Tensor& coordinates = impl->plain_indices();
+    abi_watch_register(positions, a);
+    abi_watch_register(coordinates, a);
+    return py::make_tuple(positions.detach(), coordinates.detach());
+  }
+  if (a.layout() == c10::kSparse) {
+    auto* impl = static_cast<at::SparseTensorImpl*>(a.unsafeGetTensorImpl());
+    const at::Tensor& indices = impl->indices();
+    abi_watch_register(indices, a);
+    return py::make_tuple(indices.detach());
+  }
+  throw py::type_error("torch_sparse_index_members expects a sparse CSR or COO tensor");
 }
 
 // The key a plan for a dense operand of these sizes and dtype is stored under, (sizes, dtype,
@@ -164,12 +196,14 @@ inline SpmmCsrPlan* planned_matmul_find(PyObject* plans, PyObject* key) {
 // of a torch CSR operand (its `owner`), it records in that operand's state a TransposedProductPlan
 // for it -- the carrier's plan, the permutation, and the operand's index arrays the transpose was
 // built from -- under the key that product's plan is stored under. A call is served only while
-// the operand is as it was then: the same index buffers and lengths, and the same version. The
-// version is the operand's own counter, which torch shares with every alias its crow_indices(),
-// col_indices() and values() return, so a write through any of them moves it, while the member
-// arrays read here keep counters of their own that such a write does not move. It is the counter
-// autograd.py's structure cache compares (through the aliases), so a call this declines is one
-// whose structure and transpose that cache rebuilds.
+// the operand is as it was then: the same index buffers and lengths, and no write to them since.
+// Two counters see such writes, and neither sees both kinds (native_abi.h, Write witnesses): the
+// index arrays' own, which writes through the caller's arrays and their views move, and the
+// operand's, shared with every alias its crow_indices(), col_indices() and values() return. The
+// record compares the arrays' counters, the operand's, and the epochs of the arrays' storages,
+// which move on a write through the accessors of any torch sparse tensor scorch has read over
+// them. autograd.py's structure cache compares the same, so a call this declines is one whose
+// structure and transpose that cache rebuilds.
 //
 // The transposed values are gathered into a buffer of the record's own, not the carrier's. The
 // carrier's buffer belongs to autograd.py's structure, shared by every operand over the same index
@@ -189,6 +223,10 @@ struct TransposedProductPlan {
         coordinates_(std::move(coordinates)),
         positions_data_(positions_.data_ptr()),
         coordinates_data_(coordinates_.data_ptr()),
+        positions_version_(abi_version_of(positions_)),
+        coordinates_version_(abi_version_of(coordinates_)),
+        positions_watch_(positions_),
+        coordinates_watch_(coordinates_),
         operand_version_(operand_version) {}
 
   // Whether an operand whose members are these index arrays, at this version, is the one this
@@ -200,7 +238,10 @@ struct TransposedProductPlan {
            positions.data_ptr() == positions_data_ &&
            coordinates.data_ptr() == coordinates_data_ &&
            positions.numel() == positions_.numel() &&
-           coordinates.numel() == coordinates_.numel() && operand_version == operand_version_;
+           coordinates.numel() == coordinates_.numel() && operand_version == operand_version_ &&
+           abi_version_of(positions_) == positions_version_ &&
+           abi_version_of(coordinates_) == coordinates_version_ && positions_watch_.current() &&
+           coordinates_watch_.current();
   }
 
   // Whether this records exactly this carrier plan and permutation.
@@ -237,6 +278,10 @@ struct TransposedProductPlan {
   torch::Tensor coordinates_;
   const void* positions_data_;
   const void* coordinates_data_;
+  uint32_t positions_version_;
+  uint32_t coordinates_version_;
+  PlanSourceWatch positions_watch_;
+  PlanSourceWatch coordinates_watch_;
   uint32_t operand_version_;
   int64_t served_ = 0;
 };
@@ -546,8 +591,9 @@ inline PyObject* planned_matmul_torch_call(const PlannedMatmul& s, PyObject* a, 
       } else if (plan_obj != nullptr) {
         work = TorchOperandPlanWork::kInstall;
         if (SpmmCsrPlan* plan = planned_matmul_cast(plan_obj)) {
-          // The members themselves, not aliases: nothing is allocated, and a member shares
-          // its version counter with every alias the caller may have written through.
+          // The members themselves, not aliases: nothing is allocated, and a member is the
+          // caller's own array, sharing its version counter. A write through an accessor's alias
+          // moves `a`'s counter instead, which the plan's write witnesses read (plan.h).
           auto* impl = at::sparse_csr::get_sparse_csr_impl(THPVariable_Unpack(a));
           c10::optional<torch::Tensor> served =
               plan->run_csr(impl->compressed_indices(), impl->plain_indices(), impl->values(),

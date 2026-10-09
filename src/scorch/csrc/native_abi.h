@@ -9,10 +9,13 @@
 #endif
 
 #include <algorithm>
+#include <atomic>
 #include <cmath>
 #include <cstdint>
 #include <cstdlib>
+#include <cstring>
 #include <limits>
+#include <memory>
 #include <mutex>
 #include <string>
 #include <unordered_map>
@@ -320,14 +323,17 @@ inline bool abi_screen_lex(const std::vector<const int32_t*>& levels, int64_t n)
 // exists no *different* StorageImpl can occupy the address recorded in `storage` --
 // an expired weak pointer is therefore proof the entry is stale, and a live one plus
 // an equal `storage` address is proof this is the array that was validated. nbytes,
-// numel and the version counter are compared too, so a resize or any mutation routed
-// through torch invalidates. Keying on data_ptr rather than on the StorageImpl means
+// numel, the version counter and the storage's write-witness epoch are compared too, so
+// a resize or any mutation routed through torch invalidates -- including one made through
+// a torch sparse tensor's index accessor, which moves no counter the array shares (see
+// Write witnesses below). Keying on data_ptr rather than on the StorageImpl means
 // two distinct views of one storage get an entry each instead of evicting each other
 // on every call.
 //
 // What this does NOT catch: a write straight through a shared raw buffer (numpy
 // writing into memory a torch tensor aliases) does not bump the version counter, so a
-// buffer corrupted that way can now reach a kernel unchecked. That is a deliberate
+// buffer corrupted that way can now reach a kernel unchecked; nor do the writes the
+// Write witnesses below cannot see (a sparse tensor scorch was never given). That is a deliberate
 // trade, made because the per-call scan cost is what stands between these kernels and
 // MKL. SCORCH_ABI_VALIDATE_MEMO=0 restores strict per-call validation, narrowing
 // included.
@@ -351,6 +357,342 @@ inline uint32_t abi_version_of(const torch::Tensor& t) {
              : 0u;
 }
 
+// --------------------------------------------------------------------------- //
+// Write witnesses
+//
+// An index array's version counter does not see every write to it. A torch sparse
+// tensor's index arrays are the caller's own tensors (its members:
+// get_sparse_csr_impl(a)->plain_indices() is the very TensorImpl the caller passed to
+// sparse_csr_tensor), and a write through the caller's array or any view of it moves
+// their counter. But the accessors crow_indices(), col_indices(), indices() and
+// values() return aliases that share the SPARSE TENSOR's counter, so a write through
+// one of them moves only the sparse tensor's, never the array's. (torch 2.13;
+// measured.) Any cache keyed on the array's identity and version therefore misses half
+// the writes, whichever of the two tensors it was handed.
+//
+// So every torch sparse tensor whose index arrays scorch reads is recorded, on the
+// storage of each array, as a WITNESS: a copy of its version counter
+// (c10::VariableVersion shares the counter, so the copy reads writes made through the
+// tensor and through every alias it handed out) and the version last seen. observe()
+// compares each witness with what it last saw, and when any has moved, advances the
+// storage's EPOCH. AbiArrayId carries the epoch, so a memo entry, a plan or a transpose
+// built before a write through any witnessed tensor no longer matches after it.
+//
+// A witness first seen at a version other than 0 has been written through before scorch
+// saw it, and advances the epoch at once: what a cache describes may predate that
+// write. A witness is dropped once its counter is held by nothing but this table -- the
+// tensor and every alias of it are gone, so nothing can write through it again -- after
+// a last comparison, by the next registration on the same storage (the only place that
+// prunes; see AbiWatchCopy). It is recognised again by the counter itself, so it holds no
+// reference to the tensor: a weak one would keep the dead TensorImpl's allocation, and
+// with it the counter, alive, and the counter would never be the table's alone.
+//
+// What this still cannot see: a write through the accessor of a sparse tensor scorch
+// never received (its counter is shared with no tensor scorch holds); a write through
+// the caller's own array when scorch was handed only an accessor's alias of it, as
+// `sparse_softmax_csr( csr.crow_indices(), ...)` is (an alias is not a view: torch
+// records no base, so nothing leads from it to the array or the sparse tensor); a write
+// through a raw buffer (numpy); and anything written under inference mode (no counter).
+// The memo's documented trade above covers the same ground.
+//
+// The table lives in ONE module, scorch_ops (SCORCH_ABI_WATCH_OWNER), because the
+// witnesses are registered there. A JIT-compiled kernel module, which carries its own
+// copy of this header and of the memo, reads epochs through a capsule scorch_ops
+// exports (abi_epoch_of below), so its memo sees the same writes.
+//
+// The two builds of this header must not define one external symbol two ways: macOS's
+// loader merges weak (inline) definitions across loaded images, and an owner's `static
+// const AbiWatchApi api` read as a kernel module's `static const AbiWatchApi* api`
+// crashed the first JIT-compiled kernel to run. So the owner's functions have names no
+// kernel module defines, and the kernel module's are static (internal linkage), so
+// nothing of theirs is merged with anything.
+// --------------------------------------------------------------------------- //
+
+struct AbiWatchApi {
+  // The epoch of the storage at `storage_impl` (a c10::StorageImpl*), after observing
+  // its witnesses; 0 when it has none.
+  uint64_t (*epoch_of)(const void* storage_impl);
+};
+
+#ifdef SCORCH_ABI_WATCH_OWNER
+
+// The identity of a version counter: the address of the shared object a VariableVersion
+// holds, its only member. Stable for as long as the table holds a copy, so it cannot be
+// reused while a witness names it.
+static_assert(sizeof(c10::VariableVersion) == sizeof(void*),
+              "VariableVersion is no longer one shared pointer: change abi_counter_id");
+inline const void* abi_counter_id(const c10::VariableVersion& counter) {
+  const void* id;
+  std::memcpy(&id, &counter, sizeof(id));
+  return id;
+}
+
+// One copy of a witnessed counter, shared by the watch of every storage the tensor's
+// arrays live in (a CSR operand's two), so that "held by nothing but this table" is one
+// copy, not one per array: with a copy per array the counter of a dead CSR operand was
+// never the table's alone.
+struct AbiCounterRef {
+  c10::VariableVersion counter;  // shared with the tensor and every alias it returned
+  const void* id;
+};
+
+struct AbiWitness {
+  std::shared_ptr<AbiCounterRef> ref;
+  uint32_t seen;  // per storage: each storage's epoch moves on its own observation
+};
+
+struct AbiStorageWatch {
+  c10::weak_intrusive_ptr<c10::StorageImpl> alive;
+  std::atomic<uint64_t> epoch{0};
+  // Advanced whenever a witness is added or dropped, so the holder of a copy of the
+  // list (a plan, AbiWatchCopy below) can tell without the lock that its copy is still
+  // the whole list.
+  std::atomic<uint64_t> list_version{0};
+  std::vector<AbiWitness> witnesses;  // under abi_watch_mutex()
+
+  explicit AbiStorageWatch(c10::StorageImpl* impl)
+      : alive(c10::intrusive_ptr<c10::StorageImpl>::reclaim_copy(impl)) {}
+
+  bool live() const { return !alive.expired(); }
+
+  // Under abi_watch_mutex(). The epoch after comparing every witness with what it last
+  // saw. With `prune`, also drops the witnesses whose counter only this table holds; only
+  // registration prunes, and it holds the GIL (see AbiWatchCopy for why that matters).
+  uint64_t observe_locked(bool prune) {
+    bool moved = false;
+    bool dropped = false;
+    for (auto it = witnesses.begin(); it != witnesses.end();) {
+      const uint32_t now = it->ref->counter.current_version();
+      if (now != it->seen) {
+        moved = true;
+        it->seen = now;
+      }
+      if (prune && it->ref->counter.unique()) {
+        it = witnesses.erase(it);
+        dropped = true;
+      } else {
+        ++it;
+      }
+    }
+    if (moved) epoch.fetch_add(1, std::memory_order_release);
+    if (dropped) list_version.fetch_add(1, std::memory_order_release);
+    return epoch.load(std::memory_order_acquire);
+  }
+};
+
+inline std::mutex& abi_watch_mutex() {
+  static std::mutex m;
+  return m;
+}
+
+using AbiWatchMap = std::unordered_map<const void*, std::shared_ptr<AbiStorageWatch>>;
+inline AbiWatchMap& abi_watch_map() {
+  static AbiWatchMap m;
+  return m;
+}
+
+// Drops the entries `dead` says are dead once the map has doubled since the last sweep, so
+// an insert costs amortized O(1) however many live entries there are. Under the lock.
+template <typename Map, typename Dead>
+inline void abi_sweep_when_doubled(Map& map, size_t& swept_at, Dead dead) {
+  if (map.size() < 2 * std::max<size_t>(swept_at, 32)) return;
+  for (auto it = map.begin(); it != map.end();) {
+    if (dead(it->second)) it = map.erase(it);
+    else ++it;
+  }
+  swept_at = map.size();
+}
+
+// Every witnessed counter, by identity, so the watches of several storages share one
+// copy.
+using AbiCounterRefs = std::unordered_map<const void*, std::weak_ptr<AbiCounterRef>>;
+inline AbiCounterRefs& abi_counter_refs() {
+  static AbiCounterRefs m;
+  return m;
+}
+
+// Under abi_watch_mutex(). The shared copy of `counter`, made if there is none.
+inline std::shared_ptr<AbiCounterRef> abi_counter_ref_locked(
+    const c10::VariableVersion& counter, const void* id) {
+  auto& refs = abi_counter_refs();
+  auto it = refs.find(id);
+  if (it != refs.end()) {
+    if (std::shared_ptr<AbiCounterRef> held = it->second.lock()) return held;
+    refs.erase(it);
+  }
+  static size_t swept_at = 0;
+  abi_sweep_when_doubled(refs, swept_at,
+                         [](const std::weak_ptr<AbiCounterRef>& r) { return r.expired(); });
+  auto ref = std::make_shared<AbiCounterRef>(AbiCounterRef{counter, id});
+  refs.emplace(id, ref);
+  return ref;
+}
+
+// Under abi_watch_mutex(). The watch on this storage, made if `create`; null otherwise.
+// An entry whose storage died is replaced: its address may now be another storage's.
+// Dead entries are swept once the map has doubled since the last sweep; live ones are
+// never cleared, because a plan holding one must keep receiving the witnesses registered
+// after it was built.
+inline std::shared_ptr<AbiStorageWatch> abi_watch_locked(c10::StorageImpl* impl,
+                                                         bool create) {
+  auto& map = abi_watch_map();
+  auto it = map.find(impl);
+  if (it != map.end()) {
+    if (it->second->live()) return it->second;
+    map.erase(it);
+  }
+  if (!create) return nullptr;
+  static size_t swept_at = 0;
+  abi_sweep_when_doubled(map, swept_at, [](const std::shared_ptr<AbiStorageWatch>& w) {
+    return !w->live();
+  });
+  auto watch = std::make_shared<AbiStorageWatch>(impl);
+  map.emplace(impl, watch);
+  return watch;
+}
+
+// The watch on `t`'s storage, made if there is none: what a plan holds for each array
+// it reads.
+inline std::shared_ptr<AbiStorageWatch> abi_watch_of(const torch::Tensor& t) {
+  std::lock_guard<std::mutex> guard(abi_watch_mutex());
+  return abi_watch_locked(t.storage().unsafeGetStorageImpl(), true);
+}
+
+// A copy of a storage's witness list and of what was last seen of each, taken under the
+// lock. It answers "has any witness moved since?" with plain loads, which is what a plan
+// asks on every call: observing both arrays under the lock instead cost 22-42 ns per call
+// on the M5, 1-4% of a 1-2 us product.
+//
+// The copy holds the table's AbiCounterRef pointers without owning them, and up to
+// kInline of them inside itself, so the check reads no allocation of its own and changes
+// no reference count. That matters when the list changes between calls: a new CSR object
+// over the same arrays each step adds a witness, and with owning copies every refresh paid
+// atomic reference-count traffic and freed the previous step's records inside the next
+// product -- about 1 us per cold call on mkt1 (sc2, 2026-10-08).
+//
+// A pointer is valid while the list is the one copied: an entry leaves the list only by
+// being pruned, pruning advances list_version, and the check compares list_version before
+// it reads any pointer. That holds only if no prune runs between the comparison and the
+// reads, so a prune and a check never run at once: both are made holding the GIL (plan
+// runs never release it; registration is called from Python), and observing from anywhere
+// else (a validation memo, which may run without the GIL) never prunes.
+struct AbiWatchCopy {
+  static constexpr size_t kInline = 4;
+  struct Entry {
+    const AbiCounterRef* ref;
+    uint32_t seen;
+  };
+  // No list has this version, so the first check takes a copy.
+  uint64_t list_version = ~uint64_t{0};
+  uint64_t epoch = 0;
+  size_t count = 0;
+  bool overflow = false;  // more witnesses than kInline: every check takes the lock
+  Entry entries[kInline];
+};
+
+// Without the lock, holding the GIL: whether `copy` is still the storage's whole witness
+// list and none of them has moved since it was taken, in which case the epoch is still
+// copy.epoch. Counters only grow, so a write through any copied witness shows as a
+// version other than the one copied.
+inline bool abi_watch_unchanged(const AbiStorageWatch& watch,
+                                const AbiWatchCopy& copy) {
+  if (copy.overflow ||
+      watch.list_version.load(std::memory_order_acquire) != copy.list_version) {
+    return false;
+  }
+  for (size_t i = 0; i < copy.count; ++i) {
+    if (copy.entries[i].ref->counter.current_version() != copy.entries[i].seen) {
+      return false;
+    }
+  }
+  return watch.epoch.load(std::memory_order_acquire) == copy.epoch;
+}
+
+// Holding the GIL: observes the storage under the lock, without pruning, and copies its
+// witness list into `copy`. The epoch now.
+inline uint64_t abi_watch_refresh(AbiStorageWatch& watch, AbiWatchCopy& copy) {
+  std::lock_guard<std::mutex> guard(abi_watch_mutex());
+  copy.epoch = watch.observe_locked(/*prune=*/false);
+  copy.list_version = watch.list_version.load(std::memory_order_relaxed);
+  copy.overflow = watch.witnesses.size() > AbiWatchCopy::kInline;
+  copy.count = copy.overflow ? 0 : watch.witnesses.size();
+  for (size_t i = 0; i < copy.count; ++i) {
+    copy.entries[i] = {watch.witnesses[i].ref.get(), watch.witnesses[i].seen};
+  }
+  return copy.epoch;
+}
+
+// Records the sparse tensor `operand` as a witness of the storage under `array`.
+// Nothing for an operand without a version counter (an inference tensor): it can
+// witness nothing.
+inline void abi_watch_register(const torch::Tensor& array,
+                               const torch::Tensor& operand) {
+  const c10::VariableVersion& counter =
+      operand.unsafeGetTensorImpl()->version_counter();
+  if (!counter.enabled()) return;
+  const void* id = abi_counter_id(counter);
+  std::lock_guard<std::mutex> guard(abi_watch_mutex());
+  std::shared_ptr<AbiStorageWatch> watch =
+      abi_watch_locked(array.storage().unsafeGetStorageImpl(), true);
+  watch->observe_locked(/*prune=*/true);  // called from Python: the GIL is held
+  for (const AbiWitness& w : watch->witnesses) {
+    if (w.ref->id == id) return;  // already a witness, and just compared
+  }
+  const uint32_t now = counter.current_version();
+  watch->witnesses.push_back(AbiWitness{abi_counter_ref_locked(counter, id), now});
+  if (now != 0) watch->epoch.fetch_add(1, std::memory_order_release);
+  watch->list_version.fetch_add(1, std::memory_order_release);
+}
+
+inline uint64_t abi_epoch_of_impl(const void* storage_impl) {
+  auto* impl =
+      const_cast<c10::StorageImpl*>(static_cast<const c10::StorageImpl*>(storage_impl));
+  std::lock_guard<std::mutex> guard(abi_watch_mutex());
+  std::shared_ptr<AbiStorageWatch> watch = abi_watch_locked(impl, false);
+  return watch != nullptr ? watch->observe_locked(/*prune=*/false) : 0;
+}
+
+// What scorch_ops exports in its capsule.
+inline const AbiWatchApi* abi_watch_owner_api() {
+  static const AbiWatchApi api{&abi_epoch_of_impl};
+  return &api;
+}
+
+// The epoch of `t`'s storage (see Write witnesses above).
+inline uint64_t abi_epoch_of(const torch::Tensor& t) {
+  return t.has_storage() ? abi_epoch_of_impl(t.storage().unsafeGetStorageImpl()) : 0;
+}
+
+#else  // not scorch_ops: the table is scorch_ops', reached through its capsule
+
+// Not a lazily initialized static: its initialization guard would be held while waiting
+// for the GIL, and a thread holding the GIL could be waiting on that guard. Two threads
+// importing the capsule at once is harmless; both find the same one.
+static inline const AbiWatchApi* abi_watch_imported_api() {
+  static std::atomic<const AbiWatchApi*> imported{nullptr};
+  static std::atomic<bool> looked{false};
+  if (looked.load(std::memory_order_acquire)) {
+    return imported.load(std::memory_order_acquire);
+  }
+  PyGILState_STATE gil = PyGILState_Ensure();
+  const AbiWatchApi* found = static_cast<const AbiWatchApi*>(
+      PyCapsule_Import("scorch_ops._abi_watch_api", 0));
+  if (found == nullptr) PyErr_Clear();  // no witnesses anywhere, so every epoch is 0
+  PyGILState_Release(gil);
+  imported.store(found, std::memory_order_release);
+  looked.store(true, std::memory_order_release);
+  return found;
+}
+
+// The epoch of `t`'s storage (see Write witnesses above).
+static inline uint64_t abi_epoch_of(const torch::Tensor& t) {
+  if (!t.has_storage()) return 0;
+  const AbiWatchApi* api = abi_watch_imported_api();
+  return api != nullptr ? api->epoch_of(t.storage().unsafeGetStorageImpl()) : 0;
+}
+
+#endif  // SCORCH_ABI_WATCH_OWNER
+
 // Identity of one index array, precise enough that a cached verdict about it can be
 // trusted. See the recycling-safety note above for why these fields and no others.
 struct AbiArrayId {
@@ -360,6 +702,7 @@ struct AbiArrayId {
   int64_t nbytes = 0;
   int64_t numel = 0;
   uint32_t version = 0;
+  uint64_t epoch = 0;  // the storage's write-witness epoch (see Write witnesses)
 
   AbiArrayId() : alive(c10::intrusive_ptr<c10::StorageImpl>()) {}  // null weak ref
 };
@@ -376,12 +719,13 @@ inline AbiArrayId abi_identify(const torch::Tensor& t) {
   id.nbytes = (int64_t)t.storage().nbytes();
   id.numel = t.numel();
   id.version = abi_version_of(t);
+  id.epoch = abi_epoch_of(t);
   return id;
 }
 
 inline bool abi_same_array(const AbiArrayId& a, const AbiArrayId& b) {
   return a.storage == b.storage && a.data == b.data && a.nbytes == b.nbytes &&
-         a.numel == b.numel && a.version == b.version;
+         a.numel == b.numel && a.version == b.version && a.epoch == b.epoch;
 }
 
 inline bool abi_memo_enabled() {

@@ -49,6 +49,12 @@ depends = [
     "src/scorch/csrc/spmm.h",
 ]
 extra-compile-args = [
+    # scorch_ops owns the write-witness table every module's validation memo reads
+    # (native_abi.h, "Write witnesses"). Defined for every source of this module, so no two of
+    # its translation units see different definitions; a JIT-compiled kernel module never
+    # defines it. A flag rather than define-macros: older setuptools rejects TOML's list form
+    # of a macro ("each element of 'macros' list must be a 1- or 2-tuple").
+    "-DSCORCH_ABI_WATCH_OWNER=1",
     "-O3",
     "-march=native",
     "-ffast-math",

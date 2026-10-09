@@ -623,6 +623,27 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("abi_memo_size", &scorch_native::abi_memo_size,
           "Number of live entries across both ABI validation memos");
 
+    // Write witnesses (native_abi.h). The capsule is how a JIT-compiled kernel module, which
+    // carries its own memo, reads the epochs this module keeps; the functions are what Python's
+    // caches over a torch sparse operand's index arrays use.
+    m.attr("_abi_watch_api") =
+        py::capsule(static_cast<const void*>(scorch_native::abi_watch_owner_api()),
+                    "scorch_ops._abi_watch_api");
+    m.def("torch_sparse_index_members", &scorch_native::torch_sparse_index_members,
+          "A torch sparse CSR or COO operand's index arrays as caches must key them: the "
+          "caller's own arrays (detached), with the operand recorded as a witness of their "
+          "storages",
+          py::arg("a"));
+    m.def("abi_epoch", &scorch_native::abi_epoch_of,
+          "The write-witness epoch of a tensor's storage, after observing its witnesses",
+          py::arg("t"));
+    m.def("abi_witness_count", [](const torch::Tensor& t) -> int64_t {
+            std::lock_guard<std::mutex> guard(scorch_native::abi_watch_mutex());
+            auto watch = scorch_native::abi_watch_locked(t.storage().unsafeGetStorageImpl(), false);
+            return watch != nullptr ? (int64_t)watch->witnesses.size() : 0;
+          },
+          "Witnesses recorded on a tensor's storage. For tests", py::arg("t"));
+
     // The cache size the KERNEL gates on, so a test can check it against the one
     // tiling.query_llc gates on. Two gates that disagree about the machine would
     // route a product to a tiled kernel the kernel then declines to stream for, and

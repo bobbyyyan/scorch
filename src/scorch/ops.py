@@ -817,9 +817,10 @@ def _run_torch_operand_plan(a: torch.Tensor, b: torch.Tensor, key: Any) -> Any:
     plan = plans.get(key) if plans is not None else None
     if plan is None:
         return None
+    positions, coordinates = _scorch_ops.torch_sparse_index_members(a)
     return plan.run_csr(
-        a.crow_indices(),
-        a.col_indices(),
+        positions,
+        coordinates,
         a.values(),
         b,
         _PLAN_NTHREADS(),

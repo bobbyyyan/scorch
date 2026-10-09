@@ -28,11 +28,12 @@
 //     A plan is an optimization that can always decline, never a second
 //     implementation of the contract.
 //   * The structure is pinned by the same evidence the ABI memo uses: the
-//     source index arrays' data pointers and version counters, recorded at
-//     construction and rechecked per call. A plan is therefore no weaker than
-//     the memoized validation it replaces, and carries the same documented
-//     trade: a write straight through a raw buffer that a tensor aliases does
-//     not bump torch's version counter.
+//     source index arrays' data pointers and version counters, and their
+//     storages' write-witness epochs (native_abi.h), recorded at construction
+//     and rechecked per call. A plan is therefore no weaker than the memoized
+//     validation it replaces, and carries the same documented trade: a write
+//     straight through a raw buffer that a tensor aliases does not bump torch's
+//     version counter.
 // ---------------------------------------------------------------------------
 
 #include <algorithm>
@@ -50,6 +51,28 @@
 #include "spmm.h"
 
 namespace scorch_native {
+
+// The write-witness watch on the storage of one array a plan reads, and the epoch the plan was
+// built at (native_abi.h, Write witnesses). A write through a torch sparse tensor's index accessor
+// moves no counter the array shares; it moves the epoch, once some call observes it.
+//
+// `copy` lets current() answer from atomic loads while the witness list stands still, and take
+// the lock only when it changed or a witness moved. It is written from current(), which every
+// caller reaches holding the GIL (plan runs never release it; see `served`), so no two threads
+// write it at once.
+struct PlanSourceWatch {
+  std::shared_ptr<AbiStorageWatch> watch;
+  mutable AbiWatchCopy copy;
+  uint64_t epoch;
+
+  explicit PlanSourceWatch(const torch::Tensor& t)
+      : watch(abi_watch_of(t)), epoch(abi_watch_refresh(*watch, copy)) {}
+
+  bool current() const {
+    if (abi_watch_unchanged(*watch, copy)) return copy.epoch == epoch;
+    return abi_watch_refresh(*watch, copy) == epoch;
+  }
+};
 
 // The kernels the adaptive tiling selector can choose between, plus the two float64
 // routes. The first three mirror tiling.py's decision vocabulary ("v2" / "tilej" /
@@ -107,6 +130,8 @@ class SpmmCsrPlan {
         source_coordinates_data_(source_coordinates_.data_ptr()),
         source_positions_version_(abi_version_of(source_positions_)),
         source_coordinates_version_(abi_version_of(source_coordinates_)),
+        source_positions_watch_(source_positions_),
+        source_coordinates_watch_(source_coordinates_),
         served_(0),
         team_fills_(0),
         empty_rows_(0) {
@@ -185,6 +210,9 @@ class SpmmCsrPlan {
         abi_version_of(source_coordinates_) != source_coordinates_version_) {
       return c10::nullopt;
     }
+    if (!source_positions_watch_.current() || !source_coordinates_watch_.current()) {
+      return c10::nullopt;
+    }
 
     const int rows = static_cast<int>(rows_);
     const int free_dim = static_cast<int>(free_dim_);
@@ -247,8 +275,11 @@ class SpmmCsrPlan {
   // swaps them), and then the held arrays are untouched while describing a structure the
   // operand no longer has. So the current arrays must be the held ones: the same buffer
   // and the same length. The plan's strong reference to its sources keeps their storage
-  // alive, so no other buffer can occupy the recorded address, and the version counter,
-  // which a member shares with every alias of it, is rechecked by `run`.
+  // alive, so no other buffer can occupy the recorded address. The sources are the
+  // operand's members (plan.py builds from torch_sparse_index_members), which are the
+  // caller's own arrays: `run` rechecks their counters, which writes through the caller's
+  // arrays and their views move, and their storages' epochs, which writes through the
+  // operand's accessors move (they share only the operand's counter, a witness there).
   bool built_from(const torch::Tensor& positions, const torch::Tensor& coordinates) const {
     return positions.defined() && coordinates.defined() &&
            positions.data_ptr() == source_positions_data_ &&
@@ -375,7 +406,7 @@ class SpmmCsrPlan {
         abi_version_of(source_coordinates_) != source_coordinates_version_) {
       return false;
     }
-    return true;
+    return source_positions_watch_.current() && source_coordinates_watch_.current();
   }
 
   SpmmPlanKind kind_;
@@ -401,6 +432,8 @@ class SpmmCsrPlan {
   const void* source_coordinates_data_;
   uint32_t source_positions_version_;
   uint32_t source_coordinates_version_;
+  PlanSourceWatch source_positions_watch_;
+  PlanSourceWatch source_coordinates_watch_;
   int64_t served_;
   int64_t team_fills_;
   // A's empty rows, for the v2 kinds: the output rows the core's workers zero, which the shipped

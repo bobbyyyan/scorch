@@ -57,7 +57,7 @@ from .plan import GRAD_ATTR, torch_operand_state
 from .stensor import STensor
 from .storage import tensor_version
 
-_Stamp = Tuple[int, int, int]
+_Stamp = Tuple[int, int, int, int]
 
 # The value types scorch's SpMM kernels serve.
 _DTYPES = (torch.float32, torch.float64)
@@ -122,11 +122,13 @@ def _in_layout(result: torch.Tensor, transposed: bool) -> torch.Tensor:
 
 
 def _stamp(t: torch.Tensor) -> _Stamp:
-    """Buffer, version counter and length: what identifies an array's contents without
-    reading them (the same triple storage.py's validation stamp and plan.h record). An
-    inference tensor has no version counter and reads as version 0, with the blind spot
-    storage.tensor_version describes."""
-    return (t.data_ptr(), tensor_version(t), t.numel())
+    """Buffer, version counter, length and the storage's write-witness epoch: what identifies
+    an array's contents without reading them (what plan.h records). The epoch moves on a write
+    through the index accessor of a torch sparse tensor over the array, which moves no counter
+    the array shares (csrc/native_abi.h, Write witnesses). An inference tensor has no version
+    counter and reads as version 0, with the blind spot storage.tensor_version describes.
+    """
+    return (t.data_ptr(), tensor_version(t), t.numel(), _native.abi_epoch(t))
 
 
 # --------------------------------------------------------------------------- #
@@ -274,13 +276,16 @@ class _Structure:
 # finalizer on it runs when the storage dies, so an entry is dropped with the arrays it
 # describes and a storage's id cannot be reused while an entry names it. The key holds, per
 # array, the storage's id, the array's address and length and its dtype; the entry holds
-# the arrays' versions, so a structure changed in place replaces its entry rather than
-# adding one. (The validation memo in csrc/native_abi.h keys index arrays the same way,
+# the arrays' versions and their storages' write-witness epochs, so a structure changed in place
+# -- through the caller's arrays or through an operand's index accessor -- replaces its entry
+# rather than adding one. (The validation memo in csrc/native_abi.h keys index arrays the same way,
 # with a weak pointer to the storage in place of the finalizer.)
 
 _ArrayKey = Tuple[int, int, int, torch.dtype]
+# Per source array: (version counter, write-witness epoch).
+_SourceVersions = Tuple[Tuple[int, int], ...]
 _TRANSPOSES: Dict[
-    Tuple[Any, ...], Tuple[Tuple[int, ...], Tuple["_Structure", torch.Tensor]]
+    Tuple[Any, ...], Tuple[_SourceVersions, Tuple["_Structure", torch.Tensor]]
 ] = {}
 _TRANSPOSES_LOCK = threading.Lock()
 
@@ -291,7 +296,7 @@ def _shared_transpose(s: "_Structure") -> Tuple["_Structure", torch.Tensor]:
         (id(storage), t.data_ptr(), t.numel(), t.dtype)
         for storage, t in zip(storages, s.sources)
     )
-    versions = tuple(tensor_version(t) for t in s.sources)
+    versions = tuple((tensor_version(t), _native.abi_epoch(t)) for t in s.sources)
     with _TRANSPOSES_LOCK:
         entry = _TRANSPOSES.get(key)
     if entry is not None and entry[0] == versions:
@@ -644,7 +649,8 @@ def _cached(
 def _torch_operand(a: torch.Tensor) -> Optional[Tuple[_Operand, torch.Tensor]]:
     rows, cols = a.shape
     if a.layout is torch.sparse_csr:
-        positions, coordinates = a.crow_indices(), a.col_indices()
+        # The caller's arrays, not the accessors' aliases (see _native.torch_sparse_index_members).
+        positions, coordinates = _native.torch_sparse_index_members(a)
         state = torch_operand_state(a, create=True)
         stored = _cached(
             state,
@@ -664,7 +670,7 @@ def _torch_operand(a: torch.Tensor) -> Optional[Tuple[_Operand, torch.Tensor]]:
                     a = a.coalesce()
             else:
                 a = a.coalesce()
-        indices = a.indices()
+        (indices,) = _native.torch_sparse_index_members(a)
         row_of, coordinates = indices[0], indices[1]
         state = torch_operand_state(a, create=True)
 

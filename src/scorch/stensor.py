@@ -400,8 +400,29 @@ try:  # pragma: no cover - exercised by whichever branch this import takes
     import scorch_ops as _native_ops
 
     _NATIVE_TRANSPOSE = getattr(_native_ops, "scorch_transpose_2d_float", None)
+    _NATIVE_INDEX_MEMBERS = getattr(_native_ops, "torch_sparse_index_members", None)
 except Exception:
     _NATIVE_TRANSPOSE = None
+    _NATIVE_INDEX_MEMBERS = None
+
+
+def _torch_index_members(tensor: torch.Tensor) -> Tuple[torch.Tensor, ...]:
+    """A torch sparse tensor's index arrays as every cache must key them: (crow, col) for CSR,
+    (indices,) for COO.
+
+    Not ``crow_indices()``/``col_indices()``/``indices()``: torch gives those aliases the sparse
+    tensor's own version counter, so caches keyed on them never saw a write through the caller's
+    arrays, and a product after ``col.copy_(...)`` was computed from the old columns. These are
+    the caller's arrays themselves (detached views sharing their counter), and the sparse tensor
+    is recorded as a witness of their storages, so a write through its accessors is seen too
+    (csrc/native_abi.h, Write witnesses). Without the native entry point -- an extension not yet
+    rebuilt -- the accessors, as before.
+    """
+    if _NATIVE_INDEX_MEMBERS is not None:
+        return tuple(_NATIVE_INDEX_MEMBERS(tensor))
+    if tensor.layout == torch.sparse_csr:
+        return tensor.crow_indices(), tensor.col_indices()
+    return (tensor.indices(),)
 
 
 def _contiguous_copy(tensor: torch.Tensor) -> torch.Tensor:
@@ -1298,9 +1319,8 @@ class STensor:
         if csr_matrix.device.type != "cpu":
             raise TensorStorageError("Scorch only supports CPU CSR tensors")
 
-        # Extract the crow_indices, col_indices, and values
-        crow_indices = csr_matrix.crow_indices()
-        col_indices = csr_matrix.col_indices()
+        # The index arrays as caches must key them (see _torch_index_members), and the values
+        crow_indices, col_indices = _torch_index_members(csr_matrix)
         values = csr_matrix.values().resolve_conj().resolve_neg()
         shape = csr_matrix.size()
 
@@ -1395,7 +1415,7 @@ class STensor:
                     "hybrid COO tensors with dense value dimensions are unsupported"
                 )
             coo_matrix = coo_matrix.coalesce()
-            indices = coo_matrix.indices()
+            (indices,) = _torch_index_members(coo_matrix)
             values = coo_matrix.values().resolve_conj().resolve_neg()
             shape = tuple(coo_matrix.shape)
         else:
@@ -1452,7 +1472,7 @@ class STensor:
                 ).coalesce()
             except (RuntimeError, TypeError, ValueError, OverflowError) as error:
                 raise TensorIndexError(f"invalid COO coordinates: {error}") from error
-            indices = canonical.indices()
+            (indices,) = _torch_index_members(canonical)
             values = canonical.values()
             shape = tuple(canonical.shape)
 
@@ -1571,7 +1591,7 @@ class STensor:
             if tensor.layout == torch.sparse_coo:
                 mode_indices = []
                 tensor = tensor.coalesce()
-                tensor_indices = tensor.indices()
+                (tensor_indices,) = _torch_index_members(tensor)
                 for i in range(tensor.dim()):
                     mode_indices.append([tensor_indices[i]])
 
@@ -1588,8 +1608,7 @@ class STensor:
                 )
 
             elif tensor.layout == torch.sparse_csr:
-                crow_indices = tensor.crow_indices()
-                col_indices = tensor.col_indices()
+                crow_indices, col_indices = _torch_index_members(tensor)
                 values = tensor.values()
                 shape = tensor.size()
 

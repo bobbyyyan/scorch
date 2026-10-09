@@ -349,8 +349,10 @@ def install(
     if _is_torch_operand(a):
         # The operand's own arrays: the plan pins what it was built from, and `run_csr`
         # compares it against the operand's members on every call. The factory
-        # validates them itself (plan.h).
-        mode_indices = [[], [a.crow_indices(), a.col_indices()]]
+        # validates them itself (plan.h). The members, not the accessors' aliases, whose
+        # counter is the operand's and misses writes through the caller's arrays; the
+        # operand becomes a witness of their storages (_native.torch_sparse_index_members).
+        mode_indices = [[], list(_native.torch_sparse_index_members(a))]
         values = a.values()
     else:
         mode_indices = a._native_mode_indices()
