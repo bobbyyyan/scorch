@@ -1161,6 +1161,10 @@ enum class BinaryContract {
   CsrDenseMatvec,
   CooDenseMatmul,
   CooCooMatmul,
+  // CsrDenseMatmul into a kernel that addresses B and the result with 64-bit offsets (the v2
+  // SpMM and its tiled forms), so their element counts are not held to int32; every extent still
+  // is, since the kernels take each one as an int. See the note at checked_dense_view.
+  CsrDenseMatmulInt64Elements,
 };
 
 enum class LevelKind : int {
@@ -1437,9 +1441,16 @@ inline DenseInputView checked_dense_view(
     const std::vector<Dim>& shape,
     std::vector<std::vector<torch::Tensor>>& mode_indices,
     const torch::Tensor& values, torch::ScalarType expected_dtype,
-    int64_t expected_rank, const char* op, const char* argument) {
+    int64_t expected_rank, const char* op, const char* argument,
+    bool int32_elements = true) {
+  // `int32_elements` is false only for a kernel that addresses the array with 64-bit offsets.
+  // The legacy kernels compute element offsets in int, so for them an array past INT32_MAX
+  // elements is refused here. The v2 SpMM computes every offset into B and the result as
+  // (size_t)row * (size_t)width, and refusing a B or a result of more than INT32_MAX elements
+  // made scorch.matmul raise on products torch.sparse.mm computes: a 9.9M-row matrix at k=256
+  // has a 2.5e9-element result.
   const auto logical_shape = checked_shape(shape, expected_rank, op, argument);
-  const int64_t numel = checked_product(logical_shape, op, argument, true);
+  const int64_t numel = checked_product(logical_shape, op, argument, int32_elements);
   TORCH_CHECK(mode_indices.size() == logical_shape.size(),
               argument_name(op, argument), " mode_indices must contain ",
               logical_shape.size(), " levels, got ", mode_indices.size());
@@ -1657,6 +1668,20 @@ inline void validate_binary_inputs(
     return;
   }
 
+  if (contract == BinaryContract::CsrDenseMatmulInt64Elements) {
+    checked_product(checked_shape(result_shape, 2, op, "result_shape"), op, "result_shape",
+                    /*require_legacy_int_capacity=*/false);
+    const auto a = checked_csr_view(a_shape, a_mode_indices, a_values, dtype, op, "A");
+    const auto b = checked_dense_view(b_shape, b_mode_indices, b_values, dtype, 2,
+                                      op, "B", /*int32_elements=*/false);
+    TORCH_CHECK(a.shape[1] == b.shape[0], op,
+                ": contraction mismatch: A.shape[1]=", a.shape[1],
+                " but B.shape[0]=", b.shape[0]);
+    TORCH_CHECK(result_shape[0] == a.shape[0] &&
+                    result_shape[1] == b.shape[1],
+                op, ": result_shape must equal [A.rows, B.cols]");
+    return;
+  }
   check_legacy_output_shape(result_shape, 2, op);
   if (contract == BinaryContract::CsrDenseMatmul) {
     const auto a = checked_csr_view(a_shape, a_mode_indices, a_values, dtype, op, "A");

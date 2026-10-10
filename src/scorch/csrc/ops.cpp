@@ -30,7 +30,7 @@ __attribute__((noinline)) Tensor spmm_csr_v2_panelled(
                  std::vector<std::vector<torch::Tensor>> panel_levels,
                  const torch::Tensor& panel_values, torch::Tensor& into) {
     scorch_native::validate_binary_inputs(
-        op, scorch_native::BinaryContract::CsrDenseMatmul,
+        op, scorch_native::BinaryContract::CsrDenseMatmulInt64Elements,
         single ? torch::kFloat32 : torch::kFloat64, panel_shape, panel_a_shape, panel_levels,
         panel_values, B_shape, B_mode_indices, B_values);
     const int tile = scorch_native::validate_tile_size(tile_size, op, "tile_size", B_shape[1]);
@@ -330,7 +330,7 @@ void bind_experimental_spmm_variants(py::module_& m) {
                                               A_values, B_shape, B_mode_indices, B_values,
                                               tile_size, nthreads_override, atparallel);
           scorch_native::validate_binary_inputs(
-              op, scorch_native::BinaryContract::CsrDenseMatmul,
+              op, scorch_native::BinaryContract::CsrDenseMatmulInt64Elements,
               torch::kFloat32, result_shape, A_shape, A_mode_indices, A_values,
               B_shape, B_mode_indices, B_values);
           tile_size = scorch_native::validate_tile_size(
@@ -370,7 +370,7 @@ void bind_experimental_spmm_variants(py::module_& m) {
                                               A_values, B_shape, B_mode_indices, B_values,
                                               tile_size, nthreads_override, atparallel);
           scorch_native::validate_binary_inputs(
-              op, scorch_native::BinaryContract::CsrDenseMatmul,
+              op, scorch_native::BinaryContract::CsrDenseMatmulInt64Elements,
               torch::kFloat64, result_shape, A_shape, A_mode_indices, A_values,
               B_shape, B_mode_indices, B_values);
           tile_size = scorch_native::validate_tile_size(
@@ -402,7 +402,7 @@ void bind_experimental_spmm_variants(py::module_& m) {
            torch::Tensor B_values, int Jc, int nthreads_override) {
           constexpr const char* op = "spmm_csr_float_tilej";
           scorch_native::validate_binary_inputs(
-              op, scorch_native::BinaryContract::CsrDenseMatmul,
+              op, scorch_native::BinaryContract::CsrDenseMatmulInt64Elements,
               torch::kFloat32, result_shape, A_shape, A_mode_indices, A_values,
               B_shape, B_mode_indices, B_values);
           TORCH_CHECK(Jc >= 0, op, ": Jc must be nonnegative, got ", Jc);
@@ -436,7 +436,7 @@ void bind_experimental_spmm_variants(py::module_& m) {
            torch::Tensor B_values, int Nc, int Jc, int nthreads_override) {
           constexpr const char* op = "spmm_csr_float_tileijk";
           scorch_native::validate_binary_inputs(
-              op, scorch_native::BinaryContract::CsrDenseMatmul,
+              op, scorch_native::BinaryContract::CsrDenseMatmulInt64Elements,
               torch::kFloat32, result_shape, A_shape, A_mode_indices, A_values,
               B_shape, B_mode_indices, B_values);
           TORCH_CHECK(Nc >= 0, op, ": Nc must be nonnegative, got ", Nc);

@@ -5135,7 +5135,9 @@ torch::Tensor spmm_csr_v2_core(
   // A/B override, authoritative so the whole k=1..8 map is reproducible from this
   // binary: 0 forces the shipped regblock kernel at every width, and a positive
   // value routes at every width whose row needs one vector, subject to that mean
-  // row length. A floor buys nothing in the end -- the cells it would exclude were
+  // row length. At k >= 2 the gather's offset, column * k, is int32 and nothing here
+  // can check it (the core is not given B's row count): do not use the override on
+  // a B of more than INT32_MAX elements. At k=1, the shipped route, it is the column. A floor buys nothing in the end -- the cells it would exclude were
   // positive too -- but it is how the map was drawn.
   { const char* e = std::getenv("SCORCH_NARROWK_GATHER");
     if (e && *e) {
