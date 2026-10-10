@@ -621,7 +621,9 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("abi_memo_clear", &scorch_native::abi_memo_clear,
           "Drop every cached index-validation verdict and narrowed index copy");
     m.def("abi_memo_size", &scorch_native::abi_memo_size,
-          "Number of live entries across both ABI validation memos");
+          "Entries across both ABI validation memos (dead ones until the next sweep)");
+    m.def("abi_narrow_held", &scorch_native::abi_narrow_held,
+          "(entries, bytes) the narrowing memo holds, its arrays live or not. For tests");
 
     // Write witnesses (native_abi.h). The capsule is how a JIT-compiled kernel module, which
     // carries its own memo, reads the epochs this module keeps; the functions are what Python's

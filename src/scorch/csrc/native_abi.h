@@ -59,9 +59,9 @@
 #define SCORCH_ABI_VALIDATE_GRAIN 1048576L
 #endif
 
-// Entries retained by the validation memo before it is cleared wholesale. Each entry
-// is a few dozen bytes; the bound exists so a program churning through millions of
-// distinct sparse tensors cannot grow it without limit.
+// LIVE entries retained by the validation memo before it is cleared wholesale (entries whose
+// arrays have died are swept, see abi_bound_map). Each verdict is a few dozen bytes; the bound
+// exists so a program holding millions of distinct sparse tensors cannot grow it without limit.
 #ifndef SCORCH_ABI_MEMO_MAX
 #define SCORCH_ABI_MEMO_MAX 4096
 #endif
@@ -824,20 +824,74 @@ inline std::unordered_map<AbiStructKey, AbiStructEntry, AbiStructKeyHash>& abi_s
   return m;
 }
 
-// Reclaims dead entries and keeps the map bounded. Called before every insert, and it
-// sweeps EVERY time rather than only when the map is full, because a narrow entry owns
-// an int32 copy of its source array: waiting for 4096 entries to accumulate would hold
-// 4096 dead index arrays, which on graph-scale operands is hundreds of megabytes. An
-// insert only happens on a miss — once per newly seen array — so an O(entries)
-// weak-pointer sweep there is not on any hot path. Wholesale clearing is the backstop
-// for a program holding more live arrays than the bound allows.
+// When a memo map next sweeps out the entries whose arrays have died, and what that sweep left.
+//
+// Every insert used to sweep the whole map. An insert happens once per newly seen array, which
+// was taken to keep the sweep off any hot path; but a program that keeps many structures alive
+// and meets each for the first time in turn -- a dataset of graphs in its first epoch -- inserts
+// on every call, and each insert then cost O(live entries): on the M5, 2000 new CSR tensors kept
+// alive while each was multiplied once took 64-78 us a call against 25 us when each died after
+// its call, and 23-27 us with the memo off.
+//
+// So a sweep runs once the inserts since the last one reach the entries that sweep left (at
+// least 32): an insert costs amortized O(1), and dead entries never outnumber live ones by more
+// than that. A narrowed copy is O(nnz) memory, which is why every insert used to sweep: dead
+// copies of graph-scale arrays must not pile up. The narrowing memo therefore also sweeps once
+// the bytes it has copied since the last sweep reach the live copies' bytes that sweep left (at
+// least kAbiMemoSweepBytes): the dead copies it holds never exceed the live ones' bytes, or that
+// floor, plus the newest. A program that replaces one large structure per call holds at most
+// one dead copy, as before.
+constexpr int64_t kAbiMemoSweepBytes = 1 << 20;
+
+struct AbiMemoSweep {
+  size_t live = 0;          // entries the last sweep left
+  size_t inserted = 0;      // inserts since
+  int64_t live_bytes = 0;   // bytes those entries own
+  int64_t inserted_bytes = 0;
+};
+
+inline int64_t abi_entry_bytes(const AbiNarrowEntry& e) {
+  return e.narrowed.defined() ? (int64_t)e.narrowed.nbytes() : 0;
+}
+inline int64_t abi_entry_bytes(const AbiStructEntry&) { return 0; }
+
+// Called before every insert, with the bytes the new entry owns. Wholesale clearing remains
+// the backstop for a program holding more LIVE arrays than SCORCH_ABI_MEMO_MAX: it applies
+// only to what a sweep leaves.
 template <typename Map>
-inline void abi_bound_map(Map& map) {
+inline void abi_bound_map(Map& map, AbiMemoSweep& sweep, int64_t incoming_bytes) {
+  sweep.inserted += 1;
+  sweep.inserted_bytes += incoming_bytes;
+  const bool due =
+      sweep.inserted >= std::max<size_t>(sweep.live, 32) ||
+      (incoming_bytes > 0 &&
+       sweep.inserted_bytes >= std::max<int64_t>(sweep.live_bytes, kAbiMemoSweepBytes)) ||
+      map.size() >= (size_t)SCORCH_ABI_MEMO_MAX;
+  if (!due) return;
+  int64_t live_bytes = 0;
   for (auto it = map.begin(); it != map.end();) {
-    if (!it->second.live()) it = map.erase(it);
-    else ++it;
+    if (!it->second.live()) {
+      it = map.erase(it);
+    } else {
+      live_bytes += abi_entry_bytes(it->second);
+      ++it;
+    }
   }
-  if (map.size() >= (size_t)SCORCH_ABI_MEMO_MAX) map.clear();
+  if (map.size() >= (size_t)SCORCH_ABI_MEMO_MAX) {
+    map.clear();
+    live_bytes = 0;
+  }
+  sweep = AbiMemoSweep{map.size(), 0, live_bytes, 0};
+}
+
+inline AbiMemoSweep& abi_narrow_sweep() {
+  static AbiMemoSweep s;
+  return s;
+}
+
+inline AbiMemoSweep& abi_struct_sweep() {
+  static AbiMemoSweep s;
+  return s;
 }
 
 // The int32 copy of this array, if one was already made and both still exist
@@ -861,7 +915,8 @@ inline void abi_narrow_store(AbiArrayId source, torch::Tensor narrowed) {
   if (!abi_memo_enabled()) return;
   std::lock_guard<std::mutex> guard(abi_memo_mutex());
   auto& map = abi_narrow_map();
-  abi_bound_map(map);
+  abi_bound_map(map, abi_narrow_sweep(),
+                narrowed.defined() ? (int64_t)narrowed.nbytes() : 0);
   const void* key = source.data;
   AbiNarrowEntry entry;
   entry.source = std::move(source);
@@ -888,7 +943,7 @@ inline void abi_struct_store(AbiStructEntry entry) {
   if (!abi_memo_enabled() || entry.arrays.empty()) return;
   std::lock_guard<std::mutex> guard(abi_memo_mutex());
   auto& map = abi_struct_map();
-  abi_bound_map(map);
+  abi_bound_map(map, abi_struct_sweep(), 0);
   const AbiStructKey key = abi_struct_key(entry);
   map.insert_or_assign(key, std::move(entry));
 }
@@ -903,6 +958,8 @@ inline void abi_memo_clear() {
   std::lock_guard<std::mutex> guard(abi_memo_mutex());
   abi_narrow_map().clear();
   abi_struct_map().clear();
+  abi_narrow_sweep() = AbiMemoSweep{};
+  abi_struct_sweep() = AbiMemoSweep{};
 }
 
 // A construction-time screen (storage.py) consulted through the same verdicts as the
@@ -923,6 +980,14 @@ inline bool abi_screen_through_memo(AbiStructEntry want, Screen&& screen) {
 inline size_t abi_memo_size() {
   std::lock_guard<std::mutex> guard(abi_memo_mutex());
   return abi_narrow_map().size() + abi_struct_map().size();
+}
+
+// The narrowing memo's entries and the bytes their int32 copies own, live or not. For tests.
+inline std::pair<int64_t, int64_t> abi_narrow_held() {
+  std::lock_guard<std::mutex> guard(abi_memo_mutex());
+  int64_t bytes = 0;
+  for (const auto& kv : abi_narrow_map()) bytes += abi_entry_bytes(kv.second);
+  return {(int64_t)abi_narrow_map().size(), bytes};
 }
 
 }  // namespace scorch_native
