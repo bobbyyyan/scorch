@@ -98,6 +98,18 @@ inline int64_t abi_split(int64_t n, int64_t grain) {
   return per_worker < 1 ? 1 : per_worker;
 }
 
+// at::parallel_reduce over [begin, end), split as abi_split asks -- except that a range it would
+// run inline runs here as a plain call. ATen's inline path still sets its thread-id and
+// parallel-region guards, which these bodies (loops that call nothing in ATen) do not need.
+template <typename R, typename F, typename C>
+inline R abi_reduce(int64_t begin, int64_t end, int64_t grain, R ident, const F& body,
+                    const C& combine) {
+  if (begin >= end) return ident;
+  const int64_t split = abi_split(end - begin, grain);
+  if (split >= end - begin) return body(begin, end, ident);
+  return at::parallel_reduce(begin, end, split, ident, body, combine);
+}
+
 // Every screen below splits its scan with `at::parallel_reduce` rather than a raw
 // `#pragma omp parallel for num_threads(...)`, so the work runs on TORCH'S thread pool
 // at TORCH'S thread count. That is not a stylistic preference; the raw pragma was
@@ -178,14 +190,23 @@ inline bool abi_screen_bounds(const int32_t* crd, int64_t n, int64_t limit) {
 
 // "positions do not decrease and stay within [0, nnz]", for the callers that validate
 // a position array on its own. O(rows) rather than O(nnz), but a TORCH_CHECK per row
-// is what made it show up at all.
+// is what made it show up at all -- and, run on one thread, an O(rows) loop costs more
+// than an O(nnz) one split across all of them once rows are short (see
+// abi_screen_compressed_typed), so it is split the same way.
 template <typename T>
-inline bool abi_screen_spans_typed(const T* pos, int64_t count, int64_t nnz) {
-  int bad = 0;
+inline bool abi_screen_spans_typed(const T* pos, int64_t count, int64_t nnz,
+                                   int64_t grain = SCORCH_ABI_VALIDATE_GRAIN) {
+  if (count <= 1) return false;
   const T nnz_t = (T)nnz;  // callers check nnz fits the index width first
-  for (int64_t i = 1; i < count; ++i) {
-    bad |= (pos[i] < pos[i - 1]) | (pos[i] > nnz_t);
-  }
+  const int bad = abi_reduce(
+      (int64_t)1, count, grain, 0,
+      [&](int64_t begin, int64_t end, int partial) {
+        for (int64_t i = begin; i < end; ++i) {
+          partial |= (pos[i] < pos[i - 1]) | (pos[i] > nnz_t);
+        }
+        return partial;
+      },
+      [](int a, int b) { return a | b; });
   return bad != 0;
 }
 
@@ -204,8 +225,19 @@ inline bool abi_screen_spans(const int32_t* pos, int64_t count, int64_t nnz) {
 //
 // Bounds do not care about span structure at all. Sortedness does, but only through
 // one observation: a DESCENT at position p (crd[p-1] > crd[p]) is legal exactly when p
-// is the first position of a span. So count every descent flat, count the descents
-// that sit on a span boundary (O(parent_count)), and compare.
+// is the first position of a span. So count every descent flat, subtract the descents
+// that sit on a span boundary, and require nothing left.
+//
+// No loop here runs over the parents on one thread. Run serially, the position checks
+// and the boundary count cost more than the whole coordinate scan split across workers
+// once spans are short: M5, int64, 1M nonzeros, 65 us in 1024 rows and 640 us in 1M rows
+// (8.4M nonzeros: 478 us and 1335 us). The positions are checked by a split scan first;
+// that makes them a valid partition, so each worker of the coordinate scan finds the
+// first boundary of its range by binary search and walks its boundaries as it goes. It
+// scans in blocks of 16 KiB and walks a block's boundaries straight after the block's
+// flat loop, so the two coordinates around each boundary are read from L1: where spans
+// are a cache line long or shorter, a separate boundary pass would read every line of
+// the coordinate array a second time.
 //
 // Given `pos_out` and `crd_out` (N narrower than T), the same pass also writes each
 // position and coordinate converted to N, so arrays seen for the first time are read once
@@ -223,10 +255,18 @@ inline bool abi_screen_compressed_typed(
   if constexpr (kCopy) {
     if (parent_count >= 0) pos_out[0] = (N)pos[0];
   }
-  for (int64_t parent = 0; parent < parent_count; ++parent) {
-    const T start = pos[parent], end = pos[parent + 1];
-    bad |= (start < 0) | (end < start) | (end > nnz32);
-    if constexpr (kCopy) pos_out[parent + 1] = (N)end;
+  if (parent_count > 0) {
+    bad = abi_reduce(
+        (int64_t)0, parent_count, grain, 0,
+        [&](int64_t begin, int64_t end, int partial) {
+          for (int64_t parent = begin; parent < end; ++parent) {
+            const T start = pos[parent], stop = pos[parent + 1];
+            partial |= (start < 0) | (stop < start) | (stop > nnz32);
+            if constexpr (kCopy) pos_out[parent + 1] = (N)stop;
+          }
+          return partial;
+        },
+        [](int a, int b) { return a | b; });
   }
   if (bad || nnz <= 0) return bad != 0;
 
@@ -235,8 +275,8 @@ inline bool abi_screen_compressed_typed(
   bad |= (c0 < 0) | (c0 >= lim);
   if constexpr (kCopy) crd_out[0] = (N)c0;
   if (!require_sorted) {
-    bad |= at::parallel_reduce(
-        (int64_t)1, nnz, abi_split(nnz - 1, grain), 0,
+    bad |= abi_reduce(
+        (int64_t)1, nnz, grain, 0,
         [&](int64_t begin, int64_t end, int partial) {
           for (int64_t p = begin; p < end; ++p) {
             const T c = crd[p];
@@ -253,43 +293,51 @@ inline bool abi_screen_compressed_typed(
   // any positive limit; a limit that is not positive, under which it would admit everything,
   // has already failed the first coordinate's signed test above -- and both counts are kept at
   // the index type's width, which no count can wrap: a chunk of an int32 array holds fewer than
-  // 2^31 coordinates. Together they let this loop vectorize at the full lane count. Two signed
-  // tests ORed into an int that is read as a condition after the loop kept it scalar ("value
-  // that could not be identified as reduction is used outside the loop"). M5, one thread, 8.4M
-  // coordinates: int32 1382 -> 467 us, int64 1375 -> 942 us.
+  // 2^31 coordinates. Together they let the flat loop vectorize at the full lane count. Two
+  // signed tests ORed into an int that is read as a condition after the loop kept it scalar
+  // ("value that could not be identified as reduction is used outside the loop"). M5, one
+  // thread, 8.4M coordinates: int32 1382 -> 467 us, int64 1375 -> 942 us.
   using U = std::make_unsigned_t<T>;
   const U ulim = (U)lim;
-  const int64_t OUT_OF_BOUNDS = -1;  // a descent count is never negative
-  const int64_t desc = at::parallel_reduce(
-      (int64_t)1, nnz, abi_split(nnz - 1, grain), (int64_t)0,
-      // ATen hands every chunk the identity and combines the chunks afterwards, so
-      // `partial` is always 0 here and the sentinel can only arrive via the combiner.
+  constexpr int64_t kBlock = 16384 / (int64_t)sizeof(T);
+  // Span boundaries are pos[1 .. parent_count - 1]; pos[parent_count] is nnz, past every scan.
+  const T* const first_boundary = pos + 1;
+  const T* const last_boundary = pos + std::max<int64_t>(parent_count, 1);
+  const int64_t unclean = abi_reduce(
+      (int64_t)1, nnz, grain, (int64_t)0,
       [&](int64_t begin, int64_t end, int64_t partial) {
+        // The first boundary at or past `begin`; one before it, if any, lies before `begin`,
+        // so the walk below never skips this range's first boundary as a repeat. r never
+        // passes last_boundary, so each block's search range is valid.
+        int64_t r = std::lower_bound(first_boundary, last_boundary, (T)begin) - pos;
         U out_of_range = 0;
-        U descents = 0;
-        // Reads crd[p - 1], which is in range because the scan starts at 1 and a
-        // chunk never begins before it.
-        for (int64_t p = begin; p < end; ++p) {
-          const T c = crd[p];
-          out_of_range += ((U)c >= ulim);
-          descents += (crd[p - 1] > c);
-          if constexpr (kCopy) crd_out[p] = (N)c;
+        U unsorted = 0;
+        for (int64_t b0 = begin; b0 < end; b0 += kBlock) {
+          const int64_t b1 = std::min(b0 + kBlock, end);
+          U descents = 0;
+          // Reads crd[p - 1], which is in range because the scan starts at 1.
+          for (int64_t p = b0; p < b1; ++p) {
+            const T c = crd[p];
+            out_of_range += ((U)c >= ulim);
+            descents += (crd[p - 1] > c);
+            if constexpr (kCopy) crd_out[p] = (N)c;
+          }
+          // The block's boundaries pos[r .. r_end) are the p in [b0, b1), so 1 <= p < nnz.
+          // Found by binary search, which makes the walk a counted loop the compiler can
+          // vectorize where spans hold one element and every position is a boundary. Parents
+          // with empty spans repeat a boundary, which counts once.
+          const int64_t r_end = std::lower_bound(pos + r, last_boundary, (T)b1) - pos;
+          for (int64_t q = r; q < r_end; ++q) {
+            const T p = pos[q];
+            descents -= (U)((p != pos[q - 1]) & (crd[p - 1] > crd[p]));
+          }
+          r = r_end;
+          unsorted += (descents != 0);
         }
-        return out_of_range ? OUT_OF_BOUNDS : partial + (int64_t)descents;
+        return partial + (int64_t)(out_of_range != 0) + (int64_t)unsorted;
       },
-      [OUT_OF_BOUNDS](int64_t a, int64_t b) {
-        return (a == OUT_OF_BOUNDS || b == OUT_OF_BOUNDS) ? OUT_OF_BOUNDS : a + b;
-      });
-  if (desc == OUT_OF_BOUNDS) return true;
-  int64_t allowed = 0;
-  for (int64_t parent = 1; parent < parent_count; ++parent) {
-    const T p = pos[parent];
-    if (p == pos[parent - 1]) continue;  // empty span: same boundary, already counted
-    if (p > 0 && p < nnz) allowed += (crd[p - 1] > crd[p]);
-  }
-  // `allowed` can only ever be a subset of `desc`, so a mismatch means some span is
-  // internally unsorted.
-  bad |= (desc != allowed);
+      [](int64_t a, int64_t b) { return a + b; });
+  bad |= (unclean != 0);
   return bad != 0;
 }
 

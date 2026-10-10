@@ -182,3 +182,45 @@ def test_a_limit_that_is_not_positive_leaves_no_coordinate_in_range(index, exten
         scorch_ops.abi_screen_compressed_level(crow, col, extent, False, 1 << 16)
         is True
     )
+
+
+@pytest.fixture
+def four_threads():
+    before = torch.get_num_threads()
+    torch.set_num_threads(4)
+    yield
+    torch.set_num_threads(before)
+
+
+@pytest.mark.parametrize("defect", [None, "unsorted", "column_past_the_end"])
+def test_a_pair_past_the_boundary_grain_is_narrowed_by_split_scans(
+    four_threads, defect
+):
+    """1.2M nonzeros, past the boundary's 1M-element grain, so the pass that checks and narrows
+    the pair splits across workers: its positions scan, and its coordinate scan with the
+    boundary walk. A defect in the last worker's range is reported as for the int32 pair.
+    """
+    rows, cols, deg = 150000, 1000, 8
+    generator = torch.Generator().manual_seed(0)
+    crow = torch.arange(rows + 1, dtype=torch.int64) * deg
+    col = torch.randint(0, cols, (rows, deg), generator=generator).sort(dim=1).values
+    if defect == "unsorted":
+        col[140001] = torch.arange(deg - 1, -1, -1)
+    elif defect == "column_past_the_end":
+        col[140001, 5] = cols
+    col = col.reshape(-1)
+    values = torch.rand(rows * deg, generator=generator)
+    b = torch.rand(cols, 2, generator=generator)
+    scorch_ops.abi_memo_clear()
+    if defect is None:
+        want = call("spmm_csr_float_v2", crow.int(), col.int(), values, rows, cols, b)
+        got = call(
+            "spmm_csr_float_v2", crow.clone(), col.clone(), values, rows, cols, b
+        )
+        assert torch.equal(got, want)
+        return
+    with pytest.raises(RuntimeError) as narrow:
+        call("spmm_csr_float_v2", crow.int(), col.int(), values, rows, cols, b)
+    with pytest.raises(RuntimeError) as wide:
+        call("spmm_csr_float_v2", crow.clone(), col.clone(), values, rows, cols, b)
+    assert str(wide.value).splitlines()[0] == str(narrow.value).splitlines()[0]
