@@ -249,23 +249,33 @@ inline bool abi_screen_compressed_typed(
     return bad != 0;
   }
 
+  // Out of range is one unsigned comparison -- a negative coordinate converts to a value past
+  // any positive limit; a limit that is not positive, under which it would admit everything,
+  // has already failed the first coordinate's signed test above -- and both counts are kept at
+  // the index type's width, which no count can wrap: a chunk of an int32 array holds fewer than
+  // 2^31 coordinates. Together they let this loop vectorize at the full lane count. Two signed
+  // tests ORed into an int that is read as a condition after the loop kept it scalar ("value
+  // that could not be identified as reduction is used outside the loop"). M5, one thread, 8.4M
+  // coordinates: int32 1382 -> 467 us, int64 1375 -> 942 us.
+  using U = std::make_unsigned_t<T>;
+  const U ulim = (U)lim;
   const int64_t OUT_OF_BOUNDS = -1;  // a descent count is never negative
   const int64_t desc = at::parallel_reduce(
       (int64_t)1, nnz, abi_split(nnz - 1, grain), (int64_t)0,
       // ATen hands every chunk the identity and combines the chunks afterwards, so
       // `partial` is always 0 here and the sentinel can only arrive via the combiner.
       [&](int64_t begin, int64_t end, int64_t partial) {
-        int local_bad = 0;
-        int64_t descents = 0;
+        U out_of_range = 0;
+        U descents = 0;
         // Reads crd[p - 1], which is in range because the scan starts at 1 and a
         // chunk never begins before it.
         for (int64_t p = begin; p < end; ++p) {
           const T c = crd[p];
-          local_bad |= (c < 0) | (c >= lim);
+          out_of_range += ((U)c >= ulim);
           descents += (crd[p - 1] > c);
           if constexpr (kCopy) crd_out[p] = (N)c;
         }
-        return local_bad ? OUT_OF_BOUNDS : partial + descents;
+        return out_of_range ? OUT_OF_BOUNDS : partial + (int64_t)descents;
       },
       [OUT_OF_BOUNDS](int64_t a, int64_t b) {
         return (a == OUT_OF_BOUNDS || b == OUT_OF_BOUNDS) ? OUT_OF_BOUNDS : a + b;

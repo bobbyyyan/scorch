@@ -166,3 +166,19 @@ def test_a_value_past_int32_is_reported_by_the_narrowing():
     col = torch.tensor([0, 2**31], dtype=torch.int64)
     with pytest.raises(RuntimeError, match="cannot be represented as int32"):
         call("spmm_csr_float_v2", crow, col, torch.rand(2), 2, 4, torch.rand(4, 2))
+
+
+@pytest.mark.parametrize("index", [torch.int32, torch.int64])
+@pytest.mark.parametrize("extent", [0, -1])
+def test_a_limit_that_is_not_positive_leaves_no_coordinate_in_range(index, extent):
+    """The screen tests the range with one unsigned comparison, under which a negative limit
+    would admit every coordinate; it must answer as the signed test did."""
+    crow = torch.tensor([0, 1, 2], dtype=index)
+    col = torch.tensor([0, 0], dtype=index)
+    assert (
+        scorch_ops.abi_screen_compressed_level(crow, col, extent, True, 1 << 16) is True
+    )
+    assert (
+        scorch_ops.abi_screen_compressed_level(crow, col, extent, False, 1 << 16)
+        is True
+    )
