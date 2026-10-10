@@ -52,25 +52,33 @@ DECLINES_ATTR = "_scorch_spmm_declines"
 # The CSR structure autograd.py builds for an operand a gradient flows through (its
 # transpose, and the STensors its products run on). Kept and dropped with the plans, for
 # the same reasons: it is only valid for this structure and it must die with the operand.
+# For a torch operand it is kept per OBJECT (torch_object_state), not with the plans: it
+# holds the index arrays, and the plans' state lives exactly as long as they do.
 GRAD_ATTR = "_scorch_grad_structure"
 # A torch CSR operand's TransposedProductPlans: for each key its transposed product A^T @ M has a
 # plan under, the record the C entry serves x @ A from (csrc/planned_matmul.h). Made in C when that
 # product is served for the operand; kept and dropped with its plans.
 TRANSPOSED_PLANS_ATTR = "_scorch_transposed_plans"
 
-# The same three entries for an operand that is a torch sparse CSR tensor, which cannot
-# carry them itself. torch.save and pickle write a tensor's __dict__ along with it, so a
-# native plan stored there makes the caller's own tensor unsaveable (both fail on the
-# plan object), and anything importable stored instead would make the saved file
-# unloadable wherever scorch is not installed. So these live here, keyed on the
-# operand's id() and checked against a weak reference to it -- an id is only unique
-# among live objects -- and the weak reference's callback drops the entry when the
-# operand dies, which keeps the property the STensor attributes have: the plans die with
-# the operand, and nothing here keeps a graph-scale index array alive.
+# A torch sparse tensor cannot carry these entries itself. torch.save and pickle write a
+# tensor's __dict__ along with it, so a native plan stored there makes the caller's own
+# tensor unsaveable (both fail on the plan object), and anything importable stored instead
+# would make the saved file unloadable wherever scorch is not installed.
 #
-# A plain dict probed with id() rather than a weak-keyed mapping, because the probe is
-# on the path a planned call takes and must cost what the STensor probe costs: one dict
-# lookup and one dereference. planned_matmul.h reads this dict directly.
+# A torch sparse CSR operand's plans, sightings, declines and transposed-product records are
+# facts about its STRUCTURE -- its two index arrays and its shape -- and live in the native
+# extension, one entry per structure (csrc/torch_structures.h): every tensor over the same
+# arrays shares them, and the entry is dropped when the arrays die. Keyed on the tensor
+# object instead, a program that builds a new CSR tensor over the same arrays for every call
+# (learned edge weights, attention scores) made a first sighting on every call and was never
+# planned; on mkt1 such calls were behind MKL in 1152 of 2400 runs back to back and 2184 of
+# 2400 cold, where one persistent tensor was behind in none.
+#
+# What remains per OBJECT is autograd.py's structure (GRAD_ATTR), which holds the arrays and so
+# cannot live in an entry that must die with them, and every entry of a COO operand. Those live
+# here, keyed on the operand's id() and checked against a weak reference to it -- an id is only
+# unique among live objects -- and the weak reference's callback drops the entry when the
+# operand dies, so nothing here keeps a graph-scale index array alive past its operand.
 TORCH_OPERANDS: Dict[int, Tuple["_OperandRef", Dict[str, Any]]] = {}
 
 
@@ -88,8 +96,8 @@ def _drop_torch_operand(ref: "_OperandRef") -> None:
         del TORCH_OPERANDS[ref.key]
 
 
-def torch_operand_state(tensor: torch.Tensor, create: bool = False):
-    """The plan state of a torch sparse CSR operand: its dict in TORCH_OPERANDS.
+def torch_object_state(tensor: torch.Tensor, create: bool = False):
+    """The per-object state of a torch sparse operand: its dict in TORCH_OPERANDS.
 
     None when there is none and ``create`` is false. An entry whose weak reference no
     longer names ``tensor`` belongs to an earlier object with the same id that has not
@@ -108,13 +116,22 @@ def torch_operand_state(tensor: torch.Tensor, create: bool = False):
     return state
 
 
+def torch_operand_state(tensor: torch.Tensor, create: bool = False):
+    """The plan state of a 2-D torch sparse CSR operand: its structure's (see above).
+
+    None when there is none and ``create`` is false. Asking records ``tensor`` as a write
+    witness of its index arrays (csrc/native_abi.h), as every reader of them must.
+    """
+    return _native.torch_structure_state(tensor, create)
+
+
 def _is_torch_operand(a: Any) -> bool:
     return type(a) is torch.Tensor and a.layout is torch.sparse_csr
 
 
 def _state_of(a: Any):
     """Where an operand's plans live, if it has any: an STensor's own __dict__, or for a
-    torch sparse CSR operand, its entry in TORCH_OPERANDS."""
+    torch sparse CSR operand, its structure's entry (see TORCH_OPERANDS)."""
     if _is_torch_operand(a):
         return torch_operand_state(a)
     return getattr(a, "__dict__", None)
@@ -224,6 +241,13 @@ def forget(tensor: Any) -> None:
     records the index arrays' identity and version counters. This is the belt to
     that suspenders -- it also releases the narrowed index copy.)
     """
+    if type(tensor) is torch.Tensor:
+        # autograd.py's structure for a torch operand is in the operand's per-object
+        # state; its plans are in its index arrays' entry, shared with every tensor over
+        # the same arrays.
+        held = torch_object_state(tensor)
+        if held is not None:
+            held.pop(GRAD_ATTR, None)
     state = _state_of(tensor)
     if state is None:
         return
@@ -294,9 +318,9 @@ def install(
     here would let a plan run tile-j against an ordinary path running v2.
     """
     # An STensor keeps its plans in its own __dict__; a torch sparse CSR operand keeps
-    # them in TORCH_OPERANDS (see there). ops.matmul passes a torch.Tensor here only when
-    # it is a 2-D sparse CSR operand, so the type is the whole test. `create` because the
-    # first sighting is recorded below, and a torch operand has no entry until then.
+    # them in its structure's entry (see TORCH_OPERANDS). ops.matmul passes a torch.Tensor
+    # here only when it is a 2-D sparse CSR operand, so the type is the whole test. `create`
+    # because the first sighting is recorded below, and a structure has no entry until then.
     if type(a) is torch.Tensor:
         state = torch_operand_state(a, create=True)
     else:
@@ -346,12 +370,15 @@ def install(
         plan_kind = kind
     panel_free, panel_contraction = _panels(plan_kind, param)
 
-    if _is_torch_operand(a):
-        # The operand's own arrays: the plan pins what it was built from, and `run_csr`
+    borrow = _is_torch_operand(a)
+    if borrow:
+        # The operand's own arrays: the plan records what it was built from, and `run_csr`
         # compares it against the operand's members on every call. The factory
         # validates them itself (plan.h). The members, not the accessors' aliases, whose
         # counter is the operand's and misses writes through the caller's arrays; the
         # operand becomes a witness of their storages (_native.torch_sparse_index_members).
+        # The plan BORROWS them (SpmmCsrPlan::release_sources): it lives in their
+        # structure's entry, which must die with them.
         mode_indices = [[], list(_native.torch_sparse_index_members(a))]
         values = a.values()
     else:
@@ -366,6 +393,7 @@ def install(
             int(b.shape[1]),
             panel_free,
             panel_contraction,
+            borrow,
         )
     except Exception:
         # Nothing a plan does is load-bearing, so a refusal from the factory --

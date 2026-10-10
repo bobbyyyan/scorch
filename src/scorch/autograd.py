@@ -53,7 +53,7 @@ import scorch_ops as _native
 
 from .exceptions import TensorIndexError
 from .format import LevelType
-from .plan import GRAD_ATTR, torch_operand_state
+from .plan import GRAD_ATTR, torch_object_state
 from .stensor import STensor
 from .storage import tensor_version
 
@@ -161,6 +161,8 @@ class _Structure:
         # Detached: an operand's index accessor can return a view whose base is the operand
         # itself (a COO tensor's indices()), and this structure lives in the operand's own
         # entry in plan.TORCH_OPERANDS, so a view held here would keep the operand alive.
+        # (The arrays themselves it does hold, which is why it lives there and not with the
+        # operand's plans, in an entry that must die with the arrays.)
         positions = positions.detach().contiguous()
         coordinates = coordinates.detach().contiguous()
         if positions.numel() != rows + 1 or _native.abi_screen_compressed_level(
@@ -216,7 +218,8 @@ class _Structure:
 
         ``owner``, with ``perm``, is the torch CSR operand this structure is the transpose of,
         when the product is its ``x @ A``: a planned product then records itself in the
-        operand's state, from which the C entry serves the operand's next ``x @ A``.
+        state of the operand's index arrays, from which the C entry serves the next ``x @ A``
+        of any tensor over them.
 
         Runs on an STensor this structure keeps for the dtype, so the call is planned
         like any repeated product. Its values buffer is refilled on every call: a write
@@ -651,7 +654,9 @@ def _torch_operand(a: torch.Tensor) -> Optional[Tuple[_Operand, torch.Tensor]]:
     if a.layout is torch.sparse_csr:
         # The caller's arrays, not the accessors' aliases (see _native.torch_sparse_index_members).
         positions, coordinates = _native.torch_sparse_index_members(a)
-        state = torch_operand_state(a, create=True)
+        # Per object, not with the plans in the arrays' entry: the structure holds the
+        # arrays, and that entry must die with them (plan.TORCH_OPERANDS).
+        state = torch_object_state(a, create=True)
         stored = _cached(
             state,
             (positions, coordinates),
@@ -672,7 +677,7 @@ def _torch_operand(a: torch.Tensor) -> Optional[Tuple[_Operand, torch.Tensor]]:
                 a = a.coalesce()
         (indices,) = _native.torch_sparse_index_members(a)
         row_of, coordinates = indices[0], indices[1]
-        state = torch_operand_state(a, create=True)
+        state = torch_object_state(a, create=True)
 
         def build() -> _Structure:
             positions = torch._convert_indices_from_coo_to_csr(row_of, rows)

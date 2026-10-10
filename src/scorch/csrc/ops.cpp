@@ -643,6 +643,28 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
             return watch != nullptr ? (int64_t)watch->witnesses.size() : 0;
           },
           "Witnesses recorded on a tensor's storage. For tests", py::arg("t"));
+    // The plan state of a torch sparse CSR operand's structure (torch_structures.h): the dict
+    // plan.py keeps its plans, sightings and declines in, shared by every tensor over the same
+    // index arrays and dropped when they die. Asking records the operand as a write witness.
+    m.def("torch_structure_state",
+          [](py::object a, bool create) -> py::object {
+            if (!THPVariable_Check(a.ptr()))
+              throw py::type_error("torch_structure_state expects a torch.Tensor");
+            const at::Tensor& t = THPVariable_Unpack(a.ptr());
+            // Only a 2-D CSR tensor is planned; anything else has no state.
+            if (t.layout() != c10::kSparseCsr || t.dim() != 2) return py::none();
+            PyObject* state = create ? scorch_native::torch_structure_create(t)
+                                     : scorch_native::torch_structure_python_state(t);
+            if (state == nullptr) return py::none();
+            return py::reinterpret_borrow<py::object>(state);
+          },
+          "The plan state of a 2-D torch sparse CSR tensor's index arrays; None if it has "
+          "none or is not one",
+          py::arg("a"), py::arg("create") = false);
+    m.def("torch_structure_count", &scorch_native::torch_structure_count,
+          "Structures with plan state. For tests");
+    m.def("torch_structure_sweep", &scorch_native::torch_structure_sweep,
+          "Drops the structures whose arrays are gone and returns how many remain. For tests");
 
     // The cache size the KERNEL gates on, so a test can check it against the one
     // tiling.query_llc gates on. Two gates that disagree about the machine would
@@ -1040,6 +1062,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
       .def_property_readonly("free_dim", &scorch_native::SpmmCsrPlan::free_dim)
       .def_property_readonly("served", &scorch_native::SpmmCsrPlan::served)
       .def_property_readonly("empty_rows", &scorch_native::SpmmCsrPlan::empty_rows)
+      .def_property_readonly("borrows", &scorch_native::SpmmCsrPlan::borrows)
       .def_property_readonly("team_fills", &scorch_native::SpmmCsrPlan::team_fills)
       .def_property_readonly("wide_rows", &scorch_native::SpmmCsrPlan::wide_rows)
       .def_property_readonly("wide_segments", &scorch_native::SpmmCsrPlan::wide_segments);
@@ -1076,14 +1099,13 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           "Build a CSR x dense plan, or None when one cannot serve this shape",
           py::arg("kind"), py::arg("A_shape"), py::arg("A_mode_indices"),
           py::arg("A_values"), py::arg("free_dim"), py::arg("panel_free") = 0,
-          py::arg("panel_contraction") = 0);
+          py::arg("panel_contraction") = 0, py::arg("borrow") = false);
     // scorch.matmul's planned fast path in C (planned_matmul.h). ops.py binds what this
     // returns as `matmul`; every call it does not serve goes to `ordinary` unchanged.
     m.def("install_planned_matmul", &scorch_native::install_planned_matmul,
           "Build the C callable ops.py binds as matmul",
           py::arg("ordinary"), py::arg("stensor_type"), py::arg("tensor_type"),
           py::arg("generation"), py::arg("enabled"), py::arg("plans_attr"),
-          py::arg("torch_operands"), py::arg("operand_ref_type"), py::arg("operand_died"),
           py::arg("seen_attr"), py::arg("max_plans"), py::arg("probed_kw"),
           py::arg("match_host_threads"), py::arg("atparallel"), py::arg("module"),
           py::arg("doc"));

@@ -7,6 +7,7 @@ derivatives numerically, first and second order, and forward-mode AD.
 """
 
 import gc
+import weakref
 import pickle
 
 import pytest
@@ -376,12 +377,13 @@ def test_the_c_entry_s_record_holds_its_operand_only_as_long_as_the_graph():
     w = rand(5, 3).requires_grad_()
     out = scorch.matmul(a, w)
     assert C_NODE in out.grad_fn.name()
-    key = id(a)
+    ref = weakref.ref(a)
     del a
-    assert key in plan_mod.TORCH_OPERANDS, "the graph still holds the operand"
+    assert ref() is not None, "the graph still holds the operand"
     out.sum().backward()
     del out
-    assert key not in plan_mod.TORCH_OPERANDS
+    gc.collect()
+    assert ref() is None
 
 
 def test_the_python_path_keeps_what_the_c_entry_does_not_record():

@@ -1182,8 +1182,9 @@ def test_degenerate_shapes_agree_with_the_ordinary_path(rows, cols, n, descripti
 # A caller who holds a torch.sparse_csr tensor -- the drop-in case -- used to get
 # no plan: every call converted the operand afresh, copying its index arrays and
 # walking them twice, which made the call 2-4x slower than MKL's on mkt1 although
-# the kernel was faster. Its plans live in plan.TORCH_OPERANDS, because anything
-# stored on a torch tensor is written out by torch.save with it.
+# the kernel was faster. Its plans live in its index arrays' entry in the native
+# extension (plan.torch_operand_state), because anything stored on a torch tensor is
+# written out by torch.save with it. test_structure_plans.py covers the sharing.
 # --------------------------------------------------------------------------- #
 
 
@@ -1278,18 +1279,20 @@ def test_planning_leaves_nothing_on_the_callers_tensor(tmp_path):
     assert torch.equal(pickle.loads(pickle.dumps(a)).to_dense(), a.to_dense())
 
 
-def test_a_torch_operands_plans_die_with_it():
+def test_a_torch_operands_plans_die_with_its_arrays():
     import gc
 
     a, _ = torch_csr(64, 64, 0.05)
     b = dense_rhs(64, 8)
+    gc.collect()
+    before = scorch_ops.torch_structure_count()
     for _ in range(3):
         scorch.matmul(a, b)
-    key = id(a)
-    assert key in plan_mod.TORCH_OPERANDS
-    del a
+    assert plans_of(a)
+    assert scorch_ops.torch_structure_count() == before + 1
+    del a  # the only holder of its index arrays
     gc.collect()
-    assert key not in plan_mod.TORCH_OPERANDS, "the entry outlived its operand"
+    assert scorch_ops.torch_structure_count() == before, "the entry outlived its arrays"
 
 
 def test_torch_operand_values_written_between_calls_are_picked_up():
@@ -1392,6 +1395,7 @@ def test_dense_operands_are_untouched_by_the_torch_operand_path():
         out = scorch.matmul(x, y)
     torch.testing.assert_close(out, x @ y, atol=0, rtol=0)
     assert id(x) not in plan_mod.TORCH_OPERANDS
+    assert scorch_ops.torch_structure_state(x) is None
 
 
 # The C entry point records a torch operand's first sighting itself, after the ordinary
@@ -1438,33 +1442,48 @@ def test_first_sighting_of_a_torch_operand_is_recorded_without_the_installer(
 
 
 @needs_c_entry
-def test_a_new_csr_tensor_every_call_never_reaches_the_installer(installer_keys):
+def test_new_arrays_every_call_never_reach_the_installer(installer_keys):
+    """Each call is the first sighting of a new structure, recorded in C."""
     a, dense = torch_csr(64, 64, 0.05)
     crow, col, values = a.crow_indices(), a.col_indices(), a.values()
     b = dense_rhs(64, 8)
     before = len(plan_mod.TORCH_OPERANDS)
     for _ in range(6):
-        fresh = torch.sparse_csr_tensor(crow, col, values, size=a.shape)
+        fresh = torch.sparse_csr_tensor(crow.clone(), col.clone(), values, size=a.shape)
         out = scorch.matmul(fresh, b)
         del fresh
     assert installer_keys == []
-    assert len(plan_mod.TORCH_OPERANDS) <= before, "entries outlived their operands"
+    assert len(plan_mod.TORCH_OPERANDS) <= before, "the C entry made per-object entries"
     torch.testing.assert_close(out, dense @ b, atol=1e-4, rtol=1e-4)
 
 
 @needs_c_entry
-def test_the_entry_c_records_is_the_one_python_makes():
-    import gc
+def test_a_new_csr_tensor_over_the_same_arrays_reaches_the_installer_once(installer_keys):
+    """The arrays are the structure: sighted on the first call, planned on the second,
+    served from then on by whichever tensor presents them."""
+    a, dense = torch_csr(64, 64, 0.05)
+    crow, col, values = a.crow_indices(), a.col_indices(), a.values()
+    b = dense_rhs(64, 8)
+    for _ in range(6):
+        fresh = torch.sparse_csr_tensor(crow, col, values, size=a.shape)
+        out = scorch.matmul(fresh, b)
+    assert len(installer_keys) == 1
+    assert next(iter(plans_of(fresh).values())).served == 4
+    torch.testing.assert_close(out, dense @ b, atol=1e-4, rtol=1e-4)
 
+
+@needs_c_entry
+def test_the_entry_c_records_is_the_one_python_finds():
     a, _ = torch_csr(64, 64, 0.05)
-    scorch.matmul(a, dense_rhs(64, 8))
-    key = id(a)
-    ref, state = plan_mod.TORCH_OPERANDS[key]
-    assert type(ref) is plan_mod._OperandRef and ref.key == key and ref() is a
+    b = dense_rhs(64, 8)
+    scorch.matmul(a, b)
+    # The sighting C recorded is in the state Python reads, under the key Python builds.
+    state = plan_mod.torch_operand_state(a)
+    key = (b.shape, b.dtype, plan_mod.GENERATION[0])
+    assert state is not None and state[plan_mod.SEEN_ATTR] == {key}
+    assert plan_mod.torch_operand_state(a, create=True) is state
     assert plan_mod.torch_operand_state(a) is state
-    del a, ref, state
-    gc.collect()
-    assert key not in plan_mod.TORCH_OPERANDS, "the entry outlived its operand"
+    assert id(a) not in plan_mod.TORCH_OPERANDS, "the C entry made a per-object entry"
 
 
 @needs_c_entry
@@ -1480,11 +1499,13 @@ def test_a_withdrawn_torch_operand_product_stops_reaching_the_installer(
     installer_keys,
 ):
     a, dense = torch_csr(64, 64, 0.05)
-    b = dense_rhs(64, 8)
+    # A transposed view: the plan is keyed on the shape and declines a B that is not
+    # contiguous, so it never serves. (A write to the arrays no longer makes a plan that
+    # declines forever: it clears the structure's entry, and the arrays are planned again.)
+    b = dense_rhs(8, 64).t()
     scorch.matmul(a, b)
     scorch.matmul(a, b)
     assert len(plans_of(a)) == 1
-    a.col_indices().mul_(1)  # same structure, new version: the plan declines from now on
     for _ in range(MAX_FRUITLESS_DECLINES):
         scorch.matmul(a, b)
     assert len(refused_of(a)) == 1, "precondition: the plan was withdrawn"

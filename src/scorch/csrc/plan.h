@@ -74,6 +74,57 @@ struct PlanSourceWatch {
   }
 };
 
+// What recognises an index array that a plan borrows rather than holds (a torch sparse CSR
+// operand's, whose plans live as long as the arrays and no longer: torch_structures.h).
+//
+// The storage, by address and by a weak reference: the weak reference keeps the StorageImpl's
+// memory, and so its address, from being reused while this lives, so an array in the recorded
+// storage IS in the storage that was recorded. Then the buffer, length and dtype within it. And
+// the array's own version counter, by a copy that keeps the counter (a few bytes), not the array,
+// alive: `is` requires the presented array to share it and it to be unmoved. Without the copy,
+// only the version NUMBER could be compared, and an array presented through a second tensor over
+// the same storage with a counter of its own (set_ makes one) would pass with a stale number while
+// the first one's writes went unseen. Holding the source, as an STensor's plan does, rules that
+// out the same way, by comparing the held tensor's counter.
+struct BorrowedArray {
+  const void* storage = nullptr;
+  c10::weak_intrusive_ptr<c10::StorageImpl> alive{c10::intrusive_ptr<c10::StorageImpl>()};
+  const void* data = nullptr;
+  int64_t numel = 0;
+  at::ScalarType dtype = at::kInt;
+  c10::optional<c10::VariableVersion> counter;  // none for an inference tensor
+  uint32_t version = 0;
+
+  BorrowedArray() = default;
+  explicit BorrowedArray(const torch::Tensor& t)
+      : storage(t.storage().unsafeGetStorageImpl()),
+        alive(c10::intrusive_ptr<c10::StorageImpl>::reclaim_copy(
+            t.storage().unsafeGetStorageImpl())),
+        data(t.data_ptr()),
+        numel(t.numel()),
+        dtype(t.scalar_type()) {
+    const c10::VariableVersion& v = t.unsafeGetTensorImpl()->version_counter();
+    if (v.enabled()) {
+      counter = v;
+      version = v.current_version();
+    }
+  }
+
+  // Whether `t` is the recorded array, unwritten through its counter since. Only the counter: a
+  // write through a sparse tensor's accessor moves none the array shares, which the plan's
+  // PlanSourceWatch covers.
+  bool is(const torch::Tensor& t) const {
+    if (!t.defined() || !t.has_storage() || t.storage().unsafeGetStorageImpl() != storage ||
+        t.data_ptr() != data || t.numel() != numel || t.scalar_type() != dtype) {
+      return false;
+    }
+    const c10::VariableVersion& v = t.unsafeGetTensorImpl()->version_counter();
+    if (!counter.has_value()) return !v.enabled();
+    return v.enabled() && abi_counter_id(v) == abi_counter_id(*counter) &&
+           counter->current_version() == version;
+  }
+};
+
 // The kernels the adaptive tiling selector can choose between, plus the two float64
 // routes. The first three mirror tiling.py's decision vocabulary ("v2" / "tilej" /
 // "tileijk") so a plan is built straight from the memoized decision without a
@@ -110,7 +161,8 @@ class SpmmCsrPlan {
               int64_t cols, int64_t nnz, int64_t free_dim,
               torch::Tensor source_positions, torch::Tensor source_coordinates,
               torch::Tensor positions, torch::Tensor coordinates,
-              int64_t tile_size, int64_t panel_free, int64_t panel_contraction)
+              int64_t tile_size, int64_t panel_free, int64_t panel_contraction,
+              bool borrow = false)
       : kind_(kind),
         dtype_(dtype),
         rows_(rows),
@@ -143,6 +195,7 @@ class SpmmCsrPlan {
       wide_.build(pos_, (long)rows_, (long)free_dim_, kind_ == SpmmPlanKind::V2 ? 4L : 8L);
       for (int64_t i = 0; i < rows_; ++i) empty_rows_ += pos_[i] == pos_[i + 1] ? 1 : 0;
     }
+    if (borrow) release_sources();
   }
 
   int64_t rows() const { return rows_; }
@@ -150,6 +203,9 @@ class SpmmCsrPlan {
   int64_t nnz() const { return nnz_; }
   int64_t free_dim() const { return free_dim_; }
   int64_t empty_rows() const { return empty_rows_; }
+  // Whether this plan borrows its index arrays (see release_sources): it is then served only
+  // through run_csr, given the arrays.
+  bool borrows() const { return borrow_; }
   // How many run_gathered calls the product's team filled the values of. Diagnostic, like
   // `served`: the two fills compute the same bits, so this is what shows which one ran.
   int64_t team_fills() const { return team_fills_; }
@@ -179,6 +235,7 @@ class SpmmCsrPlan {
   c10::optional<torch::Tensor> run(const torch::Tensor& a_values,
                                    const torch::Tensor& b, int64_t nthreads,
                                    bool atparallel) {
+    if (borrow_) return c10::nullopt;  // it holds no arrays to recheck: run_csr serves it
     // -- the operands must be exactly the shape of call this plan was built for
     if (!a_values.defined() || !b.defined()) return c10::nullopt;
     if (a_values.scalar_type() != dtype_ || b.scalar_type() != dtype_) {
@@ -214,57 +271,7 @@ class SpmmCsrPlan {
       return c10::nullopt;
     }
 
-    const int rows = static_cast<int>(rows_);
-    const int free_dim = static_cast<int>(free_dim_);
-    const int contraction = static_cast<int>(cols_);
-    const int nt = static_cast<int>(nthreads);
-    // Taken afresh on every call from the layout this plan owns, so it never outlives it.
-    ScorchWideRows wide;
-    const ScorchWideRows* wide_arg = wide_.view(&wide) ? &wide : nullptr;
-    torch::Tensor values;
-    switch (kind_) {
-      case SpmmPlanKind::V2:
-        values = spmm_csr_float_v2_core(
-            rows, free_dim, rows, pos_, crd_, a_values.data_ptr<float>(),
-            free_dim, b.data_ptr<float>(), static_cast<int>(tile_size_), nt,
-            atparallel, wide_arg);
-        break;
-      case SpmmPlanKind::TileJ:
-        values = spmm_csr_float_tilej_core(
-            rows, free_dim, rows, pos_, crd_, a_values.data_ptr<float>(),
-            contraction, free_dim, b.data_ptr<float>(),
-            static_cast<int>(panel_contraction_), nt);
-        break;
-      case SpmmPlanKind::TileIJK:
-        values = spmm_csr_float_tileijk_core(
-            rows, free_dim, rows, pos_, crd_, a_values.data_ptr<float>(),
-            contraction, b.data_ptr<float>(), static_cast<int>(panel_free_),
-            static_cast<int>(panel_contraction_), nt);
-        break;
-      case SpmmPlanKind::Reference:
-        values = spmm_csr_typed_core<double>(
-            rows, free_dim, rows, pos_, crd_, a_values.data_ptr<double>(),
-            free_dim, b.data_ptr<double>(), static_cast<int>(tile_size_));
-        break;
-      case SpmmPlanKind::V2Double:
-        // Not spmm_csr_v2_core<double> directly: the forwarder owns the choice of
-        // which row kernel a host gets -- AVX2's regblock/regtile, NEON's strip
-        // kernel, or the reference loop where there is no SIMD arm at all -- and
-        // calling past it would hard-code one of the three here.
-        values = spmm_csr_double_v2_core(
-            rows, free_dim, rows, pos_, crd_, a_values.data_ptr<double>(),
-            free_dim, b.data_ptr<double>(), static_cast<int>(tile_size_), nt,
-            atparallel, wide_arg);
-        break;
-      default:
-        return c10::nullopt;
-    }
-    ++served_;
-    // The kernels return a flat contiguous [rows * free_dim] buffer; the
-    // ordinary path reshapes it to 2-D in Python. Do it here, so the caller
-    // returns what `run` hands back with no further work. `view` cannot copy:
-    // the buffer was just allocated contiguous.
-    return values.view({rows_, free_dim_});
+    return compute(pos_, crd_, a_values, b, nthreads, atparallel);
   }
 
   // `run` for an operand that is a torch sparse CSR tensor rather than an STensor, given
@@ -275,7 +282,9 @@ class SpmmCsrPlan {
   // swaps them), and then the held arrays are untouched while describing a structure the
   // operand no longer has. So the current arrays must be the held ones: the same buffer
   // and the same length. The plan's strong reference to its sources keeps their storage
-  // alive, so no other buffer can occupy the recorded address. The sources are the
+  // alive, so no other buffer can occupy the recorded address (a borrowing plan's weak
+  // references keep the address from being reused, and it rechecks the storages, in
+  // borrowed_structure_current). The sources are the
   // operand's members (plan.py builds from torch_sparse_index_members), which are the
   // caller's own arrays: `run` rechecks their counters, which writes through the caller's
   // arrays and their views move, and their storages' epochs, which writes through the
@@ -293,7 +302,12 @@ class SpmmCsrPlan {
                                        const torch::Tensor& b, int64_t nthreads,
                                        bool atparallel) {
     if (!built_from(positions, coordinates)) return c10::nullopt;
-    return run(a_values, b, nthreads, atparallel);
+    if (!borrow_) return run(a_values, b, nthreads, atparallel);
+    if (!call_accepted(a_values, b, nthreads)) return c10::nullopt;
+    if (!borrowed_structure_current(positions, coordinates)) return c10::nullopt;
+    return compute(presented_positions_ ? positions.data_ptr<int32_t>() : pos_,
+                   presented_coordinates_ && nnz_ > 0 ? coordinates.data_ptr<int32_t>() : crd_,
+                   a_values, b, nthreads, atparallel);
   }
 
   // `run` for values that are another array's, permuted: the product with A's values set to
@@ -371,11 +385,87 @@ class SpmmCsrPlan {
   }
 
  private:
+  // The kernel call `run` and run_csr make once every check has passed, over index arrays `pos`
+  // and `crd`: the plan's own, or a borrowing plan's presented ones.
+  c10::optional<torch::Tensor> compute(const int32_t* pos, const int32_t* crd,
+                                       const torch::Tensor& a_values, const torch::Tensor& b,
+                                       int64_t nthreads, bool atparallel) {
+    const int rows = static_cast<int>(rows_);
+    const int free_dim = static_cast<int>(free_dim_);
+    const int contraction = static_cast<int>(cols_);
+    const int nt = static_cast<int>(nthreads);
+    // Taken afresh on every call from the layout this plan owns, so it never outlives it.
+    ScorchWideRows wide;
+    const ScorchWideRows* wide_arg = wide_.view(&wide) ? &wide : nullptr;
+    torch::Tensor values;
+    switch (kind_) {
+      case SpmmPlanKind::V2:
+        values = spmm_csr_float_v2_core(
+            rows, free_dim, rows, pos, crd, a_values.data_ptr<float>(),
+            free_dim, b.data_ptr<float>(), static_cast<int>(tile_size_), nt,
+            atparallel, wide_arg);
+        break;
+      case SpmmPlanKind::TileJ:
+        values = spmm_csr_float_tilej_core(
+            rows, free_dim, rows, pos, crd, a_values.data_ptr<float>(),
+            contraction, free_dim, b.data_ptr<float>(),
+            static_cast<int>(panel_contraction_), nt);
+        break;
+      case SpmmPlanKind::TileIJK:
+        values = spmm_csr_float_tileijk_core(
+            rows, free_dim, rows, pos, crd, a_values.data_ptr<float>(),
+            contraction, b.data_ptr<float>(), static_cast<int>(panel_free_),
+            static_cast<int>(panel_contraction_), nt);
+        break;
+      case SpmmPlanKind::Reference:
+        values = spmm_csr_typed_core<double>(
+            rows, free_dim, rows, pos, crd, a_values.data_ptr<double>(),
+            free_dim, b.data_ptr<double>(), static_cast<int>(tile_size_));
+        break;
+      case SpmmPlanKind::V2Double:
+        // Not spmm_csr_v2_core<double> directly: the forwarder owns the choice of
+        // which row kernel a host gets -- AVX2's regblock/regtile, NEON's strip
+        // kernel, or the reference loop where there is no SIMD arm at all -- and
+        // calling past it would hard-code one of the three here.
+        values = spmm_csr_double_v2_core(
+            rows, free_dim, rows, pos, crd, a_values.data_ptr<double>(),
+            free_dim, b.data_ptr<double>(), static_cast<int>(tile_size_), nt,
+            atparallel, wide_arg);
+        break;
+      default:
+        return c10::nullopt;
+    }
+    ++served_;
+    // The kernels return a flat contiguous [rows * free_dim] buffer; the
+    // ordinary path reshapes it to 2-D in Python. Do it here, so the caller
+    // returns what `run` hands back with no further work. `view` cannot copy:
+    // the buffer was just allocated contiguous.
+    return values.view({rows_, free_dim_});
+  }
+
   // Whether `run` would serve this call: `run`'s own checks, for run_gathered. `run` keeps them
   // written out in its body, which is the code it was compiled to before run_gathered existed;
   // test_gathered_run_declines_what_run_declines holds the two to the same calls.
   bool accepts(const torch::Tensor& a_values, const torch::Tensor& b, int64_t nthreads) const {
-    // -- the operands must be exactly the shape of call this plan was built for
+    if (borrow_) return false;  // run_gathered serves an STensor's plans, which own their arrays
+    if (!call_accepted(a_values, b, nthreads)) return false;
+
+    // -- the structure must still be the structure that was validated
+    if (source_positions_.data_ptr() != source_positions_data_ ||
+        source_coordinates_.data_ptr() != source_coordinates_data_) {
+      return false;
+    }
+    if (abi_version_of(source_positions_) != source_positions_version_ ||
+        abi_version_of(source_coordinates_) != source_coordinates_version_) {
+      return false;
+    }
+    return source_positions_watch_.current() && source_coordinates_watch_.current();
+  }
+
+  // `run`'s checks on the operands of one call: the values, the dense operand and the thread
+  // count must be exactly the shape of call this plan was built for.
+  bool call_accepted(const torch::Tensor& a_values, const torch::Tensor& b,
+                     int64_t nthreads) const {
     if (!a_values.defined() || !b.defined()) return false;
     if (a_values.scalar_type() != dtype_ || b.scalar_type() != dtype_) {
       return false;
@@ -396,17 +486,54 @@ class SpmmCsrPlan {
     if (nthreads < -1 || nthreads > std::numeric_limits<int>::max()) {
       return false;
     }
+    return true;
+  }
 
-    // -- the structure must still be the structure that was validated
-    if (source_positions_.data_ptr() != source_positions_data_ ||
-        source_coordinates_.data_ptr() != source_coordinates_data_) {
+  // A borrowing plan's recheck of the arrays presented to run_csr, which built_from has found at
+  // the recorded addresses and lengths: they must be the recorded arrays (BorrowedArray::is),
+  // unwritten since through their own counters and, by their storages' write-witness epochs,
+  // through any torch sparse tensor's accessors. Where the kernel reads them directly they must
+  // also be contiguous, as the recorded ones were.
+  bool borrowed_structure_current(const torch::Tensor& positions,
+                                  const torch::Tensor& coordinates) const {
+    if (!borrowed_positions_.is(positions) || !borrowed_coordinates_.is(coordinates)) {
       return false;
     }
-    if (abi_version_of(source_positions_) != source_positions_version_ ||
-        abi_version_of(source_coordinates_) != source_coordinates_version_) {
+    if ((presented_positions_ && !positions.is_contiguous()) ||
+        (presented_coordinates_ && !coordinates.is_contiguous())) {
       return false;
     }
     return source_positions_watch_.current() && source_coordinates_watch_.current();
+  }
+
+  // Makes this plan borrow its index arrays instead of holding them: for a torch sparse CSR
+  // operand's plan, which lives in its STRUCTURE's entry (torch_structures.h), dropped when the
+  // arrays die. A plan holding them would keep them alive, and its entry with them, so every
+  // structure ever planned would stay in memory.
+  //
+  // What it keeps instead is what recognises them (BorrowedArray). The int32 arrays the kernel
+  // reads are the plan's own where they were made here (narrowed from int64, or made
+  // contiguous); where they were the caller's own int32 arrays, the kernel reads the arrays
+  // presented to run_csr, once borrowed_structure_current has found them to be these, and the
+  // operand presenting them keeps them alive for the call.
+  void release_sources() {
+    borrow_ = true;
+    borrowed_positions_ = BorrowedArray(source_positions_);
+    borrowed_coordinates_ = BorrowedArray(source_coordinates_);
+    presented_positions_ = positions_.storage().unsafeGetStorageImpl() ==
+                           source_positions_.storage().unsafeGetStorageImpl();
+    presented_coordinates_ = coordinates_.storage().unsafeGetStorageImpl() ==
+                             source_coordinates_.storage().unsafeGetStorageImpl();
+    if (presented_positions_) {
+      positions_.reset();
+      pos_ = nullptr;
+    }
+    if (presented_coordinates_) {
+      coordinates_.reset();
+      crd_ = nullptr;
+    }
+    source_positions_.reset();
+    source_coordinates_.reset();
   }
 
   SpmmPlanKind kind_;
@@ -418,7 +545,7 @@ class SpmmCsrPlan {
   // The caller's arrays, held so their identity and version can be rechecked.
   // When they were already int32 these are the same tensors as positions_ /
   // coordinates_; when they were int64 they are the originals and the narrowed
-  // copies are separate.
+  // copies are separate. A borrowing plan releases them (release_sources).
   torch::Tensor source_positions_;
   torch::Tensor source_coordinates_;
   torch::Tensor positions_;
@@ -442,6 +569,14 @@ class SpmmCsrPlan {
   // A's wide rows and their segments for this plan's free dimension and dtype, and the scratch the
   // kernel sums them in (see ScorchWideLayout). Empty when A has no row the v2 kernels split.
   ScorchWideLayout wide_;
+  // A borrowing plan's record of its index arrays (release_sources). The source tensors above
+  // are then released, and so are positions_/coordinates_ where the kernel reads the presented
+  // arrays (presented_positions_/presented_coordinates_).
+  bool borrow_ = false;
+  bool presented_positions_ = false;
+  bool presented_coordinates_ = false;
+  BorrowedArray borrowed_positions_;
+  BorrowedArray borrowed_coordinates_;
 };
 
 // Builds a plan, or returns nullopt when the configuration is outside what a
@@ -458,7 +593,7 @@ inline c10::optional<SpmmCsrPlan> make_spmm_csr_plan(
     const std::string& kind_name, std::vector<int64_t> a_shape,
     std::vector<std::vector<torch::Tensor>> a_mode_indices,
     const torch::Tensor& a_values, int64_t free_dim, int64_t panel_free,
-    int64_t panel_contraction) {
+    int64_t panel_contraction, bool borrow = false) {
   SpmmPlanKind kind;
   if (!spmm_plan_kind_from_name(kind_name, kind)) return c10::nullopt;
   if (!a_values.defined()) return c10::nullopt;
@@ -508,7 +643,7 @@ inline c10::optional<SpmmCsrPlan> make_spmm_csr_plan(
   return SpmmCsrPlan(kind, dtype, a_shape[0], a_shape[1], view.nnz, free_dim,
                      source_positions, source_coordinates, view.positions,
                      view.coordinates, tile_size, panel_free,
-                     panel_contraction);
+                     panel_contraction, borrow);
 }
 
 }  // namespace scorch_native

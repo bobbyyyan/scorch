@@ -37,11 +37,9 @@ from .plan import GENERATION as _PLAN_GENERATION
 from .plan import PLANS_ATTR as _PLANS_ATTR
 from .plan import MAX_PLANS_PER_OPERAND as _PLAN_MAX_PER_OPERAND
 from .plan import SEEN_ATTR as _PLAN_SEEN_ATTR
-from .plan import TORCH_OPERANDS as _PLAN_TORCH_OPERANDS
 from .plan import TRANSPOSED_PLANS_ATTR as _PLAN_TRANSPOSED_ATTR
-from .plan import _drop_torch_operand as _plan_drop_torch_operand
-from .plan import _OperandRef as _PlanOperandRef
 from .plan import install as _plan_install
+from .plan import torch_operand_state as _plan_torch_operand_state
 from .prebuilt_kernels import execute_prebuilt_binary_kernel, resolve_prebuilt_matmul
 from .tiling import maybe_dispatch as _tiling_maybe_dispatch
 from .tiling import is_candidate as _tiling_is_candidate
@@ -799,9 +797,9 @@ def _c_probed(a: Any, b: Any, kwargs: Dict[str, Any]) -> Tuple[Any, Any, Any]:
 def _run_torch_operand_plan(a: torch.Tensor, b: torch.Tensor, key: Any) -> Any:
     """The planned call for a torch sparse CSR operand, or None to take the ordinary path.
 
-    Its plans live in plan.TORCH_OPERANDS because a torch tensor cannot carry them (see
-    there). Without them every call converted the operand afresh -- two copies of its
-    index arrays and two O(nnz) walks -- which made the whole call 2-4x slower than
+    Its plans live in its index arrays' entry (plan.torch_operand_state; see
+    plan.TORCH_OPERANDS). Without them every call converted the operand afresh -- two
+    copies of its index arrays and two O(nnz) walks -- which made the whole call 2-4x slower than
     torch.sparse.mm's on mkt1 although the kernel was faster. `run_csr` is given the
     operand's arrays as they are now and declines unless they are the plan's own.
 
@@ -810,10 +808,8 @@ def _run_torch_operand_plan(a: torch.Tensor, b: torch.Tensor, key: Any) -> Any:
     which skips this. So it runs only in a build without that entry point, or when
     `_matmul_python` is called directly.
     """
-    held = _PLAN_TORCH_OPERANDS.get(id(a))
-    if held is None or held[0]() is not a:
-        return None
-    plans = held[1].get(_PLANS_ATTR)
+    state = _plan_torch_operand_state(a)
+    plans = state.get(_PLANS_ATTR) if state is not None else None
     plan = plans.get(key) if plans is not None else None
     if plan is None:
         return None
@@ -1218,9 +1214,6 @@ if _install_planned_matmul is not None:
         _PLAN_GENERATION,
         _PLAN_ENABLED,
         _PLANS_ATTR,
-        _PLAN_TORCH_OPERANDS,
-        _PlanOperandRef,
-        _plan_drop_torch_operand,
         _PLAN_SEEN_ATTR,
         _PLAN_MAX_PER_OPERAND,
         _C_PROBED_KW,

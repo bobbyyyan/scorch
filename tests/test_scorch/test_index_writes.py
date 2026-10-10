@@ -279,7 +279,11 @@ def test_a_new_operand_per_call_does_not_accumulate_witnesses():
         scorch.matmul(_csr(crow, col, values), b)
     gc.collect()
     scorch_ops.abi_epoch(col)
-    assert scorch_ops.abi_witness_count(col) <= 1
+    # The last operand's witness, and the one before it: the arrays' entry keeps the version
+    # counter (not the operand) of the last operand recorded through it, so that a persistent
+    # operand is recognised without the lock (csrc/torch_structures.h), and a witness is pruned
+    # only once nothing else holds its counter.
+    assert scorch_ops.abi_witness_count(col) <= 2
 
 
 def test_more_witnesses_than_a_plan_copies_inline():

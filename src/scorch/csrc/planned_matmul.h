@@ -33,8 +33,9 @@
 // still holds.
 //
 // The left operand may also be a torch sparse CSR tensor (`type(a) is torch.Tensor` with the
-// sparse CSR layout), whose plans plan.py keeps in plan.TORCH_OPERANDS, keyed on id(a) and
-// checked against a weak reference, because a torch tensor cannot carry them (see there).
+// sparse CSR layout), whose plans live in the entry of its STRUCTURE -- its index arrays and
+// shape -- in torch_structures.h, shared by every tensor over the same arrays and dropped with
+// them, because a torch tensor cannot carry them (plan.py) and they are facts about the arrays.
 // Its values and index arrays are read from the tensor's implementation, so a served call
 // creates no Python object, and the index arrays go to `run_csr`, which declines unless they
 // are still the ones the plan was built from. The layout test is a field read on the
@@ -50,6 +51,7 @@
 // recorded here, once it returns. Python keeps installation and decline accounting.
 
 #include "plan.h"
+#include "torch_structures.h"
 
 #include <ATen/SparseCsrTensorUtils.h>
 #include <ATen/SparseTensorImpl.h>
@@ -74,12 +76,9 @@ struct PlannedMatmul {
   PyObject* plans_attr = nullptr;    // interned plan.PLANS_ATTR
   PyObject* storage_attr = nullptr;  // interned "_storage"
   PyObject* value_attr = nullptr;    // interned "_value"
-  // Torch sparse CSR operands: their plans and sightings live in plan.TORCH_OPERANDS.
-  PyObject* torch_operands = nullptr;    // plan.TORCH_OPERANDS: id -> (weak reference, state)
-  PyObject* operand_ref_type = nullptr;  // plan._OperandRef, the weak reference an entry holds
-  PyObject* operand_died = nullptr;      // plan._drop_torch_operand, its callback
+  // Torch sparse CSR operands: their plans and sightings live in their structure's entry
+  // (torch_structures.h).
   PyObject* seen_attr = nullptr;         // interned plan.SEEN_ATTR
-  PyObject* key_attr = nullptr;          // interned "key", _OperandRef's slot
   PyObject* probed_kwnames = nullptr;    // (ops._C_PROBED_KW,): the keyword the key travels under
   Py_ssize_t max_plans = 0;              // plan.MAX_PLANS_PER_OPERAND
   bool match_host_threads = false;       // ops._MATCH_HOST_THREADS
@@ -88,8 +87,8 @@ struct PlannedMatmul {
   // every product autograd must record goes to the Python function.
   PyObject* mm_backward = nullptr;
   // x @ A for a torch CSR A (see planned_matmul_torch_right): autograd.planned_mm_t_backward, the
-  // backward of a product PlannedMatmulGradT recorded, and the interned name under which an
-  // operand's state holds its TransposedProductPlans (plan.TRANSPOSED_PLANS_ATTR). Unset, every
+  // backward of a product PlannedMatmulGradT recorded, and the interned name under which a
+  // structure's state holds its TransposedProductPlans (plan.TRANSPOSED_PLANS_ATTR). Unset, every
   // x @ A goes to the Python function.
   PyObject* mm_t_backward = nullptr;
   PyObject* tplans_attr = nullptr;
@@ -161,6 +160,25 @@ inline PyObject* planned_matmul_key(const PlannedMatmul& s, const at::Tensor& bt
   return planned_matmul_key_sizes(s, bt.sizes(), bt.scalar_type());
 }
 
+// The same key as plain data (torch_structures.h, TorchSighting); false if it has no such form.
+inline bool planned_matmul_sighting(const PlannedMatmul& s, const at::Tensor& bt,
+                                    TorchSighting& out) {
+  if (bt.dim() < 1 || bt.dim() > 2 || !PyList_CheckExact(s.generation) ||
+      PyList_GET_SIZE(s.generation) < 1)
+    return false;
+  const long long generation = PyLong_AsLongLong(PyList_GET_ITEM(s.generation, 0));
+  if (generation == -1 && PyErr_Occurred()) {
+    PyErr_Clear();
+    return false;
+  }
+  out.dim = bt.dim();
+  out.extent[0] = bt.size(0);
+  out.extent[1] = bt.dim() == 2 ? bt.size(1) : 0;
+  out.dtype = static_cast<int32_t>(bt.scalar_type());
+  out.generation = generation;
+  return true;
+}
+
 inline SpmmCsrPlan* planned_matmul_cast(PyObject* plan_obj) {
   try {
     return py::handle(plan_obj).cast<SpmmCsrPlan*>();
@@ -192,18 +210,20 @@ inline SpmmCsrPlan* planned_matmul_find(PyObject* plans, PyObject* key) {
 // 3.1 us), and was slower than torch.mm's in 52 of 1200 cold readings, where A @ B was in none.
 //
 // So once the transposed product has a plan, x @ A is served, and recorded, here. The plan is found
-// through the operand's own state: whenever planned_matmul_gathered serves the transposed product
-// of a torch CSR operand (its `owner`), it records in that operand's state a TransposedProductPlan
-// for it -- the carrier's plan, the permutation, and the operand's index arrays the transpose was
-// built from -- under the key that product's plan is stored under. A call is served only while
-// the operand is as it was then: the same index buffers and lengths, and no write to them since.
-// Two counters see such writes, and neither sees both kinds (native_abi.h, Write witnesses): the
-// index arrays' own, which writes through the caller's arrays and their views move, and the
-// operand's, shared with every alias its crow_indices(), col_indices() and values() return. The
-// record compares the arrays' counters, the operand's, and the epochs of the arrays' storages,
+// through the state of the operand's structure (torch_structures.h): whenever
+// planned_matmul_gathered serves the transposed product of a torch CSR operand (its `owner`), it
+// records in that state a TransposedProductPlan for it -- the carrier's plan, the permutation, and
+// the index arrays the transpose was built from -- under the key that product's plan is stored
+// under, so every tensor over the same index arrays finds it.
+// A call is served only while the arrays are as they were then: the same buffers and lengths, and
+// no write to them since. Two counters see such writes, and neither sees both kinds (native_abi.h,
+// Write witnesses): the index arrays' own, which writes through the caller's arrays and their
+// views move, and each operand's, shared with every alias its crow_indices(), col_indices() and
+// values() return. The record compares the arrays' counters and the epochs of their storages,
 // which move on a write through the accessors of any torch sparse tensor scorch has read over
-// them. autograd.py's structure cache compares the same, so a call this declines is one whose
-// structure and transpose that cache rebuilds.
+// them -- every operand that reaches this record is one. autograd.py's structure cache compares
+// the same, so a call this declines is one whose structure and transpose that cache rebuilds. The
+// values are read from the operand on every call, so a write to them needs no check.
 //
 // The transposed values are gathered into a buffer of the record's own, not the carrier's. The
 // carrier's buffer belongs to autograd.py's structure, shared by every operand over the same index
@@ -213,35 +233,23 @@ inline SpmmCsrPlan* planned_matmul_find(PyObject* plans, PyObject* key) {
 // and an operand's records of one transpose share one buffer.
 struct TransposedProductPlan {
   TransposedProductPlan(py::object plan, SpmmCsrPlan* product, torch::Tensor buffer,
-                        torch::Tensor perm, torch::Tensor positions, torch::Tensor coordinates,
-                        uint32_t operand_version)
+                        torch::Tensor perm, const torch::Tensor& positions,
+                        const torch::Tensor& coordinates)
       : plan_(std::move(plan)),
         product_(product),
         buffer_(std::move(buffer)),
         perm_(std::move(perm)),
-        positions_(std::move(positions)),
-        coordinates_(std::move(coordinates)),
-        positions_data_(positions_.data_ptr()),
-        coordinates_data_(coordinates_.data_ptr()),
-        positions_version_(abi_version_of(positions_)),
-        coordinates_version_(abi_version_of(coordinates_)),
-        positions_watch_(positions_),
-        coordinates_watch_(coordinates_),
-        operand_version_(operand_version) {}
+        positions_(positions),
+        coordinates_(coordinates),
+        positions_watch_(positions),
+        coordinates_watch_(coordinates) {}
 
-  // Whether an operand whose members are these index arrays, at this version, is the one this
-  // was recorded from, unchanged since. It holds the arrays it was recorded from, so no other
-  // buffer can occupy the recorded addresses.
-  bool built_from(const at::Tensor& positions, const at::Tensor& coordinates,
-                  uint32_t operand_version) const {
-    return positions.defined() && coordinates.defined() &&
-           positions.data_ptr() == positions_data_ &&
-           coordinates.data_ptr() == coordinates_data_ &&
-           positions.numel() == positions_.numel() &&
-           coordinates.numel() == coordinates_.numel() && operand_version == operand_version_ &&
-           abi_version_of(positions_) == positions_version_ &&
-           abi_version_of(coordinates_) == coordinates_version_ && positions_watch_.current() &&
-           coordinates_watch_.current();
+  // Whether an operand whose members are these index arrays is over the arrays this was recorded
+  // from, unchanged since. It borrows them (BorrowedArray), as the operand's plans do: it lives in
+  // their structure's entry, which a reference to them would keep alive forever.
+  bool built_from(const at::Tensor& positions, const at::Tensor& coordinates) const {
+    return positions_.is(positions) && coordinates_.is(coordinates) &&
+           positions_watch_.current() && coordinates_watch_.current();
   }
 
   // Whether this records exactly this carrier plan and permutation.
@@ -274,15 +282,10 @@ struct TransposedProductPlan {
   SpmmCsrPlan* product_;
   torch::Tensor buffer_;
   torch::Tensor perm_;
-  torch::Tensor positions_;
-  torch::Tensor coordinates_;
-  const void* positions_data_;
-  const void* coordinates_data_;
-  uint32_t positions_version_;
-  uint32_t coordinates_version_;
+  BorrowedArray positions_;
+  BorrowedArray coordinates_;
   PlanSourceWatch positions_watch_;
   PlanSourceWatch coordinates_watch_;
-  uint32_t operand_version_;
   int64_t served_ = 0;
 };
 
@@ -417,20 +420,10 @@ inline bool planned_matmul_torch_csr(const PlannedMatmul& s, PyObject* a) {
   return t.layout() == c10::kSparseCsr && t.dim() == 2;
 }
 
-// The state dict of `a`'s entry in plan.TORCH_OPERANDS (borrowed), or nullptr with no error set
-// when it has none -- including an entry left by an earlier object with the same id, whose weak
-// reference no longer names `a`.
-inline PyObject* planned_matmul_torch_state(const PlannedMatmul& s, PyObject* a, PyObject* id) {
-  if (s.torch_operands == nullptr || !PyDict_CheckExact(s.torch_operands)) return nullptr;
-  PyObject* held = PyDict_GetItemWithError(s.torch_operands, id);  // borrowed
-  if (held == nullptr || !PyTuple_CheckExact(held) || PyTuple_GET_SIZE(held) != 2) {
-    PyErr_Clear();
-    return nullptr;
-  }
-  PyObject* ref = PyTuple_GET_ITEM(held, 0);
-  if (!PyWeakref_Check(ref) || PyWeakref_GetObject(ref) != a) return nullptr;
-  PyObject* state = PyTuple_GET_ITEM(held, 1);
-  return PyDict_CheckExact(state) ? state : nullptr;
+// The state dict of `a`'s structure (borrowed), recording `a` as a write witness of its index
+// arrays; nullptr with no error set when it has none (torch_structures.h).
+inline PyObject* planned_matmul_torch_state(PyObject* a) {
+  return torch_structure_lookup(THPVariable_Unpack(a));
 }
 
 // Records the first sighting of the product `key` for `a`: plan.install's rule that a plan is
@@ -438,58 +431,40 @@ inline PyObject* planned_matmul_torch_state(const PlannedMatmul& s, PyObject* a,
 // call -- one that is only ever sighted, never planned -- pays for it in C rather than in a
 // cold Python function at the end of its ordinary path (2 us of a mkt1 call). Never fails the
 // call it follows: any error is cleared.
-inline void planned_matmul_record_sighting(const PlannedMatmul& s, PyObject* a, PyObject* id,
-                                           PyObject* key) {
-  PyObject* state = planned_matmul_torch_state(s, a, id);
-  if (state != nullptr) {
-    PyObject* seen = PyDict_GetItemWithError(state, s.seen_attr);  // borrowed
-    if (seen != nullptr) {
-      if (PySet_Check(seen) && PySet_GET_SIZE(seen) < 2 * s.max_plans && PySet_Add(seen, key) < 0)
-        PyErr_Clear();
-      return;
-    }
-    if (PyErr_Occurred()) {
+inline void planned_matmul_record_sighting(const PlannedMatmul& s, PyObject* a, PyObject* key,
+                                           const at::Tensor& bt) {
+  // A structure Python keeps nothing for has its sightings kept as plain data in its entry
+  // (torch_structure_sight): an operand built over new arrays for every call only ever makes first
+  // sightings, and each would otherwise keep a dict and a set alive for as long as its arrays.
+  TorchSighting sighting;
+  if (!planned_matmul_sighting(s, bt, sighting)) return;
+  PyObject* state =
+      torch_structure_sight(THPVariable_Unpack(a), sighting, 2 * (size_t)s.max_plans);
+  if (state == nullptr) return;
+  PyObject* seen = PyDict_GetItemWithError(state, s.seen_attr);  // borrowed
+  if (seen != nullptr) {
+    if (PySet_Check(seen) && PySet_GET_SIZE(seen) < 2 * s.max_plans && PySet_Add(seen, key) < 0)
       PyErr_Clear();
-      return;
-    }
-    PyObject* fresh = PySet_New(nullptr);
-    if (fresh == nullptr || PySet_Add(fresh, key) < 0 ||
-        PyDict_SetItem(state, s.seen_attr, fresh) < 0)
-      PyErr_Clear();
-    Py_XDECREF(fresh);
     return;
   }
-  // No entry yet: (weak reference carrying its key, {SEEN_ATTR: {key}}), as
-  // plan.torch_operand_state(a, create=True) would make it.
-  PyObject* ref = PyObject_CallFunctionObjArgs(s.operand_ref_type, a, s.operand_died, nullptr);
-  if (ref == nullptr) {
+  if (PyErr_Occurred()) {
     PyErr_Clear();
     return;
   }
-  PyObject* seen = PySet_New(nullptr);
-  PyObject* fresh_state = PyDict_New();
-  PyObject* entry = nullptr;
-  bool ok = seen != nullptr && fresh_state != nullptr &&
-            PyObject_SetAttr(ref, s.key_attr, id) == 0 && PySet_Add(seen, key) == 0 &&
-            PyDict_SetItem(fresh_state, s.seen_attr, seen) == 0;
-  if (ok) {
-    entry = PyTuple_Pack(2, ref, fresh_state);
-    ok = entry != nullptr && PyDict_SetItem(s.torch_operands, id, entry) == 0;
-  }
-  if (!ok) PyErr_Clear();
-  Py_XDECREF(entry);
-  Py_XDECREF(fresh_state);
-  Py_XDECREF(seen);
-  Py_DECREF(ref);
+  PyObject* fresh = PySet_New(nullptr);
+  if (fresh == nullptr || PySet_Add(fresh, key) < 0 ||
+      PyDict_SetItem(state, s.seen_attr, fresh) < 0)
+    PyErr_Clear();
+  Py_XDECREF(fresh);
 }
 
 // Records in torch CSR `owner`'s state that its transposed product under `key` is served by the
 // carrier plan `plan_obj` (`plan`) with this permutation, unless that is what it already holds.
 // `buffer` is the carrier's values buffer: the record gathers into one of its own, of the same
 // dtype and length (see TransposedProductPlan). Bounded like its plans
-// (plan.MAX_PLANS_PER_OPERAND keys). Never fails the call it follows: any error is cleared. Only
-// an operand with an entry in plan.TORCH_OPERANDS has a state to record in, and autograd.py makes
-// that entry before it computes the product.
+// (plan.MAX_PLANS_PER_OPERAND keys). Never fails the call it follows: any error is cleared. The
+// record lives in the state of the operand's structure, made here if it has none, with the weak
+// references that drop it with the arrays: the record holds a buffer of nnz values.
 inline void planned_matmul_record_transposed(const PlannedMatmul& s, py::handle owner,
                                              PyObject* key, PyObject* plan_obj,
                                              SpmmCsrPlan* plan, const torch::Tensor& buffer,
@@ -499,8 +474,8 @@ inline void planned_matmul_record_transposed(const PlannedMatmul& s, py::handle 
     PyErr_Clear();
     return;
   }
-  py::object id = py::reinterpret_steal<py::object>(PyLong_FromVoidPtr(owner.ptr()));
-  PyObject* state = id ? planned_matmul_torch_state(s, owner.ptr(), id.ptr()) : nullptr;
+  const at::Tensor& operand = THPVariable_Unpack(owner.ptr());
+  PyObject* state = torch_structure_create(operand);
   if (state == nullptr) {
     PyErr_Clear();
     return;
@@ -519,15 +494,13 @@ inline void planned_matmul_record_transposed(const PlannedMatmul& s, py::handle 
     held = fresh.ptr();  // the state holds it now
   }
   if (!PyDict_CheckExact(held)) return;
-  const at::Tensor& operand = THPVariable_Unpack(owner.ptr());
   auto* impl = at::sparse_csr::get_sparse_csr_impl(operand);
   const at::Tensor& positions = impl->compressed_indices();
   const at::Tensor& coordinates = impl->plain_indices();
-  const uint32_t version = abi_version_of(operand);
   if (PyDict_Contains(held, key) == 1) {
     TransposedProductPlan* current = planned_matmul_find_transposed(held, key);
     if (current != nullptr && current->records(plan, perm) &&
-        current->built_from(positions, coordinates, version))
+        current->built_from(positions, coordinates))
       return;
   } else if (PyDict_GET_SIZE(held) >= s.max_plans) {
     PyErr_Clear();
@@ -551,7 +524,7 @@ inline void planned_matmul_record_transposed(const PlannedMatmul& s, py::handle 
     }
     py::object fresh = py::cast(TransposedProductPlan(py::reinterpret_borrow<py::object>(plan_obj),
                                                       plan, std::move(own), perm, positions,
-                                                      coordinates, version));
+                                                      coordinates));
     if (PyDict_SetItem(held, key, fresh.ptr()) < 0) PyErr_Clear();
   } catch (const std::exception&) {
     PyErr_Clear();
@@ -575,39 +548,56 @@ inline PyObject* planned_matmul_torch_call(const PlannedMatmul& s, PyObject* a, 
                                            PyObject* const* args, Py_ssize_t nargsf) {
   const at::Tensor& bt = THPVariable_Unpack(b);
   py::object key = py::reinterpret_steal<py::object>(planned_matmul_key(s, bt));
-  py::object id = py::reinterpret_steal<py::object>(key ? PyLong_FromVoidPtr(a) : nullptr);
-  if (!key || !id) {
+  if (!key) {
     PyErr_Clear();
     return PyObject_Vectorcall(s.ordinary, args, nargsf, nullptr);
   }
   TorchOperandPlanWork work = TorchOperandPlanWork::kFirstSighting;
-  if (PyObject* state = planned_matmul_torch_state(s, a, id.ptr())) {
-    PyObject* plans = PyDict_GetItemWithError(state, s.plans_attr);  // borrowed
-    PyObject* plan_obj = nullptr;
+  const at::Tensor& at_a = THPVariable_Unpack(a);
+  TorchStructureFound found;
+  if (torch_structure_find(at_a, found) != nullptr) {
+    torch_structure_witness(*found.entry, at_a, *found.positions, *found.coordinates);
+    PyObject* state = found.entry->state.ptr();  // none for a structure only ever sighted
+    PyObject* plans =
+        state != nullptr ? PyDict_GetItemWithError(state, s.plans_attr) : nullptr;  // borrowed
     if (plans != nullptr && PyDict_CheckExact(plans)) {
-      plan_obj = PyDict_GetItemWithError(plans, key.ptr());  // borrowed
-      if (plan_obj == Py_None) {
-        work = TorchOperandPlanWork::kNone;
-      } else if (plan_obj != nullptr) {
-        work = TorchOperandPlanWork::kInstall;
+      PyObject* plan_obj = PyDict_GetItemWithError(plans, key.ptr());  // borrowed
+      if (plan_obj != nullptr && plan_obj != Py_None) {
         if (SpmmCsrPlan* plan = planned_matmul_cast(plan_obj)) {
           // The members themselves, not aliases: nothing is allocated, and a member is the
           // caller's own array, sharing its version counter. A write through an accessor's alias
           // moves `a`'s counter instead, which the plan's write witnesses read (plan.h).
-          auto* impl = at::sparse_csr::get_sparse_csr_impl(THPVariable_Unpack(a));
+          auto* impl = at::sparse_csr::get_sparse_csr_impl(at_a);
           c10::optional<torch::Tensor> served =
-              plan->run_csr(impl->compressed_indices(), impl->plain_indices(), impl->values(),
-                            bt, planned_matmul_nthreads(s), s.atparallel);
+              plan->run_csr(*found.positions, *found.coordinates, impl->values(), bt,
+                            planned_matmul_nthreads(s), s.atparallel);
           if (served.has_value()) return THPVariable_Wrap(std::move(*served));
         }
+      }
+    }
+    PyErr_Clear();
+    // Not served. If that is because the arrays have been written, everything the entry holds is
+    // stale and is cleared here, before deciding what plan.install has to do.
+    torch_structure_revalidate(found);
+    plans = state != nullptr ? PyDict_GetItemWithError(state, s.plans_attr) : nullptr;
+    if (plans != nullptr && PyDict_CheckExact(plans)) {
+      PyObject* plan_obj = PyDict_GetItemWithError(plans, key.ptr());  // borrowed
+      if (plan_obj == Py_None) {
+        work = TorchOperandPlanWork::kNone;
+      } else if (plan_obj != nullptr) {
+        work = TorchOperandPlanWork::kInstall;  // a plan that declined: plan.install accounts
       } else if (PyDict_GET_SIZE(plans) >= s.max_plans) {
         work = TorchOperandPlanWork::kNone;
       }
     }
     PyErr_Clear();
     if (work == TorchOperandPlanWork::kFirstSighting) {
-      PyObject* seen = PyDict_GetItemWithError(state, s.seen_attr);  // borrowed
-      if (seen != nullptr && PySet_Check(seen) && PySet_Contains(seen, key.ptr()) == 1)
+      PyObject* seen =
+          state != nullptr ? PyDict_GetItemWithError(state, s.seen_attr) : nullptr;  // borrowed
+      TorchSighting sighting;
+      if ((seen != nullptr && PySet_Check(seen) && PySet_Contains(seen, key.ptr()) == 1) ||
+          (state == nullptr && planned_matmul_sighting(s, bt, sighting) &&
+           torch_structure_sighted(*found.entry, sighting)))
         work = TorchOperandPlanWork::kInstall;
       PyErr_Clear();
     }
@@ -615,7 +605,7 @@ inline PyObject* planned_matmul_torch_call(const PlannedMatmul& s, PyObject* a, 
   PyObject* argv[3] = {a, b, work == TorchOperandPlanWork::kInstall ? key.ptr() : Py_None};
   PyObject* result = PyObject_Vectorcall(s.ordinary, argv, 2, s.probed_kwnames);
   if (result != nullptr && work == TorchOperandPlanWork::kFirstSighting)
-    planned_matmul_record_sighting(s, a, id.ptr(), key.ptr());
+    planned_matmul_record_sighting(s, a, key.ptr(), bt);
   return result;
 }
 
@@ -715,10 +705,9 @@ inline PyObject* planned_matmul_torch_grad(const PlannedMatmul& s, PyObject* a, 
       at::functorch::functorchTLSAccessor())
     return nullptr;
   py::object key = py::reinterpret_steal<py::object>(planned_matmul_key(s, bt));
-  py::object id = py::reinterpret_steal<py::object>(key ? PyLong_FromVoidPtr(a) : nullptr);
   SpmmCsrPlan* plan = nullptr;
-  if (key && id) {
-    if (PyObject* state = planned_matmul_torch_state(s, a, id.ptr()))
+  if (key) {
+    if (PyObject* state = planned_matmul_torch_state(a))
       plan = planned_matmul_find(PyDict_GetItemWithError(state, s.plans_attr), key.ptr());
   }
   PyErr_Clear();
@@ -826,11 +815,10 @@ inline PyObject* planned_matmul_torch_right(const PlannedMatmul& s, PyObject* x,
   // b = x^T, the dense operand of A^T @ b, keyed by its shape as the carrier's plan is.
   const int64_t sizes[2] = {xt.size(1), xt.size(0)};
   py::object key = py::reinterpret_steal<py::object>(planned_matmul_key_sizes(s, sizes, dtype));
-  py::object id = py::reinterpret_steal<py::object>(key ? PyLong_FromVoidPtr(a) : nullptr);
   TransposedProductPlan* tp = nullptr;
   PyObject* held = nullptr;  // borrowed from the operand's state
-  if (key && id) {
-    if (PyObject* state = planned_matmul_torch_state(s, a, id.ptr())) {
+  if (key) {
+    if (PyObject* state = planned_matmul_torch_state(a)) {
       held = PyDict_GetItemWithError(state, s.tplans_attr);
       tp = planned_matmul_find_transposed(held, key.ptr());
     }
@@ -838,7 +826,7 @@ inline PyObject* planned_matmul_torch_right(const PlannedMatmul& s, PyObject* x,
   PyErr_Clear();
   if (tp == nullptr) return nullptr;
   auto* impl = at::sparse_csr::get_sparse_csr_impl(at_a);
-  if (!tp->built_from(impl->compressed_indices(), impl->plain_indices(), abi_version_of(at_a))) {
+  if (!tp->built_from(impl->compressed_indices(), impl->plain_indices())) {
     // Recorded before a write to the operand: it can never serve again, and it holds the plan of a
     // transpose autograd.py is about to rebuild. The product that next serves records afresh.
     if (PyDict_DelItem(held, key.ptr()) < 0) PyErr_Clear();
@@ -908,39 +896,31 @@ inline void planned_matmul_set(PyObject*& slot, PyObject* value) {
 inline py::object install_planned_matmul(py::object ordinary, py::object stensor_type,
                                          py::object tensor_type, py::object generation,
                                          py::object enabled, const std::string& plans_attr,
-                                         py::object torch_operands, py::object operand_ref_type,
-                                         py::object operand_died, const std::string& seen_attr,
+                                         const std::string& seen_attr,
                                          Py_ssize_t max_plans, const std::string& probed_kw,
                                          bool match_host_threads, bool atparallel,
                                          py::object module, const std::string& doc) {
   if (!PyCallable_Check(ordinary.ptr())) throw py::type_error("ordinary must be callable");
-  if (!PyType_Check(stensor_type.ptr()) || !PyType_Check(tensor_type.ptr()) ||
-      !PyType_Check(operand_ref_type.ptr()))
-    throw py::type_error("stensor_type, tensor_type and operand_ref_type must be types");
+  if (!PyType_Check(stensor_type.ptr()) || !PyType_Check(tensor_type.ptr()))
+    throw py::type_error("stensor_type and tensor_type must be types");
   if (!PyList_CheckExact(generation.ptr()) || PyList_GET_SIZE(generation.ptr()) < 1 ||
       !PyList_CheckExact(enabled.ptr()) || PyList_GET_SIZE(enabled.ptr()) < 1)
     throw py::type_error("generation and enabled must be one-element lists");
-  if (!PyDict_CheckExact(torch_operands.ptr()))
-    throw py::type_error("torch_operands must be a dict");
-  if (!PyCallable_Check(operand_died.ptr())) throw py::type_error("operand_died must be callable");
   PlannedMatmul& s = planned_matmul_state();
   planned_matmul_set(s.ordinary, ordinary.ptr());
   planned_matmul_set(s.stensor_type, stensor_type.ptr());
   planned_matmul_set(s.tensor_type, tensor_type.ptr());
   planned_matmul_set(s.generation, generation.ptr());
   planned_matmul_set(s.enabled, enabled.ptr());
-  planned_matmul_set(s.torch_operands, torch_operands.ptr());
-  planned_matmul_set(s.operand_ref_type, operand_ref_type.ptr());
-  planned_matmul_set(s.operand_died, operand_died.ptr());
   Py_XSETREF(s.plans_attr, PyUnicode_InternFromString(plans_attr.c_str()));
   Py_XSETREF(s.seen_attr, PyUnicode_InternFromString(seen_attr.c_str()));
   Py_XSETREF(s.probed_kwnames, Py_BuildValue("(s)", probed_kw.c_str()));
   if (s.storage_attr == nullptr) s.storage_attr = PyUnicode_InternFromString("_storage");
   if (s.value_attr == nullptr) s.value_attr = PyUnicode_InternFromString("_value");
-  if (s.key_attr == nullptr) s.key_attr = PyUnicode_InternFromString("key");
   if (s.plans_attr == nullptr || s.seen_attr == nullptr || s.probed_kwnames == nullptr ||
-      s.storage_attr == nullptr || s.value_attr == nullptr || s.key_attr == nullptr)
+      s.storage_attr == nullptr || s.value_attr == nullptr)
     throw py::error_already_set();
+  torch_structures().seen_attr = py::reinterpret_borrow<py::object>(s.seen_attr);
   s.max_plans = max_plans;
   s.match_host_threads = match_host_threads;
   s.atparallel = atparallel;
