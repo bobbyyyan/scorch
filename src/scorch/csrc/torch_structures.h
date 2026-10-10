@@ -168,6 +168,15 @@ struct TorchStructures {
   std::vector<py::object> graveyard;
   // plan.SEEN_ATTR, interned, from planned_matmul.h's installer: the key `sighted` is moved under.
   py::object seen_attr;
+  // The entry the last successful find returned, and its key. A product over one structure made
+  // in a loop -- the case a plan exists for -- finds its entry again by comparing keys, without
+  // hashing one and walking a bucket: the hash and the probe were 116 + about 40 of the ~250
+  // instructions a served call over a torch CSR operand spent finding its structure (gdb, mkt1).
+  // An entry's address is stable for as long as it is in `entries` (std::unordered_map moves no
+  // element on insert or rehash), and every removal goes through torch_structure_erase, which
+  // forgets it first.
+  TorchStructureKey last_key{};
+  TorchStructureEntry* last_entry = nullptr;
 };
 
 // Never destroyed: it holds Python objects, which must not be released after the interpreter.
@@ -219,6 +228,7 @@ inline void torch_structure_erase(
     std::unordered_map<TorchStructureKey, TorchStructureEntry, TorchStructureKeyHash>::iterator
         it) {
   TorchStructures& r = torch_structures();
+  if (r.last_entry == &it->second) r.last_entry = nullptr;
   py::object state = std::move(it->second.state);
   if (it->second.watchers) r.graveyard.push_back(std::move(it->second.watchers));
   r.by_id.erase(it->second.id);
@@ -295,11 +305,18 @@ inline TorchStructureEntry* torch_structure_find(const at::Tensor& a, TorchStruc
   found.entry = nullptr;
   if (!torch_structure_key(a, found.positions, found.coordinates, key)) return nullptr;
   TorchStructures& r = torch_structures();
+  // Live, necessarily, either way: `a` holds storages at the key's addresses, and no storage can
+  // have been made at the address of one an entry still references weakly, so this entry's are
+  // `a`'s. The remembered entry is in `entries` (see last_entry), so the same holds for it.
+  if (r.last_entry != nullptr && key == r.last_key) {
+    found.entry = r.last_entry;
+    return found.entry;
+  }
   auto it = r.entries.find(key);
   if (it == r.entries.end()) return nullptr;
-  // Live, necessarily: `a` holds storages at the key's addresses, and no storage can have been
-  // made at the address of one an entry still references weakly, so this entry's are `a`'s.
   found.entry = &it->second;
+  r.last_key = key;
+  r.last_entry = found.entry;
   return found.entry;
 }
 

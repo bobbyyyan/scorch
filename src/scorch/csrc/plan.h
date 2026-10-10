@@ -387,9 +387,14 @@ class SpmmCsrPlan {
  private:
   // The kernel call `run` and run_csr make once every check has passed, over index arrays `pos`
   // and `crd`: the plan's own, or a borrowing plan's presented ones.
-  c10::optional<torch::Tensor> compute(const int32_t* pos, const int32_t* crd,
-                                       const torch::Tensor& a_values, const torch::Tensor& b,
-                                       int64_t nthreads, bool atparallel) {
+  //
+  // Forced inline: it is the body `run` had before run_csr shared it, and as a call of its own it
+  // cost every served call 36 more instructions than that body did (gdb, one served call, mkt1:
+  // run 279 before; run 199 plus this 116 after), on the STensor path too, which shares nothing
+  // else with run_csr. Two callers, so the switch is emitted twice.
+  __attribute__((always_inline)) c10::optional<torch::Tensor> compute(
+      const int32_t* pos, const int32_t* crd, const torch::Tensor& a_values,
+      const torch::Tensor& b, int64_t nthreads, bool atparallel) {
     const int rows = static_cast<int>(rows_);
     const int free_dim = static_cast<int>(free_dim_);
     const int contraction = static_cast<int>(cols_);

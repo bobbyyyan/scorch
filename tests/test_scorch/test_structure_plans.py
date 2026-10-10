@@ -249,6 +249,74 @@ def test_new_arrays_where_dead_ones_were_are_a_new_structure(calls):
     print("address reuse in", hits, "of 20")
 
 
+def test_structures_used_in_turn_keep_their_own_plans():
+    """The registry remembers the entry it found last (torch_structures.h, last_entry): two
+    structures used in turn must each find their own entry every time, not the other's."""
+    shape = (40, 30)
+    b = torch.rand(30, 8, dtype=torch.float64)
+    first = _structure(seed=3)
+    second = _structure(seed=4)
+    operands = []
+    for step in range(8):
+        crow, col = first if step % 2 == 0 else second
+        values = _values(col.numel(), torch.float64, step)
+        a = _csr(crow, col, values, shape)
+        torch.testing.assert_close(
+            scorch.matmul(a, b), _dense(crow, col, values, shape) @ b, **_tol(torch.float64)
+        )
+        operands.append(a)
+    plan_first, plan_second = _plan_of(operands[-2]), _plan_of(operands[-1])
+    assert plan_first is not plan_second
+    assert plan_first.served == 2 and plan_second.served == 2, (
+        "each sighted on its first call, installed on its second, served on its third and fourth"
+    )
+
+
+def _storage_key(crow, col):
+    return (
+        crow.untyped_storage()._cdata,
+        col.untyped_storage()._cdata,
+        crow.data_ptr(),
+        col.data_ptr(),
+    )
+
+
+def test_the_entry_found_last_is_forgotten_when_it_is_dropped():
+    """A planned structure's entry is dropped the moment its arrays die (its weak-reference
+    callback), and it is the entry the registry found last. Arrays allocated next often reuse the
+    same StorageImpls and buffers -- the whole key -- and must then find no entry, not the
+    dropped one."""
+    shape = (40, 30)
+    b = torch.rand(30, 4, dtype=torch.float64)
+    reused = 0
+    for trial in range(20):
+        crow, col = _structure(seed=200 + trial)
+        for step in range(3):
+            scorch.matmul(
+                _csr(crow, col, _values(col.numel(), torch.float64, step), shape), b
+            )
+        old = _storage_key(crow, col)
+        # Found last, through the same lookup a product makes.
+        assert plan_mod.torch_operand_state(
+            _csr(crow, col, _values(col.numel(), torch.float64, 9), shape)
+        ) is not None
+        n = col.numel()
+        del crow, col
+        gc.collect()
+        crow, col = _structure(seed=200 + trial)  # the same lengths, so the same allocations
+        assert col.numel() == n
+        reused += _storage_key(crow, col) == old
+        a = _csr(crow, col, _values(n, torch.float64, 5), shape)
+        assert plan_mod.torch_operand_state(a) is None
+        torch.testing.assert_close(
+            scorch.matmul(a, b), a.to_dense() @ b, **_tol(torch.float64)
+        )
+        del a, crow, col
+        gc.collect()
+    # Not asserted: whether the allocator reused the whole key is up to it.
+    print("whole key reused in", reused, "of 20")
+
+
 def test_first_sightings_of_arrays_that_die_stay_bounded():
     """A first sighting adds an entry without the weak references that drop it (they would be
     most of what a call over new arrays costs); a sweep drops such entries once the registry has
