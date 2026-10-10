@@ -40,11 +40,17 @@ from .plan import SEEN_ATTR as _PLAN_SEEN_ATTR
 from .plan import TRANSPOSED_PLANS_ATTR as _PLAN_TRANSPOSED_ATTR
 from .plan import install as _plan_install
 from .plan import torch_operand_state as _plan_torch_operand_state
-from .prebuilt_kernels import execute_prebuilt_binary_kernel, resolve_prebuilt_matmul
+from .prebuilt_kernels import (
+    csr_dense_symbol,
+    execute_prebuilt_binary_kernel,
+    resolve_prebuilt_matmul,
+)
 from .tiling import maybe_dispatch as _tiling_maybe_dispatch
 from .tiling import is_candidate as _tiling_is_candidate
+from .tiling import shape_is_candidate as _tiling_shape_is_candidate
 from .tiling import decided as _tiling_decided
 from .tiling import _current_level as _tiling_current_level
+from .storage import _WRAP_GRAIN as _STORAGE_WRAP_GRAIN
 from .stensor import STensor, _wrap_generated_result
 from . import autograd as _autograd
 from .utils import (
@@ -1233,6 +1239,17 @@ if _install_planned_matmul is not None:
     _set_right = getattr(_scorch_ops, "set_planned_matmul_right", None)
     if _set_right is not None:
         _set_right(_autograd.planned_mm_t_backward, _PLAN_TRANSPOSED_ATTR)
+    # And a torch CSR operand's product no plan serves, where it is the call this function would
+    # make: the drop-in SpMM, where the product resolves to it, and at float32 only for a shape the
+    # tiling selector's gate declines (planned_matmul.h, planned_matmul_torch_ordinary).
+    _set_ordinary = getattr(_scorch_ops, "set_planned_matmul_ordinary", None)
+    if _set_ordinary is not None:
+        _set_ordinary(
+            _tiling_shape_is_candidate,
+            csr_dense_symbol(torch.float32) == "spmm_csr_float_v2",
+            csr_dense_symbol(torch.float64) == "spmm_csr_double_v2",
+            _STORAGE_WRAP_GRAIN,
+        )
 
 
 # Activation codes for the fused Linear kernel (must match spmm.h

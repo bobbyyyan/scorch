@@ -106,6 +106,61 @@ Tensor prebuilt_spmv_csr(
                             B_shape, B_mode_indices, B_values);
 }
 
+// The drop-in SpMM's binding, spmm_csr_float_v2 and spmm_csr_double_v2: what Python calls for a CSR
+// x dense product, and what the C entry point calls for a torch CSR operand's product it makes
+// without a plan (spmm_csr_v2_ordinary). One template so the two paths cannot drift apart.
+constexpr int kSpmmV2DefaultTile = 256;
+
+template <typename scalar_t>
+Tensor spmm_csr_v2_binding(std::vector<int64_t> result_shape, std::vector<int64_t> A_shape,
+                           std::vector<std::vector<torch::Tensor>> A_mode_indices,
+                           torch::Tensor A_values, std::vector<int64_t> B_shape,
+                           std::vector<std::vector<torch::Tensor>> B_mode_indices,
+                           torch::Tensor B_values, int tile_size, int nthreads_override,
+                           bool atparallel) {
+  constexpr bool kFloat = std::is_same<scalar_t, float>::value;
+  constexpr const char* op = kFloat ? "spmm_csr_float_v2" : "spmm_csr_double_v2";
+  // More nonzeros than an int32 offset holds: run as row panels that each fit
+  // (native_abi.h, abi_csr_row_panels).
+  if (scorch_native::abi_csr_needs_row_panels(A_mode_indices))
+    return spmm_csr_v2_panelled<scalar_t>(op, result_shape, A_shape, A_mode_indices, A_values,
+                                          B_shape, B_mode_indices, B_values, tile_size,
+                                          nthreads_override, atparallel);
+  scorch_native::validate_binary_inputs(
+      op, scorch_native::BinaryContract::CsrDenseMatmulInt64Elements,
+      kFloat ? torch::kFloat32 : torch::kFloat64, result_shape, A_shape, A_mode_indices,
+      A_values, B_shape, B_mode_indices, B_values);
+  tile_size = scorch_native::validate_tile_size(tile_size, op, "tile_size", B_shape[1]);
+  scorch_native::validate_thread_override(nthreads_override, op);
+  const auto c_shape = scorch_native::narrow_legacy_shape(result_shape, op, "result_shape");
+  const auto a_shape = scorch_native::narrow_legacy_shape(A_shape, op, "A_shape");
+  const auto b_shape = scorch_native::narrow_legacy_shape(B_shape, op, "B_shape");
+  if constexpr (kFloat)
+    return spmm_csr_float_v2(c_shape, a_shape, A_mode_indices, A_values, b_shape,
+                             B_mode_indices, B_values, tile_size, nthreads_override, atparallel);
+  else
+    return spmm_csr_double_v2(c_shape, a_shape, A_mode_indices, A_values, b_shape,
+                              B_mode_indices, B_values, tile_size, nthreads_override,
+                              atparallel);
+}
+
+// A torch CSR operand's product as the C entry point makes it without a plan
+// (planned_matmul_torch_ordinary): the call execute_prebuilt_binary_kernel makes for it -- the
+// operand's member arrays, B flattened, the default tile, the composition hints -- and the result
+// as ops.matmul returns it.
+template <typename scalar_t>
+torch::Tensor spmm_csr_v2_ordinary(const torch::Tensor& positions,
+                                   const torch::Tensor& coordinates,
+                                   const torch::Tensor& values, const torch::Tensor& b,
+                                   int64_t rows, int64_t cols, int64_t nthreads,
+                                   bool atparallel) {
+  const int64_t k = b.size(1);
+  Tensor c = spmm_csr_v2_binding<scalar_t>(
+      {rows, k}, {rows, cols}, {{}, {positions, coordinates}}, values, {cols, k}, {{}, {}},
+      b.reshape(-1), kSpmmV2DefaultTile, static_cast<int>(nthreads), atparallel);
+  return c.storage.value.reshape({rows, k});
+}
+
 void bind_binary_kernel(py::module_& m, const char* name, BinaryKernelFn fn,
                         const char* doc,
                         scorch_native::BinaryContract contract,
@@ -315,39 +370,10 @@ void bind_experimental_spmm_variants(py::module_& m) {
   // thread count (nthreads_override, avoids host<->kernel team reshape) and
   // atparallel (launch the workers on torch's intra-op pool so the SpMM shares one
   // warm team with the torch epilogue in a pipeline).
-  m.def("spmm_csr_float_v2",
-        [](std::vector<int64_t> result_shape, std::vector<int64_t> A_shape,
-           std::vector<std::vector<torch::Tensor>> A_mode_indices,
-           torch::Tensor A_values, std::vector<int64_t> B_shape,
-           std::vector<std::vector<torch::Tensor>> B_mode_indices,
-           torch::Tensor B_values, int tile_size, int nthreads_override,
-           bool atparallel) {
-          constexpr const char* op = "spmm_csr_float_v2";
-          // More nonzeros than an int32 offset holds: run as row panels that each fit
-          // (native_abi.h, abi_csr_row_panels).
-          if (scorch_native::abi_csr_needs_row_panels(A_mode_indices))
-            return spmm_csr_v2_panelled<float>(op, result_shape, A_shape, A_mode_indices,
-                                              A_values, B_shape, B_mode_indices, B_values,
-                                              tile_size, nthreads_override, atparallel);
-          scorch_native::validate_binary_inputs(
-              op, scorch_native::BinaryContract::CsrDenseMatmulInt64Elements,
-              torch::kFloat32, result_shape, A_shape, A_mode_indices, A_values,
-              B_shape, B_mode_indices, B_values);
-          tile_size = scorch_native::validate_tile_size(
-              tile_size, op, "tile_size", B_shape[1]);
-          scorch_native::validate_thread_override(nthreads_override, op);
-          return spmm_csr_float_v2(
-              scorch_native::narrow_legacy_shape(result_shape, op,
-                                                  "result_shape"),
-              scorch_native::narrow_legacy_shape(A_shape, op, "A_shape"),
-              A_mode_indices, A_values,
-              scorch_native::narrow_legacy_shape(B_shape, op, "B_shape"),
-              B_mode_indices, B_values, tile_size, nthreads_override, atparallel);
-        },
-        "Workspace + 2-nnz ILP + k-tiling SpMM",
+  m.def("spmm_csr_float_v2", &spmm_csr_v2_binding<float>, "Workspace + 2-nnz ILP + k-tiling SpMM",
         py::arg("result_shape"), py::arg("A_shape"), py::arg("A_mode_indices"),
         py::arg("A_values"), py::arg("B_shape"), py::arg("B_mode_indices"),
-        py::arg("B_values"), py::arg("tile_size") = 256,
+        py::arg("B_values"), py::arg("tile_size") = kSpmmV2DefaultTile,
         py::arg("nthreads_override") = -1, py::arg("atparallel") = false);
   // float64 CSR x dense through spmm_csr_double_v2_core, which is the float32 v2
   // kernel at double where AVX2 makes that worth doing and the reference kernel
@@ -355,40 +381,12 @@ void bind_experimental_spmm_variants(py::module_& m) {
   // the same reason v2 is: it takes the composition hints. The float64 route
   // resolves this instead of spmm_csr_double, which stays as the reference kernel
   // the tests compare against.
-  m.def("spmm_csr_double_v2",
-        [](std::vector<int64_t> result_shape, std::vector<int64_t> A_shape,
-           std::vector<std::vector<torch::Tensor>> A_mode_indices,
-           torch::Tensor A_values, std::vector<int64_t> B_shape,
-           std::vector<std::vector<torch::Tensor>> B_mode_indices,
-           torch::Tensor B_values, int tile_size, int nthreads_override,
-           bool atparallel) {
-          constexpr const char* op = "spmm_csr_double_v2";
-          // More nonzeros than an int32 offset holds: run as row panels that each fit
-          // (native_abi.h, abi_csr_row_panels).
-          if (scorch_native::abi_csr_needs_row_panels(A_mode_indices))
-            return spmm_csr_v2_panelled<double>(op, result_shape, A_shape, A_mode_indices,
-                                              A_values, B_shape, B_mode_indices, B_values,
-                                              tile_size, nthreads_override, atparallel);
-          scorch_native::validate_binary_inputs(
-              op, scorch_native::BinaryContract::CsrDenseMatmulInt64Elements,
-              torch::kFloat64, result_shape, A_shape, A_mode_indices, A_values,
-              B_shape, B_mode_indices, B_values);
-          tile_size = scorch_native::validate_tile_size(
-              tile_size, op, "tile_size", B_shape[1]);
-          scorch_native::validate_thread_override(nthreads_override, op);
-          return spmm_csr_double_v2(
-              scorch_native::narrow_legacy_shape(result_shape, op,
-                                                  "result_shape"),
-              scorch_native::narrow_legacy_shape(A_shape, op, "A_shape"),
-              A_mode_indices, A_values,
-              scorch_native::narrow_legacy_shape(B_shape, op, "B_shape"),
-              B_mode_indices, B_values, tile_size, nthreads_override, atparallel);
-        },
+  m.def("spmm_csr_double_v2", &spmm_csr_v2_binding<double>,
         "float64 CSR x dense: the float32 v2 kernel at double on AVX2, the "
         "reference kernel elsewhere",
         py::arg("result_shape"), py::arg("A_shape"), py::arg("A_mode_indices"),
         py::arg("A_values"), py::arg("B_shape"), py::arg("B_mode_indices"),
-        py::arg("B_values"), py::arg("tile_size") = 256,
+        py::arg("B_values"), py::arg("tile_size") = kSpmmV2DefaultTile,
         py::arg("nthreads_override") = -1, py::arg("atparallel") = false);
   // Column-panel ("tile-j") SpMM for the high-degree operand-over-LLC thrash
   // regime (reddit/products-class). Reached only when the adaptive tiling selector
@@ -1173,6 +1171,16 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           py::arg("panel_contraction") = 0, py::arg("borrow") = false);
     // scorch.matmul's planned fast path in C (planned_matmul.h). ops.py binds what this
     // returns as `matmul`; every call it does not serve goes to `ordinary` unchanged.
+    scorch_native::planned_matmul_state().ordinary_spmm[0] = &spmm_csr_v2_ordinary<float>;
+    scorch_native::planned_matmul_state().ordinary_spmm[1] = &spmm_csr_v2_ordinary<double>;
+    // Which of those the C entry point may call itself, and the gate float32 must clear.
+    m.def("set_planned_matmul_ordinary", &scorch_native::set_planned_matmul_ordinary,
+          "Let the C entry point make a torch CSR operand's unplanned product",
+          py::arg("tiling_candidate"), py::arg("float32"), py::arg("float64"),
+          py::arg("screen_grain"));
+    // For tests: how many products planned_matmul_torch_ordinary has made.
+    m.def("planned_matmul_ordinary_served",
+          [] { return scorch_native::planned_matmul_state().ordinary_served; });
     m.def("install_planned_matmul", &scorch_native::install_planned_matmul,
           "Build the C callable ops.py binds as matmul",
           py::arg("ordinary"), py::arg("stensor_type"), py::arg("tensor_type"),

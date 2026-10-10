@@ -136,6 +136,22 @@ def _resolve_symbol(
 # single dict lookup, eliminating a large slice of the per-call Python overhead
 # that dominates SpMM latency on small matrices. The key space is tiny and
 # bounded (a handful of formats/ranks/dtypes), so no eviction is needed.
+def csr_dense_symbol(dtype: torch.dtype) -> Optional[str]:
+    """The symbol a CSR x dense -> dense product of this dtype resolves to in this build, or
+    None: what ``resolve_prebuilt_matmul`` picks for it, read from the same table. ops.py asks,
+    to tell the C entry point which products it may make itself."""
+    for spec in _MATMUL_PREBUILT_SPECS:
+        if (spec.lhs_rank, spec.rhs_rank, spec.lhs_format, spec.rhs_format) == (
+            2,
+            2,
+            "d,s",
+            "d,d",
+        ):
+            symbols = spec.symbol_by_dtype.get(dtype)
+            return None if symbols is None else _resolve_symbol(symbols)[1]
+    return None
+
+
 _RESOLVE_MISS = object()
 _resolve_matmul_cache: dict = {}
 

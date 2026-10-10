@@ -1541,6 +1541,56 @@ inline void abi_narrow_csr_first_sight(const torch::Tensor& positions,
   abi_struct_store(std::move(copies));
 }
 
+// Whether a CSR operand over these arrays is one every check made of it would clear -- the native
+// boundary's (checked_csr_view, coordinates sorted within each row, as the drop-in SpMM requires)
+// and the construction-time screen's (storage.py), which ask the same question -- so that a caller
+// can make a call those checks guard knowing none of them will report. The O(1) conditions are
+// tested here; the structure through the verdicts both keep, reached by a scan only where neither
+// has one yet: for an int64 pair seen for the first time, the pass that also makes the int32
+// copies the kernels read (abi_narrow_csr_first_sight); for an int32 pair, the screen at `grain`.
+// Never raises and never reports: false means "make the checked call and let it report", as from
+// every screen here.
+inline bool abi_csr_screen(const torch::Tensor& positions, const torch::Tensor& coordinates,
+                           const torch::Tensor& values, int64_t rows, int64_t cols,
+                           int64_t grain) {
+  const auto plain = [](const torch::Tensor& t) {
+    return t.defined() && t.device().is_cpu() && t.layout() == torch::kStrided &&
+           t.dim() == 1 && t.is_contiguous() && !t.is_neg() && !t.is_conj();
+  };
+  if (!plain(positions) || !plain(coordinates) || !plain(values)) return false;
+  const auto index_dtype = positions.scalar_type();
+  if (coordinates.scalar_type() != index_dtype ||
+      (index_dtype != torch::kInt32 && index_dtype != torch::kInt64))
+    return false;
+  constexpr int64_t kMax = std::numeric_limits<int32_t>::max();
+  const int64_t nnz = values.numel();
+  if (rows < 0 || cols < 0 || rows > kMax || cols > kMax || nnz > kMax) return false;
+  if (positions.numel() != rows + 1 || coordinates.numel() != nnz) return false;
+  const std::vector<int64_t> params = {AbiCheckCompressed, rows, cols, nnz, 1};
+  if (index_dtype == torch::kInt64) {
+    abi_narrow_csr_first_sight(positions, coordinates, values, rows, cols, true);
+    torch::Tensor pos32, crd32;
+    if (!abi_narrow_lookup(abi_identify(positions), pos32) ||
+        !abi_narrow_lookup(abi_identify(coordinates), crd32))
+      return false;
+    AbiStructEntry copies;
+    copies.add(crd32);
+    copies.add(pos32);
+    copies.params = params;
+    return abi_struct_hit(copies);
+  }
+  const int32_t* pos = positions.data_ptr<int32_t>();
+  const int32_t* crd = coordinates.data_ptr<int32_t>();
+  if (pos[0] != 0 || pos[rows] != nnz) return false;
+  AbiStructEntry want;
+  want.add(coordinates);
+  want.add(positions);
+  want.params = params;
+  return !abi_screen_through_memo(std::move(want), [&] {
+    return abi_screen_compressed_typed<int32_t>(pos, crd, rows, nnz, cols, true, grain);
+  });
+}
+
 template <typename Dim>
 inline CsrInputView checked_csr_view(
     const std::vector<Dim>& shape,

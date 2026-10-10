@@ -92,6 +92,25 @@ struct PlannedMatmul {
   // x @ A goes to the Python function.
   PyObject* mm_t_backward = nullptr;
   PyObject* tplans_attr = nullptr;
+  // A torch CSR operand's product no plan serves is made here when it is the call the Python
+  // function would make (planned_matmul_torch_ordinary). `ordinary_spmm` is the drop-in SpMM at
+  // float32 and float64, as ops.cpp calls it for this path; `serve_ordinary` says, per dtype,
+  // whether ops.py found the CSR x dense product resolves to it; `tiling_candidate` is
+  // tiling.shape_is_candidate, the tiling selector's gate, which must decline a float32 product;
+  // `screen_grain` is the construction-time screen's (storage._WRAP_GRAIN). Unset, every such
+  // product goes to the Python function.
+  using OrdinarySpmm = torch::Tensor (*)(const torch::Tensor& positions,
+                                         const torch::Tensor& coordinates,
+                                         const torch::Tensor& values, const torch::Tensor& b,
+                                         int64_t rows, int64_t cols, int64_t nthreads,
+                                         bool atparallel);
+  OrdinarySpmm ordinary_spmm[2] = {nullptr, nullptr};
+  bool serve_ordinary[2] = {false, false};
+  PyObject* tiling_candidate = nullptr;
+  int64_t screen_grain = 65536;
+  // Products made by planned_matmul_torch_ordinary, for tests: a statistic, which calls on the
+  // shared state count through a const reference like every other read of it.
+  mutable int64_t ordinary_served = 0;
 };
 
 inline PlannedMatmul& planned_matmul_state() {
@@ -544,6 +563,59 @@ enum class TorchOperandPlanWork {
 // probed keyword, whose value is the key when plan.install has work to do and None otherwise,
 // so the Python function neither probes again nor calls the installer for nothing. A call
 // whose ordinary path raises records nothing.
+// The product of a torch CSR operand `a` no plan serves, made here when it is exactly the call the
+// Python function would make: the drop-in SpMM (`ordinary_spmm`) where the product resolves to it
+// at this dtype, B a contiguous 2-D tensor of the operand's dtype, a structure every check clears
+// (abi_csr_screen), and at float32 a shape the tiling selector's gate declines. The Python function
+// builds an STensor around each operand to make that call -- 312 Python calls, 20 of the 26 us such
+// a product took on the M5 at 256 rows. The new reference; nullptr with no error set for a call it
+// does not make, which the Python function then makes, reporting whatever is wrong with it.
+//
+// `a` is recorded as a write witness of its arrays, as the Python function's reading of them
+// records it (torch_sparse_index_members): the verdicts and int32 copies kept for the arrays are
+// then dropped by a write through `a`'s accessors too.
+inline PyObject* planned_matmul_torch_ordinary(const PlannedMatmul& s, const at::Tensor& a,
+                                               const at::Tensor& b) {
+  const at::ScalarType dtype = b.scalar_type();
+  const int which = dtype == at::kFloat ? 0 : dtype == at::kDouble ? 1 : -1;
+  if (which < 0 || !s.serve_ordinary[which] || s.ordinary_spmm[which] == nullptr) return nullptr;
+  if (which == 0 && s.tiling_candidate == nullptr) return nullptr;
+  if (!a.device().is_cpu() || !b.device().is_cpu() || b.layout() != c10::kStrided ||
+      b.dim() != 2 || !b.is_contiguous() || b.is_neg() || b.is_conj())
+    return nullptr;
+  auto* impl = at::sparse_csr::get_sparse_csr_impl(a);
+  const at::Tensor& values = impl->values();
+  const at::Tensor& positions = impl->compressed_indices();
+  const at::Tensor& coordinates = impl->plain_indices();
+  if (values.scalar_type() != dtype) return nullptr;
+  const int64_t rows = a.size(0), cols = a.size(1), k = b.size(1);
+  if (b.size(0) != cols) return nullptr;
+  abi_watch_register(positions, a);
+  abi_watch_register(coordinates, a);
+  if (!abi_csr_screen(positions, coordinates, values, rows, cols, s.screen_grain)) return nullptr;
+  if (which == 0) {
+    PyObject* argv[3] = {PyLong_FromLongLong(cols), PyLong_FromLongLong(k),
+                         PyLong_FromLongLong(values.numel())};
+    PyObject* verdict = argv[0] && argv[1] && argv[2]
+                            ? PyObject_Vectorcall(s.tiling_candidate, argv, 3, nullptr)
+                            : nullptr;
+    for (PyObject* o : argv) Py_XDECREF(o);
+    const bool declined = verdict == Py_False;
+    Py_XDECREF(verdict);
+    PyErr_Clear();
+    if (!declined) return nullptr;
+  }
+  torch::Tensor out;
+  try {
+    out = s.ordinary_spmm[which](positions, coordinates, values, b, rows, cols,
+                                 planned_matmul_nthreads(s), s.atparallel);
+  } catch (...) {
+    return nullptr;  // the Python function makes the same call, and reports
+  }
+  ++s.ordinary_served;
+  return THPVariable_Wrap(std::move(out));
+}
+
 inline PyObject* planned_matmul_torch_call(const PlannedMatmul& s, PyObject* a, PyObject* b,
                                            PyObject* const* args, Py_ssize_t nargsf) {
   const at::Tensor& bt = THPVariable_Unpack(b);
@@ -600,6 +672,13 @@ inline PyObject* planned_matmul_torch_call(const PlannedMatmul& s, PyObject* a, 
            torch_structure_sighted(*found.entry, sighting)))
         work = TorchOperandPlanWork::kInstall;
       PyErr_Clear();
+    }
+  }
+  if (work != TorchOperandPlanWork::kInstall) {
+    if (PyObject* served = planned_matmul_torch_ordinary(s, at_a, bt)) {
+      if (work == TorchOperandPlanWork::kFirstSighting)
+        planned_matmul_record_sighting(s, a, key.ptr(), bt);
+      return served;
     }
   }
   PyObject* argv[3] = {a, b, work == TorchOperandPlanWork::kInstall ? key.ptr() : Py_None};
@@ -940,6 +1019,23 @@ inline py::object install_planned_matmul(py::object ordinary, py::object stensor
   Py_DECREF(name);
   if (fn == nullptr) throw py::error_already_set();
   return py::reinterpret_steal<py::object>(fn);
+}
+
+// Lets the C entry point make a torch CSR operand's unplanned product itself (see
+// planned_matmul_torch_ordinary): `tiling_candidate` is tiling.shape_is_candidate (None withdraws
+// float32), `float32`/`float64` whether the CSR x dense product resolves to the drop-in SpMM at
+// that dtype, `screen_grain` storage._WRAP_GRAIN.
+inline void set_planned_matmul_ordinary(py::object tiling_candidate, bool float32, bool float64,
+                                        int64_t screen_grain) {
+  if (!tiling_candidate.is_none() && !PyCallable_Check(tiling_candidate.ptr()))
+    throw py::type_error("tiling_candidate must be callable or None");
+  if (screen_grain < 1) throw py::value_error("screen_grain must be positive");
+  PlannedMatmul& s = planned_matmul_state();
+  planned_matmul_set(s.tiling_candidate,
+                     tiling_candidate.is_none() ? nullptr : tiling_candidate.ptr());
+  s.serve_ordinary[0] = float32;
+  s.serve_ordinary[1] = float64;
+  s.screen_grain = screen_grain;
 }
 
 }  // namespace scorch_native

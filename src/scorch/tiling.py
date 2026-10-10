@@ -553,10 +553,33 @@ def is_candidate(a, b, level: Optional[str] = None) -> bool:
     # learned widens the gate (operand>C only) ONLY when opted-in (SCORCH_AUTOTUNE_WIDEN=1)
     # AND a per-machine model is loaded. DEFAULT: learned uses the analytic gate (no
     # widening) and only improves the within-gate pick.
+    return _gate_past_cache(J, N, C, int(a.storage._mode_indices[1][1].numel()), level)
+
+
+def _gate_past_cache(J: int, N: int, C: int, nnz: int, level: str) -> bool:
+    # learned widens the gate (operand>C only) ONLY when opted-in (SCORCH_AUTOTUNE_WIDEN=1)
+    # AND a per-machine model is loaded. DEFAULT: learned uses the analytic gate (no
+    # widening) and only improves the within-gate pick.
     if level == "learned" and _LEARNED_WIDEN and _load_learned_model() is not None:
         return _eligible_learned(J, N, C)
-    nnz = int(a.storage._mode_indices[1][1].numel())
     return _degree_pays(J, nnz, N, C)
+
+
+def shape_is_candidate(J: int, N: int, nnz: int) -> bool:
+    """``is_candidate`` for a product given as integers: ``J`` contraction columns, ``N``
+    free columns, ``nnz`` nonzeros, at the current level. The C entry point's question
+    before it makes a torch CSR operand's float32 product itself (csrc/planned_matmul.h,
+    planned_matmul_torch_ordinary): only a product the gate declines is one ``ops.matmul``
+    would hand straight to v2."""
+    if not _HAS_TILEJ:
+        return False
+    level = _current_level()
+    if level == "off":
+        return False
+    C = query_llc()
+    if not _operand_over_cache(J, N, C):
+        return False
+    return _gate_past_cache(J, N, C, nnz, level)
 
 
 def decided(a, n: int, level: Optional[str] = None, baseline_tag: str = "v2"):
