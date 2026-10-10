@@ -4267,8 +4267,11 @@ torch::Tensor spmm_csr_v2_core(
   // before computing them, inside the product's own region. Nothing is written by one worker and
   // read by another, the values are in the core that reads them, and the fill costs no region of
   // its own (a second region costs ~15 us on an M5 even right after the first).
-  constexpr bool GATHERED = !std::is_same<WideT, ScorchWideRows>::value;
+  constexpr bool GATHERED = scorch_is_gather_call<WideT>::value;
   static_assert(!(GATHERED && REDIRECT), "a gathered call claims whole rows");
+  // A panel call (ScorchPanelCall) writes its rows into the caller's buffer, not a new output.
+  constexpr bool INTO = scorch_is_panel_call<WideT>::value;
+  static_assert(!(INTO && REDIRECT), "a panel call claims whole rows");
   // REDIRECT breaks the assumption that the i-th claimed thing is the i-th output row. With it
   // A0_size counts UNITS: the first `split->n_row_units` of them are the rows, each truncated to
   // its first segment if it is wider than one, and the rest are the later segments of those wide
@@ -4322,8 +4325,10 @@ torch::Tensor spmm_csr_v2_core(
   // on it, since a non-empty row is fully overwritten by the kernel and every
   // empty row is zeroed exactly once.
   torch::Tensor C_values_torch =
-      torch::empty({(long long)C_capacity}, scorch_torch_dtype<scalar_t>());
-  scalar_t* SCORCH_RESTRICT C_values = C_values_torch.data_ptr<scalar_t>();
+      INTO ? torch::Tensor()
+           : torch::empty({(long long)C_capacity}, scorch_torch_dtype<scalar_t>());
+  scalar_t* SCORCH_RESTRICT C_values =
+      INTO ? scorch_panel_out<scalar_t>(wide_rows) : C_values_torch.data_ptr<scalar_t>();
   bool zero_empty_only = true;
 #ifdef SCORCH_TUNE_HOOKS
   // A/B hook retained for the zeroing policy. Output storage is always owned by
@@ -6515,7 +6520,8 @@ torch::Tensor spmm_csr_v2_rowsplit(
                 int tile_size, int nthreads_override, bool atparallel,
                 const WideT* wide_rows) {
   if constexpr (!std::is_same<WideT, ScorchWideRows>::value) {
-    // A gathered call claims whole rows (see spmm_csr_v2_core): never the redirected split.
+    // A gathered or panel call claims whole rows (see spmm_csr_v2_core): never the redirected
+    // split.
     return spmm_csr_v2_core<scalar_t, false, WideT>(C0_size, C1_size, A0_size, A1_pos, A1_crd,
                                                     A_val, B1_size, B_val, tile_size,
                                                     nthreads_override, atparallel, wide_rows);
@@ -6741,6 +6747,22 @@ torch::Tensor spmm_csr_double_v2_gathered_core(
     const int* SCORCH_RESTRICT A1_crd, double* SCORCH_RESTRICT A_val, int B1_size,
     const double* SCORCH_RESTRICT B_val, int tile_size, int nthreads_override, bool atparallel,
     const ScorchGatherCall<double>* g);
+
+// The v2 SpMM for a panel call (ScorchPanelCall): rows [0, C0_size) of the product go to out, a
+// slice of a larger output that other panels fill. Defined in spmm_panelled.cpp, for the reason
+// the gathered call is defined in a file of its own.
+void spmm_csr_float_v2_panel_core(int C0_size, int C1_size, int A0_size,
+                                  const int* SCORCH_RESTRICT A1_pos,
+                                  const int* SCORCH_RESTRICT A1_crd,
+                                  const float* SCORCH_RESTRICT A_val, int B1_size,
+                                  const float* SCORCH_RESTRICT B_val, int tile_size,
+                                  int nthreads_override, bool atparallel, float* out);
+void spmm_csr_double_v2_panel_core(int C0_size, int C1_size, int A0_size,
+                                   const int* SCORCH_RESTRICT A1_pos,
+                                   const int* SCORCH_RESTRICT A1_crd,
+                                   const double* SCORCH_RESTRICT A_val, int B1_size,
+                                   const double* SCORCH_RESTRICT B_val, int tile_size,
+                                   int nthreads_override, bool atparallel, double* out);
 
 #ifndef SCORCH_SPMM_KERNELS_ONLY
 // The float32 entry every existing caller uses. A one-line forwarder, so plan.h and

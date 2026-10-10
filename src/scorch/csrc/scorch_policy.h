@@ -61,6 +61,7 @@
 #include <cstring>    // scorch_omp_is_libgomp matches the runtime's file name
 #include <atomic>     // scorch_spmm_wide_reset
 #include <cstdint>    // uintptr_t: ScorchWideLayout aligns its scratch
+#include <type_traits>  // scorch_is_gather_call, scorch_is_panel_call
 #include <vector>     // scorch_spmm_find_wide_rows
 #if defined(__linux__) || defined(__APPLE__)
 #include <dlfcn.h>    // dladdr: which library the OpenMP runtime was loaded from
@@ -2872,6 +2873,32 @@ struct ScorchGatherCall : ScorchWideRows {
   const T* src = nullptr;
   const int64_t* perm = nullptr;
 };
+
+// A call that writes its rows into the caller's buffer instead of a new output (spmm_csr_v2_core's
+// INTO instance): one row panel of a product whose nonzeros exceed int32 offsets, each panel
+// writing its own rows of the product's one output (native_abi.h, abi_csr_row_panels). Without
+// it each panel made an output of its own that was then copied into place, which cost 1.10x on a
+// 4M-row matrix of degree 25 at k=64 and 1.48x at degree 4 on the M5. No wide rows (nseg 0).
+template <typename T>
+struct ScorchPanelCall : ScorchWideRows {
+  T* out = nullptr;
+};
+
+template <typename W>
+struct scorch_is_gather_call : std::false_type {};
+template <typename T>
+struct scorch_is_gather_call<ScorchGatherCall<T>> : std::true_type {};
+template <typename W>
+struct scorch_is_panel_call : std::false_type {};
+template <typename T>
+struct scorch_is_panel_call<ScorchPanelCall<T>> : std::true_type {};
+
+// A panel call's destination; nothing for any other call (never reached: see spmm_csr_v2_core).
+template <typename T, typename W>
+inline T* scorch_panel_out(const W* w) {
+  if constexpr (scorch_is_panel_call<W>::value) return w->out;
+  else return nullptr;
+}
 
 // Bytes of the per-wide-row counts, rounded up to whole lines so the segment rows start on one.
 inline long scorch_wide_left_bytes(long n) { return ((n * (long)sizeof(int) + 63) / 64) * 64; }

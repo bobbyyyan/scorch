@@ -15,6 +15,47 @@ namespace py = pybind11;
 
 namespace {
 
+// A CSR x dense product with more nonzeros than an int32 offset holds, run as row panels that each
+// fit (native_abi.h, abi_csr_row_panels). Each panel is validated as an ordinary call is, and its
+// kernel writes its rows straight into the product's one output (ScorchPanelCall). Out of line,
+// so the ordinary binding it is called from is unchanged.
+template <typename scalar_t>
+__attribute__((noinline)) Tensor spmm_csr_v2_panelled(
+    const char* op, const std::vector<int64_t>& result_shape, const std::vector<int64_t>& A_shape,
+    const std::vector<std::vector<torch::Tensor>>& A_mode_indices, const torch::Tensor& A_values,
+    const std::vector<int64_t>& B_shape, std::vector<std::vector<torch::Tensor>> B_mode_indices,
+    const torch::Tensor& B_values, int tile_size, int nthreads_override, bool atparallel) {
+  constexpr bool single = std::is_same<scalar_t, float>::value;
+  auto run = [&](const std::vector<int64_t>& panel_shape, const std::vector<int64_t>& panel_a_shape,
+                 std::vector<std::vector<torch::Tensor>> panel_levels,
+                 const torch::Tensor& panel_values, torch::Tensor& into) {
+    scorch_native::validate_binary_inputs(
+        op, scorch_native::BinaryContract::CsrDenseMatmul,
+        single ? torch::kFloat32 : torch::kFloat64, panel_shape, panel_a_shape, panel_levels,
+        panel_values, B_shape, B_mode_indices, B_values);
+    const int tile = scorch_native::validate_tile_size(tile_size, op, "tile_size", B_shape[1]);
+    scorch_native::validate_thread_override(nthreads_override, op);
+    const std::vector<int> c = scorch_native::narrow_legacy_shape(panel_shape, op, "result_shape");
+    const std::vector<int> a = scorch_native::narrow_legacy_shape(panel_a_shape, op, "A_shape");
+    const std::vector<int> b = scorch_native::narrow_legacy_shape(B_shape, op, "B_shape");
+    const int* pos = panel_levels[1][0].data_ptr<int>();
+    const int* crd = panel_levels[1][1].data_ptr<int>();
+    if constexpr (single)
+      spmm_csr_float_v2_panel_core(c[0], c[1], a[0], pos, crd, panel_values.data_ptr<float>(),
+                                   b[1], B_values.data_ptr<float>(), tile, nthreads_override,
+                                   atparallel, into.data_ptr<float>());
+    else
+      spmm_csr_double_v2_panel_core(c[0], c[1], a[0], pos, crd, panel_values.data_ptr<double>(),
+                                    b[1], B_values.data_ptr<double>(), tile, nthreads_override,
+                                    atparallel, into.data_ptr<double>());
+  };
+  Tensor C;
+  C.storage.index.mode_indices = {{}, {}};
+  C.storage.value = scorch_native::abi_csr_row_panels(op, result_shape, A_shape, A_mode_indices,
+                                                      A_values, run);
+  return C;
+}
+
 using BinaryKernelFn = Tensor (*)(std::vector<int>, std::vector<int>,
                                   std::vector<std::vector<torch::Tensor>>,
                                   torch::Tensor, std::vector<int>,
@@ -282,6 +323,12 @@ void bind_experimental_spmm_variants(py::module_& m) {
            torch::Tensor B_values, int tile_size, int nthreads_override,
            bool atparallel) {
           constexpr const char* op = "spmm_csr_float_v2";
+          // More nonzeros than an int32 offset holds: run as row panels that each fit
+          // (native_abi.h, abi_csr_row_panels).
+          if (scorch_native::abi_csr_needs_row_panels(A_mode_indices))
+            return spmm_csr_v2_panelled<float>(op, result_shape, A_shape, A_mode_indices,
+                                              A_values, B_shape, B_mode_indices, B_values,
+                                              tile_size, nthreads_override, atparallel);
           scorch_native::validate_binary_inputs(
               op, scorch_native::BinaryContract::CsrDenseMatmul,
               torch::kFloat32, result_shape, A_shape, A_mode_indices, A_values,
@@ -316,6 +363,12 @@ void bind_experimental_spmm_variants(py::module_& m) {
            torch::Tensor B_values, int tile_size, int nthreads_override,
            bool atparallel) {
           constexpr const char* op = "spmm_csr_double_v2";
+          // More nonzeros than an int32 offset holds: run as row panels that each fit
+          // (native_abi.h, abi_csr_row_panels).
+          if (scorch_native::abi_csr_needs_row_panels(A_mode_indices))
+            return spmm_csr_v2_panelled<double>(op, result_shape, A_shape, A_mode_indices,
+                                              A_values, B_shape, B_mode_indices, B_values,
+                                              tile_size, nthreads_override, atparallel);
           scorch_native::validate_binary_inputs(
               op, scorch_native::BinaryContract::CsrDenseMatmul,
               torch::kFloat64, result_shape, A_shape, A_mode_indices, A_values,
@@ -624,6 +677,22 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           "Entries across both ABI validation memos (dead ones until the next sweep)");
     m.def("abi_narrow_held", &scorch_native::abi_narrow_held,
           "(entries, bytes) the narrowing memo holds, its arrays live or not. For tests");
+    // CSR operands past the int32 offset bound run as row panels (native_abi.h). The bound is
+    // INT32_MAX; tests lower it so the panelled path runs on matrices they can build.
+    m.def("abi_csr_panel_limit",
+          [](int64_t limit) {
+            const int64_t old = scorch_native::abi_csr_panel_limit();
+            if (limit > 0)
+              scorch_native::abi_csr_panel_limit() =
+                  std::min<int64_t>(limit, std::numeric_limits<int32_t>::max());
+            return old;
+          },
+          py::arg("limit") = -1,
+          "The largest nonzero count a CSR operand may pass to an int32 kernel whole; with "
+          "limit > 0 (at most INT32_MAX), sets it and returns the previous one. For tests");
+    m.def("abi_csr_panelled_calls",
+          [] { return scorch_native::abi_csr_panelled_calls().load(); },
+          "Calls run as row panels since the module loaded. For tests");
 
     // Write witnesses (native_abi.h). The capsule is how a JIT-compiled kernel module, which
     // carries its own memo, reads the epochs this module keeps; the functions are what Python's

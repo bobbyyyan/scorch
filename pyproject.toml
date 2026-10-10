@@ -36,7 +36,11 @@ include-package-data = false
 
 [[tool.setuptools.ext-modules]]
 name = "scorch_ops"
-sources = ["src/scorch/csrc/ops.cpp", "src/scorch/csrc/spmm_gathered.cpp"]
+sources = [
+    "src/scorch/csrc/ops.cpp",
+    "src/scorch/csrc/spmm_gathered.cpp",
+    "src/scorch/csrc/spmm_panelled.cpp",
+]
 depends = [
     "src/scorch/csrc/header.h",
     "src/scorch/csrc/kernels.h",

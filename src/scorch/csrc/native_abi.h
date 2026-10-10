@@ -948,7 +948,35 @@ inline void abi_struct_store(AbiStructEntry entry) {
   map.insert_or_assign(key, std::move(entry));
 }
 
-// Drops every cached verdict and every narrowed copy held by THIS module. The maps
+// A panel's positions, rebased to start at 0, made once per panel and array version: the
+// validator's verdict and the narrowing of these positions are memoized on the identity of the
+// array they are handed, so a fresh array every call would rescan every panel's coordinates on
+// every call. Kept apart from the narrowing memo, which also maps an array's address to a
+// derived array: a view starting at the same interior element would otherwise be served the
+// rebased copy where it asked for a plain one.
+struct AbiPanelPositions {
+  AbiArrayId source;  // the slice pos[r0..r1] of the caller's array
+  int64_t base = 0;   // pos[r0]
+  torch::Tensor rebased;
+
+  bool live() const { return !source.alive.expired(); }
+};
+
+inline int64_t abi_entry_bytes(const AbiPanelPositions& e) {
+  return e.rebased.defined() ? (int64_t)e.rebased.nbytes() : 0;
+}
+
+inline std::unordered_map<const void*, AbiPanelPositions>& abi_panel_positions_map() {
+  static std::unordered_map<const void*, AbiPanelPositions> m;
+  return m;
+}
+
+inline AbiMemoSweep& abi_panel_positions_sweep() {
+  static AbiMemoSweep s;
+  return s;
+}
+
+// Drops every cached verdict, narrowed copy and rebased panel held by THIS module. The maps
 // are inline function-local statics and Python dlopens extension modules with
 // RTLD_LOCAL, so the prebuilt extension and each JIT-compiled kernel carry their own.
 // Every module amortizes over its own calls, which is all that is needed; the cost is
@@ -958,8 +986,10 @@ inline void abi_memo_clear() {
   std::lock_guard<std::mutex> guard(abi_memo_mutex());
   abi_narrow_map().clear();
   abi_struct_map().clear();
+  abi_panel_positions_map().clear();
   abi_narrow_sweep() = AbiMemoSweep{};
   abi_struct_sweep() = AbiMemoSweep{};
+  abi_panel_positions_sweep() = AbiMemoSweep{};
 }
 
 // A construction-time screen (storage.py) consulted through the same verdicts as the
@@ -988,6 +1018,130 @@ inline std::pair<int64_t, int64_t> abi_narrow_held() {
   int64_t bytes = 0;
   for (const auto& kv : abi_narrow_map()) bytes += abi_entry_bytes(kv.second);
   return {(int64_t)abi_narrow_map().size(), bytes};
+}
+
+// ---------------------------------------------------------------------------------------------
+// CSR operands whose offsets exceed int32.
+//
+// Every native kernel takes int32 offsets, so a CSR operand with more than INT32_MAX nonzeros
+// was refused at this boundary ("positions element ... cannot be represented as int32") while
+// torch.sparse.mm computed it. Six SuiteSparse matrices are that large: com-Friendster,
+// GAP-kron, GAP-urand, mycielskian20, MOLIERE_2016 and AGATHA_2015. Such an operand is a
+// sequence of row panels whose own offsets fit: panel [r0, r1) has the positions
+// pos[r0..r1] - pos[r0] and the coordinates and values in [pos[r0], pos[r1]). Each panel goes
+// through the ordinary validation and kernel, and its rows are copied into the output. Only the
+// offsets need this: columns are an int32 extent, so the coordinates narrow as they always have.
+//
+// The bound is INT32_MAX. abi_csr_panel_limit lets the tests lower it, so the panelled path runs
+// on matrices small enough to build; with it at INT32_MAX no operand an int32 kernel could take
+// is ever split.
+inline int64_t& abi_csr_panel_limit() {
+  static int64_t limit = std::numeric_limits<int32_t>::max();
+  return limit;
+}
+
+// Calls that ran in panels, for tests that must show the panelled path is the one they ran.
+inline std::atomic<int64_t>& abi_csr_panelled_calls() {
+  static std::atomic<int64_t> n{0};
+  return n;
+}
+
+// Whether this CSR operand's last offset -- its nonzero count -- is past the bound. One load,
+// taken before validation: anything this cannot read (a malformed level list, a non-CPU or
+// non-integer array) answers false and is left to the validator to refuse as before.
+inline bool abi_csr_needs_row_panels(const std::vector<std::vector<torch::Tensor>>& levels) {
+  if (levels.size() != 2 || levels[1].size() != 2) return false;
+  const torch::Tensor& pos = levels[1][0];
+  if (!pos.defined() || pos.dim() != 1 || pos.numel() < 1 || !pos.device().is_cpu() ||
+      pos.layout() != c10::kStrided)
+    return false;
+  const int64_t at = (pos.numel() - 1) * pos.stride(0);
+  int64_t last;
+  if (pos.scalar_type() == torch::kInt64) last = pos.data_ptr<int64_t>()[at];
+  else if (pos.scalar_type() == torch::kInt32) last = pos.data_ptr<int32_t>()[at];
+  else return false;
+  return last > abi_csr_panel_limit();
+}
+
+inline torch::Tensor abi_panel_positions(const torch::Tensor& slice, int64_t base) {
+  const AbiArrayId want = abi_identify(slice);
+  {
+    std::lock_guard<std::mutex> guard(abi_memo_mutex());
+    auto& map = abi_panel_positions_map();
+    auto it = map.find(want.data);
+    if (it != map.end() && it->second.live() && it->second.base == base &&
+        abi_same_array(it->second.source, want))
+      return it->second.rebased;
+  }
+  torch::Tensor rebased = slice - base;  // same dtype; the validator range-checks it
+  if (!abi_memo_enabled()) return rebased;
+  std::lock_guard<std::mutex> guard(abi_memo_mutex());
+  auto& map = abi_panel_positions_map();
+  abi_bound_map(map, abi_panel_positions_sweep(), (int64_t)rebased.nbytes());
+  AbiPanelPositions entry;
+  entry.source = want;
+  entry.base = base;
+  entry.rebased = rebased;
+  map.insert_or_assign(want.data, std::move(entry));
+  return rebased;
+}
+
+// Runs `run(result_shape, a_shape, a_levels, a_values, into)` -- the ordinary validation and
+// kernel of a CSR x dense product, writing the product's rows into `into` -- on each row panel of
+// A, and returns the output's flat values, which the panels fill in place. The checks here are the
+// ones a panel's own validation cannot see: that the panels tile A (positions length, first and
+// last offset, nondecreasing at every cut). Everything inside a panel is the validator's.
+template <typename Run>
+inline torch::Tensor abi_csr_row_panels(const char* op, const std::vector<int64_t>& result_shape,
+                                        const std::vector<int64_t>& a_shape,
+                                        const std::vector<std::vector<torch::Tensor>>& a_levels,
+                                        const torch::Tensor& a_values, Run&& run) {
+  TORCH_CHECK(a_shape.size() == 2 && result_shape.size() == 2, op,
+              ": A run as row panels: A and the result must be 2-D");
+  const torch::Tensor& raw_pos = a_levels[1][0];
+  const torch::Tensor& crd = a_levels[1][1];
+  TORCH_CHECK(raw_pos.scalar_type() == crd.scalar_type(), op,
+              ": A run as row panels: positions and coordinates must use one common index dtype");
+  const int64_t rows = a_shape[0], k = result_shape[1];
+  TORCH_CHECK(raw_pos.numel() == rows + 1, op, ": A run as row panels: positions length must be rows + 1 (",
+              rows + 1, "), got ", raw_pos.numel());
+  const torch::Tensor pos = raw_pos.contiguous();
+  const bool wide = pos.scalar_type() == torch::kInt64;
+  const int64_t* p64 = wide ? pos.data_ptr<int64_t>() : nullptr;
+  const int32_t* p32 = wide ? nullptr : pos.data_ptr<int32_t>();
+  auto P = [&](int64_t i) -> int64_t { return wide ? p64[i] : (int64_t)p32[i]; };
+  const int64_t nnz = P(rows);
+  TORCH_CHECK(P(0) == 0, op, ": A run as row panels: positions[0] must be 0, got ", P(0));
+  TORCH_CHECK(crd.numel() == nnz && a_values.numel() == nnz, op,
+              ": A run as row panels: terminal position must equal the coordinate and value counts (", nnz,
+              " vs ", crd.numel(), " and ", a_values.numel(), ")");
+
+  const int64_t limit = abi_csr_panel_limit();
+  torch::Tensor out = torch::empty({rows * k}, a_values.options());
+  for (int64_t r0 = 0; r0 < rows;) {
+    // The last row whose offset is within `limit` of this panel's first. Binary search assumes
+    // nondecreasing positions; where they are not, the cut below or the panel's validator says
+    // so, and a cut always advances by at least one row.
+    const int64_t base = P(r0);
+    int64_t lo = r0 + 1, hi = rows;
+    while (lo < hi) {
+      const int64_t mid = lo + (hi - lo + 1) / 2;
+      if (P(mid) - base <= limit) lo = mid;
+      else hi = mid - 1;
+    }
+    const int64_t r1 = lo, end = P(r1);
+    TORCH_CHECK(end >= base, op, ": A run as row panels: positions must be nondecreasing; positions[", r1,
+                "] = ", end, " < positions[", r0, "] = ", base);
+    std::vector<std::vector<torch::Tensor>> levels{
+        {}, {abi_panel_positions(pos.narrow(0, r0, r1 - r0 + 1), base),
+             crd.narrow(0, base, end - base)}};
+    torch::Tensor into = out.narrow(0, r0 * k, (r1 - r0) * k);
+    run(std::vector<int64_t>{r1 - r0, result_shape[1]}, std::vector<int64_t>{r1 - r0, a_shape[1]},
+        std::move(levels), a_values.narrow(0, base, end - base), into);
+    r0 = r1;
+  }
+  abi_csr_panelled_calls().fetch_add(1, std::memory_order_relaxed);
+  return out;
 }
 
 }  // namespace scorch_native

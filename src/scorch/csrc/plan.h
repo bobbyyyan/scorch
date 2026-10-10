@@ -612,6 +612,10 @@ inline c10::optional<SpmmCsrPlan> make_spmm_csr_plan(
   if (a_mode_indices.size() != 2 || a_mode_indices[1].size() != 2) {
     return c10::nullopt;
   }
+  // An operand past the int32 offset bound runs as row panels at the kernel boundary
+  // (native_abi.h, abi_csr_row_panels); a plan runs the kernel on the whole operand, so it has
+  // none. Declined before validation, which would scan the positions only to refuse them.
+  if (abi_csr_needs_row_panels(a_mode_indices)) return c10::nullopt;
   if (panel_free < 0 || panel_contraction < 0) return c10::nullopt;
   if (!spmm_plan_fits_int32(panel_free) ||
       !spmm_plan_fits_int32(panel_contraction)) {

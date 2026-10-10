@@ -348,6 +348,7 @@ _DEG_FLOOR = float(os.environ.get("SCORCH_TILING_DEG_FLOOR", "64"))
 _NIJK_MIN = int(os.environ.get("SCORCH_TILING_NIJK_MIN", "512"))
 
 _HAS_TILEJ = hasattr(_ops, "spmm_csr_float_tilej")
+_INT32_MAX = 2**31 - 1
 _HAS_TILEIJK = hasattr(_ops, "spmm_csr_float_tileijk")
 
 # memo: signature -> ("v2", None) | ("tilej", Jc) | ("tileijk", (Nc, Jc))
@@ -1502,6 +1503,10 @@ def maybe_dispatch(
     M = int(a.shape[0])
     idx = a._native_mode_indices()
     nnz = int(idx[1][1].numel())
+    if nnz > _INT32_MAX:
+        # The tiled kernels take int32 offsets whole. v2 runs an operand past that bound as row
+        # panels (native_abi.h, abi_csr_row_panels); these kernels have no such form.
+        return None
     C = query_llc()
     # learned uses the WIDENED gate (operand>C only) iff opted-in AND a model is loaded;
     # by default it uses the analytic gate + the _scattered pre-gate below (so
