@@ -18,6 +18,7 @@
 #include <memory>
 #include <mutex>
 #include <string>
+#include <type_traits>
 #include <unordered_map>
 #include <utility>
 #include <vector>
@@ -205,21 +206,34 @@ inline bool abi_screen_spans(const int32_t* pos, int64_t count, int64_t nnz) {
 // one observation: a DESCENT at position p (crd[p-1] > crd[p]) is legal exactly when p
 // is the first position of a span. So count every descent flat, count the descents
 // that sit on a span boundary (O(parent_count)), and compare.
-template <typename T>
+//
+// Given `pos_out` and `crd_out` (N narrower than T), the same pass also writes each
+// position and coordinate converted to N, so arrays seen for the first time are read once
+// rather than once to check and once to convert (abi_narrow_csr_first_sight). The copies
+// are exact when the screen is clean -- every position then lies in [0, nnz] and every
+// coordinate in [0, limit), and callers check both bounds fit N -- and meaningless when not.
+template <typename T, typename N = T>
 inline bool abi_screen_compressed_typed(
     const T* pos, const T* crd, int64_t parent_count, int64_t nnz, int64_t limit,
-    bool require_sorted, int64_t grain = SCORCH_ABI_VALIDATE_GRAIN) {
+    bool require_sorted, int64_t grain = SCORCH_ABI_VALIDATE_GRAIN,
+    N* pos_out = nullptr, N* crd_out = nullptr) {
+  constexpr bool kCopy = !std::is_same<T, N>::value;
   int bad = 0;
   const T nnz32 = (T)nnz;  // callers check nnz fits the index width first
+  if constexpr (kCopy) {
+    if (parent_count >= 0) pos_out[0] = (N)pos[0];
+  }
   for (int64_t parent = 0; parent < parent_count; ++parent) {
     const T start = pos[parent], end = pos[parent + 1];
     bad |= (start < 0) | (end < start) | (end > nnz32);
+    if constexpr (kCopy) pos_out[parent + 1] = (N)end;
   }
   if (bad || nnz <= 0) return bad != 0;
 
   const T lim = abi_limit_clamp<T>(limit);
   const T c0 = crd[0];
   bad |= (c0 < 0) | (c0 >= lim);
+  if constexpr (kCopy) crd_out[0] = (N)c0;
   if (!require_sorted) {
     bad |= at::parallel_reduce(
         (int64_t)1, nnz, abi_split(nnz - 1, grain), 0,
@@ -227,6 +241,7 @@ inline bool abi_screen_compressed_typed(
           for (int64_t p = begin; p < end; ++p) {
             const T c = crd[p];
             partial |= (c < 0) | (c >= lim);
+            if constexpr (kCopy) crd_out[p] = (N)c;
           }
           return partial;
         },
@@ -248,6 +263,7 @@ inline bool abi_screen_compressed_typed(
           const T c = crd[p];
           local_bad |= (c < 0) | (c >= lim);
           descents += (crd[p - 1] > c);
+          if constexpr (kCopy) crd_out[p] = (N)c;
         }
         return local_bad ? OUT_OF_BOUNDS : partial + descents;
       },
@@ -1463,6 +1479,68 @@ inline DenseInputView checked_dense_view(
   return DenseInputView(logical_shape, values);
 }
 
+// The int32 copies the native kernels read, made for int64 index arrays seen for the first time
+// in the pass that checks their structure (abi_screen_compressed_typed), in place of a range
+// pass and a copy for each array (checked_index_tensor) followed by a structural scan of the
+// copies. A clean pass leaves what those would have left -- each copy in the narrowing memo, the
+// verdict for the copies in the structural memo -- and the verdict for the int64 arrays, so the
+// checks that follow find all three and do no further work. A pair whose structure is already
+// known (the construction-time screen, storage.py, records it under the same parameters) is
+// only copied. Anything else -- either array already narrowed, a precondition of those checks
+// unmet, a pass that is not clean -- leaves the memos as they were, and the checks run as they
+// always have and report what they always have.
+inline void abi_narrow_csr_first_sight(const torch::Tensor& positions,
+                                       const torch::Tensor& coordinates,
+                                       const torch::Tensor& values, int64_t rows,
+                                       int64_t cols, bool require_sorted) {
+  if (!abi_memo_enabled()) return;
+  const auto plain = [](const torch::Tensor& t) {
+    return t.defined() && t.device().is_cpu() && t.layout() == torch::kStrided &&
+           t.dim() == 1 && t.is_contiguous() && !t.is_neg() && !t.is_conj() &&
+           t.scalar_type() == torch::kInt64;
+  };
+  if (!plain(positions) || !plain(coordinates) || !values.defined()) return;
+  const int64_t nnz = values.numel();
+  constexpr int64_t kMax = std::numeric_limits<int32_t>::max();
+  if (rows < 0 || cols < 0 || cols > kMax || nnz > kMax) return;
+  if (positions.numel() != rows + 1 || coordinates.numel() != nnz) return;
+  const int64_t* pos = positions.data_ptr<int64_t>();
+  const int64_t* crd = coordinates.data_ptr<int64_t>();
+  if (pos[0] != 0 || pos[rows] != nnz) return;
+
+  AbiArrayId pos_id = abi_identify(positions);
+  AbiArrayId crd_id = abi_identify(coordinates);
+  torch::Tensor narrowed;
+  if (abi_narrow_lookup(pos_id, narrowed) || abi_narrow_lookup(crd_id, narrowed)) return;
+
+  const std::vector<int64_t> params = {AbiCheckCompressed, rows, cols, nnz,
+                                       require_sorted ? 1 : 0};
+  AbiStructEntry source;
+  source.add(coordinates);
+  source.add(positions);
+  source.params = params;
+  torch::Tensor pos32 = torch::empty({rows + 1}, positions.options().dtype(torch::kInt32));
+  torch::Tensor crd32 = torch::empty({nnz}, coordinates.options().dtype(torch::kInt32));
+  if (abi_struct_hit(source)) {
+    pos32.copy_(positions);
+    crd32.copy_(coordinates);
+  } else {
+    // At the grain of ATen's own copy, which this pass replaces: it writes every element.
+    if (abi_screen_compressed_typed<int64_t, int32_t>(
+            pos, crd, rows, nnz, cols, require_sorted, at::internal::GRAIN_SIZE,
+            pos32.data_ptr<int32_t>(), crd32.data_ptr<int32_t>()))
+      return;
+    abi_struct_store(std::move(source));
+  }
+  AbiStructEntry copies;
+  copies.add(crd32);
+  copies.add(pos32);
+  copies.params = params;
+  abi_narrow_store(std::move(pos_id), pos32);
+  abi_narrow_store(std::move(crd_id), crd32);
+  abi_struct_store(std::move(copies));
+}
+
 template <typename Dim>
 inline CsrInputView checked_csr_view(
     const std::vector<Dim>& shape,
@@ -1480,6 +1558,8 @@ inline CsrInputView checked_csr_view(
 
   const auto raw_positions = mode_indices[1][0];
   const auto raw_coordinates = mode_indices[1][1];
+  abi_narrow_csr_first_sight(raw_positions, raw_coordinates, values, logical_shape[0],
+                             logical_shape[1], require_sorted);
   mode_indices[1][0] = checked_index_tensor(
       raw_positions, op, std::string(argument) + " positions");
   mode_indices[1][1] = checked_index_tensor(
