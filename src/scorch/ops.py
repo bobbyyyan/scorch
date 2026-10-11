@@ -1726,7 +1726,7 @@ def sparse_attention(
 
 def sparse_linear_fm(
     x_fm: Union[torch.Tensor, STensor],
-    weight: STensor,
+    weight: Union[STensor, torch.Tensor],
     bias: Optional[torch.Tensor] = None,
     activation: Optional[str] = None,
 ) -> torch.Tensor:
@@ -1744,8 +1744,11 @@ def sparse_linear_fm(
         Dense activation ``[in, batch]`` in FEATURE-MAJOR (row = input feature)
         layout. The output of a previous ``sparse_linear_fm`` (already
         ``[out, batch]``) feeds straight in.
-    weight : STensor
+    weight : STensor or torch.Tensor
         Sparse CSR weight ``[out, in]`` (as in ``F.linear``: ``y = x @ weight.T``).
+        A torch tensor -- dense or CSR -- is converted to a CSR STensor first,
+        exactly as :func:`sparse_linear` converts it; build the STensor once to
+        keep the conversion out of a per-layer call.
     bias : torch.Tensor, optional
         Dense ``[out]`` bias, added per output channel.
     activation : str, optional
@@ -1779,6 +1782,8 @@ def sparse_linear_fm(
     """
     import scorch_ops as _native
 
+    if isinstance(weight, torch.Tensor) and not isinstance(weight, STensor):
+        weight = STensor.from_csr(weight.to_sparse_csr(), "weight")
     act = _ACT_CODES.get(activation, None)
     if act is None:
         raise ValueError(f"unsupported activation {activation!r}")
@@ -1909,8 +1914,6 @@ def sparse_linear(
     >>> torch.allclose(y, torch.relu(x @ W_dense.T + b), atol=1e-3, rtol=1e-3)
     True
     """
-    if isinstance(weight, torch.Tensor) and not isinstance(weight, STensor):
-        weight = STensor.from_csr(weight.to_sparse_csr(), "weight")
     x_fm = fast_transpose(x)
     y_fm = sparse_linear_fm(x_fm, weight, bias, activation)
     return y_fm.T
