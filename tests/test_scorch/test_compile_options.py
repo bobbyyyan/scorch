@@ -1159,13 +1159,15 @@ def test_build_boundary_uses_snapshotted_compiler_without_parent_environment_mut
         *,
         input: bytes,
         env: dict[str, str],
+        stderr: int,
         check: bool,
-    ) -> object:
+    ) -> subprocess.CompletedProcess[bytes]:
         request = pickle.loads(input)
         assert type(request) is utils._JITBuildRequest
         assert command[0] == request.build_options.python_executable
         assert command[1] == "-P"
-        assert check
+        assert stderr == subprocess.PIPE
+        assert not check
         assert env["PYTHONPATH"] == request.build_options.scorch_python_path
         if (
             request.build_options.compiler_wrapper_policy
@@ -1190,7 +1192,7 @@ def test_build_boundary_uses_snapshotted_compiler_without_parent_environment_mut
         output = Path(request.build_directory) / f"{request.name}.so"
         output.parent.mkdir(parents=True, exist_ok=True)
         output.touch()
-        return object()
+        return subprocess.CompletedProcess(command, 0, None, b"")
 
     monkeypatch.setattr(utils.subprocess, "run", fake_run)
     monkeypatch.setattr(utils, "_load_extension_file", lambda name, path: path)

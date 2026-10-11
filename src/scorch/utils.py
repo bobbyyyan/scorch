@@ -1,5 +1,6 @@
 import hashlib
 import importlib.util
+import json
 import math
 import os
 import pickle
@@ -259,20 +260,67 @@ def _verify_snapshotted_build_runtime(request: _JITBuildRequest) -> None:
         )
 
 
+# The build child writes this line, then a JSON object naming the exception that
+# stopped its build, as the last thing on its stderr.
+_JIT_BUILD_ERROR_MARKER = "@@scorch-jit-build-error@@\n"
+# Exception types the parent re-raises as themselves; any other becomes a
+# RuntimeError with the same message.
+_JIT_BUILD_CHILD_ERRORS = {
+    error_type.__name__: error_type
+    for error_type in (RuntimeError, ImportError, OSError, ValueError, TypeError)
+}
+
+
 def _run_jit_build_request() -> None:
-    """Child-process entry point; build without mutating the parent environment."""
+    """Child-process entry point; build without mutating the parent environment.
+
+    The exception that stops a build -- ``load_inline``'s ``RuntimeError``,
+    whose message carries the compiler log, or a runtime-snapshot mismatch --
+    is reported after ``_JIT_BUILD_ERROR_MARKER`` on stderr, so the parent
+    raises the type and message an in-process ``load_inline`` would.
+    """
 
     from torch.utils.cpp_extension import load_inline
 
     request = _validate_jit_build_request(pickle.load(sys.stdin.buffer))
-    _verify_snapshotted_build_runtime(request)
-    load_inline(
-        name=request.name,
-        cpp_sources=list(request.cpp_sources),
-        functions=list(request.functions),
-        extra_cflags=list(request.extra_cflags),
-        extra_ldflags=list(request.extra_ldflags),
-        build_directory=request.build_directory,
+    try:
+        _verify_snapshotted_build_runtime(request)
+        load_inline(
+            name=request.name,
+            cpp_sources=list(request.cpp_sources),
+            functions=list(request.functions),
+            extra_cflags=list(request.extra_cflags),
+            extra_ldflags=list(request.extra_ldflags),
+            build_directory=request.build_directory,
+        )
+    except Exception as error:
+        sys.stderr.write(
+            _JIT_BUILD_ERROR_MARKER
+            + json.dumps({"type": type(error).__name__, "message": str(error)})
+        )
+        sys.stderr.flush()
+        raise SystemExit(1)
+
+
+def _raise_for_jit_build_child(
+    name: str, completed: "subprocess.CompletedProcess[bytes]"
+) -> None:
+    """Forward the build child's stderr and re-raise the error that stopped it."""
+
+    stderr = (completed.stderr or b"").decode("utf-8", errors="replace")
+    log, marker, payload = stderr.partition(_JIT_BUILD_ERROR_MARKER)
+    if log:
+        sys.stderr.write(log)
+        sys.stderr.flush()
+    if completed.returncode == 0 and not marker:
+        return
+    if marker:
+        error = json.loads(payload)
+        error_type = _JIT_BUILD_CHILD_ERRORS.get(error["type"], RuntimeError)
+        raise error_type(error["message"])
+    raise RuntimeError(
+        f"JIT build child for {name!r} exited with status "
+        f"{completed.returncode} before reporting an error:\n{log}"
     )
 
 
@@ -327,7 +375,7 @@ def _build_and_load_extension(request: _JITBuildRequest) -> Any:
     toolchain_directory = _prepare_compiler_toolchain(request)
     so_path = os.path.join(request.build_directory, f"{request.name}.so")
     if not os.path.isfile(so_path):
-        subprocess.run(
+        completed = subprocess.run(
             [
                 request.build_options.python_executable,
                 "-P",
@@ -340,8 +388,10 @@ def _build_and_load_extension(request: _JITBuildRequest) -> Any:
                 request,
                 toolchain_directory=toolchain_directory,
             ),
-            check=True,
+            stderr=subprocess.PIPE,
+            check=False,
         )
+        _raise_for_jit_build_child(request.name, completed)
     if not os.path.isfile(so_path):
         raise RuntimeError(f"JIT build did not produce expected extension {so_path}")
     return _load_extension_file(request.name, so_path)
