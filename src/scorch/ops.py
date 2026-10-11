@@ -68,6 +68,13 @@ from .stensor import (
     _wrap_generated_result,
     _compilation_context_at_boundary,
 )
+
+# Re-exported, not used here: compiler/loopir/pipeline.py imports this name from `ops`
+# at four sites, though it is defined in stensor.py. Dropping it because `ops` itself
+# has no caller is what broke 351 tests in the merge -- "unused in this file" and
+# "unused" are different claims for a module other modules import through. Kept on its
+# own line so the suppression covers this name only.
+from .stensor import _finalize_generated_mode_indices  # noqa: F401 - re-export
 from . import autograd as _autograd
 from .utils import (
     _PreparedJITBuild,

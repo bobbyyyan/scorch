@@ -632,13 +632,20 @@ def _normalize_level_formats(
     return tuple(result)
 
 
-# parse_format is a pure function and TensorFormat is a frozen value object, so equal
-# inputs can share one instance instead of building a new one. `matmul` alone parses a
-# format three times per call, always on the same constant strings. Bounded because
-# nothing stops a caller generating format strings in a loop; the real key space is a
-# handful of layouts.
-_PARSE_CACHE: dict = {}
-_PARSE_CACHE_MAX = 512
+# No parse memo here, deliberately. One was added on the performance line because
+# "`matmul` alone parses a format three times per call, always on the same constant
+# strings". That premise does not hold on this tree: measured on the merged dispatch,
+# a warm `matmul` constructs ZERO formats whether a memo is present or not, with or
+# without a `format=` kwarg, because the plan path and the compile-options policy hold
+# parsed formats upstream. The only path that still benefits is tensor construction,
+# where `from_torch(...).to_sparse("ds")` goes from 6.0 constructions to 5.1 -- about
+# 750 ns on a path that also walks every nonzero.
+#
+# Against that, sharing one instance is unsafe here in a way it was not there. A
+# retained format can be mutated through `object.__setattr__`, and `TensorVar` retains
+# what `parse_format` returns without rebuilding it through `owned_format`. With a
+# process-wide memo, one corrupted format becomes every later caller's format. That
+# cost 1300 test failures when the two sides were first combined.
 
 
 def parse_format(fmt: FormatInput) -> TensorFormat:
@@ -653,20 +660,7 @@ def parse_format(fmt: FormatInput) -> TensorFormat:
     try:
         if issubclass(type(fmt), TensorFormat):
             return cast(TensorFormat, fmt)
-        # A list of aliases is a legal input and is not hashable; tuple it for
-        # the key.  Sharing one parsed value between callers is safe because a
-        # retaining object rebuilds it through owned_format below.
-        key = tuple(fmt) if isinstance(fmt, list) else fmt
-        try:
-            cached = _PARSE_CACHE.get(key)
-        except TypeError:  # unhashable even as a key: parse it and do not cache
-            return TensorFormat(cast(Any, fmt))
-        if cached is not None:
-            return cached
-        parsed = TensorFormat(cast(Any, fmt))
-        if len(_PARSE_CACHE) < _PARSE_CACHE_MAX:
-            _PARSE_CACHE[key] = parsed
-        return parsed
+        return TensorFormat(cast(Any, fmt))
     except (TensorFormatError, TensorTypeError):
         raise
     except Exception as error:
