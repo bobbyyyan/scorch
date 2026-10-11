@@ -1,8 +1,9 @@
-import copy
 import os
 import sys
 import time
-from typing import Any, Dict, Union, Sequence, Optional, List, Tuple, cast
+from contextlib import contextmanager
+from dataclasses import dataclass
+from typing import Any, Dict, Iterator, List, Optional, Sequence, Tuple, Union, cast
 
 import scorch_ops as _scorch_ops
 import torch
@@ -10,6 +11,7 @@ from torch.fx import Proxy
 
 from .compiler import llir
 from .compiler.cin import (
+    IndexExpr,
     IndexVar,
     TensorVar,
     ForAll,
@@ -20,14 +22,24 @@ from .compiler.cin import (
     IndexStmt,
 )
 from .compiler.cin_lowerer import CINLowerer
+from .compiler.cin_analysis import (
+    _trusted_normalized_cin,
+    normalize_cin,
+    verify_cin_structure,
+)
+from .compiler.compile_options import CompileOptions
 from .compiler.codegen import LLIRLowerer
+from .compiler.diagnostics import CompileOptionsDiagnostic, CompileOptionsError
+from .compiler.loop_plan import ScheduledCIN
 from .compiler.scheduler import (
     Schedule,
     Scheduler,
-    _regblock_enabled,
-    _regblock_max_n,
     get_forced_schedule,
-    regblock_force,
+)
+from .compiler.compilation_context import (
+    CompilerStageId,
+    CompilerStageToken,
+    CompilationContext,
 )
 from .exceptions import CompileSpecError, TensorTypeError, TensorValidationError
 from .format import TensorFormat, LevelFormat, LevelType
@@ -51,38 +63,198 @@ from .tiling import shape_is_candidate as _tiling_shape_is_candidate
 from .tiling import decided as _tiling_decided
 from .tiling import _current_level as _tiling_current_level
 from .storage import _WRAP_GRAIN as _STORAGE_WRAP_GRAIN
-from .stensor import STensor, _wrap_generated_result
+from .stensor import (
+    STensor,
+    _wrap_generated_result,
+    _compilation_context_at_boundary,
+)
 from . import autograd as _autograd
 from .utils import (
+    _PreparedJITBuild,
     parse_format,
     topo_sort_characters,
-    get_extra_cflags,
-    get_extra_ldflags,
-    jit_preamble_text,
     _kernel_name,
-    _load_kernel,
+    _load_validated_prepared_kernel,
+    _prepare_jit_build,
 )
 
 _kernel_cache = {}
 _einsum_dispatch_cache = {}
 
 
-def _effective_schedule(kwargs: dict) -> Optional[Schedule]:
-    """Resolve an explicit or context-forced compiler schedule."""
+def _requested_schedule(kwargs: dict) -> Optional[Schedule]:
+    """Resolve only the explicit public/internal schedule spelling."""
+
     public = kwargs.get("schedule")
     internal = kwargs.get("_schedule")
     if public is not None and internal is not None and public != internal:
         raise ValueError("schedule and _schedule specify different schedules")
     schedule = public if public is not None else internal
-    if schedule is None:
-        schedule = get_forced_schedule()
     if schedule is not None and not isinstance(schedule, Schedule):
         raise TypeError("schedule must be a scorch.compiler.scheduler.Schedule")
     return schedule
 
 
+def _effective_schedule(kwargs: dict) -> Optional[Schedule]:
+    """Resolve an explicit or context-forced compiler schedule."""
+
+    schedule = _requested_schedule(kwargs)
+    return schedule if schedule is not None else get_forced_schedule()
+
+
+_UNRESOLVED_SCHEDULE = object()
+
+
+def _compile_options_from_kwargs(
+    kwargs: dict,
+    *,
+    resolved_schedule: object = _UNRESOLVED_SCHEDULE,
+) -> CompileOptions:
+    """Create or validate the one snapshot owned by a public compile call."""
+
+    provided = kwargs.get("_compile_options")
+    requested = _requested_schedule(kwargs)
+    if provided is not None:
+        if type(provided) is not CompileOptions:
+            raise TypeError("_compile_options must be a CompileOptions instance")
+        expected = (
+            requested
+            if resolved_schedule is _UNRESOLVED_SCHEDULE
+            else resolved_schedule
+        )
+        if expected is not None and provided.requested_schedule != expected:
+            raise CompileOptionsError(
+                (
+                    CompileOptionsDiagnostic(
+                        code="conflicting_schedule",
+                        field="requested_schedule",
+                        message=(
+                            "_compile_options and the requested schedule disagree"
+                        ),
+                    ),
+                )
+            )
+        return provided
+
+    if resolved_schedule is _UNRESOLVED_SCHEDULE:
+        return CompileOptions.from_environment(requested_schedule=requested)
+    return CompileOptions.from_environment(
+        requested_schedule=cast(Optional[Schedule], resolved_schedule),
+        forced_schedule=None,
+    )
+
+
+def _compilation_context_from_kwargs(
+    kwargs: dict,
+    compile_options: CompileOptions,
+) -> CompilationContext:
+    """Create or validate the one timing owner paired with the one snapshot."""
+
+    return _compilation_context_at_boundary(
+        kwargs.get("_compilation_context"), compile_options
+    )
+
+
+def _lower_generated_llir(
+    lowered_llir: Union[llir.Stmt, List[llir.Stmt]],
+    compile_options: CompileOptions,
+    compilation_context: CompilationContext,
+) -> str:
+    """Render final generated LLIR inside the canonical C++ stage."""
+
+    llir_lowerer = LLIRLowerer(compile_options=compile_options)
+    cpp_token = compilation_context.begin_stage(
+        CompilerStageId.LLIR_TO_CPP_GENERATION,
+        compile_options=compile_options,
+    )
+    try:
+        cpp_code = llir_lowerer.lower_llir(lowered_llir)
+    except Exception:
+        compilation_context.fail_stage(cpp_token)
+        raise
+    compilation_context.complete_stage(cpp_token)
+    return cpp_code
+
+
+def _prepare_generated_kernel_build(
+    header_cpp_code: str,
+    cpp_code: str,
+    compile_options: CompileOptions,
+    compilation_context: CompilationContext,
+) -> _PreparedJITBuild:
+    """Assemble and validate the generated kernel request before native work."""
+
+    kernel_name_token = compilation_context.begin_stage(
+        CompilerStageId.KERNEL_NAME_AND_BUILD_REQUEST_ASSEMBLY,
+        compile_options=compile_options,
+    )
+    try:
+        kernel_name = _kernel_name(
+            header_cpp_code,
+            cpp_code,
+            compile_options=compile_options,
+        )
+        prepared_build = _prepare_jit_build(
+            name=kernel_name,
+            cpp_sources=[header_cpp_code, cpp_code],
+            functions=["evaluate"],
+            extra_cflags=list(compile_options.build.extra_cflags),
+            extra_ldflags=list(compile_options.build.extra_ldflags),
+            compile_options=compile_options,
+        )
+    except Exception:
+        compilation_context.fail_stage(kernel_name_token)
+        raise
+    compilation_context.complete_stage(kernel_name_token)
+    return prepared_build
+
+
+def _matmul_compile_policy(
+    kwargs: dict,
+) -> Tuple[Optional[CompileOptions], Optional[Schedule]]:
+    """Resolve an existing snapshot or defer creation until compilation starts."""
+
+    if kwargs.get("_compile_options") is None:
+        return None, _effective_schedule(kwargs)
+    options = _compile_options_from_kwargs(kwargs)
+    return options, options.requested_schedule
+
+
+def _ensure_compile_options(
+    kwargs: dict,
+    effective_schedule: Optional[Schedule],
+    compile_options: Optional[CompileOptions],
+) -> CompileOptions:
+    """Create the one deferred matmul snapshot at its first compiler boundary."""
+
+    if compile_options is not None:
+        return compile_options
+    return _compile_options_from_kwargs(
+        kwargs,
+        resolved_schedule=effective_schedule,
+    )
+
+
 def _schedule_cache_key(schedule: Optional[Schedule]) -> Optional[str]:
     return schedule.cache_key if schedule is not None else None
+
+
+def _reject_unsupported_requested_schedule(
+    compile_options: CompileOptions,
+    boundary: str,
+) -> None:
+    """Fail closed when a compile entry cannot apply a requested schedule."""
+
+    if compile_options.requested_schedule is not None:
+        raise CompileOptionsError(
+            (
+                CompileOptionsDiagnostic(
+                    code="unsupported_requested_schedule",
+                    field="requested_schedule",
+                    message=f"{boundary} does not support explicit scheduling",
+                ),
+            )
+        )
 
 
 def _einsum_cache_key(
@@ -91,6 +263,7 @@ def _einsum_cache_key(
     output_format: Any,
     output_mode_order: Any,
     schedule: Optional[Schedule],
+    compile_options: Optional[CompileOptions] = None,
 ) -> tuple:
     """Build the early dispatch key, including every scheduling decision."""
 
@@ -135,15 +308,18 @@ def _einsum_cache_key(
         str(output_format) if output_format is not None else None,
         tuple(output_mode_order) if output_mode_order else None,
         _schedule_cache_key(schedule),
+        compile_options.cache_key if compile_options is not None else None,
     )
 
 
 def _codegen_kernel_cache_key(
-    cin: IndexStmt,
+    cin: Union[IndexStmt, ScheduledCIN],
     post_ops: Any,
     schedule: Optional[Schedule],
+    compile_options: Optional[CompileOptions] = None,
 ) -> str:
     """Cache a lowered CIN without allowing dtype/schedule fields to alias."""
+    normalized_cin = cin.normalized_cin if isinstance(cin, ScheduledCIN) else cin
     tensor_contracts = tuple(
         sorted(
             {
@@ -154,15 +330,17 @@ def _codegen_kernel_cache_key(
                     str(access.tensor.format),
                     tuple(access.tensor.mode_order or ()),
                 )
-                for access in cin.tensor_accesses
+                for access in normalized_cin.tensor_accesses
             }
         )
     )
-    key = str(cin) + f"|contracts:{tensor_contracts!r}"
+    key = str(normalized_cin) + f"|contracts:{tensor_contracts!r}"
     if post_ops:
         key += f"|post_ops:{post_ops}"
     if schedule is not None:
         key += f"|schedule:{schedule.cache_key}"
+    if compile_options is not None:
+        key += f"|compile_options:{compile_options.cache_fingerprint}"
     return key
 
 
@@ -252,14 +430,89 @@ def _logical_index_sizes(
     return index_to_size
 
 
+def _bind_frontend_operand_mode_orders(
+    input_index_strs: Sequence[Sequence[str]],
+    selected_loop_order_names: Sequence[str],
+    tensors: Sequence[Union[STensor, TensorSpec]],
+    tensor_vars: Sequence[TensorVar],
+) -> List[List[int]]:
+    """Bind final frontend layout metadata without executing runtime relayouts."""
+
+    desired_mode_orders: List[List[int]] = []
+    for tensor_index, input_index_str in enumerate(input_index_strs):
+        desired_index_strs = [
+            index_str
+            for index_str in selected_loop_order_names
+            if index_str in input_index_str
+        ]
+        desired_mode_order = [
+            input_index_str.index(index_str) for index_str in desired_index_strs
+        ]
+        desired_mode_orders.append(desired_mode_order)
+        tensor_vars[tensor_index].shape = tuple(
+            tensors[tensor_index].logical_shape[mode] for mode in desired_mode_order
+        )
+        if tensor_vars[tensor_index].mode_order != desired_mode_order:
+            tensor_vars[tensor_index].mode_order = desired_mode_order
+    return desired_mode_orders
+
+
+def _select_and_bind_einsum_operand_mode_orders(
+    cin_stmt: IndexStmt,
+    input_index_strs: Sequence[Sequence[str]],
+    tensors: Sequence[Union[STensor, TensorSpec]],
+    tensor_vars: Sequence[TensorVar],
+    effective_schedule: Optional[Schedule],
+    compile_options: CompileOptions,
+    compilation_context: CompilationContext,
+) -> List[List[int]]:
+    """Record the schedule-derived operand-alignment decision before relayout."""
+
+    prealignment_token = compilation_context.begin_stage(
+        CompilerStageId.SCHEDULING_AND_LOOP_PLAN_CONSTRUCTION,
+        compile_options=compile_options,
+    )
+    try:
+        if effective_schedule is not None and effective_schedule.loop_order is not None:
+            selected_loop_order = Scheduler.resolve_loop_order(
+                cin_stmt, effective_schedule.loop_order
+            )
+        else:
+            selected_loop_order = Scheduler.select_loop_order(
+                cin_stmt,
+                costs=compile_options.scheduler.cost_model,
+            )
+        selected_loop_order_names = [
+            index_var.name for index_var in selected_loop_order
+        ]
+        desired_mode_orders = _bind_frontend_operand_mode_orders(
+            input_index_strs,
+            selected_loop_order_names,
+            tensors,
+            tensor_vars,
+        )
+    except Exception:
+        compilation_context.fail_stage(prealignment_token)
+        raise
+    compilation_context.complete_stage(prealignment_token)
+    return desired_mode_orders
+
+
 def _with_compiler_mode_order(
-    tensor: Union[STensor, TensorSpec], mode_order: Sequence[int]
+    tensor: Union[STensor, TensorSpec],
+    mode_order: Sequence[int],
+    compile_options: CompileOptions,
+    compilation_context: Optional[CompilationContext] = None,
 ) -> Union[STensor, TensorSpec]:
     """Relayout a runtime tensor or functionally update a compile-only spec."""
     if isinstance(tensor, TensorSpec):
         return tensor.with_mode_order(mode_order)
     result = tensor.copy()
-    result.change_mode_order(list(mode_order))
+    result.change_mode_order(
+        list(mode_order),
+        _compile_options=compile_options,
+        _compilation_context=compilation_context,
+    )
     return result
 
 
@@ -371,55 +624,80 @@ def spmv(
     >>> torch.allclose(y, A.to_torch() @ x, atol=1e-3, rtol=1e-3)
     True
     """
-    if output_format is None:
-        output_format = parse_format("d")
-    elif not isinstance(output_format, TensorFormat):
-        output_format = parse_format(output_format)
-
-    result_shape = (a.shape[0],)
-    y = TensorVar("y", shape=result_shape, fmt=output_format, dtype=a.dtype)
-    A = TensorVar("A", shape=a.shape, fmt=a.format, dtype=a.dtype)
-    x = TensorVar("x", shape=b.shape, fmt=b.format, dtype=b.dtype)
-
-    i = IndexVar("i")
-    j = IndexVar("j")
-
-    workspace = Workspace(
-        name="wksp",
-        dim=0,
+    compile_options = _compile_options_from_kwargs(kwargs)
+    _reject_unsupported_requested_schedule(compile_options, "spmv")
+    compilation_context = _compilation_context_from_kwargs(kwargs, compile_options)
+    frontend_token = compilation_context.begin_stage(
+        CompilerStageId.FRONTEND_VALIDATED_OPERATION_CONSTRUCTION,
+        compile_options=compile_options,
     )
+    try:
+        if output_format is None:
+            output_format = parse_format("d")
+        elif not isinstance(output_format, TensorFormat):
+            output_format = parse_format(output_format)
 
-    cin_stmt = ForAll(
-        i,
-        Where(
-            producer=ForAll(
-                j,
-                TensorAssign(
-                    workspace.get_default_access(), A[i, j] * x[j], op=Operation.ADD
+        result_shape = (a.shape[0],)
+        y = TensorVar("y", shape=result_shape, fmt=output_format, dtype=a.dtype)
+        A = TensorVar("A", shape=a.shape, fmt=a.format, dtype=a.dtype)
+        x = TensorVar("x", shape=b.shape, fmt=b.format, dtype=b.dtype)
+
+        i = IndexVar("i")
+        j = IndexVar("j")
+
+        workspace = Workspace(
+            name="wksp",
+            dim=0,
+        )
+
+        cin_stmt: IndexStmt = ForAll(
+            i,
+            Where(
+                producer=ForAll(
+                    j,
+                    TensorAssign(
+                        workspace.get_default_access(),
+                        A[i, j] * x[j],
+                        op=Operation.ADD,
+                    ),
+                ),
+                consumer=TensorAssign(
+                    y[i],
+                    workspace.get_default_access(),
                 ),
             ),
-            consumer=TensorAssign(
-                y[i],
-                workspace.get_default_access(),
-            ),
-        ),
+        )
+    except Exception:
+        compilation_context.fail_stage(frontend_token)
+        raise
+
+    compilation_context.complete_stage(frontend_token)
+    cin_stmt = normalize_cin(
+        cin_stmt,
+        compile_options=compile_options,
+        compilation_context=compilation_context,
+    )
+    lowerer = CINLowerer(
+        compile_options=compile_options,
+        compilation_context=compilation_context,
+    )
+    lowered_llir = lowerer._lower_owned_IndexStmt(cin_stmt)
+    cpp_code = _lower_generated_llir(
+        lowered_llir,
+        compile_options,
+        compilation_context,
     )
 
-    lowerer = CINLowerer()
-    lowered_llir = lowerer.lower_IndexStmt(cin_stmt)
-    llir_lowerer = LLIRLowerer()
-    cpp_code = llir_lowerer.lower_llir(lowered_llir)
+    header_cpp_code = compile_options.build.preamble_source
 
-    header_cpp_code = jit_preamble_text()
-
+    prepared_build = _prepare_generated_kernel_build(
+        header_cpp_code,
+        cpp_code,
+        compile_options,
+        compilation_context,
+    )
     # start_time = time.time()
-    module = _load_kernel(
-        name=_kernel_name(header_cpp_code, cpp_code),
-        cpp_sources=[header_cpp_code, cpp_code],
-        functions=["evaluate"],
-        extra_cflags=get_extra_cflags(),
-        extra_ldflags=get_extra_ldflags(),
-    )
+    module = _load_validated_prepared_kernel(prepared_build)
     # end_time = time.time()
 
     # compile_time = end_time - start_time
@@ -441,167 +719,6 @@ def spmv(
         time_dict = kwargs["time_dict"]
         time_dict["eval_time"] = eval_time
     # m
-
-    result = _wrap_generated_result(
-        shape=result_shape,
-        tensor_format=output_format,
-        result_cpp=result_cpp,
-    )
-
-    return result
-
-
-def matmul_wksp(
-    a: Union[torch.Tensor, STensor],
-    b: Union[torch.Tensor, STensor],
-    output_format: Optional[Union[TensorFormat, str, List[str]]] = None,
-    **kwargs,
-) -> STensor:
-    """Workspace-based SpMM / SpGEMM through the CIN compiler.
-
-    Explicit workspace-lowering variant of :func:`matmul` that **always** goes
-    through the generic CIN compiler pipeline (never the prebuilt hand-written
-    kernels or the adaptive tiling selector). It builds a ``Where`` with an
-    accumulating ``Workspace`` — dense when the output format is dense (avoids the
-    COO hash-map overhead), otherwise COO-hashed — reducing over ``k`` then ``j``,
-    and JIT-compiles once per ``(a.format, b.format, output_format)`` (memoized on
-    the function attribute ``matmul_wksp._module_cache``).
-
-    Use this when you specifically want to exercise the workspace codegen path;
-    :func:`matmul` is the tuned entry point for everyday products.
-
-    Parameters
-    ----------
-    a, b : torch.Tensor or STensor
-        2-D operands. ``torch.Tensor`` inputs are **always** converted to sparse
-        via ``STensor.from_torch(...).to_sparse()`` (note the unconditional
-        ``.to_sparse()``).
-    output_format : TensorFormat or str or list of str, optional
-        Requested output format. Defaults to ``"ds"`` (CSR). Accepts anything
-        :func:`scorch.utils.parse_format` understands.
-    **kwargs
-        ``time_dict`` : dict, optional -- if given, ``time_dict["eval_time"]`` is
-        set to the kernel wall-clock time in seconds.
-
-    Returns
-    -------
-    STensor
-        Result of shape ``(a.shape[0], b.shape[1])`` in ``output_format``. Unlike
-        :func:`matmul`, a dense-format result is **not** converted back to a
-        ``torch.Tensor`` — an ``STensor`` is always returned.
-
-    See Also
-    --------
-    matmul : Tuned entry point (prebuilt kernels + tiling + thread policy).
-
-    Examples
-    --------
-    >>> import torch
-    >>> import scorch
-    >>> A = scorch.from_torch((torch.rand(64, 64) < 0.1).float(), "A").to_sparse("ds")
-    >>> B = scorch.from_torch((torch.rand(64, 64) < 0.1).float(), "B").to_sparse("ds")
-    >>> C = scorch.matmul_wksp(A, B, output_format="ds")   # STensor (CSR)
-    >>> torch.allclose(C.to_torch(), A.to_torch() @ B.to_torch(), atol=1e-3, rtol=1e-3)
-    True
-    """
-    if isinstance(a, torch.Tensor):
-        a = STensor.from_torch(a).to_sparse()
-    if isinstance(b, torch.Tensor):
-        b = STensor.from_torch(b).to_sparse()
-
-    if output_format is None:
-        output_format = parse_format("ds")
-    elif not isinstance(output_format, TensorFormat):
-        output_format = parse_format(output_format)
-
-    # ── Module cache: skip CIN→LLIR→codegen on repeat calls ──────────
-    result_shape = (a.shape[0], b.shape[1])
-    # The layouts are frozen value objects and this cache is a plain dict, so key on
-    # them directly; serializing each to JSON cost ~2.3 us per operand for nothing.
-    _cache_key = (
-        a.layout,
-        b.layout,
-        str(a.dtype),
-        str(b.dtype),
-        str(output_format),
-        result_shape,
-    )
-    if not hasattr(matmul_wksp, "_module_cache"):
-        matmul_wksp._module_cache = {}
-
-    module = matmul_wksp._module_cache.get(_cache_key)
-    if module is None:
-        C = TensorVar("C", shape=result_shape, fmt=output_format, dtype=a.dtype)
-        A = TensorVar("A", shape=a.shape, fmt=a.format, dtype=a.dtype)
-        B = TensorVar("B", shape=b.shape, fmt=b.format, dtype=b.dtype)
-
-        # Use a dense workspace when the output is dense (avoids COO hash-map overhead).
-        wksp_dense = output_format.is_dense()
-        workspace = Workspace(
-            name="wksp",
-            dim=1,
-            dense=wksp_dense,
-        )
-
-        i = IndexVar("i")
-        j = IndexVar("j")
-        k = IndexVar("k")
-
-        cin_stmt = ForAll(
-            i,
-            Where(
-                producer=ForAll(
-                    k,
-                    ForAll(
-                        j,
-                        TensorAssign(
-                            workspace[j],
-                            A[i, k] * B[k, j],
-                            op=Operation.ADD,
-                        ),
-                    ),
-                ),
-                consumer=ForAll(
-                    j,
-                    TensorAssign(
-                        C[i, j],
-                        workspace[j],
-                    ),
-                ),
-            ),
-        )
-
-        lowerer = CINLowerer()
-        lowered_llir = lowerer.lower_IndexStmt(cin_stmt)
-        llir_lowerer = LLIRLowerer()
-        cpp_code = llir_lowerer.lower_llir(lowered_llir)
-
-        header_cpp_code = jit_preamble_text()
-
-        module = _load_kernel(
-            name=_kernel_name(header_cpp_code, cpp_code),
-            cpp_sources=[header_cpp_code, cpp_code],
-            functions=["evaluate"],
-            extra_cflags=get_extra_cflags(),
-            extra_ldflags=get_extra_ldflags(),
-        )
-        matmul_wksp._module_cache[_cache_key] = module
-
-    args = [result_shape]
-
-    for tensor in [a, b]:
-        args.append(tensor.shape)  # type: ignore
-        args.append(tensor._native_mode_indices())  # type: ignore
-        args.append(tensor.values)  # type: ignore
-
-    start_time = time.time()
-    result_cpp = module.evaluate(*args)
-    end_time = time.time()
-    eval_time = end_time - start_time
-    if "time_dict" in kwargs:
-        time_dict = kwargs["time_dict"]
-        time_dict["eval_time"] = eval_time
-    # print("Time taken for evaluate:", eval_time)
 
     result = _wrap_generated_result(
         shape=result_shape,
@@ -902,7 +1019,6 @@ def matmul(
     See Also
     --------
     einsum : The generic compiler front door matmul falls through to.
-    matmul_wksp : Explicit workspace-lowering SpMM/SpGEMM (always compiled).
 
     Notes
     -----
@@ -965,7 +1081,12 @@ def matmul(
         and isinstance(b, torch.Tensor)
         and not (a.is_sparse or a.is_sparse_csr or b.is_sparse or b.is_sparse_csr)
     ):
-        if _effective_schedule(kwargs) is not None:
+        # Ask the same question the policy below asks, so a schedule carried only
+        # inside ``_compile_options`` is refused here too.  The perf line read
+        # ``kwargs`` directly because ``_compile_options`` did not exist on it; this
+        # block sits above where the policy is resolved, so reading only ``kwargs``
+        # would let that spelling through and silently return torch's product.
+        if _matmul_compile_policy(kwargs)[1] is not None:
             raise NotImplementedError(
                 "Explicit compiler schedules currently require a sparse operand"
             )
@@ -1024,7 +1145,13 @@ def matmul(
             if served is not None:
                 return served
 
-    effective_schedule = _effective_schedule(kwargs)
+    compile_options, effective_schedule = _matmul_compile_policy(kwargs)
+    compilation_context = kwargs.get("_compilation_context")
+    if (
+        compilation_context is not None
+        and type(compilation_context) is not CompilationContext
+    ):
+        raise TypeError("_compilation_context must be a CompilationContext instance")
 
     if isinstance(a, torch.Tensor) and isinstance(b, torch.Tensor):
         if (
@@ -1076,7 +1203,20 @@ def matmul(
         if output_format.is_dense():
             return result_torch
 
-        return STensor.from_torch(result_torch).to_sparse(output_format)
+        compile_options = _ensure_compile_options(
+            kwargs,
+            effective_schedule,
+            compile_options,
+        )
+        compilation_context = _compilation_context_at_boundary(
+            compilation_context,
+            compile_options,
+        )
+        return STensor.from_torch(result_torch).to_sparse(
+            output_format,
+            _compile_options=compile_options,
+            _compilation_context=compilation_context,
+        )
 
     # Never silently swallow a codegen schedule in a prebuilt dispatch.
     use_cache = kwargs.get("use_cache", True) and effective_schedule is None
@@ -1096,7 +1236,20 @@ def matmul(
             not a.format.is_dense()
         ) and a.storage.index.mode_order != default_mode_order:
             a = a.copy()
-            a.change_mode_order(default_mode_order)
+            compile_options = _ensure_compile_options(
+                kwargs,
+                effective_schedule,
+                compile_options,
+            )
+            compilation_context = _compilation_context_at_boundary(
+                compilation_context,
+                compile_options,
+            )
+            a.change_mode_order(
+                default_mode_order,
+                _compile_options=compile_options,
+                _compilation_context=compilation_context,
+            )
 
         if use_cache:
             resolved = resolve_prebuilt_matmul(
@@ -1118,6 +1271,14 @@ def matmul(
         spmv_kwargs = dict(kwargs)
         if "format" in spmv_kwargs and "output_format" not in spmv_kwargs:
             spmv_kwargs["output_format"] = spmv_kwargs.pop("format")
+        compile_options = _ensure_compile_options(
+            kwargs,
+            effective_schedule,
+            compile_options,
+        )
+        spmv_kwargs["_compile_options"] = compile_options
+        if compilation_context is not None:
+            spmv_kwargs["_compilation_context"] = compilation_context
         return spmv(a, b, **spmv_kwargs)
 
     # Normalize sparse 2D operands to canonical mode order before dispatch.
@@ -1133,10 +1294,36 @@ def matmul(
         if has_non_default_mode_order and has_sparse_input:
             if a.storage.index.mode_order != default_mode_order:
                 a = a.copy()
-                a.change_mode_order(default_mode_order)
+                compile_options = _ensure_compile_options(
+                    kwargs,
+                    effective_schedule,
+                    compile_options,
+                )
+                compilation_context = _compilation_context_at_boundary(
+                    compilation_context,
+                    compile_options,
+                )
+                a.change_mode_order(
+                    default_mode_order,
+                    _compile_options=compile_options,
+                    _compilation_context=compilation_context,
+                )
             if b.storage.index.mode_order != default_mode_order:
                 b = b.copy()
-                b.change_mode_order(default_mode_order)
+                compile_options = _ensure_compile_options(
+                    kwargs,
+                    effective_schedule,
+                    compile_options,
+                )
+                compilation_context = _compilation_context_at_boundary(
+                    compilation_context,
+                    compile_options,
+                )
+                b.change_mode_order(
+                    default_mode_order,
+                    _compile_options=compile_options,
+                    _compilation_context=compilation_context,
+                )
 
     if use_cache:
         resolved = resolve_prebuilt_matmul(a, b, output_format=requested_output_format)
@@ -1188,8 +1375,24 @@ def matmul(
                 result_cpp=result_cpp,
             )
         else:
+            compile_options = _ensure_compile_options(
+                kwargs,
+                effective_schedule,
+                compile_options,
+            )
+            einsum_kwargs["_compile_options"] = compile_options
+            if compilation_context is not None:
+                einsum_kwargs["_compilation_context"] = compilation_context
             result = einsum("ij,jk->ik", a, b, **einsum_kwargs)
     else:
+        compile_options = _ensure_compile_options(
+            kwargs,
+            effective_schedule,
+            compile_options,
+        )
+        einsum_kwargs["_compile_options"] = compile_options
+        if compilation_context is not None:
+            einsum_kwargs["_compilation_context"] = compilation_context
         result = einsum("ij,jk->ik", a, b, **einsum_kwargs)
 
     if isinstance(result, STensor) and result.format.is_dense():
@@ -1693,25 +1896,25 @@ def sparse_linear(
 # geomean 0.89), wide-k byte-identical else-arm PARITY. This is DECOUPLED from the
 # scheduler's `SCORCH_REGBLOCK` env (which stays default OFF, so a direct
 # `Scheduler.auto_schedule` caller — and the two schedule-shape tests — is unchanged):
-# `_build_regblock_dual_path` forces the tiling LOCALLY via `regblock_force`, so it
+# `_build_regblock_dual_path` derives two LOCAL immutable option snapshots, so it
 # needs nothing from the global env. Escape hatch: `SCORCH_REGBLOCK_DUAL=0` restores
 # the pre-flip single baseline path (also byte-identical to before the whole feature).
 # ─────────────────────────────────────────────────────────────────────────────
 
 
-def _regblock_dual_active() -> bool:
+def _regblock_dual_active(compile_options: CompileOptions) -> bool:
     """Whether `einsum` emits the register-block dual-path kernel for the qualifying
     pattern (dense output, sparse contraction, a tileable free dim).
 
     Default TRUE post-validation (see the module comment above). Set
     ``SCORCH_REGBLOCK_DUAL=0`` to restore the pre-flip single baseline path. This is
-    intentionally SEPARATE from the scheduler's ``SCORCH_REGBLOCK`` / ``_regblock_enabled()``
-    (default OFF): the dual builder forces its two lowerings locally, so flipping the
+    intentionally SEPARATE from the scheduler's ``SCORCH_REGBLOCK`` policy
+    (default OFF): the dual builder configures its two lowerings explicitly, so flipping the
     per-op default here leaves every direct ``auto_schedule`` caller untouched. When the
     dual-path does not apply (non-qualifying pattern → `_build_regblock_dual_path`
     returns None), einsum falls back to the byte-identical baseline single path.
     """
-    return os.environ.get("SCORCH_REGBLOCK_DUAL", "1") != "0"
+    return compile_options.regblock_dual
 
 
 def _find_top_compute_loop(
@@ -1793,7 +1996,10 @@ def _stitch_regblock_dual_path(
 
 
 def _build_regblock_dual_path(
-    cin_unscheduled: IndexStmt, post_ops: Any
+    cin_unscheduled: IndexStmt,
+    post_ops: Any,
+    compile_options: Optional[CompileOptions] = None,
+    compilation_context: Optional[CompilationContext] = None,
 ) -> Optional[Tuple[llir.Function, str]]:
     """Build the Phase 2b dual-path kernel from an unscheduled CIN.
 
@@ -1802,36 +2008,110 @@ def _build_regblock_dual_path(
     or None when the register-block path doesn't apply (schedules identical) or the
     stitch can't be formed safely — the caller then falls back to the baseline path.
     """
+    if compile_options is None:
+        compile_options = CompileOptions.from_environment()
+    elif type(compile_options) is not CompileOptions:
+        raise TypeError("compile_options must be a CompileOptions instance")
+
     if not Scheduler._has_dense_output(cin_unscheduled):
         return None
 
-    # auto_schedule mutates the CIN in place, so schedule each arm from a pristine copy.
-    with regblock_force(False):
-        cin_base = Scheduler.auto_schedule(copy.deepcopy(cin_unscheduled))
-    with regblock_force(True):
-        cin_rb = Scheduler.auto_schedule(copy.deepcopy(cin_unscheduled))
+    cin_base = Scheduler._auto_schedule_regblock_arm(
+        cin_unscheduled,
+        enabled=False,
+        compile_options=compile_options,
+        compilation_context=compilation_context,
+    )
+    cin_rb = Scheduler._auto_schedule_regblock_arm(
+        cin_unscheduled,
+        enabled=True,
+        compile_options=compile_options,
+        compilation_context=compilation_context,
+    )
     if str(cin_base) == str(cin_rb):
         # Register-block didn't change the schedule (pattern doesn't qualify) ->
         # nothing to branch on; let the caller use the plain baseline path.
         return None
 
-    with regblock_force(False):
-        fn_base = CINLowerer(post_ops=post_ops).lower_IndexStmt(cin_base)
-    with regblock_force(True):
-        fn_rb = CINLowerer(post_ops=post_ops).lower_IndexStmt(cin_rb)
+    fn_base = CINLowerer(
+        post_ops=post_ops,
+        compile_options=compile_options,
+        compilation_context=compilation_context,
+    )._lower_owned_IndexStmt(cin_base)
+    fn_rb = CINLowerer(
+        post_ops=post_ops,
+        compile_options=compile_options,
+        compilation_context=compilation_context,
+    )._lower_owned_IndexStmt(cin_rb)
     if not (isinstance(fn_base, llir.Function) and isinstance(fn_rb, llir.Function)):
         return None
 
-    stitched = _stitch_regblock_dual_path(fn_rb, fn_base, _regblock_max_n())
+    stitch_token = (
+        compilation_context.begin_stage(
+            CompilerStageId.CIN_LOWERING,
+            compile_options=compile_options,
+        )
+        if compilation_context is not None
+        else None
+    )
+    try:
+        stitched = _stitch_regblock_dual_path(
+            fn_rb,
+            fn_base,
+            compile_options.scheduler.regblock_max_n,
+        )
+    except Exception:
+        if stitch_token is not None and compilation_context is not None:
+            compilation_context.fail_stage(stitch_token)
+        raise
+    if stitch_token is not None and compilation_context is not None:
+        if stitched is None:
+            compilation_context.cancel_stage(stitch_token)
+        else:
+            compilation_context.complete_stage(stitch_token)
     if stitched is None:
         return None
-    return stitched, _codegen_kernel_cache_key(cin_rb, post_ops, None) + "|rbdual"
+    return (
+        stitched,
+        _codegen_kernel_cache_key(
+            cin_rb,
+            post_ops,
+            None,
+            compile_options=compile_options,
+        )
+        + "|rbdual",
+    )
 
 
-def einsum(
+@contextmanager
+def _trusted_compiler_built_cin(
+    cin_stmt: IndexStmt,
+    compile_options: CompileOptions,
+    compilation_context: CompilationContext,
+) -> Iterator[None]:
+    """Prove one compiler-built CIN root and scope its structural receipt."""
+
+    receipt_token = compilation_context.begin_stage(
+        CompilerStageId.CIN_NORMALIZATION_AND_VERIFICATION,
+        compile_options=compile_options,
+    )
+    try:
+        verify_cin_structure(cin_stmt)
+    except Exception:
+        compilation_context.fail_stage(receipt_token)
+        raise
+    compilation_context.cancel_stage(receipt_token)
+    with _trusted_normalized_cin(cin_stmt):
+        yield
+
+
+def _einsum_owned(
     expression: str,
     *tensors: Optional[Union[torch.Tensor, STensor, TensorSpec]],
     compile_only: Optional[bool] = False,
+    compile_options: CompileOptions,
+    compilation_context: CompilationContext,
+    frontend_token: CompilerStageToken,
     **kwargs: Any,
 ) -> Union[STensor, TensorSpec]:
     """Compile and evaluate a numpy-style einsum over sparse/dense operands.
@@ -2007,7 +2287,7 @@ def einsum(
         raise CompileSpecError(
             "TensorSpec has no runtime payload; pass compile_only=True or use STensor"
         )
-    effective_schedule = _effective_schedule(kwargs)
+    effective_schedule = compile_options.requested_schedule
 
     # ── Prebuilt SDDMM dispatch ────────────────────────────────────────
     # Pattern: 'ij,ik,jk->ij' with S(COO), A(dense), B(dense)
@@ -2028,6 +2308,7 @@ def einsum(
 
         _sddmm_fn = getattr(_ops, "sddmm_coo_float_prebuilt", None)
         if _sddmm_fn is not None:
+            compilation_context.cancel_stage(frontend_token)
             S, A, B = tensors
             result_shape = S.shape
             result_cpp = _sddmm_fn(
@@ -2066,9 +2347,11 @@ def einsum(
             kwargs.get("format", None),
             output_mode_order,
             effective_schedule,
+            compile_options,
         )
         _cached = _einsum_dispatch_cache.get(_dispatch_key)
         if _cached is not None:
+            compilation_context.cancel_stage(frontend_token)
             _module = _cached[0]
             _output_fmt = _cached[1]
             _temp_mo = _cached[2]
@@ -2082,7 +2365,12 @@ def einsum(
             _relayouted = False
             for _index, (_t, _mo) in enumerate(zip(cached_tensors, _input_mos)):
                 if list(_t.mode_order) != _mo:
-                    cached_tensors[_index] = _with_compiler_mode_order(_t, _mo)
+                    cached_tensors[_index] = _with_compiler_mode_order(
+                        _t,
+                        _mo,
+                        compile_options,
+                        compilation_context,
+                    )
                     _relayouted = True
             tensors = tuple(cached_tensors)
 
@@ -2131,7 +2419,11 @@ def einsum(
             # the permutation, takes a defensive copy of the result's own mode order and
             # sorts it, all to discover there is nothing to do. 1.0 us of a 15 us call.
             if _temp_mo and _temp_mo != _final_mo:
-                _result.change_mode_order(_final_mo)
+                _result.change_mode_order(
+                    _final_mo,
+                    _compile_options=compile_options,
+                    _compilation_context=compilation_context,
+                )
 
             return _result
     # ── End fast dispatch ────────────────────────────────────────────────
@@ -2174,18 +2466,18 @@ def einsum(
     ]
     final_mode_order = output_mode_order if output_mode_order else temp_mode_order
 
-    # Change input tensor mode orders to match schedule
-    tensors = list(tensors)
+    # Predict compiler-visible mode orders without executing a relayout while
+    # the enclosing frontend stage is open. Runtime relayout compilation is a
+    # distinct nested production path and happens only after frontend work has
+    # completed below.
+    compiler_mode_orders: List[List[int]] = []
     for tensor_index, input_index_str in enumerate(input_index_strs):
         new_mode_order = []
         str_to_mode = {s: i for i, s in enumerate(input_index_str)}
         for s in index_strs_by_schedule:
             if s in str_to_mode:
                 new_mode_order.append(str_to_mode[s])
-        tensors[tensor_index] = _with_compiler_mode_order(
-            tensors[tensor_index], new_mode_order
-        )
-    tensors = tuple(tensors)
+        compiler_mode_orders.append(new_mode_order)
 
     # Create a mapping from each index string to the list of LevelFormats
     # of the levels it indexes into each input tensor
@@ -2216,9 +2508,11 @@ def einsum(
                 TensorVar(
                     name=tensor_name,
                     fmt=tensor.format,
-                    shape=tensor.shape,
+                    shape=tuple(
+                        tensor.logical_shape[mode] for mode in compiler_mode_orders[i]
+                    ),
                     dtype=tensor.dtype,
-                    mode_order=list(tensor.mode_order),
+                    mode_order=compiler_mode_orders[i],
                 )
             )
             if output_tensor_dtype is None:
@@ -2350,47 +2644,61 @@ def einsum(
     # Build LHS access and create assignment
     lhs_indices = [index_var_dict[s] for s in result_index_strs]
     lhs_key = lhs_indices[0] if len(lhs_indices) == 1 else tuple(lhs_indices)
-    result_tensor_var[lhs_key] = rhs_expr
+    lhs_access = result_tensor_var[lhs_key]
+    cin_stmt: IndexStmt = TensorAssign(lhs_access, cast(IndexExpr, rhs_expr))
 
     # Wrap in nested ForAll loops (outermost first in schedule, built inside-out)
-    cin_stmt = result_tensor_var._assignment
     for index_str in reversed(index_strs_by_schedule):
         cin_stmt = ForAll(index_var_dict[index_str], cin_stmt)
 
     # print("CIN:\n", cin_stmt)
 
+    compilation_context.complete_stage(frontend_token)
+
+    # Preserve the legacy two-step operand alignment.  The frontend above uses
+    # the predicted compiler-visible metadata so that it can finish before a
+    # runtime relayout starts; the physical relayout still happens here, once
+    # for the topological order and again below if the selected loop order
+    # differs.
+    tensors = tuple(
+        _with_compiler_mode_order(
+            tensor,
+            compiler_mode_orders[tensor_index],
+            compile_options,
+            compilation_context,
+        )
+        for tensor_index, tensor in enumerate(tensors)
+    )
+
     # Align input tensor mode orders with the selected loop order to keep
     # parent-child level traversal valid during lowering for non-canonical
     # schedules.
-    if effective_schedule is not None and effective_schedule.loop_order is not None:
-        selected_loop_order = Scheduler.resolve_loop_order(
-            cin_stmt, effective_schedule.loop_order
-        )
-    else:
-        selected_loop_order = Scheduler.select_loop_order(cin_stmt)
-    selected_loop_order_names = [index_var.name for index_var in selected_loop_order]
-    for tensor_index, input_index_str in enumerate(input_index_strs):
-        desired_index_strs = [
-            index_str
-            for index_str in selected_loop_order_names
-            if index_str in input_index_str
-        ]
-        desired_mode_order = [
-            input_index_str.index(index_str) for index_str in desired_index_strs
-        ]
+    desired_mode_orders = _select_and_bind_einsum_operand_mode_orders(
+        cin_stmt,
+        input_index_strs,
+        cast(Sequence[Union[STensor, TensorSpec]], tensors),
+        tensor_vars,
+        effective_schedule,
+        compile_options,
+        compilation_context,
+    )
+
+    tensors = list(tensors)
+    for tensor_index, desired_mode_order in enumerate(desired_mode_orders):
         if list(tensors[tensor_index].mode_order) != desired_mode_order:
             tensors[tensor_index] = _with_compiler_mode_order(
-                tensors[tensor_index], desired_mode_order
+                tensors[tensor_index],
+                desired_mode_order,
+                compile_options,
+                compilation_context,
             )
-        tensor_vars[tensor_index].shape = tensors[tensor_index].shape
-        if tensor_vars[tensor_index].mode_order != desired_mode_order:
-            tensor_vars[tensor_index].mode_order = desired_mode_order
     tensors = tuple(tensors)
 
     # Extract PostOps for fused kernel compilation
     _post_ops = kwargs.get("_post_ops", None)
     _post_ops_tensors = kwargs.get("_post_ops_tensors", None)
     _cache_key_suffix = str(_post_ops) if _post_ops else ""
+    lowering_stmt: Union[IndexStmt, ScheduledCIN] = cin_stmt
 
     # Phase 2b (codegen-parity): emit ONE kernel that branches at runtime on the
     # free-dim size — register-block for small N (single tile, no re-traversal), the
@@ -2398,29 +2706,69 @@ def einsum(
     # (post M5+x86 validation); `SCORCH_REGBLOCK_DUAL=0` restores the single path.
     # When the pattern doesn't qualify, `_build_regblock_dual_path` returns None and
     # the else-branch below emits the byte-identical baseline (unchanged from before).
-    _dual_llir: Optional[llir.Function] = None
-    if effective_schedule is None and _regblock_dual_active() and _post_ops is None:
-        _dual = _build_regblock_dual_path(cin_stmt, _post_ops)
-        if _dual is not None:
-            _dual_llir, _kernel_cache_key = _dual
-            _kernel_cache_key = _kernel_cache_key + _cache_key_suffix
+    # The two internal dual arms and the fallback all detach the same freshly
+    # constructed CIN root.  Prove that root once, then carry the receipt only
+    # across this synchronous compiler-owned scheduling block.  No caller code
+    # can mutate the graph between the verification and these consumers.
+    with _trusted_compiler_built_cin(
+        cin_stmt,
+        compile_options,
+        compilation_context,
+    ):
+        _dual_llir: Optional[llir.Function] = None
+        if (
+            effective_schedule is None
+            and _regblock_dual_active(compile_options)
+            and _post_ops is None
+        ):
+            _dual = _build_regblock_dual_path(
+                cin_stmt,
+                _post_ops,
+                compile_options=compile_options,
+                compilation_context=compilation_context,
+            )
+            if _dual is not None:
+                _dual_llir, _kernel_cache_key = _dual
+                _kernel_cache_key = _kernel_cache_key + _cache_key_suffix
 
-    if _dual_llir is None:
-        if effective_schedule is not None:
-            cin_stmt = Scheduler.apply_schedule(cin_stmt, effective_schedule)
-        # Default single path. When regblock is on but the dual-path wasn't
-        # applicable, force it OFF here so we never ship the wide-k-regressing
-        # single-path tiled kernel as a silent fallback.
-        elif _regblock_enabled():
-            with regblock_force(False):
-                cin_stmt = Scheduler.auto_schedule(cin_stmt)
-        else:
-            cin_stmt = Scheduler.auto_schedule(cin_stmt)
-        _kernel_cache_key = _codegen_kernel_cache_key(
-            cin_stmt, _post_ops, effective_schedule
-        )
+        if _dual_llir is None:
+            if effective_schedule is not None:
+                lowering_stmt = Scheduler.apply_schedule(
+                    cin_stmt,
+                    effective_schedule,
+                    compile_options=compile_options,
+                    compilation_context=compilation_context,
+                )
+            # Default single path. When regblock is on but the dual-path wasn't
+            # applicable, force it OFF here so we never ship the wide-k-regressing
+            # single-path tiled kernel as a silent fallback.
+            elif compile_options.scheduler.regblock_enabled:
+                lowering_stmt = cast(
+                    IndexStmt,
+                    Scheduler._auto_schedule_regblock_arm(
+                        cin_stmt,
+                        enabled=False,
+                        compile_options=compile_options,
+                        compilation_context=compilation_context,
+                    ),
+                )
+            else:
+                lowering_stmt = cast(
+                    IndexStmt,
+                    Scheduler.auto_schedule(
+                        cin_stmt,
+                        compile_options=compile_options,
+                        compilation_context=compilation_context,
+                    ),
+                )
+            _kernel_cache_key = _codegen_kernel_cache_key(
+                lowering_stmt,
+                _post_ops,
+                effective_schedule,
+                compile_options=compile_options,
+            )
 
-    # print("Auto-scheduled CIN:\n", cin_stmt)
+    # print("Auto-scheduled CIN:\n", lowering_stmt)
 
     if _kernel_cache_key in _kernel_cache:
         # print(f"Using cached kernel for {cin_stmt}")
@@ -2429,24 +2777,30 @@ def einsum(
         if _dual_llir is not None:
             lowered_llir: Union[llir.Stmt, List[llir.Stmt]] = _dual_llir
         else:
-            lowerer = CINLowerer(post_ops=_post_ops)
-            lowered_llir = lowerer.lower_IndexStmt(cin_stmt)
+            lowerer = CINLowerer(
+                post_ops=_post_ops,
+                compile_options=compile_options,
+                compilation_context=compilation_context,
+            )
+            lowered_llir = lowerer._lower_owned_IndexStmt(lowering_stmt)
 
-        llir_lowerer = LLIRLowerer()
-
-        cpp_code = llir_lowerer.lower_llir(lowered_llir)
+        cpp_code = _lower_generated_llir(
+            lowered_llir,
+            compile_options,
+            compilation_context,
+        )
 
         # print("\n\n", cpp_code)
 
-        header_cpp_code = jit_preamble_text()
+        header_cpp_code = compile_options.build.preamble_source
 
-        module = _load_kernel(
-            name=_kernel_name(header_cpp_code, cpp_code),
-            cpp_sources=[header_cpp_code, cpp_code],
-            functions=["evaluate"],
-            extra_cflags=get_extra_cflags(),
-            extra_ldflags=get_extra_ldflags(),
+        prepared_build = _prepare_generated_kernel_build(
+            header_cpp_code,
+            cpp_code,
+            compile_options,
+            compilation_context,
         )
+        module = _load_validated_prepared_kernel(prepared_build)
 
         _kernel_cache[_kernel_cache_key] = module
 
@@ -2504,23 +2858,353 @@ def einsum(
 
     # Convert to final mode order if it differs from temporary mode order
     if temp_mode_order:
-        result.change_mode_order(final_mode_order)
+        result.change_mode_order(
+            final_mode_order,
+            _compile_options=compile_options,
+            _compilation_context=compilation_context,
+        )
 
     return result
 
 
-def _align_mode_orders_to_loop_order(cin_stmt: IndexStmt, args: tuple) -> None:
-    """Align input tensor mode orders to the CIN loop order.
+def einsum(
+    expression: str,
+    *tensors: Optional[Union[torch.Tensor, STensor, TensorSpec]],
+    compile_only: Optional[bool] = False,
+    **kwargs: Any,
+) -> Union[STensor, TensorSpec]:
+    """Compile and evaluate a validated numpy-style sparse/dense einsum."""
 
-    The lowerer requires parent physical levels to be iterated before child
-    levels.  When a tensor's mode_order doesn't match the loop nesting, the
-    generated code references coordinate variables before they are defined.
-    This mirrors the alignment that ``einsum`` performs (ops.py L581-591).
+    compile_options = _compile_options_from_kwargs(kwargs)
+    compilation_context = _compilation_context_from_kwargs(kwargs, compile_options)
+    frontend_token = compilation_context.begin_stage(
+        CompilerStageId.FRONTEND_VALIDATED_OPERATION_CONSTRUCTION,
+        compile_options=compile_options,
+    )
+    try:
+        return _einsum_owned(
+            expression,
+            *tensors,
+            compile_only=compile_only,
+            compile_options=compile_options,
+            compilation_context=compilation_context,
+            frontend_token=frontend_token,
+            **kwargs,
+        )
+    except Exception:
+        if compilation_context.is_stage_active(frontend_token):
+            compilation_context.fail_stage(frontend_token)
+        raise
 
-    Mutates TensorVar.mode_order in *cin_stmt* and calls
-    ``STensor.change_mode_order`` on the corresponding *args* entries.
-    """
-    # 1. Extract loop order
+
+einsum.__doc__ = _einsum_owned.__doc__
+
+
+_ModeOrderAlignmentPlan = Tuple[
+    Tuple[Optional[Tuple[int, ...]], ...],
+    Optional[Tuple[int, ...]],
+]
+
+
+@dataclass(frozen=True)
+class _RuntimeTensorSnapshot:
+    """One validated runtime tensor captured before compiler-side mutation."""
+
+    tensor: STensor
+    shape: Tuple[int, ...]
+    dtype: torch.dtype
+    tensor_format: TensorFormat
+    mode_order: Tuple[int, ...]
+    has_index: bool
+    native_mode_indices: List[List[torch.Tensor]]
+    values: torch.Tensor
+
+
+def _checked_runtime_shape(shape: object, owner: str) -> Tuple[int, ...]:
+    """Snapshot one safe public shape with signed-int64 ABI bounds."""
+
+    if (
+        type(shape) is not tuple
+        and type(shape) is not list
+        and type(shape) is not torch.Size
+        and type(shape) is not range
+    ):
+        raise CompileSpecError(
+            f"{owner} must be a tuple, list, torch.Size, or range of exact ints"
+        )
+    try:
+        rank = len(shape)
+    except OverflowError as error:
+        raise CompileSpecError(f"{owner} rank exceeds the supported limit") from error
+    if rank > 64:
+        raise CompileSpecError(f"{owner} rank must not exceed 64")
+    max_int64 = (1 << 63) - 1
+    checked: List[int] = []
+    element_count = 1
+    for extent in shape:
+        if type(extent) is not int or extent < 0 or extent > max_int64:
+            raise CompileSpecError(
+                f"{owner} must contain nonnegative signed int64 extents"
+            )
+        if extent and element_count > max_int64 // extent:
+            raise CompileSpecError(f"{owner} element count exceeds signed int64")
+        element_count *= extent
+        checked.append(extent)
+    return tuple(checked)
+
+
+def _snapshot_runtime_tensors(
+    args: tuple,
+    *,
+    expected_count: Optional[int] = None,
+) -> Tuple[_RuntimeTensorSnapshot, ...]:
+    """Validate every runtime operand before reading any operand descriptor."""
+
+    if type(args) is not tuple:
+        raise CompileSpecError("runtime tensor arguments must be an exact tuple")
+    if expected_count is not None:
+        if type(expected_count) is not int or expected_count < 0:
+            raise TypeError("expected runtime tensor count must be a nonnegative int")
+        if len(args) != expected_count:
+            raise CompileSpecError(
+                f"CIN expects {expected_count} runtime tensors, got {len(args)}"
+            )
+    for position, arg in enumerate(args):
+        if type(arg) is not STensor:
+            raise CompileSpecError(
+                f"runtime tensor argument {position} must be an exact STensor"
+            )
+
+    snapshots: List[_RuntimeTensorSnapshot] = []
+    for position, arg in enumerate(args):
+        # The all-argument exact-type pass above is deliberately separate:
+        # a hostile later object cannot make us execute a property, validation
+        # hook, or relayout on an earlier argument before the request fails.
+        try:
+            shape = _checked_runtime_shape(
+                STensor.shape.__get__(arg, STensor),
+                f"runtime tensor argument {position} shape",
+            )
+            dtype = STensor.dtype.__get__(arg, STensor)
+            tensor_format = STensor.format.__get__(arg, STensor)
+            mode_order = STensor.mode_order.__get__(arg, STensor)
+            has_index = STensor.has_index.__get__(arg, STensor)
+            values = STensor.values.__get__(arg, STensor)
+            native_mode_indices = STensor._native_mode_indices(arg)
+        except CompileSpecError:
+            raise
+        except Exception as error:
+            raise CompileSpecError(
+                f"runtime tensor argument {position} has invalid internal state"
+            ) from error
+        if type(dtype) is not torch.dtype:
+            raise CompileSpecError(
+                f"runtime tensor argument {position} dtype must be an exact "
+                "torch.dtype"
+            )
+        if type(tensor_format) is not TensorFormat:
+            raise CompileSpecError(
+                f"runtime tensor argument {position} format must be an exact "
+                "TensorFormat"
+            )
+        if type(mode_order) is not tuple or any(
+            type(mode) is not int for mode in mode_order
+        ):
+            raise CompileSpecError(
+                f"runtime tensor argument {position} mode order must be an "
+                "exact tuple of ints"
+            )
+        rank = len(shape)
+        try:
+            format_rank = TensorFormat.get_order(tensor_format)
+            level_types = TensorFormat.get_level_types(tensor_format)
+        except Exception as error:
+            raise CompileSpecError(
+                f"runtime tensor argument {position} has invalid format state"
+            ) from error
+        if (
+            format_rank != rank
+            or len(mode_order) != rank
+            or sorted(mode_order) != list(range(rank))
+        ):
+            raise CompileSpecError(
+                f"runtime tensor argument {position} format, shape, and mode "
+                "order ranks must agree"
+            )
+        if type(has_index) is not bool:
+            raise CompileSpecError(
+                f"runtime tensor argument {position} has_index must be an exact bool"
+            )
+        if not isinstance(values, torch.Tensor):
+            raise CompileSpecError(
+                f"runtime tensor argument {position} values must be a torch.Tensor"
+            )
+        try:
+            invalid_values = (
+                values.dtype is not dtype
+                or values.layout is not torch.strided
+                or values.device.type != "cpu"
+                or values.dim() != 1
+                or not values.is_contiguous()
+                or values.is_neg()
+                or values.is_conj()
+            )
+        except Exception as error:
+            raise CompileSpecError(
+                f"runtime tensor argument {position} has invalid values state"
+            ) from error
+        if invalid_values:
+            raise CompileSpecError(
+                f"runtime tensor argument {position} values violate the native "
+                "CPU storage contract"
+            )
+        if type(native_mode_indices) is not list or len(native_mode_indices) != rank:
+            raise CompileSpecError(
+                f"runtime tensor argument {position} native indices must be "
+                "rank-sized lists of tensors"
+            )
+        if (
+            any(type(arrays) is not list for arrays in native_mode_indices)
+            or type(level_types) is not list
+            or len(level_types) != rank
+            or any(type(level_type) is not LevelType for level_type in level_types)
+        ):
+            raise CompileSpecError(
+                f"runtime tensor argument {position} native index levels must "
+                "match its exact TensorFormat"
+            )
+        for level, (arrays, level_type) in enumerate(
+            zip(native_mode_indices, level_types)
+        ):
+            expected_arrays = (
+                0
+                if level_type is LevelType.DENSE
+                else (2 if level_type is LevelType.COMPRESSED else 1)
+            )
+            if len(arrays) != expected_arrays:
+                raise CompileSpecError(
+                    f"runtime tensor argument {position} level {level} requires "
+                    f"{expected_arrays} native index arrays"
+                )
+        if any(
+            not isinstance(index, torch.Tensor)
+            for arrays in native_mode_indices
+            for index in arrays
+        ):
+            raise CompileSpecError(
+                f"runtime tensor argument {position} native indices must be "
+                "rank-sized lists of tensors"
+            )
+        try:
+            invalid_index = any(
+                index.layout is not torch.strided
+                or index.device.type != "cpu"
+                or index.dtype not in (torch.int32, torch.int64)
+                or index.dim() != 1
+                or not index.is_contiguous()
+                for arrays in native_mode_indices
+                for index in arrays
+            )
+            index_dtypes = {
+                index.dtype for arrays in native_mode_indices for index in arrays
+            }
+        except Exception as error:
+            raise CompileSpecError(
+                f"runtime tensor argument {position} has invalid native index state"
+            ) from error
+        if invalid_index or len(index_dtypes) > 1:
+            raise CompileSpecError(
+                f"runtime tensor argument {position} native indices violate the "
+                "CPU index contract"
+            )
+        try:
+            stored_values = values.numel()
+            parent_positions = 1
+            for level, (extent, arrays, level_type) in enumerate(
+                zip(shape, native_mode_indices, level_types)
+            ):
+                if level_type is LevelType.DENSE:
+                    parent_positions *= extent
+                    continue
+                coordinates = arrays[-1]
+                coordinate_count = coordinates.numel()
+                if level_type in (LevelType.COORDINATE, LevelType.SINGLETON):
+                    if coordinate_count != stored_values:
+                        raise CompileSpecError(
+                            f"runtime tensor argument {position} coordinate level "
+                            f"{level} count must equal its stored value count"
+                        )
+                    parent_positions = coordinate_count
+                    continue
+                positions = arrays[0]
+                if (
+                    positions.numel() != parent_positions + 1
+                    or positions[0].item() != 0
+                    or positions[-1].item() != coordinate_count
+                ):
+                    raise CompileSpecError(
+                        f"runtime tensor argument {position} compressed level "
+                        f"{level} has an invalid positions/cardinality chain"
+                    )
+                parent_positions = coordinate_count
+            if parent_positions != stored_values:
+                raise CompileSpecError(
+                    f"runtime tensor argument {position} storage cardinality "
+                    "does not match its value count"
+                )
+        except CompileSpecError:
+            raise
+        except Exception as error:
+            raise CompileSpecError(
+                f"runtime tensor argument {position} has invalid storage "
+                "cardinality state"
+            ) from error
+        snapshots.append(
+            _RuntimeTensorSnapshot(
+                tensor=arg,
+                shape=shape,
+                dtype=dtype,
+                tensor_format=tensor_format,
+                mode_order=mode_order,
+                has_index=has_index,
+                native_mode_indices=native_mode_indices,
+                values=values,
+            )
+        )
+    return tuple(snapshots)
+
+
+def _validate_direct_runtime_formats(
+    cin_stmt: IndexStmt,
+    snapshots: Tuple[_RuntimeTensorSnapshot, ...],
+) -> None:
+    """Check every direct-CIN operand before relayout or metadata mutation."""
+
+    rhs_tensor_vars = cin_stmt.get_rhs_tensor_vars()
+    if len(rhs_tensor_vars) != len(snapshots):
+        raise CompileSpecError(
+            f"CIN expects {len(rhs_tensor_vars)} runtime tensors, got "
+            f"{len(snapshots)}"
+        )
+    mismatches = [
+        (tensor_var, snapshot.tensor_format)
+        for tensor_var, snapshot in zip(rhs_tensor_vars, snapshots)
+        if tensor_var.format != snapshot.tensor_format
+    ]
+    if mismatches:
+        tensor_var, actual_format = mismatches[0]
+        raise CompileSpecError(
+            f"CIN tensor {tensor_var.name!r} expects format "
+            f"{tensor_var.format}, got {actual_format}"
+        )
+
+
+def _plan_mode_orders_to_loop_order(
+    cin_stmt: IndexStmt,
+    args: tuple,
+) -> _ModeOrderAlignmentPlan:
+    """Plan detached CIN/runtime mode alignment without executing relayouts."""
+
     loop_order_names: List[str] = []
     curr: IndexStmt = cin_stmt
     while isinstance(curr, ForAll):
@@ -2528,39 +3212,158 @@ def _align_mode_orders_to_loop_order(cin_stmt: IndexStmt, args: tuple) -> None:
         curr = curr.stmt
 
     if not loop_order_names:
-        return
+        return tuple(None for _ in args), None
 
-    # 2. Get RHS tensor accesses (left-to-right order matches *args*)
     rhs_accesses = cin_stmt.get_rhs_tensor_accesses()
     if len(rhs_accesses) != len(args):
-        return  # can't align if we don't have a 1:1 mapping
+        return tuple(None for _ in args), None
 
-    for ta, stensor in zip(rhs_accesses, args):
+    rhs_mode_orders: List[Optional[Tuple[int, ...]]] = []
+    for ta in rhs_accesses:
         tv = ta.get_tensor()
         index_var_names = [iv.name for iv in ta.get_index_vars()]
-        # Filter loop order to vars present in this tensor
         desired_names = [n for n in loop_order_names if n in index_var_names]
-        desired_mode_order = [index_var_names.index(n) for n in desired_names]
-
-        # Skip when tiling/broadcasting causes a rank mismatch
+        desired_mode_order = tuple(index_var_names.index(n) for n in desired_names)
         if len(desired_mode_order) != len(tv.mode_order):
+            rhs_mode_orders.append(None)
             continue
-        if list(tv.mode_order) != desired_mode_order:
-            tv.mode_order = desired_mode_order
-            if stensor.has_index and stensor.shape is not None:
-                stensor.change_mode_order(desired_mode_order)
+        rhs_mode_orders.append(desired_mode_order)
 
-    # 3. Also align the output tensor
+    lhs_mode_order: Optional[Tuple[int, ...]] = None
     if isinstance(curr, TensorAssign):
         lhs_tv = curr.lhs.get_tensor()
         lhs_names = [iv.name for iv in curr.lhs.get_index_vars()]
         desired_names = [n for n in loop_order_names if n in lhs_names]
-        desired_mode_order = [lhs_names.index(n) for n in desired_names]
-        if (
-            len(desired_mode_order) == len(lhs_tv.mode_order)
-            and list(lhs_tv.mode_order) != desired_mode_order
+        desired_mode_order = tuple(lhs_names.index(n) for n in desired_names)
+        if len(desired_mode_order) == len(lhs_tv.mode_order):
+            lhs_mode_order = desired_mode_order
+    return tuple(rhs_mode_orders), lhs_mode_order
+
+
+def _plan_direct_cin_runtime_binding(
+    cin_stmt: IndexStmt,
+    result_shape: Sequence[int],
+    args: tuple,
+    compile_options: CompileOptions,
+    compilation_context: CompilationContext,
+) -> Tuple[
+    Tuple[int, ...],
+    Tuple[_RuntimeTensorSnapshot, ...],
+    _ModeOrderAlignmentPlan,
+]:
+    """Validate and plan direct-CIN binding without relayout or mutation."""
+
+    planning_token = compilation_context.begin_stage(
+        CompilerStageId.FRONTEND_VALIDATED_OPERATION_CONSTRUCTION,
+        compile_options=compile_options,
+    )
+    try:
+        checked_result_shape = _checked_runtime_shape(result_shape, "result shape")
+        rhs_tensor_vars = cin_stmt.get_rhs_tensor_vars()
+        snapshots = _snapshot_runtime_tensors(
+            args,
+            expected_count=len(rhs_tensor_vars),
+        )
+        _validate_direct_runtime_formats(cin_stmt, snapshots)
+        result_tensor_vars: List[TensorVar] = []
+        for tensor_var in cin_stmt.get_result_tensor_vars():
+            if isinstance(tensor_var, Workspace) or any(
+                tensor_var is retained for retained in result_tensor_vars
+            ):
+                continue
+            result_tensor_vars.append(tensor_var)
+        if len(result_tensor_vars) != 1:
+            raise CompileSpecError(
+                "direct CIN execution requires exactly one external result tensor"
+            )
+        result_tensor_var = result_tensor_vars[0]
+        result_format = result_tensor_var.format
+        if type(result_format) is not TensorFormat or result_format.get_order() != len(
+            checked_result_shape
         ):
-            lhs_tv.mode_order = desired_mode_order
+            raise CompileSpecError(
+                "direct CIN result format rank must match the result shape rank"
+            )
+        plan = _plan_mode_orders_to_loop_order(
+            cin_stmt,
+            tuple(snapshot.tensor for snapshot in snapshots),
+        )
+    except Exception:
+        compilation_context.fail_stage(planning_token)
+        raise
+    compilation_context.complete_stage(planning_token)
+    return checked_result_shape, snapshots, plan
+
+
+def _relayout_mode_order_args(
+    args: tuple,
+    plan: _ModeOrderAlignmentPlan,
+    compile_options: CompileOptions,
+    compilation_context: Optional[CompilationContext],
+    *,
+    snapshots: Optional[Tuple[_RuntimeTensorSnapshot, ...]] = None,
+) -> tuple:
+    """Execute only runtime relayout prerequisites from a frozen alignment plan."""
+
+    if snapshots is None:
+        snapshots = _snapshot_runtime_tensors(args)
+    if len(args) != len(snapshots) or any(
+        arg is not snapshot.tensor for arg, snapshot in zip(args, snapshots)
+    ):
+        raise CompileSpecError("runtime tensor snapshots do not match relayout inputs")
+    aligned_args = list(args)
+    for position, (snapshot, desired_mode_order) in enumerate(zip(snapshots, plan[0])):
+        if (
+            desired_mode_order is not None
+            and snapshot.mode_order != desired_mode_order
+            and snapshot.has_index
+        ):
+            aligned = STensor.copy(snapshot.tensor)
+            STensor.change_mode_order(
+                aligned,
+                list(desired_mode_order),
+                _compile_options=compile_options,
+                _compilation_context=compilation_context,
+            )
+            aligned_args[position] = aligned
+    return tuple(aligned_args)
+
+
+def _apply_mode_order_alignment(
+    cin_stmt: IndexStmt,
+    plan: _ModeOrderAlignmentPlan,
+) -> None:
+    """Apply a validated alignment plan only to compiler-owned CIN metadata."""
+
+    rhs_accesses = cin_stmt.get_rhs_tensor_accesses()
+    for tensor_access, desired_mode_order in zip(rhs_accesses, plan[0]):
+        if desired_mode_order is not None:
+            tensor_access.get_tensor().mode_order = list(desired_mode_order)
+
+    curr: IndexStmt = cin_stmt
+    while isinstance(curr, ForAll):
+        curr = curr.stmt
+    if isinstance(curr, TensorAssign) and plan[1] is not None:
+        curr.lhs.get_tensor().mode_order = list(plan[1])
+
+
+def _align_mode_orders_to_loop_order(
+    cin_stmt: IndexStmt,
+    args: tuple,
+    compile_options: CompileOptions,
+    compilation_context: Optional[CompilationContext] = None,
+) -> tuple:
+    """Compatibility helper that aligns detached CIN and replacement inputs."""
+
+    plan = _plan_mode_orders_to_loop_order(cin_stmt, args)
+    aligned_args = _relayout_mode_order_args(
+        args,
+        plan,
+        compile_options,
+        compilation_context,
+    )
+    _apply_mode_order_alignment(cin_stmt, plan)
+    return aligned_args
 
 
 def lower_and_exec_cin(
@@ -2580,8 +3383,10 @@ def lower_and_exec_cin(
     ----------
     cin_stmt : IndexStmt
         CIN statement (index-notation AST) to lower.
-    result_shape : Sequence[int]
-        Shape of the result tensor.
+    result_shape : tuple[int, ...], list[int], torch.Size, or range
+        Physical shape of the result tensor. Extents must be exact,
+        nonnegative signed-64-bit integers and their product must fit in a
+        signed 64-bit integer.
     *args : STensor
         Input tensors, matched left-to-right against the RHS tensor accesses.
     **kwargs
@@ -2591,53 +3396,97 @@ def lower_and_exec_cin(
     Returns
     -------
     STensor
-        Output tensor. The output format is hard-coded to ``"dd"`` (dense).
+        Output tensor. Dense result rank and mode order are derived from the
+        compiler-owned result declaration. Sparse-result wrapping retains its
+        historical compatibility behavior until the sparse-result migration
+        owns its assembled indices.
     """
-    _align_mode_orders_to_loop_order(cin_stmt, args)
-
-    rhs_tensor_vars = cin_stmt.get_rhs_tensor_vars()
-    if len(rhs_tensor_vars) != len(args):
-        raise CompileSpecError(
-            f"CIN expects {len(rhs_tensor_vars)} runtime tensors, got {len(args)}"
+    compile_options = _compile_options_from_kwargs(kwargs)
+    _reject_unsupported_requested_schedule(compile_options, "lower_and_exec_cin")
+    compilation_context = _compilation_context_from_kwargs(kwargs, compile_options)
+    cin_stmt = normalize_cin(
+        cin_stmt,
+        compile_options=compile_options,
+        compilation_context=compilation_context,
+    )
+    result_shape, runtime_args, alignment_plan = _plan_direct_cin_runtime_binding(
+        cin_stmt,
+        result_shape,
+        args,
+        compile_options,
+        compilation_context,
+    )
+    try:
+        args = _relayout_mode_order_args(
+            tuple(snapshot.tensor for snapshot in runtime_args),
+            alignment_plan,
+            compile_options,
+            compilation_context,
+            snapshots=runtime_args,
         )
-    for tensor_var, arg in zip(rhs_tensor_vars, args):
-        if tensor_var.format != arg.format:
-            raise CompileSpecError(
-                f"CIN tensor {tensor_var.name!r} expects format "
-                f"{tensor_var.format}, got {arg.format}"
+    except Exception:
+        if compilation_context._failed_stage_id is None:
+            relayout_failure_token = compilation_context.begin_stage(
+                CompilerStageId.FRONTEND_VALIDATED_OPERATION_CONSTRUCTION,
+                compile_options=compile_options,
             )
-        tensor_var.shape = arg.shape
-        tensor_var.dtype = arg.dtype
-        tensor_var.mode_order = list(arg.mode_order)
+            compilation_context.fail_stage(relayout_failure_token)
+        raise
 
-    output_dtype = args[0].dtype if args else torch.float32
-    for tensor_var in cin_stmt.get_result_tensor_vars():
-        if not isinstance(tensor_var, Workspace):
-            tensor_var.shape = tuple(result_shape)
-            tensor_var.dtype = output_dtype
+    frontend_binding_token = compilation_context.begin_stage(
+        CompilerStageId.FRONTEND_VALIDATED_OPERATION_CONSTRUCTION,
+        compile_options=compile_options,
+    )
+    try:
+        runtime_args = _snapshot_runtime_tensors(
+            args,
+            expected_count=len(runtime_args),
+        )
+        _apply_mode_order_alignment(cin_stmt, alignment_plan)
+        rhs_tensor_vars = cin_stmt.get_rhs_tensor_vars()
+        for tensor_var, snapshot in zip(rhs_tensor_vars, runtime_args):
+            tensor_var.shape = snapshot.shape
+            tensor_var.dtype = snapshot.dtype
+            tensor_var.mode_order = list(snapshot.mode_order)
+
+        output_dtype = runtime_args[0].dtype if runtime_args else torch.float32
+        for tensor_var in cin_stmt.get_result_tensor_vars():
+            if not isinstance(tensor_var, Workspace):
+                tensor_var.shape = tuple(result_shape)
+                tensor_var.dtype = output_dtype
+    except Exception:
+        compilation_context.fail_stage(frontend_binding_token)
+        raise
+    compilation_context.complete_stage(frontend_binding_token)
 
     # Lower to LLIR
-    lowerer = CINLowerer()
-    lowered_llir = lowerer.lower_IndexStmt(cin_stmt)
-    llir_lowerer = LLIRLowerer()
-    cpp_code = llir_lowerer.lower_llir(lowered_llir)
-    # print(cpp_code)
-    header_cpp_code = jit_preamble_text()
-
-    module = _load_kernel(
-        name=_kernel_name(header_cpp_code, cpp_code),
-        cpp_sources=[header_cpp_code, cpp_code],
-        functions=["evaluate"],
-        extra_cflags=get_extra_cflags(),
-        extra_ldflags=get_extra_ldflags(),
+    lowerer = CINLowerer(
+        compile_options=compile_options,
+        compilation_context=compilation_context,
     )
+    lowered_llir = lowerer._lower_owned_IndexStmt(cin_stmt)
+    cpp_code = _lower_generated_llir(
+        lowered_llir,
+        compile_options,
+        compilation_context,
+    )
+    # print(cpp_code)
+    header_cpp_code = compile_options.build.preamble_source
+
+    prepared_build = _prepare_generated_kernel_build(
+        header_cpp_code,
+        cpp_code,
+        compile_options,
+        compilation_context,
+    )
+    module = _load_validated_prepared_kernel(prepared_build)
 
     module_args: List[Any] = [result_shape]
 
-    for arg in args:
-        module_args.append(arg.shape)
-        module_args.append(arg._native_mode_indices())
-        module_args.append(arg.values)
+    for snapshot in runtime_args:
+        module_args.append(snapshot.shape)
+        module_args.append(snapshot.native_mode_indices)
+        module_args.append(snapshot.values)
 
     start_time = time.time()
     result_cpp = module.evaluate(*module_args)
@@ -2646,10 +3495,27 @@ def lower_and_exec_cin(
     if "time_dict" in kwargs:
         kwargs["time_dict"]["eval_time"] = eval_time
 
+    result_tensor_var = lowerer.final_result_tensor_var
+    dense_result = (
+        result_tensor_var
+        if result_tensor_var is not None
+        and result_tensor_var.format is not None
+        and result_tensor_var.format.is_dense()
+        else None
+    )
+    result_format = (
+        dense_result.get_format() if dense_result is not None else parse_format("dd")
+    )
+    result_mode_order = (
+        tuple(dense_result.mode_order)
+        if dense_result is not None and dense_result.mode_order is not None
+        else None
+    )
     result = _wrap_generated_result(
         shape=tuple(result_shape),
-        tensor_format="dd",
+        tensor_format=result_format,
         result_cpp=result_cpp,
+        mode_order=result_mode_order,
     )
 
     return result

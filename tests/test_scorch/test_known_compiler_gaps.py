@@ -2,6 +2,7 @@ import torch
 
 from scorch import STensor
 from scorch.compiler.cin import ForAll, IndexVar, Operation, TensorAssign, TensorVar
+from scorch.compiler.cin_analysis import canonical_cin_dump
 from scorch.ops import lower_and_exec_cin
 
 
@@ -80,9 +81,13 @@ def test_known_gap_spmm_transposed_mode_order():
         mode_order_a=[1, 0],
         mode_order_b=[1, 0],
     )
+    cin_before = canonical_cin_dump(cin_stmt)
+    input_mode_orders = (a.mode_order, b.mode_order)
     result = lower_and_exec_cin(cin_stmt, (n, n), a, b)
     expected = torch.matmul(a_torch, b_torch)
     assert torch.allclose(result.to_torch(), expected, atol=1e-4, rtol=1e-4)
+    assert canonical_cin_dump(cin_stmt) == cin_before
+    assert (a.mode_order, b.mode_order) == input_mode_orders
 
 
 def test_known_gap_broadcast_rhs_vector():

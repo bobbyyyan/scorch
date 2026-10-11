@@ -1,0 +1,19 @@
+<svg
+  xmlns="http://www.w3.org/2000/svg"
+  viewBox="0 0 256 256"
+  role="img"
+  aria-labelledby="scorch-icon-title"
+>
+  <title id="scorch-icon-title">Scorch pixel ember icon</title>
+
+  <g shape-rendering="geometricPrecision">
+    <rect x="168" y="24" width="64" height="64" rx="10" fill="#ee4c2c"/>
+
+    <rect x="96" y="96" width="64" height="64" rx="10" fill="#ee4c2c"/>
+    <rect x="168" y="96" width="64" height="64" rx="10" fill="#f9973b"/>
+
+    <rect x="24" y="168" width="64" height="64" rx="10" fill="#ee4c2c"/>
+    <rect x="96" y="168" width="64" height="64" rx="10" fill="#f9973b"/>
+    <rect x="168" y="168" width="64" height="64" rx="10" fill="#ee4c2c"/>
+  </g>
+</svg>

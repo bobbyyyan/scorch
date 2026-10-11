@@ -7,8 +7,9 @@ that makes SpMM row accumulation and SpGEMM (sparse × sparse) work: they let a
 loop reduce over an inner variable (say `j`) into scratch storage, then emit the
 finished output row from that scratch. This page explains what a workspace is,
 the two variants (dense and sparse/COO-hashed), how it surfaces in the CIN as a
-{doc}`Where node </compiler/index_notation>`, and how to reach the explicit
-workspace-lowering path through {func}`~scorch.matmul_wksp`.
+{doc}`Where node </compiler/index_notation>`, and how ordinary generated
+{func}`~scorch.matmul` and {func}`~scorch.einsum` lowering reaches the scheduler's
+workspace-insertion policy.
 
 For where workspaces sit in the overall lowering stack, see
 {doc}`/compiler/pipeline`; for the index-notation IR they live in, see
@@ -129,23 +130,15 @@ workspace if the schedule is actually going to **tile**; otherwise it can write
 directly to the dense result. So not every SpMM materializes a buffer — it
 depends on the chosen schedule.
 
-## Driving the workspace path: `matmul_wksp`
+## Reaching workspace lowering
 
-Most calls to {func}`~scorch.matmul` never reach the generic compiler — they hit a
-hand-written **prebuilt** kernel, or (for dense operands) delegate to
-`torch.matmul`. To exercise the workspace-based compiler path explicitly, use
-{func}`~scorch.matmul_wksp`. It **always** lowers through the CIN pipeline,
-building a `Where` with a `Workspace` — dense when the requested output is dense,
-COO-hashed when it is sparse — and JIT-compiles once per
-`(a.format, b.format, output_format)` combination.
-
-```python
-def matmul_wksp(a, b, output_format=None, **kwargs) -> STensor
-```
-
-Unlike {func}`~scorch.matmul`, it returns an {class}`~scorch.STensor` in
-`output_format` (default `"ds"` / CSR) rather than auto-densifying to a
-`torch.Tensor`, and it always converts torch inputs to sparse.
+Workspaces are scheduler-owned compiler artifacts, not a separate public
+matrix-multiplication mode. Most calls to {func}`~scorch.matmul` use a prebuilt
+kernel when one matches. Passing `use_cache=False` bypasses that prebuilt
+dispatch and reaches the generic `einsum` compiler path; the scheduler then
+decides whether the selected loop order and output format require a workspace.
+The generated kernel still participates in the normal JIT kernel and persistent
+`.so` caches.
 
 ### SpGEMM — the COO-hashed workspace
 
@@ -164,30 +157,17 @@ B_dense = (torch.rand(48, 32) < 0.15).float() * torch.rand(48, 32)
 A = scorch.from_torch(A_dense, "A").to_sparse("ds")   # CSR STensor
 B = scorch.from_torch(B_dense, "B").to_sparse("ds")   # CSR STensor
 
-C = scorch.matmul_wksp(A, B, output_format="ds")      # -> STensor (CSR)
+C = scorch.matmul(A, B, format="ds", use_cache=False)  # -> STensor (CSR)
 
 ref = A_dense @ B_dense
 assert torch.allclose(C.to_torch(), ref, atol=1e-3, rtol=1e-3)
 ```
 
-### SpMM — the dense workspace
-
-Sparse `A` × dense `B` into a dense output uses the flat dense accumulator row:
-
-```python
-x = torch.rand(48, 16)
-D = scorch.matmul_wksp(A, x, output_format="dd")      # -> STensor (dense)
-
-assert torch.allclose(D.to_torch(), A_dense @ x, atol=1e-3, rtol=1e-3)
-```
-
-:::{tip}
-Reach for {func}`~scorch.matmul_wksp` when you specifically want the workspace
-codegen path — studying the compiler, or driving a format/output combination that
-has no prebuilt kernel. For everyday matmuls, {func}`~scorch.matmul` is the tuned
-entry point (prebuilt kernels + adaptive tiling + thread policy); see
-{doc}`/user_guide/operations`.
-:::
+For a dense output, reaching the generic compiler does not by itself force a
+workspace. As described above, the scheduler inserts dense workspace storage
+only when the chosen tiling plan needs it. Compiler tests that require a
+particular `Where`/`Workspace` shape construct or schedule that CIN explicitly;
+the public operation remains policy-driven.
 
 ## Where workspaces show up
 
@@ -213,5 +193,5 @@ for parallel compressed-output generation — see {doc}`/compiler/lowering` and
   `Workspace` nodes.
 - {doc}`/compiler/lowering` — the scheduler's workspace-insertion pass and the
   producer/consumer lowering that fills and drains the buffer.
-- {doc}`/user_guide/operations` — {func}`~scorch.matmul` vs.
-  {func}`~scorch.matmul_wksp`, and the SpMM / SpGEMM operations end to end.
+- {doc}`/user_guide/operations` — {func}`~scorch.matmul`,
+  {func}`~scorch.einsum`, and the SpMM / SpGEMM operations end to end.

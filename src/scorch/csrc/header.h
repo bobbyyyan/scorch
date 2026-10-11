@@ -257,6 +257,275 @@ static inline void scorch_zero_dense(T* __restrict__ p, int64_t n) {
   }
 }
 
+// ####################################
+// Parallel single-pass sparse assembly
+// ####################################
+//
+// The generated single-pass sparse builders append into std::vector in outer-
+// loop order, which is sequential by construction. These helpers let a builder
+// keep that one-pass strategy and still run in parallel: each CHUNK of the
+// outer dense loop appends into its own private buffers, and the buffers are
+// concatenated afterwards in chunk order, which is outer-loop order.
+//
+// Chunks rather than threads own the buffers deliberately. Under a dynamic
+// schedule one thread may take a low row range and then a high one, so
+// concatenating per-THREAD buffers would not reproduce the required
+// lexicographic order; concatenating per-CHUNK buffers does, whatever the
+// schedule did, so load balancing costs nothing in ordering.
+
+// Rows per output chunk. The width is scorch_chunk's dynamic-schedule width,
+// but never so narrow that the chunk COUNT exceeds ~SCORCH_CHUNKS_PER_THREAD
+// per worker: here each chunk owns its own output buffers, so the count is an
+// allocation budget as well as a load-balancing knob, and scorch_chunk's
+// SCORCH_CHUNK_MAX clamp is a schedule bound that would otherwise let the
+// buffer count grow without limit in `rows`.
+inline int64_t scorch_chunk_rows(long rows, long work,
+                                 long grain_default = SCORCH_GRAIN_DEFAULT) {
+  const int nt = scorch_nthreads(work, rows, grain_default);
+  int64_t width = static_cast<int64_t>(scorch_chunk(rows, work, grain_default));
+  const int64_t budget = static_cast<int64_t>(nt) * SCORCH_CHUNKS_PER_THREAD;
+  if (budget > 0) {
+    const int64_t floor_width = (static_cast<int64_t>(rows) + budget - 1) / budget;
+    if (width < floor_width) {
+      width = floor_width;
+    }
+  }
+  return width < 1 ? 1 : width;
+}
+
+// The exclusive upper row of one chunk.
+inline int64_t scorch_chunk_end(int64_t begin, int64_t width, int64_t rows) {
+  const int64_t end = begin + width;
+  return end < rows ? end : rows;
+}
+
+// `chunks` empty private buffers. Returned by value; `auto` at the call site.
+template <typename T>
+inline std::vector<std::vector<T>> scorch_chunk_buffers(int64_t chunks) {
+  if (chunks < 0) {
+    throw std::out_of_range("negative chunk count");
+  }
+  return std::vector<std::vector<T>>(static_cast<size_t>(chunks));
+}
+
+// Grow a position array to `count` slots, preserving what it already holds.
+// scorch_vector_set's append path is sequential-only; once the array is
+// pre-sized every write inside the region takes its checked in-range store, so
+// disjoint chunk workers may write their own slots concurrently.
+template <typename T>
+inline void scorch_presize_positions(std::vector<T>& positions, int64_t count) {
+  if (count < 0) {
+    throw std::out_of_range("negative position count");
+  }
+  const auto wanted = static_cast<typename std::vector<T>::size_type>(count);
+  if (positions.size() < wanted) {
+    positions.resize(wanted, T(0));
+  }
+}
+
+// How many entries the chunks hold in total. O(chunks), never O(nnz).
+//
+// This replaces a per-chunk destination-offset ARRAY, which existed only so an
+// OpenMP region could memcpy disjoint slices. The merge no longer has that
+// region (see scorch_concat_chunks), and the array was a heap allocation per
+// merge -- material at the small end, where a merge is tens of nanoseconds.
+template <typename T>
+inline size_t scorch_chunk_total(size_t begin,
+                                 const std::vector<std::vector<T>>& parts) {
+  size_t total = begin;
+  for (const std::vector<T>& part : parts) {
+    total += part.size();
+  }
+  return total;
+}
+
+// Append every chunk's entries, in chunk order.
+//
+// This copy is the whole price of the single-pass strategy -- it replaces
+// legacy's redundant counting pass -- so it has to be cheap.
+//
+// The destination is grown with reserve plus one insert per chunk, and the point
+// is what that does NOT do. `out` is a std::vector<T> the generated kernel
+// declares and later MOVES into a tensor, so it cannot be given an allocator
+// that default-initializes, and C++17 has no uninitialized resize. That leaves
+// exactly two shapes:
+//
+//   * resize(total) value-initializes [begin, total) -- a whole pass of stores
+//     over a range the copy then overwrites in full -- and buys the right to
+//     memcpy disjoint slices from an OpenMP region;
+//   * reserve(total) plus one insert per chunk writes the destination ONCE,
+//     because insert copy-constructs into raw storage, but the copies are
+//     necessarily serial: only the container may move its own size.
+//
+// So the first shape moves 3N bytes and the second 2N, and the parallel copy has
+// to divide its 2N by more than two before the extra pass pays for itself. It
+// does not, over the range these merges actually reach.
+//
+// Measured rather than argued, on two hosts, 144 points each: nine total sizes
+// from 1 KB to 32 MB x {2, 8, 32} chunks x {1, 2, 4, all} threads x {int, float},
+// ABBA-interleaved, min within a round and median across rounds, against a
+// same-shape control whose floor is 0.97-1.03 at almost every point.
+//
+//   * the insert shape is faster at 97 of 144 points on an Apple M5 and 134 of
+//     144 on x86;
+//   * at ONE worker, where the parallel arm cannot fire at all, it is faster at
+//     35 of 36 M5 points (0.906x-1.595x) and 36 of 36 x86 points
+//     (1.019x-3.683x) -- that band is pure redundant zeroing removed;
+//   * at exactly the 256 KB gate with more than one worker, which is the
+//     smallest region the parallel arm fires on today, it is 3.2x-18.4x faster
+//     on the M5 and 2.4x-4.8x on x86: the OpenMP region costs more than the copy
+//     it parallelizes;
+//   * the resize-and-parallel shape wins only high and only on one host at a
+//     time -- from 4 MB up on the M5, best 1.66x at 32 MB, and on x86 only at
+//     16 MB over 32 chunks and at 32 MB, best 1.28x.
+//
+// No byte threshold therefore provably avoids firing where it hurts, which is
+// what CLAUDE.md asks a runtime gate to be, so the mechanism is removed rather
+// than given a gate that cannot be right on both hosts. The cost is stated: a
+// merge above 4 MB on the M5 gives up as much as 1.66x. Recovering it needs a
+// destination the generated kernel declares with an allocator that
+// default-initializes, which is a codegen change.
+//
+// One regression, quantified: a 1 KB total spread over 32 chunks is 0.897x-0.916x
+// on the M5 -- 32-byte chunks, where insert's per-chunk bookkeeping outweighs a
+// zero-fill that fits in a cache line burst. Twelve to eighteen nanoseconds, and
+// x86 does not show it (1.208x-1.439x on the same points).
+//
+// `threads` is kept, unnamed: the generated call site passes the assembly thread
+// count and its text is locked by the emitter's tests.
+//
+// scorch_concat_chunk_positions below still value-initializes for the same
+// reason, and it is NOT changed here: what follows its resize is a transforming
+// loop rather than a memcpy, so insert cannot express it and the trade is a
+// different one that needs its own measurement.
+template <typename T>
+inline void scorch_concat_chunks(std::vector<T>& out,
+                                 const std::vector<std::vector<T>>& parts,
+                                 int = 1) {
+  const size_t begin = out.size();
+  const size_t total = scorch_chunk_total(begin, parts);
+  if (total == begin) {
+    return;
+  }
+  // One allocation for the whole merge; without it the insert chain reallocates
+  // geometrically and copies what it has already appended.
+  out.reserve(total);
+  for (const std::vector<T>& part : parts) {
+    if (!part.empty()) {
+      out.insert(out.end(), part.begin(), part.end());
+    }
+  }
+}
+
+// Append each chunk's position entries after its leading zero, shifted by the
+// running total of that chunk's child coordinates. Chunk c's local positions
+// count into its own child buffer, so the shift is the number of child
+// coordinates every earlier chunk contributed.
+template <typename P, typename C>
+inline void scorch_concat_chunk_positions(
+    std::vector<P>& out,
+    const std::vector<std::vector<P>>& position_parts,
+    const std::vector<std::vector<C>>& child_parts,
+    int threads = 1) {
+  if (position_parts.size() != child_parts.size()) {
+    throw std::out_of_range("chunk position/child buffer count mismatch");
+  }
+  const size_t begin = out.size();
+  const size_t count = position_parts.size();
+  // Each chunk contributes its entries after the leading zero, at a destination
+  // offset and a value shift that are both prefix sums over the chunks.
+  std::vector<size_t> offsets(count + 1);
+  std::vector<int64_t> shifts(count + 1);
+  offsets[0] = begin;
+  shifts[0] = 0;
+  for (size_t chunk = 0; chunk < count; chunk++) {
+    const size_t entries =
+        position_parts[chunk].empty() ? 0 : position_parts[chunk].size() - 1;
+    offsets[chunk + 1] = offsets[chunk] + entries;
+    shifts[chunk + 1] =
+        shifts[chunk] + static_cast<int64_t>(child_parts[chunk].size());
+  }
+  const size_t total = offsets.back();
+  if (total == begin) {
+    return;
+  }
+  out.resize(total);
+  P* const destination = out.data();
+  const int64_t bytes =
+      static_cast<int64_t>(total - begin) * static_cast<int64_t>(sizeof(P));
+  const int64_t chunks = static_cast<int64_t>(count);
+  if (threads > 1 && bytes >= SCORCH_MEMSET_GRAIN_BYTES) {
+#pragma omp parallel for num_threads(threads) schedule(dynamic)
+    for (int64_t chunk = 0; chunk < chunks; chunk++) {
+      const size_t index = static_cast<size_t>(chunk);
+      const std::vector<P>& part = position_parts[index];
+      P* slot = destination + offsets[index];
+      for (size_t entry = 1; entry < part.size(); entry++) {
+        *slot++ =
+            static_cast<P>(static_cast<int64_t>(part[entry]) + shifts[index]);
+      }
+    }
+    return;
+  }
+  for (int64_t chunk = 0; chunk < chunks; chunk++) {
+    const size_t index = static_cast<size_t>(chunk);
+    const std::vector<P>& part = position_parts[index];
+    P* slot = destination + offsets[index];
+    for (size_t entry = 1; entry < part.size(); entry++) {
+      *slot++ = static_cast<P>(static_cast<int64_t>(part[entry]) + shifts[index]);
+    }
+  }
+}
+
+// Add each chunk's running coordinate base to the dense-indexed position slots
+// that chunk wrote. The first compressed level's position array is indexed by
+// the outer dense loop, so it is shared and pre-sized rather than chunked; only
+// its values are chunk-local counts. Chunk c wrote slots (lo, hi], where lo/hi
+// are its own row range, so the shift range is exact rather than searched for.
+template <typename P, typename C>
+inline void scorch_shift_chunk_positions(
+    std::vector<P>& positions,
+    const std::vector<std::vector<C>>& child_parts,
+    int64_t width,
+    int64_t rows,
+    int threads = 1) {
+  const size_t count = child_parts.size();
+  std::vector<int64_t> shifts(count + 1);
+  shifts[0] = 0;
+  for (size_t chunk = 0; chunk < count; chunk++) {
+    shifts[chunk + 1] =
+        shifts[chunk] + static_cast<int64_t>(child_parts[chunk].size());
+  }
+  if (static_cast<int64_t>(positions.size()) < rows + 1) {
+    throw std::out_of_range("position array was not pre-sized for the chunks");
+  }
+  P* const slots = positions.data();
+  const int64_t chunks = static_cast<int64_t>(count);
+  const int64_t bytes = (rows + 1) * static_cast<int64_t>(sizeof(P));
+  if (threads > 1 && bytes >= SCORCH_MEMSET_GRAIN_BYTES) {
+#pragma omp parallel for num_threads(threads) schedule(dynamic)
+    for (int64_t chunk = 1; chunk < chunks; chunk++) {
+      const int64_t begin = chunk * width;
+      const int64_t end = scorch_chunk_end(begin, width, rows);
+      const int64_t base = shifts[static_cast<size_t>(chunk)];
+      for (int64_t slot = begin + 1; slot <= end; slot++) {
+        slots[slot] =
+            static_cast<P>(static_cast<int64_t>(slots[slot]) + base);
+      }
+    }
+    return;
+  }
+  // Chunk 0's base is zero, so its slots already hold the global count.
+  for (int64_t chunk = 1; chunk < chunks; chunk++) {
+    const int64_t begin = chunk * width;
+    const int64_t end = scorch_chunk_end(begin, width, rows);
+    const int64_t base = shifts[static_cast<size_t>(chunk)];
+    for (int64_t slot = begin + 1; slot <= end; slot++) {
+      slots[slot] = static_cast<P>(static_cast<int64_t>(slots[slot]) + base);
+    }
+  }
+}
+
 
 
 // ####################################

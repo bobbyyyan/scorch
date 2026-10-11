@@ -1,0 +1,39 @@
+# The five protected tracked files, and what this file is a snapshot OF.
+#
+# These are SHA-256 digests of the five files as they are COMMITTED, taken from a
+# clean detached checkout at 01ae768 on refactor/compiler-ir-phase3-std-move-call
+# with `shasum -a 256`.  Every one of the five is byte-identical at every commit
+# from origin a3b8d1e through 01ae768, so these are also the digests at the
+# branch point.
+#
+# WHAT THE CHECK MEANS, AND WHAT IT USED TO MEAN.  The previous baseline lived
+# only in evidence folders under ~/.cache/scorch-codex/ -- seventeen copies of
+# it, sixteen byte-identical -- and its digests were taken from a WORKING TREE
+# that carried a separate CUDA project's uncommitted edits.  Every milestone that
+# reported "the five protected tracked files hash exactly as recorded" was
+# therefore reporting that the working tree had not changed since that snapshot,
+# not that the five tracked files were unmodified.  A clean checkout differed
+# from all five recorded digests, which is how the discrepancy surfaced (review
+# section 61.2).  Those past claims are true as stated about the working tree and
+# are left standing; this file is where the check's meaning is written down.
+#
+# `statics/check_protected_files.py` runs two independent checks against these
+# five paths, and the git-derived one does not read this file at all:
+#
+#   1. git-derived, and the one that cannot drift: the five tracked blobs at the
+#      tree's HEAD equal the blobs at a reference commit.  No stored digest is
+#      involved, so it stays true however this file ages.
+#   2. this snapshot: the five files ON DISK match the digests below.  A clean
+#      checkout at 01ae768 passes.  The live repository FAILS while the CUDA
+#      project's edits are present, and that failure is the correct report --
+#      it says the working tree has edits to protected files, which is a
+#      different statement from "the tracked files changed".
+#
+# Regenerate with:
+#   python statics/check_protected_files.py TREE --write
+# from a CLEAN checkout, never from the tree being edited.
+d3d3db3e72190eb5d10de96db8a96e2b81ab6804f4ff0fb141fc0fe3ed3e6537  .gitignore
+50d2455303b6d442cbf5f0d644697e7c3fc5eabb6fb25593826164c978f297fe  pyproject.toml
+432bae3293ca1e1aa0ab9ebcb35b600db660c797fa1d95ef5a5d4dab9ce327c8  src/scorch/__init__.py
+b82cb29c3d2166cf7bbe722e2f54b9bbc04c2b15ea77a1a2239d88f04dffd84d  tests/packaging/smoke_install.py
+19bc160d48d514f2c09215a6b2e987a720ed595d5bd7b769aa1a98b0a68bed73  tests/test_scorch/test_resources.py

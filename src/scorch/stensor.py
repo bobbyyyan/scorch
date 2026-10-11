@@ -3,12 +3,12 @@ import os
 import weakref
 from collections.abc import Sequence
 from copy import deepcopy
-from dataclasses import replace
-from typing import Any, Optional, Tuple, Union, List
+from typing import Any, Dict, Optional, Tuple, Union, List
 
 import torch
 
 from .compiler.cin import (
+    IndexStmt,
     TensorVar,
     ForAll,
     IndexVar,
@@ -17,16 +17,20 @@ from .compiler.cin import (
     TensorAssign,
 )
 from .compiler.cin_lowerer import CINLowerer
+from .compiler.cin_analysis import normalize_cin
+from .compiler.compile_options import CompileOptions
 from .compiler.codegen import LLIRLowerer
+from .compiler.compilation_context import CompilerStageId, CompilationContext
 from .exceptions import (
+    TensorFormatError,
     TensorIndexError,
     TensorLayoutError,
     TensorStorageError,
     TensorTypeError,
     TensorValidationError,
 )
-from .format import TensorFormat, LevelFormat, LevelType
-from .layout import TensorLayout, TensorMetadata
+from .format import TensorFormat, LevelFormat, LevelType, audit_format_state
+from .layout import TensorLayout, TensorMetadata, _normalize_shape
 
 # Names only -- plan.py imports torch and the native extension, nothing from this
 # module, so there is no cycle. Imported as constants because _set_state runs on
@@ -37,14 +41,18 @@ from .plan import (
     DECLINES_ATTR as _PLAN_DECLINES_ATTR,
     GRAD_ATTR as _PLAN_GRAD_ATTR,
 )
-from .storage import SparseStorage, TensorIndex, tensor_version
+from .storage import (
+    SparseStorage,
+    TensorIndex,
+    tensor_version,
+    _owned_sparse_storage,
+    _owned_tensor_index_components,
+)
 from .utils import (
     parse_format,
-    get_extra_cflags,
-    get_extra_ldflags,
-    jit_preamble_text,
     _kernel_name,
-    _load_kernel,
+    _load_validated_prepared_kernel,
+    _prepare_jit_build,
 )
 
 # Whether `_wrap_generated_result` may take a kernel's index arrays instead of copying
@@ -63,6 +71,26 @@ _ADOPT_KERNEL_INDICES = os.environ.get("SCORCH_ADOPT_KERNEL_INDICES", "1") not i
 # worth to a comparison between two processes. Timing both states in one process is
 # strictly better evidence, and this is what makes it possible.
 _ADOPT_CELL = [_ADOPT_KERNEL_INDICES]
+
+
+def _compilation_context_at_boundary(
+    compilation_context: Optional[CompilationContext],
+    compile_options: CompileOptions,
+) -> CompilationContext:
+    """Create or validate the one timing owner paired with the one snapshot."""
+
+    if compilation_context is not None:
+        if type(compilation_context) is not CompilationContext:
+            raise TypeError(
+                "_compilation_context must be a CompilationContext instance"
+            )
+        if compilation_context.compile_options is not compile_options:
+            raise TypeError(
+                "_compilation_context must retain this compilation's exact "
+                "CompileOptions snapshot"
+            )
+        return compilation_context
+    return CompilationContext(compile_options=compile_options)
 
 
 def _finalize_generated_mode_indices(
@@ -158,7 +186,11 @@ def _dense_result_parts(
     layout = TensorLayout.from_physical_shape(
         shape, index.format, index.mode_order, index.index_dtype
     )
-    metadata = TensorMetadata(
+    # `_from_owned_layout` and not the public constructor: a runtime tensor's
+    # metadata and storage share one layout object, which `_set_state` checks by
+    # identity. The public constructor detaches the layout it is handed, which
+    # would make the two differ.
+    metadata = TensorMetadata._from_owned_layout(
         "tensor" if name is None else name,
         value.dtype,
         value.device,
@@ -265,16 +297,111 @@ def _wrap_generated_result(
     # Build the storage here rather than letting STensor do it, because this is the one
     # construction site that may declare the index trusted: these arrays came out of our
     # own codegen microseconds ago. `SparseStorage` then skips the O(nnz) structural walk
-    # unless `storage._VALIDATE_KERNEL_RESULTS` is on, which the test suite turns on. Going
-    # through `storage=` keeps that decision local -- STensor's public signature does not
-    # grow a way for a caller to declare their own arrays trusted.
+    # unless `storage._VALIDATE_KERNEL_RESULTS` is on, which the test suite turns on.
+    # Keeping the decision here means STensor's public signature does not grow a way for
+    # a caller to declare their own arrays trusted.
     layout = TensorLayout.from_physical_shape(
         shape, index.format, index.mode_order, index.index_dtype
     )
     storage = SparseStorage(layout, value, index=index, _trusted_index=True)
-    if name is None:
-        return STensor(shape=shape, storage=storage)
-    return STensor(name=name, shape=shape, storage=storage)
+    # `_from_validated`, not `STensor(storage=...)`: the public path re-owns the storage
+    # it is handed, which rebuilds through `mode_indices=` and so clones every index
+    # array and walks it again -- discarding both the adoption and the trust granted one
+    # line above, on every generated kernel result. The re-own is right for a caller's
+    # storage and wrong for our own. This mirrors the cached branch above: the shape
+    # check `__init__` performs could only ever pass here, because `layout` was built
+    # from this same `shape`, and `_set_state` still checks the metadata's layout, dtype
+    # and device against the storage's.
+    metadata = TensorMetadata._from_owned_layout(
+        "tensor" if name is None else name,
+        value.dtype,
+        value.device,
+        layout,
+        False,
+    )
+    return STensor._from_validated(metadata, storage)
+
+
+_MAX_FORMAT_BIT_WIDTH = (1 << 63) - 1
+
+
+def _owned_sparse_format(tensor_format: TensorFormat) -> TensorFormat:
+    """Validate and detach one parsed public ``to_sparse`` format.
+
+    ``TensorFormat`` and ``LevelFormat`` are frozen value objects, but Python's
+    ``object.__setattr__`` can still forge or mutate their stored state.  A
+    runtime tensor must not retain caller-owned format objects: changing one
+    after conversion would otherwise change the tensor's declared layout while
+    leaving its index arrays and values untouched.  Inspect exact stored fields
+    without invoking overridable accessors, then rebuild both container layers.
+    """
+
+    if type(tensor_format) is not TensorFormat:
+        raise TensorTypeError("to_sparse format must be an exact TensorFormat")
+    audited = audit_format_state(tensor_format)
+    if audited is not None:
+        for audited_level in audited:
+            if (
+                audited_level.bit_width is not None
+                and audited_level.bit_width > _MAX_FORMAT_BIT_WIDTH
+            ):
+                raise TensorFormatError(
+                    "to_sparse format level bit_width must be a positive "
+                    "signed-int64 exact int or None"
+                )
+        # The shared construction-side audit already proved every stored
+        # field exact and rebuilt both container layers.
+        return TensorFormat(audited)
+    # Otherwise re-walk the same state to name the exact defect: this public
+    # entry point owes a more precise error than the shared construction
+    # boundary.
+    state = object.__getattribute__(tensor_format, "__dict__")
+    state_keys = tuple(state) if type(state) is dict else ()
+    if (
+        type(state) is not dict
+        or len(state_keys) != 1
+        or type(state_keys[0]) is not str
+        or state_keys[0] != "_level_formats"
+    ):
+        raise TensorFormatError("to_sparse format has malformed stored state")
+    levels = state["_level_formats"]
+    if type(levels) is not tuple:
+        raise TensorFormatError("to_sparse format levels must be an exact tuple")
+
+    owned_levels = []
+    for level, level_format in enumerate(levels):
+        if type(level_format) is not LevelFormat:
+            raise TensorFormatError(
+                f"to_sparse format level {level} must be an exact LevelFormat"
+            )
+        level_state = object.__getattribute__(level_format, "__dict__")
+        level_keys = tuple(level_state) if type(level_state) is dict else ()
+        if (
+            type(level_state) is not dict
+            or len(level_keys) != 2
+            or any(type(key) is not str for key in level_keys)
+            or set(level_keys) != {"_mode", "_bit_width"}
+        ):
+            raise TensorFormatError(
+                f"to_sparse format level {level} has malformed stored state"
+            )
+        mode = level_state["_mode"]
+        bit_width = level_state["_bit_width"]
+        if type(mode) is not LevelType:
+            raise TensorFormatError(
+                f"to_sparse format level {level} mode must be an exact LevelType"
+            )
+        if bit_width is not None and (
+            type(bit_width) is not int
+            or bit_width <= 0
+            or bit_width > _MAX_FORMAT_BIT_WIDTH
+        ):
+            raise TensorFormatError(
+                f"to_sparse format level {level} bit_width must be a positive "
+                "signed-int64 exact int or None"
+            )
+        owned_levels.append(LevelFormat(mode, bit_width=bit_width))
+    return TensorFormat(owned_levels)
 
 
 class Window(object):
@@ -583,6 +710,40 @@ def _dense_from_torch(
     return built
 
 
+def _is_directly_materialized_format(output_format: TensorFormat) -> bool:
+    """A ``d``/``s`` layout the per-entry filter kernel cannot assemble.
+
+    The legacy filter kernel sizes each compressed level's position array
+    from its immediately enclosing level alone, so it assembles exactly the
+    layouts whose compressed levels form one contiguous run under at most
+    one leading dense level -- ``ds``, ``ss``, ``dss``, ``sss``, ``dsss``,
+    ``ssss``, and so on.  Every other ``d``/``s`` layout is materialized
+    directly instead:
+
+    - a dense value-bearing suffix (``sd``, ``ssd``, ``dssd``, ...), whose
+      values would otherwise be stored without parent coordinates;
+    - a dense level above a compressed level that is not that single
+      leading prefix (``dds``, ``sds``, ``ddss``, ``sdss``, ...), whose
+      position array would otherwise be sized by one dense extent instead
+      of the product of every dense parent.
+
+    Both are materialized by the same rule: one complete dense block per
+    stored prefix path, a prefix path stored exactly when its block holds
+    a nonzero, and a stored block keeping its interior zeros.
+    """
+
+    kinds = output_format.get_level_types()
+    if len(kinds) < 2 or not all(
+        kind in (LevelType.DENSE, LevelType.COMPRESSED) for kind in kinds
+    ):
+        return False
+    if not any(kind is LevelType.COMPRESSED for kind in kinds):
+        return False
+    # ``d?s+`` -- the exact family the per-entry filter kernel assembles.
+    body = kinds[1:] if kinds[0] is LevelType.DENSE else kinds
+    return not all(kind is LevelType.COMPRESSED for kind in body)
+
+
 class STensor:
     """A sparse tensor stored in a custom, per-mode layout.
 
@@ -649,25 +810,21 @@ class STensor:
         requires_grad: Optional[bool] = False,
     ) -> None:
         tensor_name = "tensor" if name is None else name
-        if not isinstance(requires_grad, bool):
+        if type(requires_grad) is not bool:
             raise TensorTypeError("requires_grad must be a bool")
         if storage is not None:
             if index is not None or value is not None:
                 raise TensorStorageError(
                     "storage cannot be combined with separate index or value arguments"
                 )
-            if not isinstance(storage, SparseStorage):
-                raise TensorTypeError("storage must be a SparseStorage")
+            runtime_storage = _owned_sparse_storage(storage)
             if shape is not None:
-                if isinstance(shape, (str, bytes)) or not isinstance(shape, Sequence):
-                    raise TensorTypeError("shape must be a sequence of integers")
-                declared_shape = tuple(shape)
-                if declared_shape != storage.layout.physical_shape:
+                declared_shape = _normalize_shape(shape, "shape")
+                if declared_shape != runtime_storage.layout.physical_shape:
                     raise TensorLayoutError(
                         f"shape {declared_shape} does not match storage physical "
-                        f"shape {storage.layout.physical_shape}"
+                        f"shape {runtime_storage.layout.physical_shape}"
                     )
-            runtime_storage = storage
             fresh_storage = False
         else:
             missing = [
@@ -684,18 +841,19 @@ class STensor:
                     "runtime STensor construction requires shape, index, and value; "
                     f"missing {', '.join(missing)}. Use TensorSpec for compile-only tensors."
                 )
-            if not isinstance(index, TensorIndex):
-                raise TensorTypeError("index must be a TensorIndex")
             if not isinstance(value, torch.Tensor):
                 raise TensorTypeError("value must be a torch.Tensor")
             if shape is None:
                 raise TensorLayoutError("shape is required for runtime storage")
+            index_format, _, index_order, index_dtype = _owned_tensor_index_components(
+                index, own_arrays=False
+            )
             layout = TensorLayout.from_physical_shape(
-                shape, index.format, index.mode_order, index.index_dtype
+                shape, index_format, index_order, index_dtype
             )
             runtime_storage = SparseStorage(layout, value, index=index)
             fresh_storage = True
-        metadata = TensorMetadata(
+        metadata = TensorMetadata._from_owned_layout(
             tensor_name,
             runtime_storage.value.dtype,
             runtime_storage.value.device,
@@ -737,7 +895,7 @@ class STensor:
             raise TensorTypeError("metadata must be TensorMetadata")
         if not isinstance(storage, SparseStorage):
             raise TensorTypeError("storage must be SparseStorage")
-        if metadata.layout != storage.layout:
+        if metadata.layout is not storage.layout:
             raise TensorLayoutError(
                 "metadata and storage must reference the same layout"
             )
@@ -842,7 +1000,13 @@ class STensor:
 
     @name.setter
     def name(self, name: str) -> None:
-        self._metadata = replace(self._metadata, name=name)
+        self._metadata = TensorMetadata._from_owned_layout(
+            name=name,
+            dtype=self._metadata.dtype,
+            device=self._metadata.device,
+            layout=self._storage.layout,
+            requires_grad=self._metadata.requires_grad,
+        )
 
     @property
     def values(self) -> torch.Tensor:
@@ -965,9 +1129,15 @@ class STensor:
 
     @requires_grad.setter
     def requires_grad(self, value: bool) -> None:
-        if not isinstance(value, bool):
+        if type(value) is not bool:
             raise TensorTypeError("requires_grad must be a bool")
-        self._metadata = replace(self._metadata, requires_grad=value)
+        self._metadata = TensorMetadata._from_owned_layout(
+            name=self._metadata.name,
+            dtype=self._metadata.dtype,
+            device=self._metadata.device,
+            layout=self._storage.layout,
+            requires_grad=value,
+        )
 
     @property
     def shape(self) -> Tuple[int, ...]:
@@ -1098,72 +1268,114 @@ class STensor:
                 f"addition requires equal logical shapes, got "
                 f"{self.logical_shape} and {other.logical_shape}"
             )
+        compile_options = CompileOptions.from_environment()
+        compilation_context = CompilationContext(compile_options=compile_options)
+
         # Scheduling must not mutate the caller's right-hand operand.
         if self.storage.index.mode_order != other.storage.index.mode_order:
             other = other.copy()
-            other.change_mode_order(self.storage.index.mode_order)
+            other.change_mode_order(
+                self.storage.index.mode_order,
+                _compile_options=compile_options,
+                _compilation_context=compilation_context,
+            )
 
-        # Perform element-wise addition
-        # TODO: support broadcasting
-        a_index_vars = [IndexVar(f"i{i}") for i in self.storage.index.mode_order]
-        index_vars = [IndexVar(f"i{i}") for i in range(len(self.shape))]
-        # TODO: output format inferred from input formats
-        output_format = self.format
-        result_shape = self.shape
-
-        A = TensorVar(
-            name="A",
-            fmt=output_format,
-            shape=result_shape,
-            dtype=self.dtype,
-            mode_order=self.storage.index.mode_order,
-        )
-        B = TensorVar(
-            name="B",
-            fmt=self.format,
-            shape=self.shape,
-            dtype=self.dtype,
-            mode_order=self.storage.index.mode_order,
-        )
-        C = TensorVar(
-            name="C",
-            fmt=other.format,
-            shape=other.shape,
-            dtype=other.dtype,
-            mode_order=other.storage.index.mode_order,
+        frontend_token = compilation_context.begin_stage(
+            CompilerStageId.FRONTEND_VALIDATED_OPERATION_CONSTRUCTION,
+            compile_options=compile_options,
         )
 
-        # Generate the python code for the element-wise addition
-        # e.g. A[i0, i1, ...] = B[i0, i1, ...] + C[i0, i1, ...]
-        lhs = f'A[{", ".join(["index_vars[{i}]".format(i=i) for i in range(len(self.shape))])}]'
-        rhs = f'B[{", ".join(["index_vars[{i}]".format(i=i) for i in range(len(self.shape))])}]'
-        rhs += f' + C[{", ".join(["index_vars[{i}]".format(i=i) for i in range(len(self.shape))])}]'
-        code = f"{lhs} = {rhs}"
-        exec(code)
+        try:
+            # Perform element-wise addition
+            # TODO: support broadcasting
+            index_vars = [IndexVar(f"i{i}") for i in range(len(self.shape))]
+            ordered_index_vars = [index_vars[i] for i in self.storage.index.mode_order]
+            # TODO: output format inferred from input formats
+            output_format = self.format
+            result_shape = self.shape
 
-        # Generate the python code for constructing the ForAll's and execute it
-        # e.g. cin_stmt = ForAll(i0, ForAll(i1, ForAll(i2, A._assignment)))
-        rhs = "A._assignment"
-        for i in range(len(self.shape))[::-1]:
-            rhs = f"ForAll(a_index_vars[{i}], {rhs})"
-        cin_stmt = eval(rhs)
+            A = TensorVar(
+                name="A",
+                fmt=output_format,
+                shape=result_shape,
+                dtype=self.dtype,
+                mode_order=self.storage.index.mode_order,
+            )
+            B = TensorVar(
+                name="B",
+                fmt=self.format,
+                shape=self.shape,
+                dtype=self.dtype,
+                mode_order=self.storage.index.mode_order,
+            )
+            C = TensorVar(
+                name="C",
+                fmt=other.format,
+                shape=other.shape,
+                dtype=other.dtype,
+                mode_order=other.storage.index.mode_order,
+            )
 
-        lowerer = CINLowerer()
-        lowered_llir = lowerer.lower_IndexStmt(cin_stmt)
-        llir_lowerer = LLIRLowerer()
-        cpp_code = llir_lowerer.lower_llir(lowered_llir)
+            access_key = index_vars[0] if len(index_vars) == 1 else tuple(index_vars)
+            rhs_expr = B[access_key] + C[access_key]
+            lhs_access = A[access_key]
+            cin_stmt: IndexStmt = TensorAssign(lhs_access, rhs_expr)
+            for index_var in reversed(ordered_index_vars):
+                cin_stmt = ForAll(index_var, cin_stmt)
+        except Exception:
+            compilation_context.fail_stage(frontend_token)
+            raise
+
+        compilation_context.complete_stage(frontend_token)
+        cin_stmt = normalize_cin(
+            cin_stmt,
+            compile_options=compile_options,
+            compilation_context=compilation_context,
+        )
+        lowerer = CINLowerer(
+            compile_options=compile_options,
+            compilation_context=compilation_context,
+        )
+        lowered_llir = lowerer._lower_owned_IndexStmt(cin_stmt)
+        llir_lowerer = LLIRLowerer(compile_options=compile_options)
+        cpp_token = compilation_context.begin_stage(
+            CompilerStageId.LLIR_TO_CPP_GENERATION,
+            compile_options=compile_options,
+        )
+        try:
+            cpp_code = llir_lowerer.lower_llir(lowered_llir)
+        except Exception:
+            compilation_context.fail_stage(cpp_token)
+            raise
+        compilation_context.complete_stage(cpp_token)
 
         # print("\n\ncpp_code:\n\n", cpp_code)
 
-        header_cpp_code = jit_preamble_text()
+        header_cpp_code = compile_options.build.preamble_source
 
-        module = _load_kernel(
-            name=_kernel_name(header_cpp_code, cpp_code),
-            cpp_sources=[header_cpp_code, cpp_code],
-            functions=["evaluate"],
-            extra_cflags=get_extra_cflags(),
-            extra_ldflags=get_extra_ldflags(),
+        kernel_name_token = compilation_context.begin_stage(
+            CompilerStageId.KERNEL_NAME_AND_BUILD_REQUEST_ASSEMBLY,
+            compile_options=compile_options,
         )
+        try:
+            kernel_name = _kernel_name(
+                header_cpp_code,
+                cpp_code,
+                compile_options=compile_options,
+            )
+            prepared_build = _prepare_jit_build(
+                name=kernel_name,
+                cpp_sources=[header_cpp_code, cpp_code],
+                functions=["evaluate"],
+                extra_cflags=list(compile_options.build.extra_cflags),
+                extra_ldflags=list(compile_options.build.extra_ldflags),
+                compile_options=compile_options,
+            )
+        except Exception:
+            compilation_context.fail_stage(kernel_name_token)
+            raise
+        compilation_context.complete_stage(kernel_name_token)
+        module = _load_validated_prepared_kernel(prepared_build)
 
         result_cpp = module.evaluate(
             result_shape,
@@ -1223,7 +1435,15 @@ class STensor:
 
         :meth:`clone` is an alias for this operation.
         """
-        return STensor._from_validated(self.metadata, self.storage.copy())
+        storage = self.storage.copy()
+        metadata = TensorMetadata._from_owned_layout(
+            name=self.metadata.name,
+            dtype=self.metadata.dtype,
+            device=self.metadata.device,
+            layout=storage.layout,
+            requires_grad=self.metadata.requires_grad,
+        )
+        return STensor._from_validated(metadata, storage)
 
     @classmethod
     def from_components(
@@ -1684,6 +1904,9 @@ class STensor:
         self,
         fmt: Optional[Union[TensorFormat, str, List[str]]] = None,
         in_place: bool = False,
+        *,
+        _compile_options: Optional[CompileOptions] = None,
+        _compilation_context: Optional[CompilationContext] = None,
     ) -> STensor:
         """Densify to an all-dense ``STensor`` (stays within Scorch).
 
@@ -1726,88 +1949,139 @@ class STensor:
             else:
                 return self.copy()
 
-        default_index_vars = [IndexVar(name) for name in ["i", "j", "k", "l", "m", "n"]]
+        compile_options = (
+            CompileOptions.from_environment()
+            if _compile_options is None
+            else _compile_options
+        )
+        if type(compile_options) is not CompileOptions:
+            raise TypeError("_compile_options must be a CompileOptions instance")
+        compilation_context = _compilation_context_at_boundary(
+            _compilation_context, compile_options
+        )
+        frontend_token = compilation_context.begin_stage(
+            CompilerStageId.FRONTEND_VALIDATED_OPERATION_CONSTRUCTION,
+            compile_options=compile_options,
+        )
 
-        if len(self.shape) > len(default_index_vars):
-            index_vars = [IndexVar(f"i{i}") for i in range(len(self.shape))]
-        else:
-            index_vars = default_index_vars[: len(self.shape)]
+        try:
+            default_index_vars = [
+                IndexVar(name) for name in ["i", "j", "k", "l", "m", "n"]
+            ]
 
-        # Permute index_vars by mode_order so ForAll nesting matches
-        # the physical level order. Don't pass mode_order to TensorVars
-        # because the permuted index_vars already reflect physical order;
-        # get_sorted_index_vars() with identity mode_order will then
-        # correctly map subscript position k to physical level k.
-        if self.storage.index.mode_order:
-            index_vars = [index_vars[i] for i in self.storage.index.mode_order]
+            if len(self.shape) > len(default_index_vars):
+                index_vars = [IndexVar(f"i{i}") for i in range(len(self.shape))]
+            else:
+                index_vars = default_index_vars[: len(self.shape)]
 
-        if self.has_index:
-            B = TensorVar(
-                name="B",
-                fmt=self.format,
-                shape=self.shape,
-                dtype=self.dtype,
-            )
-        else:
-            B = TensorVar(
-                name="B",
-                fmt=TensorFormat(
+            # Permute index_vars by mode_order so ForAll nesting matches
+            # the physical level order. Don't pass mode_order to TensorVars
+            # because the permuted index_vars already reflect physical order;
+            # get_sorted_index_vars() with identity mode_order will then
+            # correctly map subscript position k to physical level k.
+            if self.storage.index.mode_order:
+                index_vars = [index_vars[i] for i in self.storage.index.mode_order]
+
+            if self.has_index:
+                B = TensorVar(
+                    name="B",
+                    fmt=self.format,
+                    shape=self.shape,
+                    dtype=self.dtype,
+                )
+            else:
+                B = TensorVar(
+                    name="B",
+                    fmt=TensorFormat(
+                        level_formats=[
+                            LevelFormat(mode=LevelType.DENSE)
+                            for _ in range(len(self.shape))
+                        ]
+                    ),
+                    shape=self.shape,
+                    dtype=self.dtype,
+                )
+
+            if fmt is None:
+                # TODO: infer output format from input format
+                # For now, make every level COMPRESSED
+                output_format = TensorFormat(
                     level_formats=[
                         LevelFormat(mode=LevelType.DENSE)
                         for _ in range(len(self.shape))
                     ]
-                ),
+                )
+            else:
+                output_format = parse_format(fmt)
+
+            A = TensorVar(
+                name="A",
+                fmt=output_format,
                 shape=self.shape,
                 dtype=self.dtype,
             )
 
-        if fmt is None:
-            # TODO: infer output format from input format
-            # For now, make every level COMPRESSED
-            output_format = TensorFormat(
-                level_formats=[
-                    LevelFormat(mode=LevelType.DENSE) for _ in range(len(self.shape))
-                ]
-            )
-        else:
-            output_format = parse_format(fmt)
+            access_key = index_vars[0] if len(index_vars) == 1 else tuple(index_vars)
+            rhs_access = B[access_key]
+            lhs_access = A[access_key]
+            cin_stmt: IndexStmt = TensorAssign(lhs_access, rhs_access)
+            for index_var in reversed(index_vars):
+                cin_stmt = ForAll(index_var, cin_stmt)
+        except Exception:
+            compilation_context.fail_stage(frontend_token)
+            raise
 
-        A = TensorVar(
-            name="A",
-            fmt=output_format,
-            shape=self.shape,
-            dtype=self.dtype,
+        compilation_context.complete_stage(frontend_token)
+        cin_stmt = normalize_cin(
+            cin_stmt,
+            compile_options=compile_options,
+            compilation_context=compilation_context,
         )
-
-        # Generate the python code for A[i0, i1, etc.] = B[i0, i1, etc.] and execute it
-        lhs = f'A[{", ".join(["index_vars[{i}]".format(i=i) for i in range(len(self.shape))])}]'
-        rhs = f'B[{", ".join(["index_vars[{i}]".format(i=i) for i in range(len(self.shape))])}]'
-        code = f"{lhs} = {rhs}"
-        exec(code)
-
-        # Generate the python code for constructing the ForAll's and execute it
-        # e.g. cin_stmt = ForAll(i0, ForAll(i1, ForAll(i2, A._assignment)))
-        rhs = "A._assignment"
-        for i in range(len(self.shape))[::-1]:
-            rhs = f"ForAll(index_vars[{i}], {rhs})"
-        cin_stmt = eval(rhs)
-
-        lowerer = CINLowerer(filter_zeros=True)
-        lowered_llir = lowerer.lower_IndexStmt(cin_stmt)
-        llir_lowerer = LLIRLowerer()
-        cpp_code = llir_lowerer.lower_llir(lowered_llir)
+        lowerer = CINLowerer(
+            filter_zeros=True,
+            compile_options=compile_options,
+            compilation_context=compilation_context,
+        )
+        lowered_llir = lowerer._lower_owned_IndexStmt(cin_stmt)
+        llir_lowerer = LLIRLowerer(compile_options=compile_options)
+        cpp_token = compilation_context.begin_stage(
+            CompilerStageId.LLIR_TO_CPP_GENERATION,
+            compile_options=compile_options,
+        )
+        try:
+            cpp_code = llir_lowerer.lower_llir(lowered_llir)
+        except Exception:
+            compilation_context.fail_stage(cpp_token)
+            raise
+        compilation_context.complete_stage(cpp_token)
 
         # print("\n\ncpp_code:\n\n", cpp_code)
 
-        header_cpp_code = jit_preamble_text()
+        header_cpp_code = compile_options.build.preamble_source
 
-        module = _load_kernel(
-            name=_kernel_name(header_cpp_code, cpp_code),
-            cpp_sources=[header_cpp_code, cpp_code],
-            functions=["evaluate"],
-            extra_cflags=get_extra_cflags(),
-            extra_ldflags=get_extra_ldflags(),
+        kernel_name_token = compilation_context.begin_stage(
+            CompilerStageId.KERNEL_NAME_AND_BUILD_REQUEST_ASSEMBLY,
+            compile_options=compile_options,
         )
+        try:
+            kernel_name = _kernel_name(
+                header_cpp_code,
+                cpp_code,
+                compile_options=compile_options,
+            )
+            prepared_build = _prepare_jit_build(
+                name=kernel_name,
+                cpp_sources=[header_cpp_code, cpp_code],
+                functions=["evaluate"],
+                extra_cflags=list(compile_options.build.extra_cflags),
+                extra_ldflags=list(compile_options.build.extra_ldflags),
+                compile_options=compile_options,
+            )
+        except Exception:
+            compilation_context.fail_stage(kernel_name_token)
+            raise
+        compilation_context.complete_stage(kernel_name_token)
+        module = _load_validated_prepared_kernel(prepared_build)
 
         result_cpp = module.evaluate(
             self.shape,
@@ -1836,7 +2110,11 @@ class STensor:
         return new_tensor
 
     def to_sparse(
-        self, fmt: Optional[Union[TensorFormat, str, List[str]]] = None
+        self,
+        fmt: Optional[Union[TensorFormat, str, List[str]]] = None,
+        *,
+        _compile_options: Optional[CompileOptions] = None,
+        _compilation_context: Optional[CompilationContext] = None,
     ) -> STensor:
         """Compress to a sparse ``STensor``, mutating in place.
 
@@ -1858,10 +2136,14 @@ class STensor:
 
         Notes
         -----
-        The 1-D case is special-cased and builds a single compressed level
-        directly from ``torch.nonzero`` (no kernel compile). For rank ≥ 2 Scorch
-        JIT-compiles a filter-zeros kernel (honoring the tensor's ``mode_order``);
-        the first call of a given shape/format incurs a C++ compile.
+        The 1-D case is special-cased and builds a single compressed or
+        coordinate level directly from ``torch.nonzero`` (no kernel compile).
+        Rank-2-and-higher formats that the per-entry filter kernel cannot
+        assemble -- a dense value-bearing suffix, or a dense level above a
+        compressed level other than one leading prefix -- materialize their
+        blocked output directly from a dense snapshot; sparse inputs may
+        first use the ordinary densification kernel.  Other rank-2-and-higher
+        formats JIT-compile a filter-zeros kernel honoring ``mode_order``.
 
         Examples
         --------
@@ -1877,118 +2159,277 @@ class STensor:
         to_dense : The inverse (densify).
         """
         if len(self.shape) == 1:
-            # Find indexes of non-zero elements in self.values, flatten them
-            nonzero_indices = torch.nonzero(self.values).flatten()
+            parsed_rank_one_format = None if fmt is None else parse_format(fmt)
+            rank_one_format: Optional[TensorFormat]
+            rank_one_format = (
+                None
+                if parsed_rank_one_format is None
+                else _owned_sparse_format(parsed_rank_one_format)
+            )
+            rank_one_options = (
+                CompileOptions.from_environment()
+                if _compile_options is None
+                else _compile_options
+            )
+            if type(rank_one_options) is not CompileOptions:
+                raise TypeError("_compile_options must be a CompileOptions instance")
+            rank_one_context = _compilation_context_at_boundary(
+                _compilation_context, rank_one_options
+            )
+            if rank_one_format is not None:
+                if rank_one_format.get_order() != 1:
+                    raise TensorStorageError(
+                        f"format rank {rank_one_format.get_order()} does not "
+                        "match tensor rank 1"
+                    )
+                rank_one_kind = rank_one_format.get_level_types()[0]
+                if rank_one_kind not in (
+                    LevelType.COMPRESSED,
+                    LevelType.COORDINATE,
+                ):
+                    # This branch assembles one supported sparse level; a
+                    # dense request is ``to_dense``'s job and SINGLETON is
+                    # not executable by the runtime.
+                    raise TensorStorageError(
+                        "to_sparse builds a compressed or coordinate rank-1 "
+                        f"level; {str(rank_one_format)!r} requests no supported "
+                        "sparse mode"
+                    )
+                output_format = rank_one_format
+            else:
+                rank_one_kind = LevelType.COMPRESSED
+                output_format = TensorFormat(
+                    level_formats=[LevelFormat(mode=rank_one_kind)]
+                )
+            # A sparse receiver must be read as coordinates, not as stored
+            # positions: filtering ``self.values`` directly would reinterpret
+            # a compressed value array as dense coordinates and silently
+            # corrupt the tensor.  Densify out of place under the caller's
+            # exact options and context, exactly like the rank>=2 route.
+            source_values = (
+                self.values
+                if self.format.is_dense()
+                else self.to_dense(
+                    in_place=False,
+                    _compile_options=rank_one_options,
+                    _compilation_context=rank_one_context,
+                ).storage.value.reshape(-1)
+            )
+            # Find indexes of non-zero elements, flatten them
+            nonzero_indices = torch.nonzero(source_values).flatten()
             size = len(nonzero_indices)
             # Create a filtered value tensor that only contains non-zero elements
-            filtered_values = self.values[nonzero_indices]
+            filtered_values = source_values[nonzero_indices].clone()
+            mode_indices = (
+                [
+                    [
+                        torch.tensor(
+                            [0, size],
+                            dtype=nonzero_indices.dtype,
+                            device=nonzero_indices.device,
+                        ),
+                        nonzero_indices,
+                    ]
+                ]
+                if rank_one_kind is LevelType.COMPRESSED
+                else [[nonzero_indices]]
+            )
             new_tensor = STensor(
                 name=self.name,
                 shape=self.shape,
                 index=TensorIndex(
-                    tensor_format=TensorFormat(
-                        level_formats=[LevelFormat(mode=LevelType.COMPRESSED)]
-                    ),
-                    mode_indices=[
-                        [
-                            torch.tensor(
-                                [0, size],
-                                dtype=nonzero_indices.dtype,
-                                device=nonzero_indices.device,
-                            ),
-                            nonzero_indices,
-                        ]
-                    ],
+                    tensor_format=output_format,
+                    mode_indices=mode_indices,
                     mode_order=self.storage.index.mode_order,
                 ),
                 value=filtered_values,
             )
             self._set_state(new_tensor.metadata, new_tensor.storage)
         else:
-            default_index_vars = [
-                IndexVar(name) for name in ["i", "j", "k", "l", "m", "n"]
-            ]
-            if len(self.shape) > len(default_index_vars):
-                index_vars = [IndexVar(f"i{i}") for i in range(len(self.shape))]
-            else:
-                index_vars = default_index_vars[: len(self.shape)]
-
-            # Permute index_vars by mode_order for ForAll construction
-            ordered_index_vars = [index_vars[i] for i in self.storage.index.mode_order]
-
-            if self.has_index:
-                B = TensorVar(
-                    name="B",
-                    fmt=self.format,
-                    shape=self.shape,
-                    dtype=self.dtype,
-                    mode_order=self.storage.index.mode_order,
+            parsed_requested_format = None if fmt is None else parse_format(fmt)
+            requested_format: Optional[TensorFormat]
+            requested_format = (
+                None
+                if parsed_requested_format is None
+                else _owned_sparse_format(parsed_requested_format)
+            )
+            if requested_format is not None:
+                if requested_format.get_order() != len(self.shape):
+                    raise TensorStorageError(
+                        f"format rank {requested_format.get_order()} does not "
+                        f"match tensor rank {len(self.shape)}"
+                    )
+                requested_level_types = tuple(requested_format.get_level_types())
+                if any(
+                    level_type is LevelType.COORDINATE
+                    for level_type in requested_level_types
+                ) and any(
+                    level_type is not LevelType.COORDINATE
+                    for level_type in requested_level_types
+                ):
+                    raise TensorStorageError(
+                        "to_sparse does not support mixed coordinate hierarchies"
+                    )
+                if any(
+                    level_type is LevelType.SINGLETON
+                    for level_type in requested_level_types
+                ):
+                    # ``validate_runtime_contract`` already declares singleton
+                    # levels unrunnable, and the rank-1 arm rejects them before
+                    # touching the receiver.  Without this the rank>=2 arm runs
+                    # the whole JIT pipeline and leaks a bare ``ValueError``
+                    # out of code generation, so an invalid requested format
+                    # was not being rejected atomically after all.
+                    raise TensorStorageError(
+                        "to_sparse does not support singleton levels; "
+                        "'singleton' requests no supported sparse materialization"
+                    )
+            compile_options = (
+                CompileOptions.from_environment()
+                if _compile_options is None
+                else _compile_options
+            )
+            if type(compile_options) is not CompileOptions:
+                raise TypeError("_compile_options must be a CompileOptions instance")
+            compilation_context = _compilation_context_at_boundary(
+                _compilation_context, compile_options
+            )
+            if (
+                requested_format is not None
+                and _is_directly_materialized_format(requested_format)
+                and requested_format.get_order() == len(self.shape)
+            ):
+                return self._to_sparse_materialized_blocks(
+                    requested_format,
+                    compile_options=compile_options,
+                    compilation_context=compilation_context,
                 )
-            else:
-                B = TensorVar(
-                    name="B",
-                    fmt=TensorFormat(
+            frontend_token = compilation_context.begin_stage(
+                CompilerStageId.FRONTEND_VALIDATED_OPERATION_CONSTRUCTION,
+                compile_options=compile_options,
+            )
+            try:
+                default_index_vars = [
+                    IndexVar(name) for name in ["i", "j", "k", "l", "m", "n"]
+                ]
+                if len(self.shape) > len(default_index_vars):
+                    index_vars = [IndexVar(f"i{i}") for i in range(len(self.shape))]
+                else:
+                    index_vars = default_index_vars[: len(self.shape)]
+
+                # Permute index_vars by mode_order for ForAll construction
+                ordered_index_vars = [
+                    index_vars[i] for i in self.storage.index.mode_order
+                ]
+
+                if self.has_index:
+                    B = TensorVar(
+                        name="B",
+                        fmt=self.format,
+                        shape=self.shape,
+                        dtype=self.dtype,
+                        mode_order=self.storage.index.mode_order,
+                    )
+                else:
+                    B = TensorVar(
+                        name="B",
+                        fmt=TensorFormat(
+                            level_formats=[
+                                LevelFormat(mode=LevelType.DENSE)
+                                for _ in range(len(self.shape))
+                            ]
+                        ),
+                        shape=self.shape,
+                        dtype=self.dtype,
+                        mode_order=self.storage.index.mode_order,
+                    )
+
+                if fmt is None:
+                    # TODO: infer output format from input format
+                    # For now, make every level COMPRESSED
+                    output_format = TensorFormat(
                         level_formats=[
-                            LevelFormat(mode=LevelType.DENSE)
+                            LevelFormat(mode=LevelType.COMPRESSED)
                             for _ in range(len(self.shape))
                         ]
-                    ),
+                    )
+                else:
+                    assert requested_format is not None
+                    output_format = requested_format
+
+                A = TensorVar(
+                    name="A",
+                    fmt=output_format,
                     shape=self.shape,
                     dtype=self.dtype,
                     mode_order=self.storage.index.mode_order,
                 )
 
-            if fmt is None:
-                # TODO: infer output format from input format
-                # For now, make every level COMPRESSED
-                output_format = TensorFormat(
-                    level_formats=[
-                        LevelFormat(mode=LevelType.COMPRESSED)
-                        for _ in range(len(self.shape))
-                    ]
+                access_key = (
+                    index_vars[0] if len(index_vars) == 1 else tuple(index_vars)
                 )
-            else:
-                output_format = parse_format(fmt)
+                rhs_access = B[access_key]
+                lhs_access = A[access_key]
+                cin_stmt: IndexStmt = TensorAssign(lhs_access, rhs_access)
+                for index_var in reversed(ordered_index_vars):
+                    cin_stmt = ForAll(index_var, cin_stmt)
 
-            A = TensorVar(
-                name="A",
-                fmt=output_format,
-                shape=self.shape,
-                dtype=self.dtype,
-                mode_order=self.storage.index.mode_order,
+                # print("\n\ncin_stmt: ", cin_stmt)
+            except Exception:
+                compilation_context.fail_stage(frontend_token)
+                raise
+
+            compilation_context.complete_stage(frontend_token)
+            cin_stmt = normalize_cin(
+                cin_stmt,
+                compile_options=compile_options,
+                compilation_context=compilation_context,
             )
-
-            # Generate the python code for A[i0, i1, etc.] = B[i0, i1, etc.] and execute it
-            lhs = f'A[{", ".join(["index_vars[{i}]".format(i=i) for i in range(len(self.shape))])}]'
-            rhs = f'B[{", ".join(["index_vars[{i}]".format(i=i) for i in range(len(self.shape))])}]'
-            code = f"{lhs} = {rhs}"
-            exec(code)
-
-            # Generate the python code for constructing the ForAll's and execute it
-            # e.g. cin_stmt = ForAll(i0, ForAll(i1, ForAll(i2, A._assignment)))
-            rhs = "A._assignment"
-            for i in range(len(self.shape))[::-1]:
-                rhs = f"ForAll(ordered_index_vars[{i}], {rhs})"
-            cin_stmt = eval(rhs)
-
-            # print("\n\ncin_stmt: ", cin_stmt)
-
-            lowerer = CINLowerer(filter_zeros=True)
-            lowered_llir = lowerer.lower_IndexStmt(cin_stmt)
-            llir_lowerer = LLIRLowerer()
-            cpp_code = llir_lowerer.lower_llir(lowered_llir)
+            lowerer = CINLowerer(
+                filter_zeros=True,
+                compile_options=compile_options,
+                compilation_context=compilation_context,
+            )
+            lowered_llir = lowerer._lower_owned_IndexStmt(cin_stmt)
+            llir_lowerer = LLIRLowerer(compile_options=compile_options)
+            cpp_token = compilation_context.begin_stage(
+                CompilerStageId.LLIR_TO_CPP_GENERATION,
+                compile_options=compile_options,
+            )
+            try:
+                cpp_code = llir_lowerer.lower_llir(lowered_llir)
+            except Exception:
+                compilation_context.fail_stage(cpp_token)
+                raise
+            compilation_context.complete_stage(cpp_token)
 
             # print("to_sparse cpp_code:\n\n", cpp_code)
 
-            header_cpp_code = jit_preamble_text()
+            header_cpp_code = compile_options.build.preamble_source
 
-            module = _load_kernel(
-                name=_kernel_name(header_cpp_code, cpp_code),
-                cpp_sources=[header_cpp_code, cpp_code],
-                functions=["evaluate"],
-                extra_cflags=get_extra_cflags(),
-                extra_ldflags=get_extra_ldflags(),
+            kernel_name_token = compilation_context.begin_stage(
+                CompilerStageId.KERNEL_NAME_AND_BUILD_REQUEST_ASSEMBLY,
+                compile_options=compile_options,
             )
+            try:
+                kernel_name = _kernel_name(
+                    header_cpp_code,
+                    cpp_code,
+                    compile_options=compile_options,
+                )
+                prepared_build = _prepare_jit_build(
+                    name=kernel_name,
+                    cpp_sources=[header_cpp_code, cpp_code],
+                    functions=["evaluate"],
+                    extra_cflags=list(compile_options.build.extra_cflags),
+                    extra_ldflags=list(compile_options.build.extra_ldflags),
+                    compile_options=compile_options,
+                )
+            except Exception:
+                compilation_context.fail_stage(kernel_name_token)
+                raise
+            compilation_context.complete_stage(kernel_name_token)
+            module = _load_validated_prepared_kernel(prepared_build)
 
             result_cpp = module.evaluate(
                 self.shape,
@@ -2013,7 +2454,121 @@ class STensor:
 
         return self
 
-    def change_mode_order(self, mode_order: List[int]) -> STensor:
+    def _to_sparse_materialized_blocks(
+        self,
+        output_format: TensorFormat,
+        *,
+        compile_options: CompileOptions,
+        compilation_context: CompilationContext,
+    ) -> STensor:
+        """Materialize a ``d``/``s`` block layout directly, in place.
+
+        A ``d``/``s`` prefix over zero-or-more trailing DENSE levels stores
+        one complete dense value block per stored prefix path: a prefix
+        path is stored exactly when its block contains any nonzero, and a
+        stored block keeps its interior zeros.  With no trailing DENSE level
+        the block is one scalar and the rule degenerates to ordinary sparse
+        storage, so the same walk serves both directly materialized families
+        (see :func:`_is_directly_materialized_format`).  This is the same
+        conditional-parent discipline the compiled assembly families use.
+        The defective filter kernel is never used: an already-dense source is
+        copied directly, while a sparse source obtains its snapshot through
+        ordinary non-mutating densification under the caller's exact compiler
+        options and timing context.
+        """
+
+        kinds = output_format.get_level_types()
+        rank = len(kinds)
+        shape = tuple(self.shape)
+        if rank != len(shape):
+            raise TensorStorageError(
+                f"format rank {rank} does not match tensor rank {len(shape)}"
+            )
+        suffix = 0
+        while suffix < rank and kinds[rank - 1 - suffix] is LevelType.DENSE:
+            suffix += 1
+        split = rank - suffix
+        dense_tensor = self.to_dense(
+            in_place=False,
+            _compile_options=compile_options,
+            _compilation_context=compilation_context,
+        )
+        dense = dense_tensor.storage.value.reshape(shape)
+        block_numel = 1
+        for extent in shape[split:]:
+            block_numel *= extent
+        collapsed = dense.reshape(*shape[:split], block_numel)
+        mask = (collapsed != 0).any(dim=-1)
+        stored = torch.nonzero(mask)  # lexicographic prefix coordinates
+        paths = [tuple(int(x) for x in row) for row in stored]
+
+        mode_indices: List[List[torch.Tensor]] = []
+        # ``paths`` is lexicographically sorted (``torch.nonzero`` is
+        # row-major), so every prefix's stored children are contiguous and
+        # non-decreasing.  Each level therefore groups its children in one
+        # pass and carries the enumerated parent prefixes forward, instead of
+        # rescanning the whole path list once per parent at every level.
+        parents: List[Tuple[int, ...]] = [()]
+        for level in range(split):
+            if kinds[level] is LevelType.DENSE:
+                mode_indices.append([])
+                parents = [
+                    parent + (coordinate,)
+                    for parent in parents
+                    for coordinate in range(shape[level])
+                ]
+                continue
+
+            grouped: Dict[Tuple[int, ...], List[int]] = {}
+            for path in paths:
+                children = grouped.get(path[:level])
+                if children is None:
+                    children = []
+                    grouped[path[:level]] = children
+                if not children or children[-1] != path[level]:
+                    children.append(path[level])
+
+            pos = [0]
+            crd: List[int] = []
+            next_parents: List[Tuple[int, ...]] = []
+            for parent in parents:
+                for coordinate in grouped.get(parent, ()):
+                    crd.append(coordinate)
+                    next_parents.append(parent + (coordinate,))
+                pos.append(len(crd))
+            parents = next_parents
+            mode_indices.append(
+                [
+                    torch.tensor(pos, dtype=torch.int32),
+                    torch.tensor(crd, dtype=torch.int32),
+                ]
+            )
+        for _ in range(suffix):
+            mode_indices.append([])
+        if paths:
+            values = collapsed[mask].reshape(-1).clone()
+        else:
+            values = dense.reshape(-1)[:0].clone()
+        new_tensor = STensor(
+            name=self.name,
+            shape=shape,
+            index=TensorIndex(
+                tensor_format=output_format,
+                mode_indices=mode_indices,
+                mode_order=self.storage.index.mode_order,
+            ),
+            value=values,
+        )
+        self._set_state(new_tensor.metadata, new_tensor.storage)
+        return self
+
+    def change_mode_order(
+        self,
+        mode_order: List[int],
+        *,
+        _compile_options: Optional[CompileOptions] = None,
+        _compilation_context: Optional[CompilationContext] = None,
+    ) -> STensor:
         """Relay out the tensor into a new logical mode order (transpose).
 
         Permutes the tensor's modes, updating storage and shape in place. A
@@ -2207,72 +2762,127 @@ class STensor:
             self._set_state(new_tensor.metadata, new_tensor.storage)
             return self
 
-        default_index_vars = [IndexVar(name) for name in ["i", "j", "k", "l", "m", "n"]]
-        if dim > len(default_index_vars):
-            index_vars = [IndexVar(f"i{i}") for i in range(dim)]
-        else:
-            index_vars = default_index_vars[:dim]
-
-        b_index_vars = [index_vars[i] for i in old_mode_order]
-        a_index_vars = [index_vars[i] for i in mode_order]
-
-        B = TensorVar(
-            name="B",
-            fmt=self.format,
-            shape=self.shape,
-            dtype=self.dtype,
-            mode_order=old_mode_order[:],
+        compile_options = (
+            CompileOptions.from_environment()
+            if _compile_options is None
+            else _compile_options
         )
-
-        A = TensorVar(
-            name="A",
-            fmt=self.format,
-            shape=result_shape,
-            dtype=self.dtype,
-            mode_order=mode_order[:],
+        if type(compile_options) is not CompileOptions:
+            raise TypeError("_compile_options must be a CompileOptions instance")
+        compilation_context = _compilation_context_at_boundary(
+            _compilation_context, compile_options
         )
-
-        workspace = Workspace(
-            name="wksp",
-            dim=len(self.shape),
-            mode_order=mode_order[:],
+        frontend_token = compilation_context.begin_stage(
+            CompilerStageId.FRONTEND_VALIDATED_OPERATION_CONSTRUCTION,
+            compile_options=compile_options,
         )
+        try:
+            default_index_vars = [
+                IndexVar(name) for name in ["i", "j", "k", "l", "m", "n"]
+            ]
+            if dim > len(default_index_vars):
+                index_vars = [IndexVar(f"i{i}") for i in range(dim)]
+            else:
+                index_vars = default_index_vars[:dim]
 
-        producer_stmt = TensorAssign(
-            workspace[tuple(index_vars)],
-            B[tuple(index_vars)],
+            b_index_vars = [index_vars[i] for i in old_mode_order]
+            a_index_vars = [index_vars[i] for i in mode_order]
+
+            B = TensorVar(
+                name="B",
+                fmt=self.format,
+                shape=self.shape,
+                dtype=self.dtype,
+                mode_order=old_mode_order[:],
+            )
+
+            A = TensorVar(
+                name="A",
+                fmt=self.format,
+                shape=result_shape,
+                dtype=self.dtype,
+                mode_order=mode_order[:],
+            )
+
+            workspace = Workspace(
+                name="wksp",
+                dim=len(self.shape),
+                mode_order=mode_order[:],
+            )
+
+            producer_stmt = TensorAssign(
+                workspace[tuple(index_vars)],
+                B[tuple(index_vars)],
+            )
+
+            for index_var in b_index_vars[::-1]:
+                producer_stmt = ForAll(index_var, producer_stmt)
+
+            consumer_stmt = TensorAssign(
+                A[tuple(index_vars)],
+                workspace[tuple(index_vars)],
+            )
+
+            for index_var in a_index_vars[::-1]:
+                consumer_stmt = ForAll(index_var, consumer_stmt)
+
+            cin_stmt: IndexStmt = Where(
+                producer=producer_stmt,
+                consumer=consumer_stmt,
+            )
+        except Exception:
+            compilation_context.fail_stage(frontend_token)
+            raise
+
+        compilation_context.complete_stage(frontend_token)
+        cin_stmt = normalize_cin(
+            cin_stmt,
+            compile_options=compile_options,
+            compilation_context=compilation_context,
         )
-
-        for index_var in b_index_vars[::-1]:
-            producer_stmt = ForAll(index_var, producer_stmt)
-
-        consumer_stmt = TensorAssign(
-            A[tuple(index_vars)],
-            workspace[tuple(index_vars)],
+        lowerer = CINLowerer(
+            filter_zeros=True,
+            compile_options=compile_options,
+            compilation_context=compilation_context,
         )
-
-        for index_var in a_index_vars[::-1]:
-            consumer_stmt = ForAll(index_var, consumer_stmt)
-
-        cin_stmt = Where(
-            producer=producer_stmt,
-            consumer=consumer_stmt,
+        lowered_llir = lowerer._lower_owned_IndexStmt(cin_stmt)
+        llir_lowerer = LLIRLowerer(compile_options=compile_options)
+        cpp_token = compilation_context.begin_stage(
+            CompilerStageId.LLIR_TO_CPP_GENERATION,
+            compile_options=compile_options,
         )
+        try:
+            cpp_code = llir_lowerer.lower_llir(lowered_llir)
+        except Exception:
+            compilation_context.fail_stage(cpp_token)
+            raise
+        compilation_context.complete_stage(cpp_token)
 
-        lowerer = CINLowerer(filter_zeros=True)
-        lowered_llir = lowerer.lower_IndexStmt(cin_stmt)
-        llir_lowerer = LLIRLowerer()
-        cpp_code = llir_lowerer.lower_llir(lowered_llir)
+        header_cpp_code = compile_options.build.preamble_source
 
-        header_cpp_code = jit_preamble_text()
-
-        module = _load_kernel(
-            name=_kernel_name(header_cpp_code, cpp_code),
-            cpp_sources=[header_cpp_code, cpp_code],
-            functions=["evaluate"],
-            extra_cflags=get_extra_cflags(),
-            extra_ldflags=get_extra_ldflags(),
+        kernel_name_token = compilation_context.begin_stage(
+            CompilerStageId.KERNEL_NAME_AND_BUILD_REQUEST_ASSEMBLY,
+            compile_options=compile_options,
         )
+        try:
+            kernel_name = _kernel_name(
+                header_cpp_code,
+                cpp_code,
+                compile_options=compile_options,
+            )
+            prepared_build = _prepare_jit_build(
+                name=kernel_name,
+                cpp_sources=[header_cpp_code, cpp_code],
+                functions=["evaluate"],
+                extra_cflags=list(compile_options.build.extra_cflags),
+                extra_ldflags=list(compile_options.build.extra_ldflags),
+                compile_options=compile_options,
+            )
+        except Exception:
+            compilation_context.fail_stage(kernel_name_token)
+            raise
+        compilation_context.complete_stage(kernel_name_token)
+        module = _load_validated_prepared_kernel(prepared_build)
 
         result_cpp = module.evaluate(
             result_shape,

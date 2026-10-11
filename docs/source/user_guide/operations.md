@@ -3,9 +3,9 @@
 Scorch's public operations are the everyday verbs of sparse linear algebra:
 matrix–vector and matrix–matrix products, sampled dense–dense products, and
 sparse–sparse products. They live in {func}`~scorch.matmul`,
-{func}`~scorch.einsum`, and {func}`~scorch.matmul_wksp`, and they all share one
-promise — you write the same call you would in PyTorch, and Scorch picks the
-fastest correct path for the formats you hand it.
+and {func}`~scorch.einsum`, and they share one promise — you write the same call
+you would in PyTorch, and Scorch picks the fastest correct path for the formats
+you hand it.
 
 ```python
 import torch
@@ -60,10 +60,10 @@ flowchart TD
    pipeline (Compiler Index Notation → Low-Level IR → generated C++ → a JIT-
    compiled `.so`) and cached. See {doc}`the compiler pipeline </compiler/pipeline>`.
 
-Every tier is memoized. The prebuilt resolver, the workspace path, and `einsum`
-each keep an in-process cache keyed by operand formats and dtypes, backed by a
-persistent `.so` cache on disk. The first call for a novel format combination
-pays a one-time compile; subsequent calls hit the cache.
+Every tier is memoized. The prebuilt resolver and `einsum` keep in-process caches
+keyed by operand formats and dtypes, backed by a persistent `.so` cache on disk.
+The first call for a novel format combination pays a one-time compile;
+subsequent calls hit the cache.
 
 :::{tip}
 Warm the cache ahead of time with {func}`~scorch.precompile_kernels`, which
@@ -350,36 +350,6 @@ A native COO × COO → COO prebuilt path also exists; which fires depends on th
 operand formats. Either way you get a correct sparse result.
 :::
 
-## `matmul_wksp` — the explicit workspace path
-
-```python
-scorch.matmul_wksp(a, b, output_format="ds", **kwargs) -> STensor
-```
-
-`matmul_wksp` is a workspace-based SpMM/SpGEMM that **always** goes through the
-CIN compiler — it never takes a prebuilt kernel. It builds a `Where` with a
-{doc}`workspace </compiler/workspaces>` (dense when the output is dense, else
-COO-hashed) that accumulates over the contraction indices, and JIT-compiles once
-per `(a.format, b.format, output_format)` combination.
-
-Unlike `matmul`, both torch inputs are always converted to sparse, and the result
-is **always** an {class}`~scorch.STensor` of shape `(a.shape[0], b.shape[1])` —
-it does not auto-convert a dense-format result back to `torch.Tensor`. Use
-`matmul` for production (it is the tuned entry point with prebuilt kernels,
-tiling, and thread policy); reach for `matmul_wksp` when you specifically want to
-exercise the workspace-lowering codegen path.
-
-```python
-import torch, scorch
-
-A = scorch.from_torch((torch.rand(64, 64) < .1).float(), "A").to_sparse("ds")
-B = scorch.from_torch((torch.rand(64, 64) < .1).float(), "B").to_sparse("ds")
-
-C = scorch.matmul_wksp(A, B, output_format="ds")       # STensor
-ref = A.to_torch() @ B.to_torch()
-assert torch.allclose(C.to_torch(), ref, atol=1e-3, rtol=1e-3)
-```
-
 ## Reference table
 
 | Operation | Scorch call | PyTorch reference |
@@ -390,7 +360,6 @@ assert torch.allclose(C.to_torch(), ref, atol=1e-3, rtol=1e-3)
 | SDDMM (sampled) | `scorch.einsum("ij,ik,kj->ij", S, A, B)` | `torch.mul(S, A @ B)` |
 | SDDMM (prebuilt order) | `scorch.einsum("ij,ik,jk->ij", S, A, B)` | `S * (A @ B.T)` |
 | SpGEMM (sparse · sparse) | `scorch.matmul(A, B, format="ds")` | `torch.matmul` |
-| SpGEMM (workspace path) | `scorch.matmul_wksp(A, B, output_format="ds")` | `torch.matmul` |
 | Elementwise multiply | `scorch.einsum("ij,ij->ij", A, B)` | `torch.mul` |
 
 Match the correctness convention when checking your own code: compare against a

@@ -215,7 +215,8 @@ inline bool abi_screen_spans(const int32_t* pos, int64_t count, int64_t nnz) {
 }
 
 // "positions partition [0, nnz] without decreasing, every coordinate lies in
-// [0, limit), and — when required — coordinates ascend inside each parent's span."
+// [0, limit), and — when required — coordinates STRICTLY ascend inside each
+// parent's span."
 //
 // Both coordinate tests run as FLAT loops over the whole coordinate array rather than
 // nested per-parent loops. A per-parent loop cannot vectorize usefully when spans are
@@ -223,10 +224,20 @@ inline bool abi_screen_spans(const int32_t* pos, int64_t count, int64_t nnz) {
 // eight-wide body, ~3.5 cycles per nonzero, i.e. the check cost more than the SpMM it
 // was guarding.
 //
-// Bounds do not care about span structure at all. Sortedness does, but only through
-// one observation: a DESCENT at position p (crd[p-1] > crd[p]) is legal exactly when p
-// is the first position of a span. So count every descent flat, subtract the descents
-// that sit on a span boundary, and require nothing left.
+// Bounds do not care about span structure at all. Ordering does, but only through one
+// observation: a NON-INCREASE at position p (crd[p-1] >= crd[p]) is legal exactly when
+// p is the first position of a span. So count every non-increase flat, subtract the
+// non-increases that sit on a span boundary, and require nothing left.
+//
+// The comparison is `>=` rather than `>` because this tree requires STRICTLY increasing
+// coordinates inside a compressed span, not merely non-decreasing ones (commit 7fd9116:
+// a duplicate entry silently miscomputes a merged kernel). A duplicate is a violation
+// here, so the screen has to count it as one; counting descents instead would report a
+// duplicate clean and the serial loop that names it would never run. Both
+// `require_sorted=true` callers — checked_csr_view on the prebuilt route and
+// validate_jit_tensor's compressed level on the generated route — are the two sites
+// 7fd9116 made strict; the `require_sorted=false` caller (the CSR attention mask) never
+// enters this branch.
 //
 // No loop here runs over the parents on one thread. Run serially, the position checks
 // and the boundary count cost more than the whole coordinate scan split across workers
@@ -296,7 +307,8 @@ inline bool abi_screen_compressed_typed(
   // 2^31 coordinates. Together they let the flat loop vectorize at the full lane count. Two
   // signed tests ORed into an int that is read as a condition after the loop kept it scalar
   // ("value that could not be identified as reduction is used outside the loop"). M5, one
-  // thread, 8.4M coordinates: int32 1382 -> 467 us, int64 1375 -> 942 us.
+  // thread, 8.4M coordinates: int32 1382 -> 467 us, int64 1375 -> 942 us. The ordering test is
+  // `crd[p - 1] >= crd[p]`, the strict contract above.
   using U = std::make_unsigned_t<T>;
   const U ulim = (U)lim;
   constexpr int64_t kBlock = 16384 / (int64_t)sizeof(T);
@@ -311,30 +323,32 @@ inline bool abi_screen_compressed_typed(
         // passes last_boundary, so each block's search range is valid.
         int64_t r = std::lower_bound(first_boundary, last_boundary, (T)begin) - pos;
         U out_of_range = 0;
-        U unsorted = 0;
+        U unordered = 0;
         for (int64_t b0 = begin; b0 < end; b0 += kBlock) {
           const int64_t b1 = std::min(b0 + kBlock, end);
-          U descents = 0;
+          U nonincr = 0;
           // Reads crd[p - 1], which is in range because the scan starts at 1.
           for (int64_t p = b0; p < b1; ++p) {
             const T c = crd[p];
             out_of_range += ((U)c >= ulim);
-            descents += (crd[p - 1] > c);
+            nonincr += (crd[p - 1] >= c);
             if constexpr (kCopy) crd_out[p] = (N)c;
           }
           // The block's boundaries pos[r .. r_end) are the p in [b0, b1), so 1 <= p < nnz.
           // Found by binary search, which makes the walk a counted loop the compiler can
           // vectorize where spans hold one element and every position is a boundary. Parents
-          // with empty spans repeat a boundary, which counts once.
+          // with empty spans repeat a boundary, which counts once. Each boundary's own
+          // non-increase was counted by the flat loop of THIS block, so the subtraction
+          // cannot take the count below zero.
           const int64_t r_end = std::lower_bound(pos + r, last_boundary, (T)b1) - pos;
           for (int64_t q = r; q < r_end; ++q) {
             const T p = pos[q];
-            descents -= (U)((p != pos[q - 1]) & (crd[p - 1] > crd[p]));
+            nonincr -= (U)((p != pos[q - 1]) & (crd[p - 1] >= crd[p]));
           }
           r = r_end;
-          unsorted += (descents != 0);
+          unordered += (nonincr != 0);
         }
-        return partial + (int64_t)(out_of_range != 0) + (int64_t)unsorted;
+        return partial + (int64_t)(out_of_range != 0) + (int64_t)unordered;
       },
       [](int64_t a, int64_t b) { return a + b; });
   bad |= (unclean != 0);
@@ -834,7 +848,8 @@ struct AbiNarrowEntry {
 // a CSR matrix validated through the prebuilt path is validated for a JIT kernel too.
 enum AbiCheckKind : int64_t {
   AbiCheckBounds = 1,      // every coordinate in [0, extent)
-  AbiCheckCompressed = 2,  // spans partition [0, nnz], coordinates in range, sorted
+  AbiCheckCompressed = 2,  // spans partition [0, nnz], coordinates in range and,
+                           // when required, strictly increasing inside each span
   AbiCheckLex = 3,         // coordinate levels ascend lexicographically
   AbiCheckSpans = 4,       // positions alone: non-decreasing and within [0, nnz]
 };
@@ -1600,7 +1615,8 @@ inline void abi_narrow_csr_first_sight(const torch::Tensor& positions,
 }
 
 // Whether a CSR operand over these arrays is one every check made of it would clear -- the native
-// boundary's (checked_csr_view, coordinates sorted within each row, as the drop-in SpMM requires)
+// boundary's (checked_csr_view, coordinates strictly increasing within each row, as the drop-in
+// SpMM requires)
 // and the construction-time screen's (storage.py), which ask the same question -- so that a caller
 // can make a call those checks guard knowing none of them will report. The O(1) conditions are
 // tested here; the structure through the verdicts both keep, reached by a scan only where neither
@@ -1721,9 +1737,10 @@ inline CsrInputView checked_csr_view(
                     argument_name(op, argument), " coordinate ", crd[p],
                     " at position ", p, " is outside [0, ", cols, ")");
         if (require_sorted && p > start) {
-          TORCH_CHECK(crd[p - 1] <= crd[p], argument_name(op, argument),
-                      " coordinates must be sorted within each CSR row; row ", row,
-                      " decreases at position ", p);
+          TORCH_CHECK(
+              crd[p - 1] < crd[p], argument_name(op, argument),
+              " coordinates must be strictly increasing within each CSR row; row ",
+              row, " is non-increasing at position ", p);
         }
       }
       previous = end;
@@ -2187,7 +2204,7 @@ inline void validate_jit_tensor(
     TORCH_CHECK(pos[0] == 0, argument_name(op, argument),
                 " compressed level ", level, " must start at position 0");
     // Same three checks the CSR view runs — spans partition [0, nnz], coordinates in
-    // range, coordinates sorted within a span — so the same screen and the same memo
+    // range, coordinates strictly increasing within a span — so the same screen and memo
     // family serve both. (Sharing is within one module: see the note on abi_memo_clear
     // for why each loaded kernel carries its own maps.)
     AbiStructEntry level_memo;
@@ -2210,9 +2227,10 @@ inline void validate_jit_tensor(
                       " at compressed level ", level, " position ", p,
                       " is outside [0, ", extent, ")");
           if (p > pos[parent]) {
-            TORCH_CHECK(crd[p - 1] <= crd[p], argument_name(op, argument),
-                        " coordinates decrease at compressed level ", level,
-                        " position ", p);
+            TORCH_CHECK(
+                crd[p - 1] < crd[p], argument_name(op, argument),
+                " coordinates must be strictly increasing at compressed level ",
+                level, " position ", p);
           }
         }
       }

@@ -98,11 +98,13 @@ def main():
                     default=["band", "scatter", "pubmed", "bcsstk17"])
     ap.add_argument("--ns", nargs="+", type=int, default=[8, 32, 128])
     ap.add_argument("--rows", type=int, default=20000)
-    # Separate from --rows because to_sparse("ss") lowers through a filter-zeros kernel
-    # that materializes a dense rows x cols intermediate: a square 100k operand asks for
-    # 10^10 elements and is rejected outright. nnz (= rows * deg) is what the ABI walk
-    # costs, so keep the column count small and grow the row count instead.
-    ap.add_argument("--cols", type=int, default=0, help="0 = square")
+    # Columns default to rows, which is what upstream's copy hardcoded. They have to be
+    # separable on this branch: the dcsr_dd route builds A via to_sparse("ss"), which
+    # evaluates a generated kernel, and that kernel's allocation bound is checked
+    # against the DECLARED extent product rather than the nonzero count -- so a square
+    # 100000 x 100000 matrix refuses at 1e10 elements no matter how sparse it is. Making
+    # J independent reaches the 2.4M-nonzero regime with M * J under the bound.
+    ap.add_argument("--cols", type=int, default=None)
     ap.add_argument("--deg", type=int, default=24)
     ap.add_argument("--reps", type=int, default=11)
     ap.add_argument("--inner", type=int, default=3)
@@ -114,8 +116,23 @@ def main():
 
     import scorch
     from scorch.stensor import STensor
-    from scorch.ops import matmul_wksp
 
+    # The wksp_ds route calls matmul_wksp, which THIS branch removed in a37371c
+    # ("remove legacy workspace matmul") because production matmul/einsum scheduling
+    # now owns workspace insertion. Upstream's copy of this harness forked before that
+    # removal, so the import is route-local and refuses with a structured code rather
+    # than an ImportError at the top of main -- which would otherwise take the dcsr_dd
+    # route down with it, and dcsr_dd needs nothing from the workspace API.
+    matmul_wksp = None
+    if args.route == "wksp_ds":
+        try:
+            from scorch.ops import matmul_wksp  # type: ignore[no-redef]
+        except ImportError:
+            print("REFUSE unsupported_route_entry_point_removed: "
+                  "scorch.ops.matmul_wksp does not exist on this tree (removed in "
+                  "a37371c); the workspace question is measured through the "
+                  "production API by the section 67 harness instead")
+            return 3
 
     memo = os.environ.get("SCORCH_ABI_VALIDATE_MEMO", "1")
     idtype = torch.int32 if args.index_dtype == "int32" else torch.int64
@@ -127,8 +144,8 @@ def main():
 
     rows_out = []
     for name in args.matrices:
-        indptr, indices, data, M, J = build_csr(
-            name, args.rows, args.cols or args.rows, args.deg)
+        cols = args.cols if args.cols is not None else args.rows
+        indptr, indices, data, M, J = build_csr(name, args.rows, cols, args.deg)
         nnz = int(indices.size)
         t_csr = torch.sparse_csr_tensor(torch.from_numpy(indptr).to(idtype),
                                         torch.from_numpy(indices).to(idtype),

@@ -5,7 +5,7 @@ Symposium on Code Generation and Optimization). If you use Scorch in academic
 work, please cite it.
 
 The authoritative citation — with the final author list, page numbers, and DOI —
-is on the [paper page](https://fredrikbk.com/cgo26scorch.html). A template BibTeX
+is on the [paper page](https://ieeexplore.ieee.org/abstract/document/11394842). A template BibTeX
 entry:
 
 ```bibtex
@@ -14,7 +14,7 @@ entry:
   booktitle = {Proceedings of the 2026 IEEE/ACM International Symposium on
                Code Generation and Optimization (CGO)},
   year      = {2026},
-  note      = {See https://fredrikbk.com/cgo26scorch.html for the canonical entry},
+  note      = {See https://ieeexplore.ieee.org/abstract/document/11394842 for the canonical entry},
 }
 ```
 

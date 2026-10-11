@@ -11,7 +11,7 @@ sd_hide_title: true
   <div class="scorch-cta">
     <a class="scorch-btn scorch-btn-primary" href="getting_started/index.html">Get started</a>
     <a class="scorch-btn scorch-btn-secondary" href="https://github.com/bobbyyyan/scorch">GitHub</a>
-    <a class="scorch-btn scorch-btn-secondary" href="https://fredrikbk.com/cgo26scorch.html">Read the paper</a>
+    <a class="scorch-btn scorch-btn-secondary" href="https://ieeexplore.ieee.org/abstract/document/11394842">Read the paper</a>
   </div>
 </div>
 
@@ -24,7 +24,7 @@ describe each tensor's layout with a compact **format notation** (`"ds"` is CSR,
 `"oo"` is COO), and call familiar operations like {func}`~scorch.matmul` and
 {func}`~scorch.einsum`. The first call **JIT-compiles a specialized C++ kernel**
 with OpenMP parallelism; every call after that reuses the cached shared library
-and runs at full speed. In the [CGO 2026 paper](https://fredrikbk.com/cgo26scorch.html),
+and runs at full speed. In the [CGO 2026 paper](https://ieeexplore.ieee.org/abstract/document/11394842),
 Scorch reached **1.05–5.80× speedups over PyTorch Sparse** across sparse-matrix
 and graph-neural-network workloads.
 

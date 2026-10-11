@@ -228,6 +228,64 @@ def test_adoption_is_on_by_default_where_it_is_safe():
     )
 
 
+def test_the_wrapped_result_really_shares_the_kernel_arrays():
+    """The flag being on does not mean the arrays survived to the STensor.
+
+    `test_adoption_is_on_by_default_where_it_is_safe` above asserts `_ADOPT_CELL`, which
+    is the mechanism's *input*. Everything downstream of the flag can still copy: the
+    index adopts, and then a construction path re-owns the storage it was handed and
+    clones the arrays anyway. Its own docstring says nothing fails when adoption
+    regresses to copying -- which is true of a flag assertion and is the reason this test
+    exists. This one measures the effect instead, by pointer, end to end through
+    `_wrap_generated_result`.
+
+    Equality of contents is exactly what keeps passing while the sharing is gone, so the
+    assertion is identity.
+    """
+    positions = torch.tensor([0, 2, 3], dtype=torch.int32)
+    coordinates = torch.tensor([0, 2, 1], dtype=torch.int32)
+    values = torch.tensor([1.0, 2.0, 3.0], dtype=torch.float32)
+    result = FakeKernelResult([[], [positions, coordinates]], values)
+
+    wrapped = _wrap_generated_result(
+        shape=(2, 3), tensor_format="ds", result_cpp=result
+    )
+
+    held = wrapped._storage._mode_indices[1]
+    assert held[0].data_ptr() == positions.data_ptr(), (
+        "the wrapped result copied the kernel's position array; adoption was granted "
+        "and then discarded downstream"
+    )
+    assert (
+        held[1].data_ptr() == coordinates.data_ptr()
+    ), "the wrapped result copied the kernel's coordinate array"
+    assert wrapped.values.data_ptr() == values.data_ptr()
+
+
+def test_a_caller_built_storage_is_still_re_owned():
+    """The counterpart: what the generated path skips, the public path must still do.
+
+    The fix for the test above is to stop routing our own storage through the public
+    `storage=` constructor, not to stop that constructor re-owning. A caller handing in
+    a storage object must still get a detached copy, or mutating what they kept would
+    reach inside a validated tensor.
+    """
+    positions = torch.tensor([0, 2, 3], dtype=torch.int32)
+    coordinates = torch.tensor([0, 2, 1], dtype=torch.int32)
+    values = torch.tensor([1.0, 2.0, 3.0], dtype=torch.float32)
+    index = TensorIndex("ds", [[], [positions, coordinates]], _adopt=True)
+    layout = storage_module.TensorLayout.from_physical_shape(
+        (2, 3), index.format, index.mode_order, index.index_dtype
+    )
+    storage = storage_module.SparseStorage(layout, values, index=index)
+
+    tensor = STensor(shape=(2, 3), storage=storage)
+
+    held = tensor._storage._mode_indices[1]
+    assert held[0].data_ptr() != positions.data_ptr()
+    assert held[1].data_ptr() != coordinates.data_ptr()
+
+
 # --------------------------------------------------------------------------- #
 # Debug-only structural validation of generated results
 # --------------------------------------------------------------------------- #

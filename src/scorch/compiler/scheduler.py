@@ -1,11 +1,10 @@
 import copy
 import math
-import os
 from collections import defaultdict, deque
 from contextlib import contextmanager
 from contextvars import ContextVar
 from dataclasses import dataclass, replace
-from typing import Dict, List, Optional, Sequence, Set, Tuple
+from typing import Any, Dict, List, NoReturn, Optional, Sequence, Set, Tuple
 
 import torch
 
@@ -15,91 +14,210 @@ from scorch.compiler.cin import (
     CINIndexVariablesGetter,
     CINVisitorAccept,
     ForAll,
+    IndexStmt,
     IndexVar,
     Operation,
     TensorAccess,
     TensorAssign,
+    TensorVar,
     TileSizeVar,
     Where,
     Workspace,
     WorkspaceAccess,
+    _is_index_stmt_instance,
+)
+from .cin_analysis import (
+    _compile_options_at_cin_boundary,
+    _trusted_normalized_cin,
+    normalize_cin,
+)
+from .compilation_context import CompilerStageId, CompilationContext
+from .compile_options import CompileOptions, SchedulerCostModel, SchedulerPolicy
+from .identity import IndexId, SymbolId
+from .diagnostics import (
+    CompileOptionsDiagnostic,
+    CompileOptionsError,
+    CompilerInvariantError,
+    InvalidSchedule,
+    UnsupportedFeature,
+    VerificationError,
+)
+from .legacy_cin_adapter import validate_legacy_cin_display_names
+from .loop_plan import (
+    AUTO_ORIGIN_POLICY_SCHEMA,
+    MAX_AFFINE_TILE_WIDTH,
+    AutoOriginPolicy,
+    LoopPart,
+    LoopPlacement,
+    LoopPlan,
+    LoopRef,
+    LoopTile,
+    OperandRelayout,
+    PanelBound,
+    PlacementKind,
+    ResultTile,
+    ScheduledCIN,
+    WorkspaceInsertion,
+    entity_display_names,
+    verify_loop_plan,
+)
+from .sparse_accumulator import (
+    SPARSE_ACCUMULATOR_STRUCTURES,
+    is_accumulator_structure,
+)
+from .sparse_assembly import (
+    SPARSE_ASSEMBLY_STRATEGIES,
+    is_assembly_strategy,
+    partitionable_receiver_levels,
 )
 from scorch.format import LevelType
 
-# Per-call override for the register-block decision. When not None it takes
-# precedence over the SCORCH_REGBLOCK env var. Phase 2b lowers the SAME CIN twice
-# (regblock forced OFF -> baseline nest, forced ON -> tiled nest) and stitches a
-# runtime free-dim branch (see ops._build_regblock_dual_path); the two lowerings
-# must be able to select their path independently of the process-wide env.
-_REGBLOCK_FORCE: Optional[bool] = None
+# Compatibility override read only while constructing a snapshot at a direct
+# scheduler boundary. Compiler stages receive the resulting immutable options
+# explicitly and never consult mutable process or context state.
+_REGBLOCK_FORCE: ContextVar[Optional[bool]] = ContextVar(
+    "scorch_regblock_force", default=None
+)
+
+# The loop-plan legality codes that are properties of the recorded loop ORDER
+# alone -- the two rules ``_verify_storage_order`` owns.  Named here so the
+# automatic plan origin can recognize a refusal a different legal order could
+# answer without restating either rule.
+_ORDER_LEGALITY_CODES = frozenset({"result_storage_order", "sparse_parent_dominance"})
 
 
-def _regblock_enabled() -> bool:
-    """SCORCH_REGBLOCK=1 opts into the free-dim register-block tiling (Phase 2 of
-    the codegen-parity work): tile the dense free/output dim of a sparse contraction
-    so the output tile accumulates in a stack-local buffer across the reduction
-    (register-eligible) instead of round-tripping memory per nonzero.
+def get_forced_regblock() -> Optional[bool]:
+    """Return the register-block compatibility override for this context."""
 
-    A per-call `regblock_force(...)` override wins over the env var when set.
+    value = _REGBLOCK_FORCE.get()
+    if value is not None and type(value) is not bool:
+        raise TypeError("register-block override must be a bool or None")
+    return value
 
-    Default OFF -> codegen is byte-identical to before. See codegen-parity notes.
-    """
-    if _REGBLOCK_FORCE is not None:
-        return _REGBLOCK_FORCE
-    return os.environ.get("SCORCH_REGBLOCK", "0") == "1"
+
+def _compile_options_at_scheduler_boundary(
+    compile_options: Optional[CompileOptions] = None,
+) -> CompileOptions:
+    """Resolve one immutable snapshot at a direct scheduler boundary."""
+
+    if compile_options is not None:
+        if type(compile_options) is not CompileOptions:
+            raise TypeError("compile_options must be a CompileOptions snapshot")
+        return compile_options
+
+    return _compile_options_at_cin_boundary()
+
+
+def _regblock_enabled(
+    compile_options: Optional[CompileOptions] = None,
+) -> bool:
+    """Return the snapshotted register-block scheduling decision."""
+
+    return _compile_options_at_scheduler_boundary(
+        compile_options
+    ).scheduler.regblock_enabled
 
 
 @contextmanager
 def regblock_force(value: Optional[bool]):
-    """Temporarily force `_regblock_enabled()` to `value` (or restore env-driven
-    behavior with None). Used by the Phase 2b dual-path builder to lower the baseline
-    and register-block nests from one CIN. Nestable and exception-safe."""
-    global _REGBLOCK_FORCE
-    prev = _REGBLOCK_FORCE
-    _REGBLOCK_FORCE = value
+    """Temporarily override register blocking at direct scheduler boundaries."""
+
+    if value is not None and type(value) is not bool:
+        raise TypeError("regblock_force expects a bool or None")
+    token = _REGBLOCK_FORCE.set(value)
     try:
         yield
     finally:
-        _REGBLOCK_FORCE = prev
+        _REGBLOCK_FORCE.reset(token)
 
 
-def _regblock_max_n() -> int:
-    """Runtime free-dim cutoff for the dual-path branch (SCORCH_REGBLOCK_MAX_N,
-    default 8): the register-block arm runs only when the free/output dim size is
-    <= this. It is ALSO used as the tile width so the regblock arm is always a
-    single tile (no sparse re-traversal, no ragged tail). Data (doc 04): N<=3 wins,
-    N>=16 regresses; 8 places the threshold between them (tune with N in {4,8})."""
-    try:
-        n = int(os.environ.get("SCORCH_REGBLOCK_MAX_N", "8"))
-    except ValueError:
-        return 8
-    return n if n > 0 else 8
+def _regblock_max_n(
+    compile_options: Optional[CompileOptions] = None,
+) -> int:
+    """Return the snapshotted runtime free-dimension cutoff."""
+
+    return _compile_options_at_scheduler_boundary(
+        compile_options
+    ).scheduler.regblock_max_n
 
 
-def _regblock_tile_width() -> int:
-    """Free-dim tile width for the register-block path. Defaults to REGBLOCK_MAX_N so
-    the regblock arm is single-tile; SCORCH_REGBLOCK_T overrides for experiments."""
-    env = os.environ.get("SCORCH_REGBLOCK_T")
-    if env is not None:
-        try:
-            t = int(env)
-            if t > 0:
-                return t
-        except ValueError:
-            pass
-    return _regblock_max_n()
+def _regblock_tile_width(
+    compile_options: Optional[CompileOptions] = None,
+) -> int:
+    """Return the snapshotted register-block tile width."""
+
+    return _compile_options_at_scheduler_boundary(
+        compile_options
+    ).scheduler.regblock_tile_width
 
 
-@dataclass(frozen=True)
-class _CostModelConstants:
-    alpha: float = 2.975
-    beta: float = 0.1005
-    gamma: float = 43.55
-    c_insert: float = 85.34
-    c_sort: float = 1.741
-    c_trans: float = 40.61
-    rho: float = 0.0014
-    default_dim_size: int = 1024
+def _scheduler_costs_at_boundary(
+    costs: Optional[SchedulerCostModel],
+    compile_options: Optional[CompileOptions],
+) -> Tuple[CompileOptions, SchedulerCostModel]:
+    """Resolve a snapshot and its effective immutable cost model once."""
+
+    options = _compile_options_at_scheduler_boundary(compile_options)
+    if costs is None:
+        costs = options.scheduler.cost_model
+    elif type(costs) is not SchedulerCostModel:
+        raise CompileOptionsError(
+            (
+                CompileOptionsDiagnostic(
+                    code="invalid_type",
+                    field="scheduler.cost_model",
+                    message="expected an exact SchedulerCostModel",
+                ),
+            )
+        )
+    elif compile_options is not None and costs != options.scheduler.cost_model:
+        raise CompileOptionsError(
+            (
+                CompileOptionsDiagnostic(
+                    code="conflicting_scheduler_cost_model",
+                    field="scheduler.cost_model",
+                    message=("the explicit cost model disagrees with CompileOptions"),
+                ),
+            )
+        )
+    elif costs != options.scheduler.cost_model:
+        options = replace(
+            options,
+            scheduler=replace(options.scheduler, cost_model=costs),
+        )
+    return options, costs
+
+
+def _validate_requested_schedule(
+    options: CompileOptions,
+    schedule: Optional["Schedule"],
+    *,
+    exact: bool = False,
+) -> None:
+    """Keep legacy schedule arguments consistent with the owned snapshot."""
+
+    requested = options.requested_schedule
+    if schedule is not None:
+        _validate_schedule_structure(schedule)
+    if requested is not None and requested is not schedule:
+        _validate_schedule_structure(requested)
+    if (exact and requested != schedule) or (
+        not exact and requested is not None and requested != schedule
+    ):
+        raise CompileOptionsError(
+            (
+                CompileOptionsDiagnostic(
+                    code="conflicting_schedule",
+                    field="requested_schedule",
+                    message=("the scheduler argument disagrees with CompileOptions"),
+                ),
+            )
+        )
+
+
+# Preserve the existing private spelling for downstream tests and extensions
+# while making the immutable policy type part of CompileOptions.
+_CostModelConstants = SchedulerCostModel
 
 
 @dataclass(frozen=True)
@@ -127,25 +245,27 @@ class TileSpec:
     unroll: bool = True
 
     def __post_init__(self) -> None:
-        if not isinstance(self.index_var, str) or not self.index_var:
+        if type(self.index_var) is not str or not self.index_var:
             raise ValueError("TileSpec.index_var must be a non-empty string")
-        if isinstance(self.width, bool) or not isinstance(self.width, int):
+        if type(self.width) is not int:
             raise TypeError("TileSpec.width must be an integer")
         if self.width <= 0:
             raise ValueError("TileSpec.width must be greater than zero")
-        if not isinstance(self.placement, str):
+        if self.width > MAX_AFFINE_TILE_WIDTH:
+            raise ValueError("TileSpec.width must fit the C++ constexpr int target")
+        if type(self.placement) is not str:
             raise TypeError("TileSpec.placement must be a string")
-        if not isinstance(self.parallel, bool):
+        if type(self.parallel) is not bool:
             raise TypeError("TileSpec.parallel must be a bool")
-        if not isinstance(self.kind, str):
+        if type(self.kind) is not str:
             raise TypeError("TileSpec.kind must be a string")
         if self.kind not in ("affine", "panel"):
             raise ValueError("TileSpec.kind must be 'affine' or 'panel'")
-        if not isinstance(self.accum, str):
+        if type(self.accum) is not str:
             raise TypeError("TileSpec.accum must be a string")
         if self.accum not in ("stack", "direct", "heap"):
             raise ValueError("TileSpec.accum must be 'stack', 'direct', or 'heap'")
-        if not isinstance(self.unroll, bool):
+        if type(self.unroll) is not bool:
             raise TypeError("TileSpec.unroll must be a bool")
         if not (
             self.placement == "outermost"
@@ -198,16 +318,20 @@ class RelayoutSpec:
     scope_var: Optional[str] = None
 
     def __post_init__(self) -> None:
-        if not isinstance(self.operand, str) or not isinstance(self.pack_var, str):
+        if type(self.operand) is not str or type(self.pack_var) is not str:
             raise TypeError("RelayoutSpec operand and pack_var must be strings")
         if not self.operand or not self.pack_var:
             raise ValueError("RelayoutSpec operand and pack_var must be non-empty")
-        if isinstance(self.strip_width, bool) or not isinstance(self.strip_width, int):
+        if type(self.strip_width) is not int:
             raise TypeError("RelayoutSpec.strip_width must be an integer")
         if self.strip_width <= 0:
             raise ValueError("RelayoutSpec.strip_width must be greater than zero")
+        if self.strip_width > MAX_AFFINE_TILE_WIDTH:
+            raise ValueError(
+                "RelayoutSpec.strip_width must fit the C++ constexpr int target"
+            )
         if self.scope_var is not None:
-            if not isinstance(self.scope_var, str):
+            if type(self.scope_var) is not str:
                 raise TypeError("RelayoutSpec.scope_var must be a string or None")
             if not self.scope_var:
                 raise ValueError("RelayoutSpec.scope_var must be non-empty")
@@ -218,11 +342,13 @@ class _RelayoutPlan:
     """CIN-derived metadata consumed by the post-lowering staging pass."""
 
     operand: str
+    operand_id: SymbolId
     pack_var: str
     panel_var: str
     scope_var: str
     row_var: str
     access_index_vars: Tuple[str, ...]
+    access_index_ids: Tuple[IndexId, ...]
     operand_panel_level: int
     operand_pack_level: int
 
@@ -238,10 +364,12 @@ class _ResultTilePlan:
     """
 
     result: str
+    result_id: SymbolId
     tile_var: str
     result_level: int
     result_prefix_vars: Tuple[str, ...]
     access_index_vars: Tuple[str, ...]
+    access_index_ids: Tuple[IndexId, ...]
 
 
 @dataclass(frozen=True)
@@ -252,6 +380,25 @@ class Schedule:
     tuple order, making placement deterministic for multi-axis tiling.
     ``parallel_loop`` may name a logical loop or a generated ``*_out``/``*_in``
     loop. The full representation, rather than the human tag, is the cache key.
+
+    ``assembly`` requests one sparse-output assembly strategy by name -- one
+    traversal or two, distributed across workers or not
+    (``SPARSE_ASSEMBLY_STRATEGIES`` lists them).  Which one is fastest depends
+    on the operands' formats and density rather than on the receiver alone, so
+    it is a schedule decision like the others.  ``None`` requests nothing and
+    leaves the compiler its own per-receiver choice; it is not a synonym for
+    ``"single_pass_serial"``.  A strategy the receiver cannot support is
+    refused rather than silently downgraded.
+
+    ``accumulator`` requests one sparse accumulation structure by name -- a list
+    of the keys inserted, or a chain indexed by the key
+    (``SPARSE_ACCUMULATOR_STRUCTURES`` lists them).  Which one is faster depends
+    on the density and on the receiver's compressed extent, so it is a schedule
+    decision like the others.  ``None`` requests nothing and leaves every layer
+    its own choice -- which, where the two-phase assembly transform fires,
+    remains the chain it substitutes today; it is not a synonym for
+    ``"coordinate_list"``.  A structure this program cannot use is refused rather
+    than silently ignored.
     """
 
     loop_order: Optional[Tuple[str, ...]] = None
@@ -259,26 +406,33 @@ class Schedule:
     relayout: Optional[RelayoutSpec] = None
     tag: str = ""
     parallel_loop: Optional[str] = None
+    assembly: Optional[str] = None
+    accumulator: Optional[str] = None
 
     def __post_init__(self) -> None:
         if self.loop_order is not None:
-            if isinstance(self.loop_order, str):
+            if type(self.loop_order) is str:
                 raise TypeError("Schedule.loop_order must be a sequence of names")
-            if not isinstance(self.loop_order, tuple):
+            if type(self.loop_order) not in (list, tuple):
+                raise TypeError(
+                    "Schedule.loop_order must be an owned list or tuple of names"
+                )
+            if type(self.loop_order) is list:
                 object.__setattr__(self, "loop_order", tuple(self.loop_order))
-            if any(not isinstance(name, str) or not name for name in self.loop_order):
+            if any(type(name) is not str or not name for name in self.loop_order):
                 raise ValueError("Schedule.loop_order must contain non-empty strings")
             if len(self.loop_order) != len(set(self.loop_order)):
                 raise ValueError("Schedule.loop_order contains duplicate variables")
-        if not isinstance(self.tiles, tuple):
-            try:
-                object.__setattr__(self, "tiles", tuple(self.tiles))
-            except TypeError as exc:
-                raise TypeError("Schedule.tiles must be a sequence") from exc
-        if any(not isinstance(tile, TileSpec) for tile in self.tiles):
-            raise TypeError("Schedule.tiles must contain TileSpec instances")
-        if self.relayout is not None and not isinstance(self.relayout, RelayoutSpec):
-            raise TypeError("Schedule.relayout must be a RelayoutSpec or None")
+        if type(self.tiles) not in (list, tuple):
+            raise TypeError("Schedule.tiles must be an owned list or tuple")
+        if type(self.tiles) is list:
+            object.__setattr__(self, "tiles", tuple(self.tiles))
+        if any(type(tile) is not TileSpec for tile in self.tiles):
+            # Exact-type admission: a TileSpec subclass is caller code that
+            # would otherwise execute inside compiler-trusted scopes.
+            raise TypeError("Schedule.tiles must contain exact TileSpec instances")
+        if self.relayout is not None and type(self.relayout) is not RelayoutSpec:
+            raise TypeError("Schedule.relayout must be an exact RelayoutSpec or None")
         if self.relayout is not None and self.relayout.scope_var is None:
             panel_tiles = [tile for tile in self.tiles if tile.kind == "panel"]
             if len(panel_tiles) == 1:
@@ -297,17 +451,486 @@ class Schedule:
                 "Use either Schedule.parallel_loop or TileSpec.parallel, not both"
             )
         if self.parallel_loop is not None:
-            if not isinstance(self.parallel_loop, str):
+            if type(self.parallel_loop) is not str:
                 raise TypeError("Schedule.parallel_loop must be a string or None")
             if not self.parallel_loop:
                 raise ValueError("Schedule.parallel_loop must be a non-empty string")
-        if not isinstance(self.tag, str):
+        if type(self.tag) is not str:
             raise TypeError("Schedule.tag must be a string")
+        if self.assembly is not None and not is_assembly_strategy(self.assembly):
+            raise ValueError(
+                "Schedule.assembly must name a sparse assembly strategy "
+                f"({', '.join(SPARSE_ASSEMBLY_STRATEGIES)}) or be None"
+            )
+        if self.accumulator is not None and not is_accumulator_structure(
+            self.accumulator
+        ):
+            raise ValueError(
+                "Schedule.accumulator must name a sparse accumulation structure "
+                f"({', '.join(SPARSE_ACCUMULATOR_STRUCTURES)}) or be None"
+            )
 
     @property
     def cache_key(self) -> str:
         """Canonical cache discriminator containing every schedule field."""
-        return repr(self)
+        return repr(_validate_schedule_structure(self))
+
+
+def _stored_schedule_fields(
+    value: object,
+    expected_type: type,
+    expected_fields: Tuple[str, ...],
+    what: str,
+) -> Dict[str, Any]:
+    """Snapshot one exact frozen schedule carrier without invoking caller code."""
+
+    if type(value) is not expected_type:
+        raise InvalidSchedule(f"{what} must be an exact {expected_type.__name__}")
+    try:
+        state = object.__getattribute__(value, "__dict__")
+    except Exception as error:
+        raise InvalidSchedule(f"{what} has inaccessible stored state") from error
+    if (
+        type(state) is not dict
+        or any(type(key) is not str for key in state)
+        or set(state) != set(expected_fields)
+    ):
+        raise InvalidSchedule(f"{what} has invalid stored fields")
+    for field_name in expected_fields:
+        try:
+            observed = object.__getattribute__(value, field_name)
+        except Exception as error:
+            raise InvalidSchedule(
+                f"{what}.{field_name} is not safely readable"
+            ) from error
+        if observed is not state[field_name]:
+            raise InvalidSchedule(f"{what}.{field_name} diverges from its stored value")
+    return state
+
+
+def _assembly_diagnostic(code: str, strategy: str, reason: str) -> Tuple[str, object]:
+    """One structured assembly refusal, spelled the way the plan boundary spells it.
+
+    The explicit surface refuses earlier than the plan legality boundary does, and
+    a refusal without a structured code is not a refusal this branch's
+    fail-closed gate can count.  Building the diagnostic here rather than
+    importing the boundary's private helpers keeps the module dependency one-way.
+    """
+
+    from .loop_plan_legality import LoopPlanDiagnostic
+
+    message = f"stage=Schedule: {code} at schedule/assembly: {strategy!r} {reason}"
+    return message, LoopPlanDiagnostic(
+        code=code,
+        message=f"{strategy!r} {reason}",
+        path=("schedule", "assembly"),
+        stage="schedule",
+        pass_name="apply_schedule",
+    )
+
+
+def _unsupported_assembly(strategy: str, reason: str) -> NoReturn:
+    message, diagnostic = _assembly_diagnostic(
+        "unsupported_schedule_assembly", strategy, reason
+    )
+    raise UnsupportedFeature(message, diagnostics=(diagnostic,))
+
+
+def _invalid_assembly(strategy: str, reason: str) -> NoReturn:
+    message, diagnostic = _assembly_diagnostic(
+        "invalid_schedule_assembly", strategy, reason
+    )
+    raise InvalidSchedule(message, diagnostics=(diagnostic,))
+
+
+def _accumulator_diagnostic(
+    code: str, structure: str, reason: str
+) -> Tuple[str, object]:
+    """One structured accumulation-structure refusal, spelled like the others."""
+
+    from .loop_plan_legality import LoopPlanDiagnostic
+
+    message = f"stage=Schedule: {code} at schedule/accumulator: {structure!r} {reason}"
+    return message, LoopPlanDiagnostic(
+        code=code,
+        message=f"{structure!r} {reason}",
+        path=("schedule", "accumulator"),
+        stage="schedule",
+        pass_name="apply_schedule",
+    )
+
+
+def _unsupported_accumulator(structure: str, reason: str) -> NoReturn:
+    message, diagnostic = _accumulator_diagnostic(
+        "unsupported_schedule_accumulator", structure, reason
+    )
+    raise UnsupportedFeature(message, diagnostics=(diagnostic,))
+
+
+def _validate_schedule_structure(schedule: object) -> Schedule:
+    """Revalidate a frozen public schedule at every compiler use boundary."""
+
+    state = _stored_schedule_fields(
+        schedule,
+        Schedule,
+        (
+            "loop_order",
+            "tiles",
+            "relayout",
+            "tag",
+            "parallel_loop",
+            "assembly",
+            "accumulator",
+        ),
+        "Schedule",
+    )
+    loop_order = state["loop_order"]
+    tiles = state["tiles"]
+    relayout = state["relayout"]
+    tag = state["tag"]
+    parallel_loop = state["parallel_loop"]
+    assembly = state["assembly"]
+    accumulator = state["accumulator"]
+    if loop_order is not None and type(loop_order) is not tuple:
+        raise InvalidSchedule("Schedule.loop_order must be an owned tuple or None")
+    if type(tiles) is not tuple:
+        raise InvalidSchedule("Schedule.tiles must be an owned tuple")
+    if relayout is not None and type(relayout) is not RelayoutSpec:
+        raise InvalidSchedule("Schedule.relayout must be an exact RelayoutSpec or None")
+    if type(tag) is not str:
+        raise InvalidSchedule("Schedule.tag must be an exact str")
+    if parallel_loop is not None and type(parallel_loop) is not str:
+        raise InvalidSchedule("Schedule.parallel_loop must be an exact str or None")
+    if assembly is not None and not is_assembly_strategy(assembly):
+        raise InvalidSchedule(
+            "Schedule.assembly must name a sparse assembly strategy or be None"
+        )
+    if accumulator is not None and not is_accumulator_structure(accumulator):
+        raise InvalidSchedule(
+            "Schedule.accumulator must name a sparse accumulation structure "
+            "or be None"
+        )
+
+    checked_tiles = []
+    for position, tile in enumerate(tiles):
+        tile_state = _stored_schedule_fields(
+            tile,
+            TileSpec,
+            (
+                "index_var",
+                "width",
+                "placement",
+                "parallel",
+                "kind",
+                "accum",
+                "unroll",
+            ),
+            f"Schedule.tiles[{position}]",
+        )
+        try:
+            checked_tiles.append(TileSpec(**tile_state))
+        except (TypeError, ValueError) as error:
+            raise InvalidSchedule(
+                f"Schedule.tiles[{position}] has invalid stored values"
+            ) from error
+
+    checked_relayout = None
+    if relayout is not None:
+        relayout_state = _stored_schedule_fields(
+            relayout,
+            RelayoutSpec,
+            ("operand", "pack_var", "strip_width", "scope_var"),
+            "Schedule.relayout",
+        )
+        try:
+            checked_relayout = RelayoutSpec(**relayout_state)
+        except (TypeError, ValueError) as error:
+            raise InvalidSchedule(
+                "Schedule.relayout has invalid stored values"
+            ) from error
+
+    try:
+        canonical = Schedule(
+            loop_order=loop_order,
+            tiles=tuple(checked_tiles),
+            relayout=checked_relayout,
+            tag=tag,
+            parallel_loop=parallel_loop,
+            assembly=assembly,
+            accumulator=accumulator,
+        )
+    except (TypeError, ValueError) as error:
+        raise InvalidSchedule("Schedule has invalid stored values") from error
+    if canonical != schedule:
+        raise InvalidSchedule("Schedule state is not in canonical owned form")
+    return schedule
+
+
+def _entity_ids_by_name(
+    cin: CIN,
+) -> Tuple[Dict[str, IndexVar], Dict[str, TensorVar]]:
+    """Resolve public display names once at the Schedule-to-LoopPlan boundary."""
+
+    index_names, symbol_names = entity_display_names(cin)
+    index_vars = {
+        index_var.index_id: index_var
+        for index_var in Scheduler.get_index_variables(cin)
+    }
+    for access in cin.tensor_accesses:
+        for index_var in access.indices or ():
+            index_vars.setdefault(index_var.index_id, index_var)
+
+    indices_by_name: Dict[str, IndexVar] = {}
+    for index_id, name in index_names.items():
+        index_var = index_vars[index_id]
+        previous = indices_by_name.get(name)
+        if previous is not None and previous.index_id != index_id:
+            raise ValueError(
+                f"Schedule name {name!r} is ambiguous between distinct IndexId values"
+            )
+        indices_by_name[name] = index_var
+
+    symbols_by_name: Dict[str, TensorVar] = {}
+    symbol_objects = {
+        access.tensor.symbol_id: access.tensor for access in cin.tensor_accesses
+    }
+    for symbol_id, name in symbol_names.items():
+        symbol = symbol_objects[symbol_id]
+        previous = symbols_by_name.get(name)
+        if previous is not None and previous.symbol_id != symbol_id:
+            raise ValueError(
+                f"Schedule name {name!r} is ambiguous between distinct SymbolId values"
+            )
+        symbols_by_name[name] = symbol
+    return indices_by_name, symbols_by_name
+
+
+def _loop_ref_from_name(
+    name: str,
+    indices_by_name: Dict[str, IndexVar],
+) -> LoopRef:
+    index_var = indices_by_name.get(name)
+    if index_var is not None:
+        return LoopRef(index_var.index_id)
+    for suffix, part in (("_out", LoopPart.OUTER), ("_in", LoopPart.INNER)):
+        if name.endswith(suffix):
+            index_var = indices_by_name.get(name[: -len(suffix)])
+            if index_var is not None:
+                return LoopRef(index_var.index_id, part)
+    raise ValueError(f"Schedule references unknown logical loop {name!r}")
+
+
+def _loop_placement_from_public(
+    placement: str,
+    indices_by_name: Dict[str, IndexVar],
+) -> LoopPlacement:
+    if placement == "outermost":
+        return LoopPlacement(PlacementKind.OUTERMOST)
+    if placement.startswith("child_of:"):
+        return LoopPlacement(
+            PlacementKind.CHILD_OF,
+            parent=_loop_ref_from_name(placement.split(":", 1)[1], indices_by_name),
+        )
+    if placement.startswith("at_depth:"):
+        return LoopPlacement(
+            PlacementKind.AT_DEPTH,
+            depth=int(placement.split(":", 1)[1]),
+        )
+    raise ValueError(f"Unsupported loop placement {placement!r}")
+
+
+def _build_loop_plan(
+    cin: CIN,
+    schedule: Schedule,
+    logical_order: Sequence[IndexVar],
+    panel_bounds: Sequence[PanelBound],
+    relayout_plan: Optional[_RelayoutPlan],
+    result_tile_plan: Optional[_ResultTilePlan],
+    provenance: str,
+) -> LoopPlan:
+    indices_by_name, symbols_by_name = _entity_ids_by_name(cin)
+
+    tiles = tuple(
+        LoopTile(
+            loop=_loop_ref_from_name(tile.index_var, indices_by_name),
+            width=tile.width,
+            placement=_loop_placement_from_public(tile.placement, indices_by_name),
+            parallel=tile.parallel,
+            kind=tile.kind,
+            accumulation=tile.accum,
+            unroll=tile.unroll,
+        )
+        for tile in schedule.tiles
+    )
+
+    relayout = None
+    if relayout_plan is not None:
+        if schedule.relayout is None:
+            raise CompilerInvariantError(
+                "validated relayout metadata has no public relayout decision"
+            )
+        relayout = OperandRelayout(
+            operand_id=relayout_plan.operand_id,
+            pack_loop=_loop_ref_from_name(relayout_plan.pack_var, indices_by_name),
+            panel_loop=_loop_ref_from_name(relayout_plan.panel_var, indices_by_name),
+            scope_loop=_loop_ref_from_name(relayout_plan.scope_var, indices_by_name),
+            row_loop=_loop_ref_from_name(relayout_plan.row_var, indices_by_name),
+            strip_width=schedule.relayout.strip_width,
+            access_indices=relayout_plan.access_index_ids,
+            operand_panel_level=relayout_plan.operand_panel_level,
+            operand_pack_level=relayout_plan.operand_pack_level,
+        )
+
+    result_tile = None
+    if result_tile_plan is not None:
+        result_tile = ResultTile(
+            result_id=result_tile_plan.result_id,
+            tile_loop=_loop_ref_from_name(result_tile_plan.tile_var, indices_by_name),
+            result_level=result_tile_plan.result_level,
+            result_prefix=tuple(
+                indices_by_name[name].index_id
+                for name in result_tile_plan.result_prefix_vars
+            ),
+            access_indices=result_tile_plan.access_index_ids,
+        )
+
+    parallel_loop = (
+        _loop_ref_from_name(schedule.parallel_loop, indices_by_name)
+        if schedule.parallel_loop is not None
+        else None
+    )
+    plan = LoopPlan(
+        loop_order=tuple(index_var.index_id for index_var in logical_order),
+        tiles=tiles,
+        panel_bounds=tuple(panel_bounds),
+        relayout=relayout,
+        result_tile=result_tile,
+        parallel_loop=parallel_loop,
+        assembly=schedule.assembly,
+        accumulator=schedule.accumulator,
+        provenance=provenance,
+        tag=schedule.tag,
+    )
+    return verify_loop_plan(cin, plan)
+
+
+def _render_loop_ref(loop: LoopRef, index_names: Dict[IndexId, str]) -> str:
+    name = index_names[loop.index_id]
+    if loop.part == LoopPart.OUTER:
+        return f"{name}_out"
+    if loop.part == LoopPart.INNER:
+        return f"{name}_in"
+    return name
+
+
+def _loop_ref_from_legacy_index_var(index_var: IndexVar) -> LoopRef:
+    """Recover the logical loop reference represented by a legacy tile part."""
+
+    if index_var.has_parent:
+        if index_var.is_outer:
+            return LoopRef(index_var.parent.index_id, LoopPart.OUTER)
+        if index_var.is_inner:
+            return LoopRef(index_var.parent.index_id, LoopPart.INNER)
+    return LoopRef(index_var.index_id)
+
+
+def _render_placement(
+    placement: LoopPlacement,
+    index_names: Dict[IndexId, str],
+) -> str:
+    if placement.kind == PlacementKind.OUTERMOST:
+        return "outermost"
+    if placement.kind == PlacementKind.CHILD_OF:
+        if placement.parent is None:
+            raise VerificationError("child placement has no parent loop")
+        return f"child_of:{_render_loop_ref(placement.parent, index_names)}"
+    if placement.depth is None:
+        raise VerificationError("depth placement has no depth")
+    return f"at_depth:{placement.depth}"
+
+
+def materialize_legacy_schedule(
+    cin: CIN,
+    plan: LoopPlan,
+) -> Tuple[
+    Schedule,
+    Dict[str, str],
+    Optional[_RelayoutPlan],
+    Optional[_ResultTilePlan],
+]:
+    """Translate a verified LoopPlan only at the legacy LLIR compatibility seam."""
+
+    verify_loop_plan(cin, plan)
+    index_names, symbol_names = entity_display_names(cin)
+    tiles = tuple(
+        TileSpec(
+            index_var=_render_loop_ref(tile.loop, index_names),
+            width=tile.width,
+            placement=_render_placement(tile.placement, index_names),
+            parallel=tile.parallel,
+            kind=tile.kind,
+            accum=tile.accumulation,
+            unroll=tile.unroll,
+        )
+        for tile in plan.tiles
+    )
+
+    relayout_spec = None
+    relayout_plan = None
+    if plan.relayout is not None:
+        relayout = plan.relayout
+        relayout_spec = RelayoutSpec(
+            operand=symbol_names[relayout.operand_id],
+            pack_var=_render_loop_ref(relayout.pack_loop, index_names),
+            strip_width=relayout.strip_width,
+            scope_var=_render_loop_ref(relayout.scope_loop, index_names),
+        )
+        relayout_plan = _RelayoutPlan(
+            operand=symbol_names[relayout.operand_id],
+            operand_id=relayout.operand_id,
+            pack_var=_render_loop_ref(relayout.pack_loop, index_names),
+            panel_var=_render_loop_ref(relayout.panel_loop, index_names),
+            scope_var=_render_loop_ref(relayout.scope_loop, index_names),
+            row_var=_render_loop_ref(relayout.row_loop, index_names),
+            access_index_vars=tuple(index_names[i] for i in relayout.access_indices),
+            access_index_ids=tuple(relayout.access_indices),
+            operand_panel_level=relayout.operand_panel_level,
+            operand_pack_level=relayout.operand_pack_level,
+        )
+
+    result_tile_plan = None
+    if plan.result_tile is not None:
+        result_tile = plan.result_tile
+        result_tile_plan = _ResultTilePlan(
+            result=symbol_names[result_tile.result_id],
+            result_id=result_tile.result_id,
+            tile_var=_render_loop_ref(result_tile.tile_loop, index_names),
+            result_level=result_tile.result_level,
+            result_prefix_vars=tuple(index_names[i] for i in result_tile.result_prefix),
+            access_index_vars=tuple(index_names[i] for i in result_tile.access_indices),
+            access_index_ids=tuple(result_tile.access_indices),
+        )
+
+    schedule = Schedule(
+        loop_order=tuple(index_names[index_id] for index_id in plan.loop_order),
+        tiles=tiles,
+        relayout=relayout_spec,
+        tag=plan.tag,
+        parallel_loop=(
+            _render_loop_ref(plan.parallel_loop, index_names)
+            if plan.parallel_loop is not None
+            else None
+        ),
+        assembly=plan.assembly,
+        accumulator=plan.accumulator,
+    )
+    rendered_panel_bounds = {
+        _render_loop_ref(bound.loop, index_names): (
+            f"{symbol_names[bound.tensor_id]}{bound.level}_size"
+        )
+        for bound in plan.panel_bounds
+    }
+    return schedule, rendered_panel_bounds, relayout_plan, result_tile_plan
 
 
 _SCHEDULE_FORCE: ContextVar[Optional[Schedule]] = ContextVar(
@@ -348,12 +971,12 @@ class Scheduler:
 
     @staticmethod
     def _unique_index_vars(index_vars: List[IndexVar]) -> List[IndexVar]:
-        seen: Set[str] = set()
+        seen: Set[IndexId] = set()
         unique: List[IndexVar] = []
         for index_var in index_vars:
-            if index_var.name in seen:
+            if index_var.index_id in seen:
                 continue
-            seen.add(index_var.name)
+            seen.add(index_var.index_id)
             unique.append(index_var)
         return unique
 
@@ -365,6 +988,149 @@ class Scheduler:
         if isinstance(body, TensorAssign):
             return body.lhs.get_tensor().is_dense()
         return False
+
+    @staticmethod
+    def _has_proven_non_dense_receiver(cin: CIN) -> bool:
+        """Is the FINAL result receiver provably NOT dense?
+
+        ``_has_dense_output`` cannot answer this once a workspace has been
+        inserted: it walks the ``ForAll`` chain looking for a ``TensorAssign``,
+        and insertion puts a ``Where`` there, so past that point it answers
+        ``False`` for *every* receiver -- dense ones included.  Anything using it
+        as a post-insertion legality guard therefore silently disables itself
+        everywhere rather than firing where it means to.
+
+        The receiver the tiling-legality question is about is the single
+        non-``Workspace`` result tensor.  The polarity here is deliberate: this
+        returns ``True`` only when there is exactly one such receiver *and* its
+        format is known and non-dense.  Anything unrecognized answers ``False``
+        and leaves the existing behaviour alone, so the guard can only ever
+        subtract tiling from a shape it has positively identified.
+        """
+
+        receivers = [
+            var
+            for var in cin.get_result_tensor_vars()
+            if not isinstance(var, Workspace)
+        ]
+        if len(receivers) != 1:
+            return False
+        result_format = receivers[0].format
+        if result_format is None:
+            return False
+        return not result_format.is_dense()
+
+    @staticmethod
+    def _require_legal_assembly_request(cin: CIN, schedule: Schedule) -> None:
+        """State the explicit path's assembly-strategy legality rules.
+
+        The explicit path states its own legality rules and the automatic origin
+        is then held to them -- the ordering §57.5's blocker-1 fix established,
+        after fixing only one of two duplicated layers landed twelve cells on the
+        wrong code.  There are two rules, and both are structural:
+
+        1. every strategy except the always-legal serial one needs the shared
+           receiver contract -- a dense level zero with every level below it
+           compressed -- because that is the correspondence that lets the
+           assembly be split by outer cell at all;
+        2. a requested strategy owns the result's assembly, so it cannot compose
+           with a panel tile, a relayout, or an explicit parallel loop, each of
+           which owns part of the same assembly.
+
+        A request that cannot be honoured is REFUSED rather than silently
+        downgraded to the default: a user who asks for a strategy and gets
+        another one has no way to know.  That is the difference between this and
+        the target's own choice, which declines silently because declining there
+        means "keep emitting exactly what you emit today".
+
+        The refusals carry the same structured codes the plan legality boundary
+        raises (``unsupported_schedule_assembly`` /
+        ``invalid_schedule_assembly``), and the receiver rule itself is the one
+        shared predicate rather than a restatement of it -- the two boundaries
+        differ in WHEN they refuse, never in WHAT they refuse.
+
+        Extents, densities and thread counts are deliberately absent.  Whether a
+        legal strategy pays is cost, and cost is the selector's question.
+        """
+
+        strategy = schedule.assembly
+        if strategy is None or strategy == "single_pass_serial":
+            return
+        receivers = [
+            var
+            for var in cin.get_result_tensor_vars()
+            if not isinstance(var, Workspace)
+        ]
+        if len(receivers) != 1 or receivers[0].format is None:
+            _unsupported_assembly(
+                strategy,
+                "requires exactly one result tensor with a known format",
+            )
+        levels = tuple(receivers[0].format.get_level_types())
+        if not partitionable_receiver_levels(levels):
+            _unsupported_assembly(
+                strategy,
+                "requires a result whose level zero is dense with every level "
+                f"below it compressed; {receivers[0].get_name()!r} is not one",
+            )
+        if (
+            any(tile.kind == "panel" for tile in schedule.tiles)
+            or schedule.relayout is not None
+            or schedule.parallel_loop is not None
+            or any(tile.parallel for tile in schedule.tiles)
+        ):
+            _invalid_assembly(
+                strategy,
+                "owns the result's assembly and its own parallel policy; it "
+                "cannot compose with a sparse panel tile, an operand relayout, "
+                "or an explicit parallel loop selection",
+            )
+
+    @staticmethod
+    def _require_legal_accumulator_request(cin: CIN, schedule: Schedule) -> None:
+        """State the explicit path's accumulation-structure legality rule.
+
+        One rule, and it is the only one provable without the emitted body: an
+        accumulation structure is a property of a SPARSE reduction's workspace,
+        and a dense result has no sparse accumulation workspace to hold.  So a
+        recorded structure requires exactly one result tensor with a known
+        format that is not dense.
+
+        Everything else this decision can be refused for needs a fact this
+        boundary does not have -- the workspace's key rank, and whether the
+        emitted body puts the declaration where the two-phase transform can
+        reach it -- so those refusals live in target lowering and in the pass,
+        each where its input lives.  The two boundaries differ in WHEN they
+        refuse, never in WHAT.
+
+        A request that cannot be honoured is REFUSED rather than ignored, for
+        the reason the assembly request is: a caller who asks for one structure
+        and gets another has no way to find out.
+
+        Extents and densities are deliberately absent.  Whether a legal
+        structure pays is cost, and cost is the selector's question.
+        """
+
+        structure = schedule.accumulator
+        if structure is None:
+            return
+        receivers = [
+            var
+            for var in cin.get_result_tensor_vars()
+            if not isinstance(var, Workspace)
+        ]
+        if len(receivers) != 1 or receivers[0].format is None:
+            _unsupported_accumulator(
+                structure,
+                "requires exactly one result tensor with a known format",
+            )
+        if receivers[0].format.is_dense():
+            _unsupported_accumulator(
+                structure,
+                "names the structure a sparse reduction accumulates through; "
+                f"{receivers[0].get_name()!r} is dense and has no sparse "
+                "accumulation workspace",
+            )
 
     @staticmethod
     def _extract_loop_chain(cin: CIN) -> Tuple[List[IndexVar], CIN]:
@@ -546,8 +1312,18 @@ class Scheduler:
                 continue
 
             logical_pos = tensor_access.get_index_vars().index(index_var)
-            if logical_pos < len(tensor_shape):
-                sizes.append(float(tensor_shape[logical_pos]))
+            mode_order = tensor_access.get_tensor().mode_order
+            physical_pos = logical_pos
+            if mode_order is not None:
+                try:
+                    physical_pos = mode_order.index(logical_pos)
+                except ValueError:
+                    # The normalized-CIN verifier owns the malformed
+                    # permutation diagnostic.  A cost heuristic must not
+                    # leak a raw lookup error before that boundary.
+                    continue
+            if physical_pos < len(tensor_shape):
+                sizes.append(float(tensor_shape[physical_pos]))
 
         if sizes:
             return max(max(sizes), 1.0)
@@ -1165,10 +1941,74 @@ class Scheduler:
         )
 
     @staticmethod
+    def _workspace_insertion_record(cin: CIN) -> Optional[WorkspaceInsertion]:
+        """Derive the workspace decision :meth:`insert_workspace` will apply.
+
+        This is the recording twin of the derivation inside
+        :meth:`insert_workspace` — the last in-order reduction variable, the
+        trailing free variables after it, and the dense-versus-sparse
+        representation (dense only for a single all-dense trailing axis).  It
+        is computed on the pre-insertion nest so the automatic scheduler can
+        record its standalone workspace decision as an explicit, replayable
+        ``LoopPlan`` fact instead of hidden policy state.  Returns ``None``
+        when insertion would not materialize a workspace.
+        """
+
+        if not isinstance(cin, ForAll):
+            return None
+        cin_ivar_getter = CINIndexVariablesGetter()
+        cin_ivar_getter.visit(cin)
+        result_tensor_accesses = cin.get_result_tensor_accesses()
+        if not result_tensor_accesses:
+            return None
+        result_tensor_access = result_tensor_accesses[0]
+        reduction_vars = cin_ivar_getter.get_reduction_vars()
+        free_vars = cin_ivar_getter.get_free_vars()
+        index_vars_ordered = cin.loop_order
+        reduction_vars_todo = [
+            var for var in reduction_vars if var in index_vars_ordered
+        ]
+        if not reduction_vars_todo:
+            return None
+        next_reduction_var = reduction_vars_todo[-1]
+        last_reduction_var_index = index_vars_ordered.index(next_reduction_var)
+        vars_after_last_reduction = index_vars_ordered[last_reduction_var_index + 1 :]
+        free_vars_after_last_reduction = [
+            var for var in vars_after_last_reduction if var in free_vars
+        ]
+        if not free_vars_after_last_reduction:
+            return None
+        level_types = [
+            result_tensor_access.level_type_of_index_var(var)
+            for var in free_vars_after_last_reduction
+        ]
+        are_all_dense_levels = all(
+            level_type == LevelType.DENSE for level_type in level_types
+        )
+        if are_all_dense_levels and len(free_vars_after_last_reduction) > 1:
+            are_all_dense_levels = False
+        return WorkspaceInsertion(
+            reduction_loop=LoopRef(next_reduction_var.index_id),
+            axis_loops=tuple(
+                LoopRef(var.index_id) for var in free_vars_after_last_reduction
+            ),
+            dense=are_all_dense_levels,
+        )
+
+    @staticmethod
     def _find_index_var_by_name(cin: CIN, name: str) -> IndexVar:
         matches = [index_var for index_var in cin.index_vars if index_var.name == name]
         if not matches:
             raise ValueError(f"Unknown index variable {name!r}")
+        return matches[0]
+
+    @staticmethod
+    def _find_index_var_by_id(cin: CIN, index_id: IndexId) -> IndexVar:
+        matches = [
+            index_var for index_var in cin.index_vars if index_var.index_id == index_id
+        ]
+        if not matches:
+            raise ValueError(f"Unknown IndexId {index_id.value}")
         return matches[0]
 
     @staticmethod
@@ -1233,7 +2073,6 @@ class Scheduler:
     def _insert_loop_at_depth(cin: CIN, loop: ForAll, depth: int) -> CIN:
         if depth == 0:
             loop.stmt = cin
-            cin.set_parent(loop)
             loop.inserted_workspace = cin.inserted_workspace
             loop.no_tile_list = list(cin.no_tile_list)
             return loop
@@ -1248,12 +2087,7 @@ class Scheduler:
 
         child = parent.stmt
         loop.stmt = child
-        child.set_parent(loop)
         parent.stmt = loop
-        loop.set_parent(parent)
-        # ``loop`` starts with the root as a temporary constructor body. Restore
-        # the actual root relationship after inserting it deeper.
-        cin.parent = None
         return cin
 
     @staticmethod
@@ -1265,6 +2099,7 @@ class Scheduler:
         parallel: bool = False,
         unroll: bool = True,
         use_workspace: bool = True,
+        compile_options: Optional[CompileOptions] = None,
     ) -> CIN:
         """
         Tile the index_var of a CIN statement.
@@ -1376,8 +2211,11 @@ class Scheduler:
             raise ValueError("tile_size must be greater than zero")
         if not isinstance(cin, ForAll):
             raise ValueError("Expected input CIN to be a ForAll statement")
+        if compile_options is not None:
+            _compile_options_at_scheduler_boundary(compile_options)
 
         target_name = index_var.name
+        target_id = index_var.index_id
         if (
             use_workspace
             and not cin.inserted_workspace
@@ -1389,7 +2227,7 @@ class Scheduler:
 
         # Workspace insertion deep-copies the graph. Resolve the target by name
         # in the transformed graph instead of retaining the pre-copy identity.
-        index_var = Scheduler._find_index_var_by_name(cin, target_name)
+        index_var = Scheduler._find_index_var_by_id(cin, target_id)
         if index_var.is_tiled or getattr(index_var, "_expr", None) is not None:
             raise ValueError(f"Index variable {target_name!r} is already tiled")
 
@@ -1406,7 +2244,8 @@ class Scheduler:
             )
 
         if placement is None:
-            if _regblock_enabled():
+            options = _compile_options_at_scheduler_boundary(compile_options)
+            if _regblock_enabled(options):
                 placement = f"child_of:{cin.index_var.name}"
             else:
                 placement = "outermost"
@@ -1456,7 +2295,6 @@ class Scheduler:
                     self.new_index_var if index == self.old_index_var else index
                     for index in workspace_access.indices
                 ]
-                workspace_access.indices = indices
                 workspace_access.update_indices(indices)
 
         replace_index_var_visitor = ReplaceIndexVarVisitor(
@@ -1553,14 +2391,24 @@ class Scheduler:
             return cin
 
         new_cin = copy.deepcopy(cin)
+        copied_indices = {
+            index_var.index_id: index_var for index_var in new_cin.index_vars
+        }
+        workspace_indices = [
+            copied_indices[index_var.index_id]
+            for index_var in free_vars_after_last_reduction
+        ]
 
         workspace = Workspace(
-            name="wksp", dim=dim_workspace, dense=are_all_dense_levels
+            name="wksp",
+            dim=dim_workspace,
+            dtype=result_tensor_access.tensor.dtype,
+            dense=are_all_dense_levels,
         )
 
         workspace_access = WorkspaceAccess(
             wksp=workspace,
-            indices=free_vars_after_last_reduction,
+            indices=workspace_indices,
         )
 
         # Note: parent_forall not necessarily ForAll statement at the end
@@ -1677,13 +2525,43 @@ class Scheduler:
     @staticmethod
     def select_loop_order(
         cin: CIN,
-        costs: _CostModelConstants = _DEFAULT_COSTS,
+        costs: Optional[_CostModelConstants] = None,
+        compile_options: Optional[CompileOptions] = None,
+        *,
+        pre_forced_order: Optional[List[IndexVar]] = None,
     ) -> List[IndexVar]:
+        """Select the automatic logical loop order.
+
+        ``pre_forced_order``, when given an empty list, receives the composed
+        order as it stands immediately before the sparse-output forced reorder
+        below -- the one block of this composition that no legality rule
+        constrains.  It is an out-parameter rather than a second return value so
+        that every existing caller, which passes nothing, executes exactly the
+        statements it executed before.
+        """
+        if costs is None:
+            _, costs = _scheduler_costs_at_boundary(costs, compile_options)
+        elif compile_options is not None:
+            _, costs = _scheduler_costs_at_boundary(costs, compile_options)
+        elif type(costs) is not SchedulerCostModel:
+            raise CompileOptionsError(
+                (
+                    CompileOptionsDiagnostic(
+                        code="invalid_type",
+                        field="scheduler.cost_model",
+                        message="expected an exact SchedulerCostModel",
+                    ),
+                )
+            )
         loop_order = Scheduler.init_loop_order(cin, costs=costs)
         loop_order = Scheduler.optimize_loop_order(cin, loop_order, costs=costs)
         loop_order = Scheduler.apply_mode_order_constraints(
             cin, loop_order, costs=costs
         )
+        if pre_forced_order is not None:
+            if type(pre_forced_order) is not list or pre_forced_order:
+                raise TypeError("pre_forced_order must be an empty exact list")
+            pre_forced_order.extend(loop_order)
 
         # For sparse output with reduction variables, ensure at least one free
         # variable appears after the last reduction variable.  The lowerer
@@ -1998,12 +2876,14 @@ class Scheduler:
 
         return _ResultTilePlan(
             result=result_access.tensor.name,
+            result_id=result_access.tensor_id,
             tile_var=tile.index_var,
             result_level=result_level,
             result_prefix_vars=result_names[:-1],
             access_index_vars=tuple(
                 index_var.name for index_var in result_access.indices
             ),
+            access_index_ids=tuple(result_access.index_ids),
         )
 
     @staticmethod
@@ -2213,6 +3093,7 @@ class Scheduler:
 
         return _RelayoutPlan(
             operand=relayout.operand,
+            operand_id=packed_access.tensor_id,
             pack_var=relayout.pack_var,
             panel_var=panel_var,
             scope_var=scope_var,
@@ -2220,6 +3101,7 @@ class Scheduler:
             access_index_vars=tuple(
                 index_var.name for index_var in packed_access.indices
             ),
+            access_index_ids=tuple(packed_access.index_ids),
             operand_panel_level=packed_access.level_of_index_var(
                 Scheduler._find_index_var_by_name(cin, panel_var)
             ),
@@ -2229,11 +3111,90 @@ class Scheduler:
         )
 
     @staticmethod
-    def apply_schedule(
-        cin: CIN,
+    def _validate_legacy_replay_scope(
+        cin: ForAll,
         schedule: Schedule,
-        costs: _CostModelConstants = _DEFAULT_COSTS,
-    ) -> CIN:
+        costs: _CostModelConstants,
+    ) -> bool:
+        """Validate public decisions that transitional replay can represent."""
+
+        is_identity = (
+            schedule.loop_order is None
+            and not schedule.tiles
+            and schedule.relayout is None
+            and schedule.parallel_loop is None
+        )
+        # ``assembly`` is deliberately NOT part of this test, and that was
+        # measured rather than assumed.  Treating a schedule that carries one as
+        # explicit makes three of the four strategies unreachable: they apply
+        # only to sparse-output programs, every such program needs an
+        # accumulation workspace, and ``WorkspaceInsertion`` is an
+        # automatic-provenance decision that the explicit path has no way to
+        # record -- so the explicit route produced a CIN with a workspace and a
+        # plan without the fact, and all 24 legal cells failed
+        # ``unsupported_program_shape`` / ``sparse_parent_dominance``.  A
+        # requested strategy therefore rides on the automatic plan as an
+        # ATTESTED decision, exactly as the cost-model loop order does: recorded,
+        # legality-verified, and not re-derived.  The origin still chooses
+        # nothing, so an automatic request without one records ``None`` and emits
+        # today's kernel byte for byte.
+        #
+        # ``accumulator`` is out of the test for exactly the same reason: the
+        # structure is a property of the accumulation workspace, so a schedule
+        # carrying only one must reach the route that inserts the workspace.
+        if not is_identity and cin.get_workspace_accesses():
+            raise NotImplementedError(
+                "CIN with an existing workspace supports only an empty auto Schedule"
+            )
+        if len(cin.get_result_tensor_accesses()) == 1:
+            return is_identity
+        if (
+            schedule.tiles
+            or schedule.relayout is not None
+            or schedule.parallel_loop is not None
+        ):
+            raise NotImplementedError(
+                "Tiling, relayout, and explicit parallel scheduling require "
+                "one assignment"
+            )
+        prospective_order = (
+            Scheduler.select_loop_order(cin, costs=costs)
+            if schedule.loop_order is None
+            else Scheduler.resolve_loop_order(cin, schedule.loop_order)
+        )
+        if Scheduler.should_insert_workspace(cin, prospective_order):
+            raise NotImplementedError(
+                "Derived workspace scheduling requires one assignment"
+            )
+        return is_identity
+
+    @staticmethod
+    def _validate_stack_workspace_scope(
+        loop_order: Sequence[IndexVar],
+        reduction_names: Set[str],
+        stack_targets: Set[str],
+    ) -> None:
+        """Reject a stack workspace that would replace the replay root."""
+
+        if not stack_targets:
+            return
+        reduction_positions = [
+            position
+            for position, index_var in enumerate(loop_order)
+            if index_var.name in reduction_names
+        ]
+        if reduction_positions and max(reduction_positions) == 0:
+            raise NotImplementedError(
+                "Stack tiling cannot wrap a workspace inserted at the root scope"
+            )
+
+    @staticmethod
+    def _apply_schedule_legacy(
+        cin: IndexStmt,
+        schedule: Schedule,
+        costs: Optional[_CostModelConstants] = None,
+        compile_options: Optional[CompileOptions] = None,
+    ) -> ScheduledCIN:
         """Apply an explicit tuner schedule to a CIN loop nest.
 
         An empty schedule delegates to :meth:`auto_schedule`, preserving the
@@ -2242,6 +3203,12 @@ class Scheduler:
         """
         if not isinstance(schedule, Schedule):
             raise TypeError("apply_schedule expects a Schedule")
+        options, costs = _scheduler_costs_at_boundary(costs, compile_options)
+        _validate_requested_schedule(options, schedule)
+        source_cin = cin
+        # Legacy scheduling still uses local tree surgery.  Keep that mutation
+        # behind this boundary by applying it only to a private working copy.
+        cin = copy.deepcopy(cin)
         if not isinstance(cin, ForAll):
             if (
                 schedule.loop_order is not None
@@ -2252,7 +3219,17 @@ class Scheduler:
                 raise NotImplementedError(
                     "Non-empty schedules require a ForAll CIN statement"
                 )
-            return cin
+            plan = verify_loop_plan(
+                source_cin,
+                LoopPlan(
+                    loop_order=(),
+                    auto_policy=Scheduler._auto_origin_policy(options.scheduler),
+                    provenance="auto",
+                    tag=schedule.tag,
+                ),
+            )
+            return ScheduledCIN(cin, plan)
+        is_identity = Scheduler._validate_legacy_replay_scope(cin, schedule, costs)
         panel_tiles = [tile for tile in schedule.tiles if tile.kind == "panel"]
         if len(panel_tiles) > 1:
             raise NotImplementedError("Only one sparse panel tile is supported")
@@ -2308,6 +3285,8 @@ class Scheduler:
                 "Explicit affine tiling currently requires a dense result tensor; "
                 "tiled sparse-output assembly is unsupported"
             )
+        Scheduler._require_legal_assembly_request(cin, schedule)
+        Scheduler._require_legal_accumulator_request(cin, schedule)
 
         parallel_names = [tile.index_var for tile in schedule.tiles if tile.parallel]
         if schedule.parallel_loop is not None:
@@ -2386,7 +3365,10 @@ class Scheduler:
             if schedule.loop_order is None:
                 panel_logical_order = [
                     index_var.name
-                    for index_var in Scheduler.select_loop_order(cin, costs=costs)
+                    for index_var in Scheduler.select_loop_order(
+                        cin,
+                        costs=costs,
+                    )
                 ]
             else:
                 panel_logical_order = list(schedule.loop_order)
@@ -2437,17 +3419,23 @@ class Scheduler:
             reduction_names,
         )
 
-        is_identity = (
-            schedule.loop_order is None
-            and not schedule.tiles
-            and schedule.relayout is None
-            and schedule.parallel_loop is None
-        )
         if is_identity:
-            return Scheduler.auto_schedule(cin, costs=costs)
+            scheduled_cin, plan = Scheduler._originate_auto_plan(
+                cin,
+                source_cin,
+                options,
+                costs,
+                tag=schedule.tag,
+                assembly=schedule.assembly,
+                accumulator=schedule.accumulator,
+            )
+            return ScheduledCIN(scheduled_cin, plan)
 
         if schedule.loop_order is None:
-            logical_order = Scheduler.select_loop_order(cin, costs=costs)
+            logical_order = Scheduler.select_loop_order(
+                cin,
+                costs=costs,
+            )
         else:
             logical_order = Scheduler.resolve_loop_order(cin, schedule.loop_order)
         cin = Scheduler._rebuild_loop_nest(cin, logical_order)
@@ -2469,6 +3457,11 @@ class Scheduler:
                 f"dimension after a reduction: {unsupported_stack_tiles}"
             )
         stack_targets = {tile.index_var for tile in stack_tiles}
+        Scheduler._validate_stack_workspace_scope(
+            loop_order,
+            reduction_names,
+            stack_targets,
+        )
         if Scheduler.should_insert_workspace(cin, loop_order) and (
             not Scheduler._has_dense_output(cin) or stack_targets
         ):
@@ -2487,6 +3480,7 @@ class Scheduler:
                 parallel=tile.parallel,
                 unroll=tile.unroll,
                 use_workspace=False,
+                compile_options=options,
             )
             generated_outer_names[tile.index_var] = f"{tile.index_var}_out"
 
@@ -2496,7 +3490,7 @@ class Scheduler:
             )
             Scheduler._set_explicit_parallel_loop(cin, parallel_name)
 
-        panel_bounds: Dict[str, str] = {}
+        panel_bounds: List[PanelBound] = []
         for tile in panel_tiles:
             target = Scheduler._find_index_var_by_name(cin, tile.index_var)
             dense_accesses = [
@@ -2511,18 +3505,96 @@ class Scheduler:
                 )
             access = dense_accesses[0]
             level = access.level_of_index_var(target)
-            panel_bounds[tile.index_var] = f"{access.tensor.name}{level}_size"
+            panel_bounds.append(
+                PanelBound(
+                    loop=LoopRef(target.index_id),
+                    tensor_id=access.tensor.symbol_id,
+                    level=level,
+                )
+            )
 
-        # The CIN lowerer consumes panel tiles after concrete sparse iterators are
-        # available in LLIR. Affine tiles above remain ordinary CIN transforms.
-        cin.explicit_schedule = schedule
-        cin.panel_bounds = panel_bounds
-        cin.relayout_plan = relayout_plan
-        cin.result_tile_plan = result_tile_plan
-        return cin
+        plan = _build_loop_plan(
+            source_cin,
+            schedule,
+            logical_order,
+            panel_bounds=panel_bounds,
+            relayout_plan=relayout_plan,
+            result_tile_plan=result_tile_plan,
+            provenance="explicit",
+        )
+        return ScheduledCIN(cin, plan)
 
     @staticmethod
-    def _select_index_vars_to_tile(cin: CIN) -> List[IndexVar]:
+    def apply_schedule(
+        cin: IndexStmt,
+        schedule: Schedule,
+        costs: Optional[_CostModelConstants] = None,
+        compile_options: Optional[CompileOptions] = None,
+        compilation_context: Optional[CompilationContext] = None,
+    ) -> ScheduledCIN:
+        """Pair detached semantic CIN with a verified stable-ID schedule.
+
+        The legacy validator still performs private tree surgery. Its mutable
+        result is discarded here and replayed only inside the lowering adapter.
+        """
+
+        _validate_schedule_structure(schedule)
+        options, costs = _scheduler_costs_at_boundary(costs, compile_options)
+        if compile_options is None and options.requested_schedule is None:
+            options = replace(options, requested_schedule=schedule)
+        _validate_requested_schedule(options, schedule, exact=True)
+        # Normalization owns the structural preflight, so it must run before
+        # the display-name walk: the legacy-name validator traverses stored
+        # forward edges recursively and would otherwise leak raw attribute
+        # or recursion failures on a forged graph.  The clone preserves every
+        # display name and stable ID, so validating the normalized graph is
+        # semantically identical.
+        normalized_cin = normalize_cin(
+            cin,
+            compile_options=options,
+            compilation_context=compilation_context,
+        )
+        validate_legacy_cin_display_names(normalized_cin)
+        stage_token = (
+            compilation_context.begin_stage(
+                CompilerStageId.SCHEDULING_AND_LOOP_PLAN_CONSTRUCTION,
+                compile_options=options,
+            )
+            if compilation_context is not None
+            else None
+        )
+        try:
+            with _trusted_normalized_cin(normalized_cin):
+                try:
+                    legacy_scheduled = Scheduler._apply_schedule_legacy(
+                        normalized_cin,
+                        schedule,
+                        costs=costs,
+                        compile_options=options,
+                    )
+                except (InvalidSchedule, UnsupportedFeature, VerificationError):
+                    raise
+                except NotImplementedError as exc:
+                    raise UnsupportedFeature(str(exc)) from exc
+                except ValueError as exc:
+                    raise InvalidSchedule(str(exc)) from exc
+                scheduled = ScheduledCIN(
+                    normalized_cin,
+                    legacy_scheduled.verified_loop_plan,
+                )
+        except Exception:
+            if stage_token is not None and compilation_context is not None:
+                compilation_context.fail_stage(stage_token)
+            raise
+        if stage_token is not None and compilation_context is not None:
+            compilation_context.complete_stage(stage_token)
+        return scheduled
+
+    @staticmethod
+    def _select_index_vars_to_tile(
+        cin: CIN,
+        scheduler_policy: SchedulerPolicy,
+    ) -> List[IndexVar]:
         all_index_vars = cin.index_vars
         tensor_accesses = cin.tensor_accesses
 
@@ -2585,7 +3657,7 @@ class Scheduler:
         # and holding the accumulator in registers removes the per-nonzero output
         # round-trip). So skip this guard when regblock is on. Byte-identical when off.
         loop_order = cin.loop_order
-        if loop_order and not _regblock_enabled():
+        if loop_order and not scheduler_policy.regblock_enabled:
 
             def _causes_sparse_retraversal(iv: IndexVar) -> bool:
                 if iv not in loop_order:
@@ -2606,7 +3678,12 @@ class Scheduler:
         return index_vars_to_tile
 
     @staticmethod
-    def _apply_tiling_heuristics(cin: CIN) -> CIN:
+    def _apply_tiling_heuristics(
+        cin: CIN,
+        compile_options: CompileOptions,
+        scheduler_policy: SchedulerPolicy,
+        plan_tiles: Optional[List[LoopTile]] = None,
+    ) -> CIN:
         if not isinstance(cin, ForAll):
             return cin
         # Preserve the legacy auto-scheduler's scope: before ``add_tile`` grew
@@ -2616,32 +3693,621 @@ class Scheduler:
         # schedules such as reduction-innermost SDDMM.
         if not cin.inserted_workspace:
             return cin
-        tile_width = _regblock_tile_width() if _regblock_enabled() else 32
-        for index_var in Scheduler._select_index_vars_to_tile(cin):
-            cin = Scheduler.add_tile(cin, index_var, tile_width)
+        # An affine tile over a non-dense result is illegal, and the scheduler
+        # already says so -- ``apply_schedule`` refuses exactly this composition
+        # for an explicitly requested schedule ("Explicit affine tiling currently
+        # requires a dense result tensor; tiled sparse-output assembly is
+        # unsupported").  That check reads ``schedule.tiles``, which is empty on
+        # the automatic origin, so it is vacuous precisely where the automatic
+        # heuristic then goes on to choose tiles itself.  The automatic path was
+        # constructing the artifact the explicit path declares unsupported, and
+        # nothing downstream re-checked it.
+        #
+        # The illegality is not theoretical.  Strip-mining a dense prefix loop and
+        # lifting the tile loop (OUTERMOST, or CHILD_OF the root on the regblock
+        # arm) stops the nest visiting a compressed result level's parent prefix
+        # in lexicographic order, so the assembled position array is malformed.
+        #
+        # Byte-neutral wherever tiling is legal, by construction: the guard cannot
+        # fire on a dense receiver, and it answers "not proven" -- leaving
+        # behaviour unchanged -- for any receiver shape it does not recognize.
+        if Scheduler._has_proven_non_dense_receiver(cin):
+            return cin
+        regblock_enabled = scheduler_policy.regblock_enabled
+        tile_width = (
+            scheduler_policy.regblock_tile_width
+            if regblock_enabled
+            else scheduler_policy.auto_tile_width
+        )
+        for index_var in Scheduler._select_index_vars_to_tile(cin, scheduler_policy):
+            if regblock_enabled:
+                parent_ref = _loop_ref_from_legacy_index_var(cin.index_var)
+                placement = f"child_of:{cin.index_var.name}"
+                loop_placement = LoopPlacement(
+                    PlacementKind.CHILD_OF,
+                    parent=parent_ref,
+                )
+            else:
+                placement = "outermost"
+                loop_placement = LoopPlacement(PlacementKind.OUTERMOST)
+            cin = Scheduler.add_tile(
+                cin,
+                index_var,
+                tile_width,
+                placement=placement,
+                compile_options=compile_options,
+            )
+            if plan_tiles is not None:
+                plan_tiles.append(
+                    LoopTile(
+                        loop=LoopRef(index_var.index_id),
+                        width=tile_width,
+                        placement=loop_placement,
+                        parallel=False,
+                        kind="affine",
+                        accumulation="direct",
+                        unroll=True,
+                    )
+                )
+        return cin
+
+    @staticmethod
+    def _auto_origin_policy(scheduler_policy: SchedulerPolicy) -> AutoOriginPolicy:
+        """The typed origin fact for one automatic-scheduling arm.
+
+        Records exactly the policy inputs the heuristics consume so plan
+        verification can re-derive every tile and workspace decision:
+        which regblock arm ran and the tile width that arm applies.
+        """
+
+        return AutoOriginPolicy(
+            schema=AUTO_ORIGIN_POLICY_SCHEMA,
+            regblock_enabled=scheduler_policy.regblock_enabled,
+            tile_width=(
+                scheduler_policy.regblock_tile_width
+                if scheduler_policy.regblock_enabled
+                else scheduler_policy.auto_tile_width
+            ),
+        )
+
+    @staticmethod
+    def _refused_for_order_legality(error: InvalidSchedule) -> bool:
+        """Whether one plan refusal names a rule about the loop ORDER alone.
+
+        ``loop_plan_legality._verify_storage_order`` owns exactly two such
+        rules -- a non-workspace result's own physical storage order, and every
+        sparse access's physical-parent dominance -- and both are properties of
+        the recorded order rather than of the program.  A refusal naming one of
+        them is therefore a statement that the order the automatic origin chose
+        is illegal, which is the only refusal a different legal order can
+        answer.  Every other code stays untouched, including the tile and
+        workspace decisions the same layer pins to a re-derived heuristic.
+        """
+
+        diagnostics = getattr(error, "diagnostics", ())
+        if type(diagnostics) is not tuple:
+            return False
+        return any(
+            getattr(diagnostic, "code", None) in _ORDER_LEGALITY_CODES
+            for diagnostic in diagnostics
+        )
+
+    @staticmethod
+    def _verified_auto_plan(
+        working: CIN,
+        plan_source: CIN,
+        logical_order: List[IndexVar],
+        options: CompileOptions,
+        scheduler_policy: SchedulerPolicy,
+        *,
+        tag: str,
+        require_complete_plan: bool,
+        assembly: Optional[str] = None,
+        accumulator: Optional[str] = None,
+    ) -> Tuple[CIN, LoopPlan]:
+        """Apply one automatic order and verify the plan that records it.
+
+        ``assembly`` is the sparse-output assembly strategy the public schedule
+        REQUESTED, carried onto the automatic plan as an attested decision -- the
+        same standing the cost-model loop order has: recorded, legality-verified
+        at the plan boundary, and not re-derived.  The automatic origin itself
+        chooses no strategy, so an ordinary automatic compilation records ``None``
+        here and emits exactly the kernel it emitted before the field existed.
+
+        ``accumulator`` rides along on exactly the same terms and for exactly the
+        same reason: the structure applies only to sparse-output programs, whose
+        workspace insertion is a decision only the automatic path can record.
+        """
+
+        auto_tiles: List[LoopTile] = []
+        auto_workspace: List[WorkspaceInsertion] = []
+        scheduled_cin = Scheduler._apply_auto_order_owned(
+            working,
+            logical_order,
+            options,
+            scheduler_policy=scheduler_policy,
+            plan_tiles=auto_tiles,
+            plan_workspace=auto_workspace,
+            require_complete_plan=require_complete_plan,
+        )
+        plan = verify_loop_plan(
+            plan_source,
+            LoopPlan(
+                loop_order=tuple(index_var.index_id for index_var in logical_order),
+                tiles=tuple(auto_tiles),
+                workspace=auto_workspace[0] if auto_workspace else None,
+                assembly=assembly,
+                accumulator=accumulator,
+                auto_policy=Scheduler._auto_origin_policy(scheduler_policy),
+                provenance="auto",
+                tag=tag,
+            ),
+        )
+        return scheduled_cin, plan
+
+    @staticmethod
+    def _originate_auto_plan(
+        working: CIN,
+        plan_source: CIN,
+        options: CompileOptions,
+        costs: _CostModelConstants,
+        *,
+        scheduler_policy: Optional[SchedulerPolicy] = None,
+        tag: str = "",
+        require_complete_plan: bool = False,
+        assembly: Optional[str] = None,
+        accumulator: Optional[str] = None,
+    ) -> Tuple[CIN, LoopPlan]:
+        """Originate one verified automatic plan at a plan-producing boundary.
+
+        :meth:`select_loop_order` ends with an unchecked forced reorder that
+        moves the last free variable inward so that a free variable follows the
+        last reduction -- the nest shape legacy lowering and workspace insertion
+        require.  Nothing constrains that block, and for a sparse result whose
+        every coordinate is already bound above the outermost reduction it
+        produces an order the plan's own legality rules refuse: moving one
+        result coordinate inward puts a compressed physical parent below its
+        child.  Such a program needs no workspace at all, so the reorder buys
+        nothing and costs legality.
+
+        When exactly that happens -- the recorded plan refused for an
+        order-legality rule, and the composition's own pre-forced order
+        different from the forced one -- the plan is re-originated from the
+        pre-forced order and offered to the same trust boundary, which accepts
+        or refuses it on its own terms.  Two properties make this narrow:
+
+        * It defers to the legality layer instead of restating either the
+          reorder or the rules it breaks, so no policy is duplicated here.
+        * It runs only after a refusal, so a program that produces generated
+          code today cannot reach it; and if the pre-forced order is refused
+          too, the original refusal is the one reported.
+        """
+
+        policy = options.scheduler if scheduler_policy is None else scheduler_policy
+        pre_forced: List[IndexVar] = []
+        logical_order = Scheduler.select_loop_order(
+            working, costs=costs, pre_forced_order=pre_forced
+        )
+        try:
+            return Scheduler._verified_auto_plan(
+                working,
+                plan_source,
+                logical_order,
+                options,
+                policy,
+                tag=tag,
+                require_complete_plan=require_complete_plan,
+                assembly=assembly,
+                accumulator=accumulator,
+            )
+        except InvalidSchedule as refusal:
+            if not Scheduler._refused_for_order_legality(refusal) or [
+                index_var.index_id for index_var in pre_forced
+            ] == [index_var.index_id for index_var in logical_order]:
+                raise
+            repaired = copy.deepcopy(plan_source)
+            repaired_order: List[IndexVar] = []
+            Scheduler.select_loop_order(
+                repaired, costs=costs, pre_forced_order=repaired_order
+            )
+            try:
+                return Scheduler._verified_auto_plan(
+                    repaired,
+                    plan_source,
+                    repaired_order,
+                    options,
+                    policy,
+                    tag=tag,
+                    require_complete_plan=require_complete_plan,
+                    assembly=assembly,
+                    accumulator=accumulator,
+                )
+            except (InvalidSchedule, UnsupportedFeature, VerificationError):
+                raise refusal
+
+    @staticmethod
+    def _apply_auto_order_owned(
+        cin: CIN,
+        loop_order: List[IndexVar],
+        compile_options: CompileOptions,
+        scheduler_policy: Optional[SchedulerPolicy] = None,
+        plan_tiles: Optional[List[LoopTile]] = None,
+        plan_workspace: Optional[List[WorkspaceInsertion]] = None,
+        require_complete_plan: bool = False,
+    ) -> CIN:
+        """Apply selected auto decisions on a CIN owned by the scheduler."""
+
+        if type(require_complete_plan) is not bool:
+            raise TypeError("require_complete_plan must be an exact bool")
+        if require_complete_plan and (
+            type(plan_tiles) is not list
+            or type(plan_workspace) is not list
+            or plan_tiles is plan_workspace
+            or plan_tiles
+            or plan_workspace
+        ):
+            raise TypeError(
+                "require_complete_plan needs empty exact plan tile and "
+                "workspace sinks"
+            )
+        if not isinstance(cin, ForAll):
+            return cin
+        if scheduler_policy is None:
+            scheduler_policy = compile_options.scheduler
+
+        cin = Scheduler._rebuild_loop_nest(cin, loop_order)
+
+        recorded: Optional[WorkspaceInsertion] = None
+        dense_output = Scheduler._has_dense_output(cin)
+        if Scheduler.should_insert_workspace(cin, loop_order):
+            # For dense outputs the workspace only exists to support tiling.
+            # If nothing will be tiled, the workspace is pure overhead
+            # (extra memset + copy-back per iteration).
+            will_tile = (
+                len(Scheduler._select_index_vars_to_tile(cin, scheduler_policy)) > 0
+            )
+            insert = not dense_output or will_tile
+            if insert and dense_output:
+                # A dense-output insertion at the nest root demotes the root
+                # to a Where, so the candidate tiles that justified the
+                # workspace can never materialize — and the legacy emission of
+                # that composition mixes the dense and sparse workspace APIs
+                # over one undeclared symbol, so it has never compiled
+                # (retained einsum('jk->k') clang evidence).  Elide exactly as
+                # the established empty-Schedule replay contract does, keeping
+                # the plan-free production route and replay in agreement.
+                root_getter = CINIndexVariablesGetter()
+                root_getter.visit(cin)
+                reductions_in_order = [
+                    var
+                    for var in root_getter.get_reduction_vars()
+                    if var in cin.loop_order
+                ]
+                if reductions_in_order and cin.index_var == reductions_in_order[-1]:
+                    insert = False
+            if insert:
+                # Recording is a plan-construction concern.  Ordinary release
+                # auto-scheduling owns only the legacy mutation and must not
+                # depend on this helper when no recording sink was requested.
+                if plan_workspace is not None:
+                    recorded = Scheduler._workspace_insertion_record(cin)
+                cin = Scheduler.insert_workspace(cin, allow_dense=True)
+                if plan_workspace is not None:
+                    materialized = {
+                        (access.tensor.symbol_id, access.tensor.dense)
+                        for access in cin.get_workspace_accesses()
+                    }
+                    if (
+                        recorded is None
+                        or not cin.inserted_workspace
+                        or len(materialized) != 1
+                        or next(iter(materialized))[1] is not recorded.dense
+                    ):
+                        raise VerificationError(
+                            "stage=auto plan recording: the workspace "
+                            "insertion decision did not materialize as derived"
+                        )
+
+        if isinstance(cin, ForAll):
+            cin = Scheduler._apply_tiling_heuristics(
+                cin,
+                compile_options,
+                scheduler_policy,
+                plan_tiles=plan_tiles,
+            )
+        if plan_workspace is not None and recorded is not None:
+            # The root-scope dense elision above makes production surgery and
+            # the ``ScheduledCIN`` replay contract agree by construction: any
+            # materialized dense-output workspace now has candidate tiles that
+            # actually materialize.  The guard below is defense in depth — if
+            # a future heuristic change reintroduces a materialized dense
+            # workspace whose tiles bailed, recording ``None`` would falsely
+            # claim a complete recording, so complete-plan mode fails closed
+            # instead.
+            if not dense_output or (plan_tiles is not None and plan_tiles):
+                plan_workspace.append(recorded)
+            elif require_complete_plan:
+                raise UnsupportedFeature(
+                    "stage=auto plan recording: a materialized dense "
+                    "workspace without derived tiles is not represented by "
+                    "the automatic LoopPlan replay contract"
+                )
+        return cin
+
+    @staticmethod
+    def _auto_schedule_owned(
+        cin: CIN,
+        compile_options: CompileOptions,
+        costs: Optional[_CostModelConstants] = None,
+        scheduler_policy: Optional[SchedulerPolicy] = None,
+        plan_tiles: Optional[List[LoopTile]] = None,
+        plan_workspace: Optional[List[WorkspaceInsertion]] = None,
+    ) -> CIN:
+        """Select policy once, then mutate only scheduler-owned CIN."""
+
+        if not isinstance(cin, ForAll):
+            return cin
+        if scheduler_policy is None:
+            scheduler_policy = compile_options.scheduler
+        if costs is None:
+            costs = scheduler_policy.cost_model
+        loop_order = Scheduler.select_loop_order(
+            cin,
+            costs=costs,
+        )
+        return Scheduler._apply_auto_order_owned(
+            cin,
+            loop_order,
+            compile_options,
+            scheduler_policy=scheduler_policy,
+            plan_tiles=plan_tiles,
+            plan_workspace=plan_workspace,
+        )
+
+    @staticmethod
+    def _replay_auto_plan_owned(
+        cin: IndexStmt,
+        plan: LoopPlan,
+        compile_options: Optional[CompileOptions] = None,
+    ) -> IndexStmt:
+        """Replay recorded auto decisions without rerunning scheduling policy."""
+
+        options = _compile_options_at_scheduler_boundary(compile_options)
+        verify_loop_plan(cin, plan)
+        if not isinstance(cin, ForAll):
+            if plan.loop_order or plan.tiles:
+                raise VerificationError(
+                    "stage=legacy auto replay: non-loop CIN has loop decisions"
+                )
+            return cin
+        if (
+            plan.panel_bounds
+            or plan.relayout is not None
+            or plan.result_tile is not None
+            or plan.parallel_loop is not None
+        ):
+            raise VerificationError(
+                "stage=legacy auto replay: auto LoopPlan contains explicit-only "
+                "decisions"
+            )
+
+        index_names, _ = entity_display_names(cin)
+        logical_order = [
+            Scheduler._find_index_var_by_id(cin, index_id)
+            for index_id in plan.loop_order
+        ]
+        cin = Scheduler._rebuild_loop_nest(cin, logical_order)
+
+        # Replay consumes the recorded workspace decision instead of
+        # re-deriving hidden scheduler-policy state; the plan verifier has
+        # already proved the stored fact equals the derived decision, and the
+        # replayed nest is cross-checked against it before materialization.
+        if plan.workspace is not None:
+            derived = Scheduler._workspace_insertion_record(cin)
+            if derived != plan.workspace:
+                raise VerificationError(
+                    "stage=legacy auto replay: the recorded workspace "
+                    "insertion does not match the replayed nest"
+                )
+            cin = Scheduler.insert_workspace(cin, allow_dense=True)
+            if not cin.inserted_workspace:
+                raise VerificationError(
+                    "stage=legacy auto replay: the recorded workspace "
+                    "insertion did not materialize"
+                )
+
+        for tile in plan.tiles:
+            if tile.loop.part != LoopPart.LOGICAL or tile.kind != "affine":
+                raise VerificationError(
+                    "stage=legacy auto replay: unsupported recorded auto tile"
+                )
+            target = Scheduler._find_index_var_by_id(cin, tile.loop.index_id)
+            cin = Scheduler.add_tile(
+                cin=cin,
+                index_var=target,
+                tile_size=tile.width,
+                placement=_render_placement(tile.placement, index_names),
+                parallel=tile.parallel,
+                unroll=tile.unroll,
+                use_workspace=False,
+                compile_options=options,
+            )
         return cin
 
     @staticmethod
     def auto_schedule(
         cin: CIN,
-        costs: _CostModelConstants = _DEFAULT_COSTS,
+        costs: Optional[_CostModelConstants] = None,
+        compile_options: Optional[CompileOptions] = None,
+        compilation_context: Optional[CompilationContext] = None,
     ) -> CIN:
-        if not isinstance(cin, ForAll):
-            return cin
+        """Auto-schedule without mutating caller-owned CIN state."""
 
-        loop_order = Scheduler.select_loop_order(cin, costs=costs)
-        cin = Scheduler._rebuild_loop_nest(cin, loop_order)
+        options, costs = _scheduler_costs_at_boundary(costs, compile_options)
+        _validate_requested_schedule(options, None)
+        return Scheduler._auto_schedule_boundary_owned(
+            cin,
+            options,
+            costs,
+            options.scheduler,
+            compilation_context=compilation_context,
+        )
 
-        if Scheduler.should_insert_workspace(cin, loop_order):
-            # For dense outputs the workspace only exists to support tiling.
-            # If nothing will be tiled, the workspace is pure overhead
-            # (extra memset + copy-back per iteration).
-            will_tile = len(Scheduler._select_index_vars_to_tile(cin)) > 0
-            if not Scheduler._has_dense_output(cin) or will_tile:
-                cin = Scheduler.insert_workspace(cin, allow_dense=True)
+    @staticmethod
+    def auto_schedule_plan(
+        cin: CIN,
+        costs: Optional[_CostModelConstants] = None,
+        compile_options: Optional[CompileOptions] = None,
+        compilation_context: Optional[CompilationContext] = None,
+        *,
+        regblock_enabled: Optional[bool] = None,
+    ) -> ScheduledCIN:
+        """Originate a verified automatic LoopPlan at the auto boundary.
 
-        if not isinstance(cin, ForAll):
-            return cin
+        The plan-producing twin of :meth:`auto_schedule` and one regblock
+        arm of the internal dual-path algorithm: the same policy selects the
+        loop order, workspace insertion, and heuristic tiles, but every
+        decision is recorded as an explicit fact of one verified
+        ``provenance="auto"`` LoopPlan instead of surviving only as private
+        tree surgery.  The mutable surgery result is discarded exactly as
+        :meth:`apply_schedule` discards it; release dispatch does not consume
+        this entry yet.  The dense root-scope reduction family records the
+        elided decision (``workspace=None``): plan-free production surgery
+        now elides that insertion exactly as the empty-Schedule replay
+        contract always has, because the abandoned materialized form never
+        produced compilable C++ (retained einsum('jk->k') clang evidence).
+        """
 
-        cin = Scheduler._apply_tiling_heuristics(cin)
-        return cin
+        options, costs = _scheduler_costs_at_boundary(costs, compile_options)
+        _validate_requested_schedule(options, None)
+        scheduler_policy = options.scheduler
+        if regblock_enabled is not None:
+            if type(regblock_enabled) is not bool:
+                raise TypeError("regblock_enabled must be an exact bool")
+            scheduler_policy = replace(
+                scheduler_policy,
+                regblock_enabled=regblock_enabled,
+            )
+            costs = scheduler_policy.cost_model
+        if not _is_index_stmt_instance(cin):
+            raise TypeError("auto_schedule_plan expects an IndexStmt")
+        # Normalization owns the structural preflight; validate display names
+        # on the normalized clone so a forged graph fails closed first (the
+        # clone preserves every display name and stable ID).
+        normalized = normalize_cin(
+            cin,
+            compile_options=options,
+            compilation_context=compilation_context,
+        )
+        validate_legacy_cin_display_names(normalized)
+        stage_token = (
+            compilation_context.begin_stage(
+                CompilerStageId.SCHEDULING_AND_LOOP_PLAN_CONSTRUCTION,
+                compile_options=options,
+            )
+            if compilation_context is not None
+            else None
+        )
+        try:
+            with _trusted_normalized_cin(normalized):
+                working = copy.deepcopy(normalized)
+                if not isinstance(working, ForAll):
+                    plan = verify_loop_plan(
+                        normalized,
+                        LoopPlan(
+                            loop_order=(),
+                            auto_policy=Scheduler._auto_origin_policy(scheduler_policy),
+                            provenance="auto",
+                        ),
+                    )
+                else:
+                    _, plan = Scheduler._originate_auto_plan(
+                        working,
+                        normalized,
+                        options,
+                        costs,
+                        scheduler_policy=scheduler_policy,
+                        require_complete_plan=True,
+                    )
+                scheduled = ScheduledCIN(normalized, plan)
+        except Exception:
+            if stage_token is not None and compilation_context is not None:
+                compilation_context.fail_stage(stage_token)
+            raise
+        if stage_token is not None and compilation_context is not None:
+            compilation_context.complete_stage(stage_token)
+        return scheduled
+
+    @staticmethod
+    def _auto_schedule_regblock_arm(
+        cin: CIN,
+        *,
+        enabled: bool,
+        compile_options: CompileOptions,
+        compilation_context: Optional[CompilationContext] = None,
+    ) -> CIN:
+        """Run one deterministic arm of the internal dual-path algorithm."""
+
+        if type(enabled) is not bool:
+            raise TypeError("enabled must be an exact bool")
+        if type(compile_options) is not CompileOptions:
+            raise TypeError("compile_options must be an exact CompileOptions")
+        _validate_requested_schedule(compile_options, None)
+        scheduler_policy = replace(
+            compile_options.scheduler,
+            regblock_enabled=enabled,
+        )
+        return Scheduler._auto_schedule_boundary_owned(
+            cin,
+            compile_options,
+            scheduler_policy.cost_model,
+            scheduler_policy,
+            compilation_context=compilation_context,
+        )
+
+    @staticmethod
+    def _auto_schedule_boundary_owned(
+        cin: CIN,
+        options: CompileOptions,
+        costs: _CostModelConstants,
+        scheduler_policy: SchedulerPolicy,
+        compilation_context: Optional[CompilationContext] = None,
+    ) -> CIN:
+        """Shared owned implementation after the public boundary is resolved."""
+
+        if not _is_index_stmt_instance(cin):
+            raise TypeError("auto_schedule expects an IndexStmt")
+        # Normalization owns the structural preflight; validate display names
+        # on the normalized clone so a forged graph fails closed first (the
+        # clone preserves every display name and stable ID).
+        working = normalize_cin(
+            cin,
+            compile_options=options,
+            compilation_context=compilation_context,
+        )
+        validate_legacy_cin_display_names(working)
+        stage_token = (
+            compilation_context.begin_stage(
+                CompilerStageId.SCHEDULING_AND_LOOP_PLAN_CONSTRUCTION,
+                compile_options=options,
+            )
+            if compilation_context is not None
+            else None
+        )
+        try:
+            with _trusted_normalized_cin(working):
+                scheduled = Scheduler._auto_schedule_owned(
+                    working,
+                    options,
+                    costs=costs,
+                    scheduler_policy=scheduler_policy,
+                )
+                if isinstance(scheduled, IndexStmt):
+                    validate_legacy_cin_display_names(scheduled)
+        except Exception:
+            if stage_token is not None and compilation_context is not None:
+                compilation_context.fail_stage(stage_token)
+            raise
+        if stage_token is not None and compilation_context is not None:
+            compilation_context.complete_stage(stage_token)
+        return scheduled

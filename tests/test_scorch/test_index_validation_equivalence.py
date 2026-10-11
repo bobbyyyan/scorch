@@ -13,7 +13,9 @@ verbatim, as ``reference_validate``, and compares the two over a grid of well-fo
 malformed storage. When they disagree the test prints both outcomes.
 
 The reference is a frozen copy on purpose: it is what shipped, and it must not be
-refactored alongside the production code it exists to check.
+refactored alongside the production code it exists to check. Its ordering rule is the
+refactor line's (7fd9116): coordinates strictly increasing within a parent, so a repeated
+coordinate is rejected like a descent. That loop is copied as it shipped there.
 """
 
 import copy
@@ -153,11 +155,11 @@ def reference_validate(
             ):
                 segment = coordinates[start:end]
                 if segment.numel() > 1 and bool(
-                    torch.any(segment[1:] < segment[:-1]).item()
+                    torch.any(segment[1:] <= segment[:-1]).item()
                 ):
                     raise TensorIndexError(
-                        f"compressed mode {mode} coordinates must be sorted "
-                        f"within parent {parent}"
+                        f"compressed mode {mode} coordinates must be strictly "
+                        f"increasing within parent {parent}"
                     )
             parent_positions = coordinates.numel()
             continue
@@ -327,13 +329,25 @@ def test_single_entry_parents():
         "ok", "")
 
 
-def test_duplicate_coordinates_in_a_parent_are_allowed():
-    """Sortedness is nondecreasing, not strictly increasing."""
+def test_duplicate_coordinates_in_a_parent_are_rejected_identically():
+    """Ordering is strictly increasing (7fd9116): a repeat inside a parent is rejected,
+    with the same message as a descent, naming that parent."""
     layout = layout_for("ds", (2, 8))
     positions = torch.tensor([0, 3, 4], dtype=torch.int32)
     coordinates = torch.tensor([1, 1, 4, 2], dtype=torch.int32)
     values = torch.rand(4)
-    assert check_same(layout, ((), (positions, coordinates)), values, "dups") == ("ok", "")
+    verdict = check_same(layout, ((), (positions, coordinates)), values, "dups")
+    assert verdict[0] == "TensorIndexError" and "within parent 0" in verdict[1], verdict
+
+
+def test_a_repeat_across_a_parent_boundary_is_allowed():
+    """Two rows may share a column, so a repeat that straddles a boundary is legal."""
+    layout = layout_for("ds", (2, 8))
+    positions = torch.tensor([0, 2, 4], dtype=torch.int32)
+    coordinates = torch.tensor([1, 4, 4, 6], dtype=torch.int32)
+    values = torch.rand(4)
+    verdict = check_same(layout, ((), (positions, coordinates)), values, "shared column")
+    assert verdict == ("ok", ""), verdict
 
 
 @pytest.mark.parametrize(
@@ -505,9 +519,9 @@ def test_in_place_corruption_of_the_internal_arrays_is_still_caught():
     internal[1] = internal[0] - 1 if internal[0] > 0 else 0
     internal[0] = 3
     # The stamp's version counter moved, so the skip does not apply.
-    with pytest.raises(TensorIndexError, match="sorted within parent"):
+    with pytest.raises(TensorIndexError, match="strictly increasing within parent"):
         tensor._storage.validate_unless_already_checked()
-    with pytest.raises(TensorIndexError, match="sorted within parent"):
+    with pytest.raises(TensorIndexError, match="strictly increasing within parent"):
         tensor.validate()
 
 
@@ -618,7 +632,7 @@ def test_a_copied_tensor_still_rejects_broken_storage(validation_counter):
     revived = copy.deepcopy(tensor)
     internal = revived._storage._mode_indices[1][1]
     internal[0], internal[1] = internal[1].clone(), internal[0].clone()
-    with pytest.raises(TensorIndexError, match="sorted within parent"):
+    with pytest.raises(TensorIndexError, match="strictly increasing within parent"):
         revived._storage.validate_unless_already_checked()
 
 

@@ -6,13 +6,39 @@ outer coordinate panel. This pass lowers that explicit schedule after the CSR
 position/coordinate iterators exist in LLIR.
 """
 
-import re
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Sequence, Tuple, cast
 
 from . import llir
+from .identity import IndexId, SymbolId
+from .llir_traversal import (
+    LLIRRewriter,
+    LLIRStatementSequence,
+    LLIRStatementValue,
+    LLIRTraversalContext,
+    LLIRValue,
+    LLIRWalker,
+)
 from .scheduler import Schedule, TileSpec, _RelayoutPlan, _ResultTilePlan
+from .iterator import match_mode_position_bounds
 
 LoopLocation = Tuple[List[llir.Stmt], int, llir.ForLoop]
+
+_ACCESS_REWRITE_CONTEXT = LLIRTraversalContext(
+    stage="schedule lowering",
+    pass_name="redirect_tensor_access",
+)
+_PANEL_WINDOW_CONTEXT = LLIRTraversalContext(
+    stage="schedule lowering",
+    pass_name="window_sparse_loop",
+)
+_PACKED_STORAGE_CONTEXT = LLIRTraversalContext(
+    stage="schedule lowering",
+    pass_name="build_packed_storage",
+)
+_HEAP_RESULT_STORAGE_CONTEXT = LLIRTraversalContext(
+    stage="schedule lowering",
+    pass_name="build_heap_result_storage",
+)
 
 
 def _nested_bodies(stmt: llir.Stmt) -> List[List[llir.Stmt]]:
@@ -53,13 +79,31 @@ def _find_tagged_loop(
     raise LookupError(f"No generated loop is tagged for index variable {name!r}")
 
 
-def _find_coordinate_array(stmts: List[llir.Stmt], position: str) -> str:
-    pattern = re.compile(rf"^([A-Za-z_]\w*_crd)\[{re.escape(position)}\]$")
+def _find_coordinate_array(stmts: List[llir.Stmt], position: str) -> llir.Var:
     for stmt in stmts:
-        if isinstance(stmt, llir.VarInit) and isinstance(stmt.value, llir.Var):
-            match = pattern.match(stmt.value.name)
-            if match:
-                return match.group(1)
+        if type(stmt) is llir.VarInit and type(stmt.value) is llir.ArrayAccess:
+            access = cast(llir.ArrayAccess, stmt.value)
+            if type(access.array) is llir.Var and type(access.index) is llir.Var:
+                array = cast(llir.Var, access.array)
+                index = cast(llir.Var, access.index)
+                if (
+                    access.tensor_access is None
+                    and array.type is llir.DataType.PTR_INT
+                    and array.is_ptr is False
+                    and array.is_restrict is False
+                    and array.tensor_access is None
+                    and type(array.name) is str
+                    and array.name.isidentifier()
+                    and array.name.endswith("_crd")
+                    and index.type is llir.DataType.INT
+                    and index.is_ptr is False
+                    and index.is_restrict is False
+                    and index.tensor_access is None
+                    and type(index.name) is str
+                    and index.name.isidentifier()
+                    and index.name == position
+                ):
+                    return llir.Var(array.name, llir.DataType.PTR_INT)
         for body in _nested_bodies(stmt):
             try:
                 return _find_coordinate_array(body, position)
@@ -68,6 +112,53 @@ def _find_coordinate_array(stmts: List[llir.Stmt], position: str) -> str:
     raise LookupError(
         f"Cannot find a coordinate array indexed by sparse position {position!r}"
     )
+
+
+def _panel_bound_expression(
+    coordinate_array: llir.Var,
+    begin: llir.Expr,
+    end: llir.Expr,
+    value: llir.Expr,
+) -> llir.Cast:
+    """Build one detached typed ``lower_bound`` position expression."""
+
+    if not (
+        type(coordinate_array) is llir.Var
+        and type(coordinate_array.name) is str
+        and coordinate_array.name.isidentifier()
+        and coordinate_array.name.endswith("_crd")
+        and coordinate_array.type is llir.DataType.PTR_INT
+        and coordinate_array.is_ptr is False
+        and coordinate_array.is_restrict is False
+        and coordinate_array.tensor_access is None
+    ):
+        raise TypeError("panel coordinate array must be a plain PTR_INT Var")
+
+    rewriter = LLIRRewriter(_PANEL_WINDOW_CONTEXT)
+
+    def detach(expression: llir.Expr) -> llir.Expr:
+        detached = rewriter.rewrite(expression)
+        if not isinstance(detached, llir.Expr):
+            raise AssertionError("a panel bound child must remain an expression")
+        return detached
+
+    expression = llir.Cast(
+        expr=llir.BinOp(
+            op="-",
+            left=llir.FunctionCall(
+                name="std::lower_bound",
+                args=[
+                    llir.Add(detach(coordinate_array), detach(begin)),
+                    llir.Add(detach(coordinate_array), detach(end)),
+                    detach(value),
+                ],
+            ),
+            right=detach(coordinate_array),
+        ),
+        data_type=llir.DataType.INT,
+    )
+    LLIRWalker(_PANEL_WINDOW_CONTEXT).walk(expression)
+    return expression
 
 
 def _find_end_init(
@@ -90,8 +181,6 @@ def _window_sparse_loop(
     container, loop_index, sparse_loop = location
     if not isinstance(sparse_loop.init, llir.VarInit):
         raise NotImplementedError("Panel tiling requires a canonical sparse for-loop")
-    if not isinstance(sparse_loop.init.value, llir.Var):
-        raise NotImplementedError("Panel tiling requires a named CSR row begin")
     if not isinstance(sparse_loop.cond, llir.BinOp):
         raise NotImplementedError("Panel tiling requires a canonical sparse bound")
     if not isinstance(sparse_loop.cond.right, llir.Var):
@@ -100,20 +189,41 @@ def _window_sparse_loop(
     position = sparse_loop.init.var.name
     end_name = sparse_loop.cond.right.name
     end_index, end_init = _find_end_init(container, loop_index, end_name)
-    if not isinstance(end_init.value, llir.Var):
-        raise NotImplementedError("Panel tiling requires a named CSR row end value")
+    if not (
+        type(end_init.var) is llir.Var
+        and end_init.var.type is llir.DataType.INT
+        and end_init.var.is_ptr is False
+        and end_init.var.is_restrict is False
+        and end_init.var.tensor_access is None
+    ):
+        raise NotImplementedError(
+            "Panel tiling requires a plain INT sparse iterator end"
+        )
+    row_begin = match_mode_position_bounds(
+        sparse_loop.init.value,
+        end_init.value,
+    )
+    if row_begin is None:
+        raise NotImplementedError(
+            "Panel tiling requires matching structured CSR row bounds"
+        )
     coordinate_array = _find_coordinate_array(sparse_loop.body, position)
 
     row_end = f"{position}_row_end"
     panel_begin = f"{position}_panel_begin"
-    row_begin_expr = sparse_loop.init.value.name
-    lower_expr = (
-        f"(int) (std::lower_bound({coordinate_array} + {row_begin_expr}, "
-        f"{coordinate_array} + {row_end}, {panel_var}) - {coordinate_array})"
+    row_end_value = llir.Var(row_end, end_init.var.type)
+    panel_begin_value = llir.Var(panel_begin, end_init.var.type)
+    lower_value = _panel_bound_expression(
+        coordinate_array,
+        row_begin,
+        row_end_value,
+        llir.Var(panel_var, llir.DataType.INT64),
     )
-    upper_expr = (
-        f"(int) (std::lower_bound({coordinate_array} + {panel_begin}, "
-        f"{coordinate_array} + {row_end}, {panel_end_var}) - {coordinate_array})"
+    upper_value = _panel_bound_expression(
+        coordinate_array,
+        panel_begin_value,
+        row_end_value,
+        llir.Var(panel_end_var, llir.DataType.INT64),
     )
 
     replacements: List[llir.Stmt] = [
@@ -123,11 +233,11 @@ def _window_sparse_loop(
         ),
         llir.VarInit(
             var=llir.Var(panel_begin, end_init.var.type),
-            value=llir.Var(lower_expr, end_init.var.type),
+            value=lower_value,
         ),
         llir.VarInit(
             var=end_init.var,
-            value=llir.Var(upper_expr, end_init.var.type),
+            value=upper_value,
         ),
     ]
     container[end_index : end_index + 1] = replacements
@@ -255,7 +365,9 @@ def _declared_names(function: llir.Function) -> set[str]:
 
     def collect(stmts: List[llir.Stmt]) -> None:
         for stmt in stmts:
-            if isinstance(stmt, (llir.VarInit, llir.VarDecl)):
+            if type(stmt) is llir.FixedStackArrayDecl:
+                names.add(stmt.name)
+            elif isinstance(stmt, (llir.VarInit, llir.DirectInit, llir.VarDecl)):
                 names.add(stmt.var.name)
             elif isinstance(stmt, llir.ForLoop) and stmt.init is not None:
                 names.add(stmt.init.var.name)
@@ -280,192 +392,483 @@ def _unique_name(base: str, used: set[str]) -> str:
 
 def _matches_tensor_access(
     expr: llir.Expr,
-    tensor_name: str,
-    index_vars: Tuple[str, ...],
+    tensor_id: SymbolId,
+    index_ids: Tuple[IndexId, ...],
     role: llir.TensorAccessRole,
 ) -> bool:
-    if not isinstance(expr, llir.Var) or expr.tensor_access is None:
+    if type(expr) is llir.Var:
+        metadata = expr.tensor_access
+    elif type(expr) is llir.ArrayAccess:
+        metadata = expr.tensor_access
+    else:
         return False
-    metadata = expr.tensor_access
+    if type(metadata) is not llir.TensorAccessMetadata:
+        return False
     return (
-        metadata.tensor_name == tensor_name
-        and metadata.index_vars == index_vars
+        metadata.tensor_id == tensor_id
+        and metadata.index_ids == index_ids
         and metadata.role == role
     )
 
 
+class _TensorAccessRewriter(LLIRRewriter):
+    """Detach an expression while replacing selected logical accesses."""
+
+    def __init__(
+        self,
+        tensor_id: SymbolId,
+        index_ids: Tuple[IndexId, ...],
+        role: llir.TensorAccessRole,
+        replacement: llir.Expr,
+    ) -> None:
+        super().__init__(_ACCESS_REWRITE_CONTEXT)
+        self.tensor_id = tensor_id
+        self.index_ids = index_ids
+        self.role = role
+        self.replacement = replacement
+        self.rewrite_count = 0
+
+    def _rewrite_expr(self, node: llir.Expr, path: Tuple[str, ...]) -> llir.Expr:
+        rewritten = super()._rewrite_expr(node, path)
+        if _matches_tensor_access(
+            rewritten,
+            self.tensor_id,
+            self.index_ids,
+            self.role,
+        ):
+            self.rewrite_count += 1
+            cloned = LLIRRewriter(self.context).rewrite(self.replacement)
+            if not isinstance(cloned, llir.Expr):
+                raise AssertionError(
+                    "an expression replacement must remain an expression"
+                )
+            return cloned
+        return rewritten
+
+
+class _TensorAccessRewritePreflight(LLIRWalker):
+    """Validate a replacement everywhere it would become an lvalue."""
+
+    def __init__(
+        self,
+        tensor_id: SymbolId,
+        index_ids: Tuple[IndexId, ...],
+        role: llir.TensorAccessRole,
+        replacement: llir.Expr,
+    ) -> None:
+        super().__init__(_ACCESS_REWRITE_CONTEXT)
+        self.tensor_id = tensor_id
+        self.index_ids = index_ids
+        self.role = role
+        self.replacement = replacement
+
+    def visit_assign(self, node: llir.Assign, path: Tuple[str, ...]) -> None:
+        rewritten_target, _ = _rewrite_expr_access(
+            node.var,
+            self.tensor_id,
+            self.index_ids,
+            self.role,
+            self.replacement,
+        )
+        self._walk_assignment_target(rewritten_target, path + ("var",))
+        super().visit_assign(node, path)
+
+
 def _rewrite_expr_access(
     expr: llir.Expr,
-    tensor_name: str,
-    index_vars: Tuple[str, ...],
+    tensor_id: SymbolId,
+    index_ids: Tuple[IndexId, ...],
     role: llir.TensorAccessRole,
-    replacement: llir.Var,
+    replacement: llir.Expr,
 ) -> Tuple[llir.Expr, int]:
-    """Redirect one CIN tensor access in a structured LLIR expression tree."""
-    if isinstance(expr, llir.Var):
-        if _matches_tensor_access(expr, tensor_name, index_vars, role):
-            return replacement, 1
-        return expr, 0
-    if isinstance(expr, llir.BinOp):
-        expr.left, left_count = _rewrite_expr_access(
-            expr.left, tensor_name, index_vars, role, replacement
-        )
-        expr.right, right_count = _rewrite_expr_access(
-            expr.right, tensor_name, index_vars, role, replacement
-        )
-        return expr, left_count + right_count
-    if isinstance(expr, llir.UnaryOp):
-        expr.operand, count = _rewrite_expr_access(
-            expr.operand, tensor_name, index_vars, role, replacement
-        )
-        return expr, count
-    if isinstance(expr, llir.FunctionCall):
-        count = 0
-        rewritten_args = []
-        for arg in expr.args:
-            new_arg, arg_count = _rewrite_expr_access(
-                arg, tensor_name, index_vars, role, replacement
-            )
-            rewritten_args.append(new_arg)
-            count += arg_count
-        expr.args = rewritten_args
-        return expr, count
-    if isinstance(expr, llir.ArrayAccess):
-        expr.array, array_count = _rewrite_expr_access(
-            expr.array, tensor_name, index_vars, role, replacement
-        )
-        expr.index, index_count = _rewrite_expr_access(
-            expr.index, tensor_name, index_vars, role, replacement
-        )
-        return expr, array_count + index_count
-    if isinstance(expr, llir.Cast):
-        rewritten_expr, count = _rewrite_expr_access(
-            expr.expr, tensor_name, index_vars, role, replacement
-        )
-        return llir.Cast(rewritten_expr, expr.data_type), count
-    return expr, 0
+    """Redirect one CIN tensor access in a detached expression tree."""
+    rewriter = _TensorAccessRewriter(
+        tensor_id,
+        index_ids,
+        role,
+        replacement,
+    )
+    rewritten = rewriter.rewrite(expr)
+    if not isinstance(rewritten, llir.Expr):
+        raise AssertionError("an expression rewrite must remain an expression")
+    return rewritten, rewriter.rewrite_count
 
 
-def _rewrite_stmt_accesses(
-    stmts: List[llir.Stmt],
-    tensor_name: str,
-    index_vars: Tuple[str, ...],
+def _rewrite_stmt_access_sequence(
+    stmts: LLIRStatementSequence,
+    tensor_id: SymbolId,
+    index_ids: Tuple[IndexId, ...],
     role: llir.TensorAccessRole,
-    replacement: llir.Var,
-) -> int:
-    """Rewrite matching tensor accesses without parsing rendered C++ names."""
+    replacement: llir.Expr,
+    *,
+    _validated: bool = False,
+) -> Tuple[LLIRStatementSequence, int]:
+    """Rewrite matching tensor accesses without parsing rendered C++ names.
+
+    The three call branches reconstruct their statement, so each threads
+    ``result_storage``, the statement-level result-storage marker
+    ``result_write_pass`` reads.  ``Assign``, ``VarInit`` and ``IfThenElse`` are
+    mutated in place here and keep theirs without help.
+    """
+    if not _validated:
+        LLIRWalker(_ACCESS_REWRITE_CONTEXT).walk(replacement)
+        _TensorAccessRewritePreflight(
+            tensor_id,
+            index_ids,
+            role,
+            replacement,
+        ).walk(cast(LLIRValue, stmts))
     count = 0
+    rewritten_stmts: List[LLIRStatementValue] = []
     for stmt in stmts:
+        rewritten_stmt = stmt
         if isinstance(stmt, llir.VarInit):
             stmt.value, rewritten = _rewrite_expr_access(
-                stmt.value, tensor_name, index_vars, role, replacement
+                stmt.value, tensor_id, index_ids, role, replacement
             )
             count += rewritten
         elif isinstance(stmt, llir.Assign):
-            stmt.var, lhs_count = _rewrite_expr_access(
-                stmt.var, tensor_name, index_vars, role, replacement
+            rewritten_target, lhs_count = _rewrite_expr_access(
+                stmt.var, tensor_id, index_ids, role, replacement
             )
+            stmt.var = cast(llir.AssignmentTarget, rewritten_target)
             stmt.value, rhs_count = _rewrite_expr_access(
-                stmt.value, tensor_name, index_vars, role, replacement
+                stmt.value, tensor_id, index_ids, role, replacement
             )
             count += lhs_count + rhs_count
         elif isinstance(stmt, llir.ForLoop):
             if stmt.init is not None:
-                count += _rewrite_stmt_accesses(
-                    [stmt.init], tensor_name, index_vars, role, replacement
+                rewritten_init, init_count = _rewrite_stmt_access_sequence(
+                    [stmt.init],
+                    tensor_id,
+                    index_ids,
+                    role,
+                    replacement,
+                    _validated=True,
                 )
+                stmt.init = cast(llir.VarInit, rewritten_init[0])
+                count += init_count
             stmt.cond, cond_count = _rewrite_expr_access(
-                stmt.cond, tensor_name, index_vars, role, replacement
+                stmt.cond, tensor_id, index_ids, role, replacement
             )
             count += cond_count
             if isinstance(stmt.update, llir.Assign):
-                count += _rewrite_stmt_accesses(
-                    [stmt.update], tensor_name, index_vars, role, replacement
+                rewritten_update, update_count = _rewrite_stmt_access_sequence(
+                    [stmt.update],
+                    tensor_id,
+                    index_ids,
+                    role,
+                    replacement,
+                    _validated=True,
                 )
-            count += _rewrite_stmt_accesses(
-                stmt.body, tensor_name, index_vars, role, replacement
+                stmt.update = cast(llir.Assign, rewritten_update[0])
+                count += update_count
+            rewritten_body, body_count = _rewrite_stmt_access_sequence(
+                cast(LLIRStatementSequence, stmt.body),
+                tensor_id,
+                index_ids,
+                role,
+                replacement,
+                _validated=True,
             )
+            stmt.body = cast(List[llir.Stmt], rewritten_body)
+            count += body_count
         elif isinstance(stmt, llir.WhileLoop):
             stmt.cond, cond_count = _rewrite_expr_access(
-                stmt.cond, tensor_name, index_vars, role, replacement
+                stmt.cond, tensor_id, index_ids, role, replacement
             )
             count += cond_count
-            count += _rewrite_stmt_accesses(
-                stmt.body, tensor_name, index_vars, role, replacement
+            rewritten_body, body_count = _rewrite_stmt_access_sequence(
+                cast(LLIRStatementSequence, stmt.body),
+                tensor_id,
+                index_ids,
+                role,
+                replacement,
+                _validated=True,
             )
+            stmt.body = cast(List[llir.Stmt], rewritten_body)
+            count += body_count
         elif isinstance(stmt, llir.IfThenElse):
             if stmt.cond is not None:
                 stmt.cond, cond_count = _rewrite_expr_access(
-                    stmt.cond, tensor_name, index_vars, role, replacement
+                    stmt.cond, tensor_id, index_ids, role, replacement
                 )
                 count += cond_count
             if stmt.cond_list:
                 rewritten_conditions = []
                 for condition in stmt.cond_list:
                     condition, cond_count = _rewrite_expr_access(
-                        condition, tensor_name, index_vars, role, replacement
+                        condition, tensor_id, index_ids, role, replacement
                     )
                     rewritten_conditions.append(condition)
                     count += cond_count
                 stmt.cond_list = rewritten_conditions
-            for body in _nested_bodies(stmt):
-                count += _rewrite_stmt_accesses(
-                    body, tensor_name, index_vars, role, replacement
+            if stmt.then_body is not None:
+                rewritten_body, body_count = _rewrite_stmt_access_sequence(
+                    cast(LLIRStatementSequence, stmt.then_body),
+                    tensor_id,
+                    index_ids,
+                    role,
+                    replacement,
+                    _validated=True,
+                )
+                stmt.then_body = cast(List[llir.Stmt], rewritten_body)
+                count += body_count
+            if stmt.else_body is not None:
+                rewritten_body, body_count = _rewrite_stmt_access_sequence(
+                    cast(LLIRStatementSequence, stmt.else_body),
+                    tensor_id,
+                    index_ids,
+                    role,
+                    replacement,
+                    _validated=True,
+                )
+                stmt.else_body = cast(List[llir.Stmt], rewritten_body)
+                count += body_count
+            if stmt.then_body_list is not None:
+                rewritten_branches: List[LLIRStatementSequence] = []
+                for branch in stmt.then_body_list:
+                    rewritten_branch, branch_count = _rewrite_stmt_access_sequence(
+                        cast(LLIRStatementSequence, branch),
+                        tensor_id,
+                        index_ids,
+                        role,
+                        replacement,
+                        _validated=True,
+                    )
+                    rewritten_branches.append(rewritten_branch)
+                    count += branch_count
+                stmt.then_body_list = cast(
+                    List[List[llir.Stmt]],
+                    (
+                        tuple(rewritten_branches)
+                        if type(stmt.then_body_list) is tuple
+                        else rewritten_branches
+                    ),
                 )
         elif isinstance(stmt, llir.FunctionCallStmt):
             rewritten_args = []
             for arg in stmt.args:
                 arg, arg_count = _rewrite_expr_access(
-                    arg, tensor_name, index_vars, role, replacement
+                    arg, tensor_id, index_ids, role, replacement
                 )
                 rewritten_args.append(arg)
                 count += arg_count
-            stmt.args = rewritten_args
+            rewritten_stmt = llir.FunctionCallStmt(
+                name=stmt.name,
+                template_args=stmt.template_args,
+                args=rewritten_args,
+                result_storage=stmt.result_storage,
+            )
+        elif isinstance(stmt, llir.MemberCallStmt):
+            rewritten_base, base_count = _rewrite_expr_access(
+                stmt.base,
+                tensor_id,
+                index_ids,
+                role,
+                replacement,
+            )
+            count += base_count
+            rewritten_args = []
+            for arg in stmt.args:
+                arg, arg_count = _rewrite_expr_access(
+                    arg, tensor_id, index_ids, role, replacement
+                )
+                rewritten_args.append(arg)
+                count += arg_count
+            rewritten_stmt = llir.MemberCallStmt(
+                base=rewritten_base,
+                member=stmt.member,
+                template_args=stmt.template_args,
+                args=rewritten_args,
+                result_storage=stmt.result_storage,
+            )
+        elif isinstance(stmt, llir.GuardedCallStmt):
+            rewritten_cond, cond_count = _rewrite_expr_access(
+                stmt.cond, tensor_id, index_ids, role, replacement
+            )
+            count += cond_count
+            rewritten_args = []
+            for arg in stmt.call.args:
+                arg, arg_count = _rewrite_expr_access(
+                    arg, tensor_id, index_ids, role, replacement
+                )
+                rewritten_args.append(arg)
+                count += arg_count
+            rewritten_stmt = llir.GuardedCallStmt(
+                cond=rewritten_cond,
+                call=llir.FunctionCallStmt(
+                    name=stmt.call.name,
+                    template_args=stmt.call.template_args,
+                    args=rewritten_args,
+                    result_storage=stmt.call.result_storage,
+                ),
+            )
+        rewritten_stmts.append(rewritten_stmt)
+    rewritten_sequence: LLIRStatementSequence = (
+        tuple(rewritten_stmts) if type(stmts) is tuple else rewritten_stmts
+    )
+    if not _validated:
+        LLIRWalker(_ACCESS_REWRITE_CONTEXT).walk(cast(LLIRValue, rewritten_sequence))
+    return rewritten_sequence, count
+
+
+def _rewrite_stmt_accesses(
+    stmts: List[llir.Stmt],
+    tensor_id: SymbolId,
+    index_ids: Tuple[IndexId, ...],
+    role: llir.TensorAccessRole,
+    replacement: llir.Expr,
+    *,
+    _validated: bool = False,
+) -> int:
+    """Rewrite a mutable statement list and retain the legacy count result."""
+    rewritten, count = _rewrite_stmt_access_sequence(
+        cast(LLIRStatementSequence, stmts),
+        tensor_id,
+        index_ids,
+        role,
+        replacement,
+        _validated=_validated,
+    )
+    stmts[:] = cast(List[llir.Stmt], rewritten)
     return count
 
 
 def _contains_tensor_access(
-    stmts: List[llir.Stmt],
-    tensor_name: str,
-    index_vars: Tuple[str, ...],
+    stmts: Sequence[llir.Stmt],
+    tensor_id: SymbolId,
+    index_ids: Tuple[IndexId, ...],
     role: llir.TensorAccessRole,
 ) -> bool:
     """Whether structured LLIR still contains a selected logical access."""
-    for stmt in stmts:
-        expressions: List[llir.Expr] = []
-        if isinstance(stmt, llir.VarInit):
-            expressions.append(stmt.value)
-        elif isinstance(stmt, llir.Assign):
-            expressions.extend([stmt.var, stmt.value])
-        elif isinstance(stmt, (llir.ForLoop, llir.WhileLoop)):
-            expressions.append(stmt.cond)
-        elif isinstance(stmt, llir.IfThenElse):
-            if stmt.cond is not None:
-                expressions.append(stmt.cond)
-            expressions.extend(stmt.cond_list or [])
-        elif isinstance(stmt, llir.FunctionCallStmt):
-            expressions.extend(stmt.args)
 
-        pending = list(expressions)
-        while pending:
-            expr = pending.pop()
-            if _matches_tensor_access(expr, tensor_name, index_vars, role):
-                return True
-            if isinstance(expr, llir.BinOp):
-                pending.extend([expr.left, expr.right])
-            elif isinstance(expr, llir.UnaryOp):
-                pending.append(expr.operand)
-            elif isinstance(expr, llir.FunctionCall):
-                pending.extend(expr.args)
-            elif isinstance(expr, llir.ArrayAccess):
-                pending.extend([expr.array, expr.index])
-            elif isinstance(expr, llir.Cast):
-                pending.append(expr.expr)
+    class _TensorAccessMatchWalker(LLIRWalker):
+        def __init__(self) -> None:
+            super().__init__(_ACCESS_REWRITE_CONTEXT)
+            self.found = False
 
-        for body in _nested_bodies(stmt):
-            if _contains_tensor_access(body, tensor_name, index_vars, role):
-                return True
-    return False
+        def enter_node(self, node: llir.Node, path: Tuple[str, ...]) -> None:
+            if isinstance(node, llir.Expr) and _matches_tensor_access(
+                node,
+                tensor_id,
+                index_ids,
+                role,
+            ):
+                self.found = True
+
+    walker = _TensorAccessMatchWalker()
+    walker.walk(cast(LLIRValue, stmts))
+    return walker.found
+
+
+def _is_plain_prefetch_reference(
+    value: object, expected_name: str | None = None
+) -> bool:
+    """Whether ``value`` is one exact metadata-free P1 reference."""
+
+    if type(value) is not llir.Var:
+        return False
+    fields = vars(value)
+    name = fields.get("name")
+    return bool(
+        type(name) is str
+        and (expected_name is None or name == expected_name)
+        and fields.get("type") is llir.DataType.NO_TYPE
+        and fields.get("is_ptr") is False
+        and fields.get("is_restrict") is False
+        and fields.get("tensor_access", False) is None
+    )
+
+
+def _is_prefetch_int_literal(value: object, expected: int) -> bool:
+    if type(value) is not llir.Literal:
+        return False
+    fields = vars(value)
+    return bool(
+        type(fields.get("value")) is int
+        and fields["value"] == expected
+        and fields.get("data_type") is llir.DataType.INT
+    )
+
+
+def _prefetch_next_position(value: object) -> str | None:
+    if type(value) is not llir.Add or value.op != "+":
+        return None
+    if not _is_plain_prefetch_reference(value.left):
+        return None
+    if not _is_prefetch_int_literal(value.right, 1):
+        return None
+    return cast(llir.Var, value.left).name
+
+
+def _is_operand_prefetch_guard(
+    stmt: llir.Stmt,
+    operand_value_array: str,
+    *,
+    iterator: str | None = None,
+    end: str | None = None,
+    coordinate_array: str | None = None,
+) -> bool:
+    """Exactly recognize one typed P1 guard addressing one operand value array.
+
+    Recognition is structural, not textual: the statement must be the exact
+    guarded ``__builtin_prefetch`` call whose first argument borrows the
+    selected operand value array.  Raw statements that merely spell similar
+    text are decoys and stay untouched.
+    """
+
+    if type(stmt) is not llir.GuardedCallStmt:
+        return False
+    try:
+        llir._validate_guarded_call_fields(stmt)
+    except TypeError:
+        return False
+
+    condition = stmt.cond
+    if type(condition) is not llir.BinOp or condition.op != "<":
+        return False
+    matched_iterator = _prefetch_next_position(condition.left)
+    if matched_iterator is None or not _is_plain_prefetch_reference(
+        condition.right, end
+    ):
+        return False
+    if iterator is not None and matched_iterator != iterator:
+        return False
+
+    call = stmt.call
+    if (
+        type(call) is not llir.FunctionCallStmt
+        or type(call.name) is not str
+        or call.name != "__builtin_prefetch"
+        or call.template_args
+    ):
+        return False
+    if type(call.args) is not tuple or len(call.args) != 3:
+        return False
+    if not _is_prefetch_int_literal(call.args[1], 0) or not _is_prefetch_int_literal(
+        call.args[2], 1
+    ):
+        return False
+    address = call.args[0]
+    if type(address) is not llir.AddressOf:
+        return False
+    operand = address.operand
+    if type(operand) is not llir.ArrayAccess or operand.tensor_access is not None:
+        return False
+    if not _is_plain_prefetch_reference(operand.array, operand_value_array):
+        return False
+    product = operand.index
+    if type(product) is not llir.Mul or product.op != "*":
+        return False
+    coordinate = product.left
+    if type(coordinate) is not llir.ArrayAccess or coordinate.tensor_access is not None:
+        return False
+    if not _is_plain_prefetch_reference(coordinate.array, coordinate_array):
+        return False
+    if _prefetch_next_position(coordinate.index) != matched_iterator:
+        return False
+    return _is_plain_prefetch_reference(product.right)
 
 
 def _redirect_sparse_prefetch(
@@ -476,7 +879,19 @@ def _redirect_sparse_prefetch(
     panel_end: str,
     panel_tile_var: str,
     stage_row_origin: Optional[str],
-) -> None:
+    coordinate_array_name: Optional[str] = None,
+) -> int:
+    """Replace the operand prefetch guard with its packed-storage twin.
+
+    The legacy caller leaves ``coordinate_array_name`` unset and the
+    coordinate array is discovered by the compatibility name scan; the
+    typed LoopIR completion passes its own emission-record spelling so no
+    name discovery runs on that path.  The number of removed canonical
+    guards is returned so typed callers can enforce exact cardinality;
+    the compatibility caller deliberately preserves its historical
+    best-effort behavior by ignoring the result.
+    """
+
     if not isinstance(sparse_loop.init, llir.VarInit):
         raise NotImplementedError(
             "Packed relayout requires a canonical compressed iterator"
@@ -488,36 +903,96 @@ def _redirect_sparse_prefetch(
             "Packed relayout requires a named compressed iterator end"
         )
     position = sparse_loop.init.var.name
-    coordinate_array = _find_coordinate_array(sparse_loop.body, position)
+    coordinate_name = (
+        coordinate_array_name
+        if coordinate_array_name is not None
+        else _find_coordinate_array(sparse_loop.body, position).name
+    )
     end_name = sparse_loop.cond.right.name
-    marker = f"__builtin_prefetch(&{operand_value_array}["
-    removed = False
+    removed = 0
     retained: List[llir.Stmt] = []
     for stmt in sparse_loop.body:
-        if isinstance(stmt, llir.RawStmt) and marker in stmt.code:
-            removed = True
+        if _is_operand_prefetch_guard(
+            stmt,
+            operand_value_array,
+            iterator=position,
+            end=end_name,
+            coordinate_array=coordinate_name,
+        ):
+            removed += 1
             continue
         retained.append(stmt)
-    sparse_loop.body = retained
-    if removed:
-        coordinate = f"{coordinate_array}[{position} + 1]"
-        staged_row = (
-            coordinate
-            if stage_row_origin is None
-            else f"({coordinate} - {stage_row_origin})"
+    if not removed:
+        return 0
+
+    staged_names = [
+        position,
+        end_name,
+        coordinate_name,
+        packed_name,
+        panel_var,
+        panel_end,
+    ]
+    staged_names.append(panel_tile_var)
+    if stage_row_origin is not None:
+        staged_names.append(stage_row_origin)
+    if any(type(name) is not str or not name.isidentifier() for name in staged_names):
+        raise NotImplementedError(
+            "Packed relayout requires identifier spellings for the staged "
+            "prefetch guard"
         )
-        sparse_loop.body.insert(
-            0,
-            llir.RawStmt(
-                code=(
-                    f"if ({position} + 1 < {end_name} && "
-                    f"{coordinate_array}[{position} + 1] >= {panel_var} && "
-                    f"{coordinate_array}[{position} + 1] < {panel_end}) "
-                    f"__builtin_prefetch(&{packed_name}[{staged_row} * "
-                    f"{panel_tile_var}], 0, 1)"
-                )
+
+    def _reference(name: str) -> llir.Var:
+        return llir.Var(name=name, type=llir.DataType.NO_TYPE)
+
+    def _next_coordinate() -> llir.ArrayAccess:
+        return llir.ArrayAccess(
+            array=_reference(coordinate_name),
+            index=llir.Add(
+                _reference(position),
+                llir.Literal(1, llir.DataType.INT),
             ),
         )
+
+    staged_row: llir.Expr = _next_coordinate()
+    if stage_row_origin is not None:
+        staged_row = llir.BinOp("-", staged_row, _reference(stage_row_origin))
+    replacement = llir.GuardedCallStmt(
+        cond=llir.BinOp(
+            "&&",
+            llir.BinOp(
+                "&&",
+                llir.BinOp(
+                    "<",
+                    llir.Add(
+                        _reference(position),
+                        llir.Literal(1, llir.DataType.INT),
+                    ),
+                    _reference(end_name),
+                ),
+                llir.BinOp(">=", _next_coordinate(), _reference(panel_var)),
+            ),
+            llir.BinOp("<", _next_coordinate(), _reference(panel_end)),
+        ),
+        call=llir.FunctionCallStmt(
+            "__builtin_prefetch",
+            (
+                llir.AddressOf(
+                    operand=llir.ArrayAccess(
+                        array=_reference(packed_name),
+                        index=llir.Mul(
+                            staged_row,
+                            _reference(panel_tile_var),
+                        ),
+                    )
+                ),
+                llir.Literal(0, llir.DataType.INT),
+                llir.Literal(1, llir.DataType.INT),
+            ),
+        ),
+    )
+    sparse_loop.body = [replacement, *retained]
+    return removed
 
 
 def _remove_dense_result_zero(function: llir.Function, result: str) -> None:
@@ -537,6 +1012,318 @@ def _remove_dense_result_zero(function: llir.Function, result: str) -> None:
             "Heap accumulation requires exactly one generated dense-result zero"
         )
     del function.body[matches[0]]
+
+
+def _heap_result_storage_declaration(
+    *,
+    storage_name: str,
+    scalar_type: llir.DataType,
+    prefix_dimension_names: Tuple[str, ...],
+    tile_size_name: str,
+) -> llir.DirectInit:
+    """Build one detached typed owner for reusable heap-result storage."""
+
+    if not prefix_dimension_names:
+        raise ValueError("heap-result storage requires a nonempty dense prefix")
+    prefix_dimensions = tuple(
+        llir.Var(prefix_dimension_name, llir.DataType.INT64)
+        for prefix_dimension_name in prefix_dimension_names
+    )
+    prefix_product: llir.Expr = prefix_dimensions[0]
+    for dimension in prefix_dimensions[1:]:
+        prefix_product = llir.Mul(prefix_product, dimension)
+
+    return llir.DirectInit(
+        var=llir.Var(
+            storage_name,
+            llir.DataType.std_vector_type(scalar_type),
+        ),
+        args=(
+            llir.Mul(
+                llir.Cast(prefix_product, llir.DataType.SIZE_T),
+                llir.Cast(
+                    llir.Var(tile_size_name, llir.DataType.CONSTEXPR_INT),
+                    llir.DataType.SIZE_T,
+                ),
+            ),
+        ),
+    )
+
+
+def _heap_result_tile_names(
+    function: llir.Function,
+    result: str,
+    tile_var: str,
+    *,
+    reserved_names: Optional[set[str]] = None,
+) -> Tuple[str, str, str, str, str, str, str, str]:
+    """The deterministic generated-name family of one compact result tile."""
+
+    used_names = _declared_names(function)
+    if reserved_names is not None:
+        used_names.update(reserved_names)
+    compact_name = _unique_name(f"tiled_{result}", used_names)
+    storage_name = _unique_name(f"{compact_name}_storage", used_names)
+    init_prefix = _unique_name(f"{result}_tile_init", used_names)
+    init_inner = _unique_name(f"{tile_var}_tile_init", used_names)
+    init_logical = _unique_name(f"{tile_var}_tile_logical", used_names)
+    copy_prefix = _unique_name(f"{result}_tile_copy", used_names)
+    copy_inner = _unique_name(f"{tile_var}_tile_copy", used_names)
+    copy_logical = _unique_name(f"{tile_var}_copy_logical", used_names)
+    return (
+        compact_name,
+        storage_name,
+        init_prefix,
+        init_inner,
+        init_logical,
+        copy_prefix,
+        copy_inner,
+        copy_logical,
+    )
+
+
+def _heap_compact_access(
+    *,
+    compact_name: str,
+    pointer_type: llir.DataType,
+    prefix_position_name: str,
+    tile_size_name: str,
+    tile_inner_name: str,
+) -> llir.ArrayAccess:
+    """The compact-storage twin of the redirected dense result write."""
+
+    return llir.ArrayAccess(
+        array=llir.Var(
+            name=compact_name,
+            type=pointer_type,
+        ),
+        index=llir.Add(
+            llir.Mul(
+                llir.Var(
+                    name=prefix_position_name,
+                    type=llir.DataType.INT64,
+                ),
+                llir.Var(name=tile_size_name, type=llir.DataType.INT64),
+            ),
+            llir.Var(name=tile_inner_name, type=llir.DataType.INT64),
+        ),
+    )
+
+
+def _heap_result_init_group(
+    *,
+    result: str,
+    compact_name: str,
+    pointer_type: llir.DataType,
+    scalar_type: llir.DataType,
+    zero_value: str,
+    tile_outer_name: str,
+    tile_size_name: str,
+    trailing_bound: str,
+    prefix_extent: str,
+    init_prefix: str,
+    init_inner: str,
+    init_logical: str,
+) -> List[llir.Stmt]:
+    """The per-strip compact-tile zero-initialization group."""
+
+    init_inner_loop = llir.ForLoop(
+        init=llir.VarInit(
+            var=llir.Var(init_inner, llir.DataType.INT64),
+            value=llir.Literal(0),
+        ),
+        cond=llir.BinOp(
+            op="<",
+            left=llir.Var(init_inner, llir.DataType.INT64),
+            right=llir.Var(tile_size_name, llir.DataType.INT64),
+        ),
+        update=llir.Increment(llir.Var(init_inner, llir.DataType.INT64)),
+        body=[
+            llir.VarInit(
+                var=llir.Var(init_logical, llir.DataType.INT64),
+                value=llir.Add(
+                    llir.Var(tile_outer_name, llir.DataType.INT64),
+                    llir.Var(init_inner, llir.DataType.INT64),
+                ),
+            ),
+            llir.IfThenElse(
+                cond=llir.BinOp(
+                    op=">=",
+                    left=llir.Var(init_logical, llir.DataType.INT64),
+                    right=llir.Var(trailing_bound, llir.DataType.INT64),
+                ),
+                then_body=[llir.Break()],
+            ),
+            llir.Assign(
+                var=llir.ArrayAccess(
+                    array=llir.Var(compact_name, pointer_type),
+                    index=llir.Add(
+                        llir.Mul(
+                            llir.Var(init_prefix, llir.DataType.INT64),
+                            llir.Var(tile_size_name, llir.DataType.INT64),
+                        ),
+                        llir.Var(init_inner, llir.DataType.INT64),
+                    ),
+                ),
+                value=llir.Var(zero_value, scalar_type),
+            ),
+        ],
+    )
+    init_loop = llir.ForLoop(
+        init=llir.VarInit(
+            var=llir.Var(init_prefix, llir.DataType.INT64),
+            value=llir.Literal(0),
+        ),
+        cond=llir.BinOp(
+            op="<",
+            left=llir.Var(init_prefix, llir.DataType.INT64),
+            right=llir.Var(prefix_extent, llir.DataType.INT64),
+        ),
+        update=llir.Increment(llir.Var(init_prefix, llir.DataType.INT64)),
+        body=[init_inner_loop],
+        omp_parallel_for=True,
+        omp_schedule="static",
+        omp_num_threads=(
+            f"scorch_nthreads(({prefix_extent}) * {tile_size_name}, "
+            f"({prefix_extent}))"
+        ),
+    )
+    init_loop.scorch_index_var = f"init:{result}"
+    return [
+        llir.Comment(f"Initialize compact result tile for {result}"),
+        init_loop,
+        llir.BlankLine(),
+    ]
+
+
+def _heap_result_copy_group(
+    *,
+    result: str,
+    result_values: str,
+    compact_name: str,
+    pointer_type: llir.DataType,
+    tile_outer_name: str,
+    tile_size_name: str,
+    trailing_bound: str,
+    prefix_extent: str,
+    copy_prefix: str,
+    copy_inner: str,
+    copy_logical: str,
+) -> List[llir.Stmt]:
+    """The exactly-once strip copy-out group at pack-origin exit."""
+
+    copy_inner_loop = llir.ForLoop(
+        init=llir.VarInit(
+            var=llir.Var(copy_inner, llir.DataType.INT64),
+            value=llir.Literal(0),
+        ),
+        cond=llir.BinOp(
+            op="<",
+            left=llir.Var(copy_inner, llir.DataType.INT64),
+            right=llir.Var(tile_size_name, llir.DataType.INT64),
+        ),
+        update=llir.Increment(llir.Var(copy_inner, llir.DataType.INT64)),
+        body=[
+            llir.VarInit(
+                var=llir.Var(copy_logical, llir.DataType.INT64),
+                value=llir.Add(
+                    llir.Var(tile_outer_name, llir.DataType.INT64),
+                    llir.Var(copy_inner, llir.DataType.INT64),
+                ),
+            ),
+            llir.IfThenElse(
+                cond=llir.BinOp(
+                    op=">=",
+                    left=llir.Var(copy_logical, llir.DataType.INT64),
+                    right=llir.Var(trailing_bound, llir.DataType.INT64),
+                ),
+                then_body=[llir.Break()],
+            ),
+            llir.Assign(
+                var=llir.ArrayAccess(
+                    array=llir.Var(result_values, pointer_type),
+                    index=llir.Add(
+                        llir.Mul(
+                            llir.Var(copy_prefix, llir.DataType.INT64),
+                            llir.Var(trailing_bound, llir.DataType.INT64),
+                        ),
+                        llir.Var(copy_logical, llir.DataType.INT64),
+                    ),
+                ),
+                value=llir.ArrayAccess(
+                    array=llir.Var(compact_name, pointer_type),
+                    index=llir.Add(
+                        llir.Mul(
+                            llir.Var(copy_prefix, llir.DataType.INT64),
+                            llir.Var(tile_size_name, llir.DataType.INT64),
+                        ),
+                        llir.Var(copy_inner, llir.DataType.INT64),
+                    ),
+                ),
+            ),
+        ],
+    )
+    copy_loop = llir.ForLoop(
+        init=llir.VarInit(
+            var=llir.Var(copy_prefix, llir.DataType.INT64),
+            value=llir.Literal(0),
+        ),
+        cond=llir.BinOp(
+            op="<",
+            left=llir.Var(copy_prefix, llir.DataType.INT64),
+            right=llir.Var(prefix_extent, llir.DataType.INT64),
+        ),
+        update=llir.Increment(llir.Var(copy_prefix, llir.DataType.INT64)),
+        body=[copy_inner_loop],
+        omp_parallel_for=True,
+        omp_schedule="static",
+        omp_num_threads=(
+            f"scorch_nthreads(({prefix_extent}) * {tile_size_name}, "
+            f"({prefix_extent}))"
+        ),
+    )
+    copy_loop.scorch_index_var = f"copy:{result}"
+    return [
+        llir.BlankLine(),
+        llir.Comment(f"Copy compact result tile to {result}"),
+        copy_loop,
+    ]
+
+
+def _heap_result_storage_statements(
+    *,
+    result: str,
+    storage_name: str,
+    compact_name: str,
+    pointer_type: llir.DataType,
+    scalar_type: llir.DataType,
+    prefix_dimension_names: Tuple[str, ...],
+    tile_size_name: str,
+) -> List[llir.Stmt]:
+    """The reusable compact-storage declaration block above the pack origin."""
+
+    storage_declaration = _heap_result_storage_declaration(
+        storage_name=storage_name,
+        scalar_type=scalar_type,
+        prefix_dimension_names=prefix_dimension_names,
+        tile_size_name=tile_size_name,
+    )
+    LLIRWalker(_HEAP_RESULT_STORAGE_CONTEXT).walk(storage_declaration)
+    return [
+        llir.Comment(f"Allocate reusable compact result tile for {result}"),
+        storage_declaration,
+        llir.VarInit(
+            var=llir.Var(compact_name, pointer_type, is_restrict=True),
+            value=llir.MemberCall(
+                base=llir.Var(
+                    storage_name,
+                    llir.DataType.std_vector_type(scalar_type),
+                ),
+                member="data",
+            ),
+        ),
+        llir.BlankLine(),
+    ]
 
 
 def _apply_heap_result_tile(
@@ -582,185 +1369,85 @@ def _apply_heap_result_tile(
             "Heap accumulation supports generated float or double result pointers"
         )
 
-    used_names = _declared_names(function)
-    compact_name = _unique_name(f"tiled_{plan.result}", used_names)
-    storage_name = _unique_name(f"{compact_name}_storage", used_names)
-    init_prefix = _unique_name(f"{plan.result}_tile_init", used_names)
-    init_inner = _unique_name(f"{plan.tile_var}_tile_init", used_names)
-    init_logical = _unique_name(f"{plan.tile_var}_tile_logical", used_names)
-    copy_prefix = _unique_name(f"{plan.result}_tile_copy", used_names)
-    copy_inner = _unique_name(f"{plan.tile_var}_tile_copy", used_names)
-    copy_logical = _unique_name(f"{plan.tile_var}_copy_logical", used_names)
+    (
+        compact_name,
+        storage_name,
+        init_prefix,
+        init_inner,
+        init_logical,
+        copy_prefix,
+        copy_inner,
+        copy_logical,
+    ) = _heap_result_tile_names(function, plan.result, plan.tile_var)
 
     trailing_bound = f"{plan.result}{plan.result_level}_size"
-    prefix_extent = " * ".join(
+    prefix_dimension_names = tuple(
         f"{plan.result}{level}_size" for level in range(plan.result_level)
     )
+    prefix_extent = " * ".join(prefix_dimension_names)
     if not prefix_extent:
         raise NotImplementedError(
             "Heap accumulation requires at least one dense result prefix level"
         )
 
-    compact_access = llir.Var(
-        name=(
-            f"{compact_name}[p{plan.result}{plan.result_level - 1} * "
-            f"{tile_size_name} + {tile_inner_name}]"
-        ),
-        type=scalar_type,
+    compact_access = _heap_compact_access(
+        compact_name=compact_name,
+        pointer_type=pointer_type,
+        prefix_position_name=f"p{plan.result}{plan.result_level - 1}",
+        tile_size_name=tile_size_name,
+        tile_inner_name=tile_inner_name,
     )
-    rewritten = _rewrite_stmt_accesses(
-        tile_loop.body,
-        plan.result,
-        plan.access_index_vars,
+    rewritten_body, rewritten = _rewrite_stmt_access_sequence(
+        cast(LLIRStatementSequence, tile_loop.body),
+        plan.result_id,
+        plan.access_index_ids,
         llir.TensorAccessRole.RESULT_WRITE,
         compact_access,
     )
+    tile_loop.body = cast(List[llir.Stmt], rewritten_body)
     if rewritten == 0:
         raise NotImplementedError(
             "Cannot redirect the selected logical result access to compact storage"
         )
     if _contains_tensor_access(
         tile_loop.body,
-        plan.result,
-        plan.access_index_vars,
+        plan.result_id,
+        plan.access_index_ids,
         llir.TensorAccessRole.RESULT_WRITE,
     ):
         raise NotImplementedError(
             "Heap accumulation left a direct result write in the compute region"
         )
 
-    init_inner_loop = llir.ForLoop(
-        init=llir.VarInit(
-            var=llir.Var(init_inner, llir.DataType.INT64),
-            value=llir.Literal(0),
-        ),
-        cond=llir.BinOp(
-            op="<",
-            left=llir.Var(init_inner, llir.DataType.INT64),
-            right=llir.Var(tile_size_name, llir.DataType.INT64),
-        ),
-        update=llir.Increment(llir.Var(init_inner, llir.DataType.INT64)),
-        body=[
-            llir.VarInit(
-                var=llir.Var(init_logical, llir.DataType.INT64),
-                value=llir.Add(
-                    llir.Var(tile_outer_name, llir.DataType.INT64),
-                    llir.Var(init_inner, llir.DataType.INT64),
-                ),
-            ),
-            llir.IfThenElse(
-                cond=llir.BinOp(
-                    op=">=",
-                    left=llir.Var(init_logical, llir.DataType.INT64),
-                    right=llir.Var(trailing_bound, llir.DataType.INT64),
-                ),
-                then_body=[llir.Break()],
-            ),
-            llir.Assign(
-                var=llir.Var(
-                    f"{compact_name}[{init_prefix} * {tile_size_name} + "
-                    f"{init_inner}]",
-                    scalar_type,
-                ),
-                value=llir.Var(zero_value, scalar_type),
-            ),
-        ],
-    )
-    init_loop = llir.ForLoop(
-        init=llir.VarInit(
-            var=llir.Var(init_prefix, llir.DataType.INT64),
-            value=llir.Literal(0),
-        ),
-        cond=llir.BinOp(
-            op="<",
-            left=llir.Var(init_prefix, llir.DataType.INT64),
-            right=llir.Var(prefix_extent, llir.DataType.INT64),
-        ),
-        update=llir.Increment(llir.Var(init_prefix, llir.DataType.INT64)),
-        body=[init_inner_loop],
-        omp_parallel_for=True,
-        omp_schedule="static",
-        omp_num_threads=(
-            f"scorch_nthreads(({prefix_extent}) * {tile_size_name}, "
-            f"({prefix_extent}))"
-        ),
-    )
-    init_loop.scorch_index_var = f"init:{plan.result}"
-
-    copy_inner_loop = llir.ForLoop(
-        init=llir.VarInit(
-            var=llir.Var(copy_inner, llir.DataType.INT64),
-            value=llir.Literal(0),
-        ),
-        cond=llir.BinOp(
-            op="<",
-            left=llir.Var(copy_inner, llir.DataType.INT64),
-            right=llir.Var(tile_size_name, llir.DataType.INT64),
-        ),
-        update=llir.Increment(llir.Var(copy_inner, llir.DataType.INT64)),
-        body=[
-            llir.VarInit(
-                var=llir.Var(copy_logical, llir.DataType.INT64),
-                value=llir.Add(
-                    llir.Var(tile_outer_name, llir.DataType.INT64),
-                    llir.Var(copy_inner, llir.DataType.INT64),
-                ),
-            ),
-            llir.IfThenElse(
-                cond=llir.BinOp(
-                    op=">=",
-                    left=llir.Var(copy_logical, llir.DataType.INT64),
-                    right=llir.Var(trailing_bound, llir.DataType.INT64),
-                ),
-                then_body=[llir.Break()],
-            ),
-            llir.Assign(
-                var=llir.Var(
-                    f"{result_values}[{copy_prefix} * {trailing_bound} + "
-                    f"{copy_logical}]",
-                    scalar_type,
-                ),
-                value=llir.Var(
-                    f"{compact_name}[{copy_prefix} * {tile_size_name} + "
-                    f"{copy_inner}]",
-                    scalar_type,
-                ),
-            ),
-        ],
-    )
-    copy_loop = llir.ForLoop(
-        init=llir.VarInit(
-            var=llir.Var(copy_prefix, llir.DataType.INT64),
-            value=llir.Literal(0),
-        ),
-        cond=llir.BinOp(
-            op="<",
-            left=llir.Var(copy_prefix, llir.DataType.INT64),
-            right=llir.Var(prefix_extent, llir.DataType.INT64),
-        ),
-        update=llir.Increment(llir.Var(copy_prefix, llir.DataType.INT64)),
-        body=[copy_inner_loop],
-        omp_parallel_for=True,
-        omp_schedule="static",
-        omp_num_threads=(
-            f"scorch_nthreads(({prefix_extent}) * {tile_size_name}, "
-            f"({prefix_extent}))"
-        ),
-    )
-    copy_loop.scorch_index_var = f"copy:{plan.result}"
-
     _remove_dense_result_zero(function, plan.result)
-    tile_loop.body[0:0] = [
-        llir.Comment(f"Initialize compact result tile for {plan.result}"),
-        init_loop,
-        llir.BlankLine(),
-    ]
+    tile_loop.body[0:0] = _heap_result_init_group(
+        result=plan.result,
+        compact_name=compact_name,
+        pointer_type=pointer_type,
+        scalar_type=scalar_type,
+        zero_value=zero_value,
+        tile_outer_name=tile_outer_name,
+        tile_size_name=tile_size_name,
+        trailing_bound=trailing_bound,
+        prefix_extent=prefix_extent,
+        init_prefix=init_prefix,
+        init_inner=init_inner,
+        init_logical=init_logical,
+    )
     tile_loop.body.extend(
-        [
-            llir.BlankLine(),
-            llir.Comment(f"Copy compact result tile to {plan.result}"),
-            copy_loop,
-        ]
+        _heap_result_copy_group(
+            result=plan.result,
+            result_values=result_values,
+            compact_name=compact_name,
+            pointer_type=pointer_type,
+            tile_outer_name=tile_outer_name,
+            tile_size_name=tile_size_name,
+            trailing_bound=trailing_bound,
+            prefix_extent=prefix_extent,
+            copy_prefix=copy_prefix,
+            copy_inner=copy_inner,
+            copy_logical=copy_logical,
+        )
     )
 
     # Removing the default zero shifts top-level positions, so resolve the tagged
@@ -768,17 +1455,218 @@ def _apply_heap_result_tile(
     (tile_container, tile_index, _), _ = _find_tagged_loop(
         function.body, tile_outer_name
     )
-    tile_container[tile_index:tile_index] = [
-        llir.Comment(f"Allocate reusable compact result tile for {plan.result}"),
-        llir.RawStmt(
-            code=(
-                f"std::vector<{scalar_type.value}> {storage_name}("
-                f"(size_t) ({prefix_extent}) * (size_t) {tile_size_name})"
-            )
+    tile_container[tile_index:tile_index] = _heap_result_storage_statements(
+        result=plan.result,
+        storage_name=storage_name,
+        compact_name=compact_name,
+        pointer_type=pointer_type,
+        scalar_type=scalar_type,
+        prefix_dimension_names=prefix_dimension_names,
+        tile_size_name=tile_size_name,
+    )
+
+
+def _packed_storage_declaration(
+    *,
+    storage_name: str,
+    scalar_type: llir.DataType,
+    stage_rows: str,
+    stage_rows_type: llir.DataType,
+    pack_tile_var: str,
+) -> llir.DirectInit:
+    """Build one detached typed owner for reusable packed operand storage."""
+
+    return llir.DirectInit(
+        var=llir.Var(
+            storage_name,
+            llir.DataType.std_vector_type(scalar_type),
         ),
+        args=(
+            llir.Mul(
+                llir.Cast(
+                    llir.Var(stage_rows, stage_rows_type),
+                    llir.DataType.SIZE_T,
+                ),
+                llir.Cast(
+                    llir.Var(pack_tile_var, llir.DataType.CONSTEXPR_INT),
+                    llir.DataType.SIZE_T,
+                ),
+            ),
+        ),
+    )
+
+
+def _panel_range_guard(
+    panel_var: str,
+    panel_outer_name: str,
+    panel_end: str,
+) -> llir.IfThenElse:
+    """The compatibility continue-guard the packed compute loop retains."""
+
+    return llir.IfThenElse(
+        cond=llir.BinOp(
+            op="||",
+            left=llir.BinOp(
+                op="<",
+                left=llir.Var(panel_var, llir.DataType.INT64),
+                right=llir.Var(panel_outer_name, llir.DataType.INT64),
+            ),
+            right=llir.BinOp(
+                op=">=",
+                left=llir.Var(panel_var, llir.DataType.INT64),
+                right=llir.Var(panel_end, llir.DataType.INT64),
+            ),
+        ),
+        then_body=[llir.Continue()],
+    )
+
+
+def _relayout_pack_loop(
+    *,
+    panel_scoped: bool,
+    pack_row: str,
+    pack_col: str,
+    logical_pack_col: str,
+    packed_name: str,
+    pointer_type: llir.DataType,
+    operand_value_array: str,
+    pack_outer_name: str,
+    pack_tile_var: str,
+    pack_axis_bound: str,
+    panel_axis_bound: str,
+    panel_outer_name: str,
+    panel_end: str,
+) -> llir.ForLoop:
+    """Build the parallel staging (pack) loop for one relayout scope."""
+
+    destination_row: llir.Expr = (
+        llir.BinOp(
+            op="-",
+            left=llir.Var(pack_row, llir.DataType.INT64),
+            right=llir.Var(panel_outer_name, llir.DataType.INT64),
+        )
+        if panel_scoped
+        else llir.Var(pack_row, llir.DataType.INT64)
+    )
+    destination_index = llir.Add(
+        llir.Mul(
+            destination_row,
+            llir.Var(pack_tile_var, llir.DataType.INT64),
+        ),
+        llir.Var(pack_col, llir.DataType.INT64),
+    )
+    pack_inner = llir.ForLoop(
+        init=llir.VarInit(
+            var=llir.Var(pack_col, llir.DataType.INT64),
+            value=llir.Literal(0),
+        ),
+        cond=llir.BinOp(
+            op="<",
+            left=llir.Var(pack_col, llir.DataType.INT64),
+            right=llir.Var(pack_tile_var, llir.DataType.INT64),
+        ),
+        update=llir.Increment(llir.Var(pack_col, llir.DataType.INT64)),
+        body=[
+            llir.VarInit(
+                var=llir.Var(logical_pack_col, llir.DataType.INT64),
+                value=llir.Add(
+                    llir.Var(pack_outer_name, llir.DataType.INT64),
+                    llir.Var(pack_col, llir.DataType.INT64),
+                ),
+            ),
+            llir.IfThenElse(
+                cond=llir.BinOp(
+                    op=">=",
+                    left=llir.Var(logical_pack_col, llir.DataType.INT64),
+                    right=llir.Var(pack_axis_bound, llir.DataType.INT64),
+                ),
+                then_body=[llir.Break()],
+            ),
+            llir.Assign(
+                var=llir.ArrayAccess(
+                    array=llir.Var(packed_name, pointer_type),
+                    index=destination_index,
+                ),
+                value=llir.ArrayAccess(
+                    array=llir.Var(operand_value_array, pointer_type),
+                    index=llir.Add(
+                        llir.Mul(
+                            llir.Var(pack_row, llir.DataType.INT64),
+                            llir.Var(pack_axis_bound, llir.DataType.INT64),
+                        ),
+                        llir.Var(logical_pack_col, llir.DataType.INT64),
+                    ),
+                ),
+            ),
+        ],
+    )
+    return llir.ForLoop(
+        init=llir.VarInit(
+            var=llir.Var(pack_row, llir.DataType.INT64),
+            value=(
+                llir.Var(panel_outer_name, llir.DataType.INT64)
+                if panel_scoped
+                else llir.Literal(0)
+            ),
+        ),
+        cond=llir.BinOp(
+            op="<",
+            left=llir.Var(pack_row, llir.DataType.INT64),
+            right=llir.Var(
+                panel_end if panel_scoped else panel_axis_bound,
+                llir.DataType.INT64,
+            ),
+        ),
+        update=llir.Increment(llir.Var(pack_row, llir.DataType.INT64)),
+        body=[pack_inner],
+        omp_parallel_for=True,
+        omp_schedule="static",
+        omp_num_threads=(
+            "scorch_nthreads("
+            + (
+                f"({panel_end} - {panel_outer_name}) * {pack_tile_var}, "
+                f"({panel_end} - {panel_outer_name})"
+                if panel_scoped
+                else f"{panel_axis_bound} * {pack_tile_var}, {panel_axis_bound}"
+            )
+            + ")"
+        ),
+    )
+
+
+def _relayout_storage_statements(
+    *,
+    operand: str,
+    storage_name: str,
+    packed_name: str,
+    pointer_type: llir.DataType,
+    scalar_type: llir.DataType,
+    stage_rows: str,
+    stage_rows_type: llir.DataType,
+    pack_tile_var: str,
+) -> List[llir.Stmt]:
+    """The reusable packed-storage declaration block above the pack origin."""
+
+    packed_storage = _packed_storage_declaration(
+        storage_name=storage_name,
+        scalar_type=scalar_type,
+        stage_rows=stage_rows,
+        stage_rows_type=stage_rows_type,
+        pack_tile_var=pack_tile_var,
+    )
+    LLIRWalker(_PACKED_STORAGE_CONTEXT).walk(packed_storage)
+    return [
+        llir.Comment(f"Allocate reusable packed storage for {operand}"),
+        packed_storage,
         llir.VarInit(
-            var=llir.Var(compact_name, pointer_type, is_restrict=True),
-            value=llir.Var(f"{storage_name}.data()", pointer_type),
+            var=llir.Var(packed_name, pointer_type, is_restrict=True),
+            value=llir.MemberCall(
+                base=llir.Var(
+                    storage_name,
+                    llir.DataType.std_vector_type(scalar_type),
+                ),
+                member="data",
+            ),
         ),
         llir.BlankLine(),
     ]
@@ -845,23 +1733,33 @@ def _apply_relayout(
     panel_axis_bound = f"{plan.operand}{plan.operand_panel_level}_size"
     panel_scoped = plan.scope_var == plan.panel_var
     stage_row_origin = panel_outer_name if panel_scoped else None
-    staged_read_row = (
-        f"({plan.panel_var} - {panel_outer_name})" if panel_scoped else plan.panel_var
+    staged_read_row: llir.Expr = (
+        llir.BinOp(
+            op="-",
+            left=llir.Var(plan.panel_var, llir.DataType.INT64),
+            right=llir.Var(panel_outer_name, llir.DataType.INT64),
+        )
+        if panel_scoped
+        else llir.Var(plan.panel_var, llir.DataType.INT64)
     )
-    packed_read = llir.Var(
-        name=(
-            f"{packed_name}[{staged_read_row} * "
-            f"{pack_tile_var} + {pack_inner_name}]"
+    packed_read = llir.ArrayAccess(
+        array=llir.Var(packed_name, pointer_type),
+        index=llir.Add(
+            llir.Mul(
+                staged_read_row,
+                llir.Var(pack_tile_var, llir.DataType.INT64),
+            ),
+            llir.Var(pack_inner_name, llir.DataType.INT64),
         ),
-        type=scalar_type,
     )
-    rewritten = _rewrite_stmt_accesses(
-        row_loop.body,
-        plan.operand,
-        plan.access_index_vars,
+    rewritten_body, rewritten = _rewrite_stmt_access_sequence(
+        cast(LLIRStatementSequence, row_loop.body),
+        plan.operand_id,
+        plan.access_index_ids,
         llir.TensorAccessRole.INPUT_READ,
         packed_read,
     )
+    row_loop.body = cast(List[llir.Stmt], rewritten_body)
     if rewritten == 0:
         raise NotImplementedError(
             "Cannot redirect the selected logical operand access to packed storage"
@@ -889,27 +1787,12 @@ def _apply_relayout(
         )
     sparse_loop.body.insert(
         panel_coordinate_index + 1,
-        llir.IfThenElse(
-            cond=llir.BinOp(
-                op="||",
-                left=llir.BinOp(
-                    op="<",
-                    left=llir.Var(plan.panel_var, llir.DataType.INT64),
-                    right=llir.Var(panel_outer_name, llir.DataType.INT64),
-                ),
-                right=llir.BinOp(
-                    op=">=",
-                    left=llir.Var(plan.panel_var, llir.DataType.INT64),
-                    right=llir.Var(panel_end, llir.DataType.INT64),
-                ),
-            ),
-            then_body=[llir.Continue()],
-        ),
+        _panel_range_guard(plan.panel_var, panel_outer_name, panel_end),
     )
     if _contains_tensor_access(
         row_loop.body,
-        plan.operand,
-        plan.access_index_vars,
+        plan.operand_id,
+        plan.access_index_ids,
         llir.TensorAccessRole.INPUT_READ,
     ):
         raise NotImplementedError(
@@ -919,73 +1802,20 @@ def _apply_relayout(
     pack_row = _unique_name(f"{plan.panel_var}_pack", used_names)
     pack_col = _unique_name(f"{plan.pack_var}_pack", used_names)
     logical_pack_col = _unique_name(f"{plan.pack_var}_packed", used_names)
-    source_index = f"{pack_row} * {pack_axis_bound} + {logical_pack_col}"
-    destination_row = f"({pack_row} - {panel_outer_name})" if panel_scoped else pack_row
-    destination_index = f"{destination_row} * {pack_tile_var} + {pack_col}"
-    pack_inner = llir.ForLoop(
-        init=llir.VarInit(
-            var=llir.Var(pack_col, llir.DataType.INT64),
-            value=llir.Literal(0),
-        ),
-        cond=llir.BinOp(
-            op="<",
-            left=llir.Var(pack_col, llir.DataType.INT64),
-            right=llir.Var(pack_tile_var, llir.DataType.INT64),
-        ),
-        update=llir.Increment(llir.Var(pack_col, llir.DataType.INT64)),
-        body=[
-            llir.VarInit(
-                var=llir.Var(logical_pack_col, llir.DataType.INT64),
-                value=llir.Add(
-                    llir.Var(pack_outer_name, llir.DataType.INT64),
-                    llir.Var(pack_col, llir.DataType.INT64),
-                ),
-            ),
-            llir.IfThenElse(
-                cond=llir.BinOp(
-                    op=">=",
-                    left=llir.Var(logical_pack_col, llir.DataType.INT64),
-                    right=llir.Var(pack_axis_bound, llir.DataType.INT64),
-                ),
-                then_body=[llir.Break()],
-            ),
-            llir.Assign(
-                var=llir.Var(f"{packed_name}[{destination_index}]", scalar_type),
-                value=llir.Var(f"{operand_value_array}[{source_index}]", scalar_type),
-            ),
-        ],
-    )
-    pack_outer = llir.ForLoop(
-        init=llir.VarInit(
-            var=llir.Var(pack_row, llir.DataType.INT64),
-            value=(
-                llir.Var(panel_outer_name, llir.DataType.INT64)
-                if panel_scoped
-                else llir.Literal(0)
-            ),
-        ),
-        cond=llir.BinOp(
-            op="<",
-            left=llir.Var(pack_row, llir.DataType.INT64),
-            right=llir.Var(
-                panel_end if panel_scoped else panel_axis_bound,
-                llir.DataType.INT64,
-            ),
-        ),
-        update=llir.Increment(llir.Var(pack_row, llir.DataType.INT64)),
-        body=[pack_inner],
-        omp_parallel_for=True,
-        omp_schedule="static",
-        omp_num_threads=(
-            "scorch_nthreads("
-            + (
-                f"({panel_end} - {panel_outer_name}) * {pack_tile_var}, "
-                f"({panel_end} - {panel_outer_name})"
-                if panel_scoped
-                else f"{panel_axis_bound} * {pack_tile_var}, {panel_axis_bound}"
-            )
-            + ")"
-        ),
+    pack_outer = _relayout_pack_loop(
+        panel_scoped=panel_scoped,
+        pack_row=pack_row,
+        pack_col=pack_col,
+        logical_pack_col=logical_pack_col,
+        packed_name=packed_name,
+        pointer_type=pointer_type,
+        operand_value_array=operand_value_array,
+        pack_outer_name=pack_outer_name,
+        pack_tile_var=pack_tile_var,
+        pack_axis_bound=pack_axis_bound,
+        panel_axis_bound=panel_axis_bound,
+        panel_outer_name=panel_outer_name,
+        panel_end=panel_end,
     )
     pack_outer.scorch_index_var = f"pack:{plan.operand}"
 
@@ -1016,20 +1846,19 @@ def _apply_relayout(
 
     pack_container, pack_index, _ = pack_location
     stage_rows = panel_tile_var if panel_scoped else panel_axis_bound
-    pack_container[pack_index:pack_index] = [
-        llir.Comment(f"Allocate reusable packed storage for {plan.operand}"),
-        llir.RawStmt(
-            code=(
-                f"std::vector<{scalar_type.value}> {storage_name}("
-                f"(size_t) {stage_rows} * (size_t) {pack_tile_var})"
-            )
-        ),
-        llir.VarInit(
-            var=llir.Var(packed_name, pointer_type, is_restrict=True),
-            value=llir.Var(f"{storage_name}.data()", pointer_type),
-        ),
-        llir.BlankLine(),
-    ]
+    stage_rows_type = (
+        llir.DataType.CONSTEXPR_INT if panel_scoped else llir.DataType.INT64
+    )
+    pack_container[pack_index:pack_index] = _relayout_storage_statements(
+        operand=plan.operand,
+        storage_name=storage_name,
+        packed_name=packed_name,
+        pointer_type=pointer_type,
+        scalar_type=scalar_type,
+        stage_rows=stage_rows,
+        stage_rows_type=stage_rows_type,
+        pack_tile_var=pack_tile_var,
+    )
 
 
 def apply_schedule_to_llir(

@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+from array import array as _Array
+from collections import deque as _Deque
+from collections.abc import Mapping as _AbcMapping, Sequence
 from dataclasses import dataclass
 from enum import Enum
 import json
@@ -9,10 +12,12 @@ import json
 # route isinstance through __subclasscheck__ at 153 ns against 73 ns for the
 # abc. `from __future__ import annotations` above means the annotations that
 # also use these names are never evaluated at runtime.
-from collections.abc import Mapping, Sequence
+from collections.abc import Mapping
+from types import MappingProxyType
 from typing import (
     TYPE_CHECKING,
     Any,
+    cast,
     ClassVar,
     List,
     Optional,
@@ -98,19 +103,90 @@ _STR_TO_LEVEL_TYPE = {
 }
 
 
+def _actual_type_name(value: object) -> str:
+    """Return the real type name without invoking caller-owned descriptors."""
+
+    name = type.__dict__["__name__"].__get__(type(value), type)
+    return str.__str__(name)
+
+
+# ``collections.abc`` registers several concrete standard-library types
+# virtually rather than by inheritance -- ``Mapping not in dict.__mro__`` and
+# ``Sequence not in list.__mro__`` -- so an MRO-identity recognizer has to name
+# them explicitly.  Keep the complete concrete Sequence set that the old ABC
+# check accepted: some of these cannot contain valid level aliases, but
+# recognition must not change which boundary reports that content error.
+# Anything else must genuinely derive from the ABC; arbitrary third-party
+# virtual registrations fail closed exactly like every other foreign
+# lookalike here.
+_MAPPING_BASES: Tuple[type, ...] = (_AbcMapping, dict, MappingProxyType)
+_SEQUENCE_BASES: Tuple[type, ...] = (
+    Sequence,
+    list,
+    tuple,
+    range,
+    str,
+    bytes,
+    bytearray,
+    memoryview,
+    _Deque,
+    _Array,
+)
+
+
+def _derives_from(value_type: type, *bases: type) -> bool:
+    """Whether ``value_type``'s real MRO contains any of ``bases``.
+
+    This exists instead of ``issubclass``/``isinstance`` against the
+    ``collections.abc`` ABCs.  ``ABCMeta``'s subclass check inserts the
+    candidate into its positive and negative ``WeakSet`` caches, and those
+    inserts call the candidate metaclass's ``__hash__`` and ``__eq__``.  A
+    caller-owned metaclass therefore observed public format validation, and
+    a raising one escaped it as a bare ``RuntimeError`` — including on the
+    success path for a genuine ``Sequence`` subclass.
+
+    Identity membership in the MRO, read through the base ``type``
+    descriptor, answers the same question for every genuine subclass while
+    running no caller-owned code.  Virtual (``register``-ed) subclasses are
+    not recognized and therefore fail closed, which is exactly how this
+    boundary already treats every other foreign lookalike.
+    """
+
+    try:
+        mro = type.__dict__["__mro__"].__get__(value_type, type)
+    except Exception:
+        return False
+    if type(mro) is not tuple:
+        return False
+    for entry in mro:
+        for base in bases:
+            if entry is base:
+                return True
+    return False
+
+
 def _parse_level_type(s: str) -> LevelType:
     """Convert one canonicalized string alias to a :class:`LevelType`."""
-    if not isinstance(s, str):
+    string_type = type(s)
+    if string_type is str:
+        text = s
+        key = s.strip().lower()
+    elif issubclass(string_type, str):
+        # Bypass every subclass hook while preserving real ``str`` subclasses
+        # as accepted aliases.  The base descriptors return exact strings, so
+        # both lookup and any failure rendering below are callback-free.
+        text = str.__str__(s)
+        key = str.lower(str.strip(text))
+    else:
         raise TensorTypeError(
-            f"level format must be a string or LevelType, got {type(s).__name__}"
+            f"level format must be a string or LevelType, got {_actual_type_name(s)}"
         )
-    key = s.strip().lower()
     try:
         return _STR_TO_LEVEL_TYPE[key]
     except KeyError as error:
         aliases = ", ".join(sorted(_STR_TO_LEVEL_TYPE))
         raise TensorFormatError(
-            f"invalid level format {s!r}; expected one of: {aliases}"
+            f"invalid level format {text!r}; expected one of: {aliases}"
         ) from error
 
 
@@ -163,16 +239,32 @@ class LevelFormat:
         mode: Union[str, LevelType],
         bit_width: Optional[int] = None,
     ):
-        parsed_mode = _parse_level_type(mode) if isinstance(mode, str) else mode
-        if not isinstance(parsed_mode, LevelType):
+        mode_type = type(mode)
+        parsed_mode: LevelType
+        if mode_type is str:
+            parsed_mode = _parse_level_type(cast(str, mode))
+        elif mode_type is LevelType:
+            parsed_mode = cast(LevelType, mode)
+        elif issubclass(mode_type, str):
+            parsed_mode = _parse_level_type(cast(str, mode))
+        else:
             raise TensorTypeError(
                 "level format mode must be a string alias or LevelType, "
-                f"got {type(mode).__name__}"
+                f"got {_actual_type_name(mode)}"
             )
         if bit_width is not None:
-            if isinstance(bit_width, bool) or not isinstance(bit_width, int):
+            bit_width_type = type(bit_width)
+            if bit_width_type is int:
+                canonical_bit_width = bit_width
+            elif bit_width_type is bool or not issubclass(bit_width_type, int):
                 raise TensorTypeError("level format bit_width must be an integer")
-            if bit_width <= 0:
+            else:
+                # Validate the underlying integer without trusting subclass
+                # comparison or conversion hooks.  Retain the caller's value
+                # here for constructor compatibility; retaining boundaries
+                # canonicalize it to the exact integer proven by this check.
+                canonical_bit_width = int.__int__(bit_width)
+            if canonical_bit_width <= 0:
                 raise TensorFormatError("level format bit_width must be positive")
         object.__setattr__(self, "_mode", parsed_mode)
         object.__setattr__(self, "_bit_width", bit_width)
@@ -276,6 +368,12 @@ class TensorFormat:
     LevelFormat : One mode's format.
     """
 
+    # The derived values memoized below (level types, density, the string form) live in
+    # slots, so the instance __dict__ holds exactly the declared state, {_level_formats}:
+    # what audit_format_state inspects at every ownership boundary. A memo never crosses
+    # that boundary -- owned_format builds a fresh format, which derives its own.
+    __slots__ = ("_level_types", "_is_dense", "_str", "__dict__", "__weakref__")
+
     _level_formats: Tuple[LevelFormat, ...]
 
     # Fill value default to 0.0
@@ -293,9 +391,17 @@ class TensorFormat:
             ]
         ] = None,
     ):
-        object.__setattr__(
-            self, "_level_formats", _normalize_level_formats(level_formats)
-        )
+        try:
+            normalized = _normalize_level_formats(level_formats)
+        except (TensorFormatError, TensorTypeError):
+            raise
+        except Exception as error:
+            # A genuine user-defined Sequence has to be consumed to obtain
+            # its levels.  Its iteration/indexing hooks are outside the
+            # callback-free *recognition* contract, but their exceptions must
+            # not escape this public constructor as arbitrary builtins.
+            raise TensorFormatError("tensor format sequence is malformed") from error
+        object.__setattr__(self, "_level_formats", normalized)
 
     def get_level_formats(self) -> Tuple[LevelFormat, ...]:
         """Return immutable per-mode :class:`LevelFormat` values in storage order.
@@ -325,7 +431,7 @@ class TensorFormat:
         For the construction paths, which ask for them several times per tensor;
         ``get_level_types`` returns a fresh list for callers that may modify it.
         """
-        cached = self.__dict__.get("_level_types")
+        cached = getattr(self, "_level_types", None)
         if cached is None:
             cached = tuple(
                 level_format.get_level_type() for level_format in self._level_formats
@@ -358,7 +464,7 @@ class TensorFormat:
         # this three times per matmul. Written through object.__setattr__ because the
         # dataclass is frozen; the field is not declared, so it takes no part in
         # __eq__ or __hash__.
-        cached = self.__dict__.get("_is_dense")
+        cached = getattr(self, "_is_dense", None)
         if cached is None:
             cached = all(
                 level_format.get_level_type() == LevelType.DENSE
@@ -372,13 +478,18 @@ class TensorFormat:
         # per-call path (kernel resolution keys on it). A cached str is also cheaper to
         # hash than the underlying tuple of LevelFormat, since CPython caches string
         # hashes and hashing the tuple recurses through every level.
-        cached = self.__dict__.get("_str")
+        cached = getattr(self, "_str", None)
         if cached is None:
             cached = ",".join(
                 [str(level_format) for level_format in self._level_formats]
             )
             object.__setattr__(self, "_str", cached)
         return cached
+
+    def __getstate__(self):
+        # Only the declared state: the memos are slots and are derived again on use. A
+        # frozen dataclass could not have them restored through setattr anyway.
+        return dict(self.__dict__)
 
     def __repr__(self):
         return f"TensorFormat({str(self)!r})"
@@ -397,22 +508,42 @@ class TensorFormat:
     @classmethod
     def from_dict(cls, data: Mapping[str, Any]) -> "TensorFormat":
         """Reconstruct a format from :meth:`to_dict`."""
-        if not isinstance(data, Mapping) or "levels" not in data:
-            raise TensorFormatError("serialized tensor format must contain 'levels'")
-        fill_value = data.get("fill_value", 0.0)
-        if fill_value != 0.0:
-            raise TensorFormatError("only a zero tensor fill value is supported")
-        levels = data["levels"]
-        if not isinstance(levels, Sequence) or isinstance(levels, (str, bytes)):
-            raise TensorFormatError("serialized tensor format levels must be a list")
-        parsed = []
-        for level in levels:
-            if not isinstance(level, Mapping) or "type" not in level:
+        # Recognition is by real MRO, never by an ABC check: see
+        # ``_derives_from``.  Reading a value once it has been recognized as
+        # a genuine mapping/sequence is ordinary consumption and can invoke
+        # its protocol hooks.  Translate any exception from that consumption
+        # into this public boundary's domain error.
+        try:
+            if not _derives_from(type(data), *_MAPPING_BASES) or "levels" not in data:
                 raise TensorFormatError(
-                    "each serialized tensor level must contain a 'type'"
+                    "serialized tensor format must contain 'levels'"
                 )
-            parsed.append(LevelFormat(level["type"], level.get("bit_width")))
-        return cls(parsed)
+            fill_value = data.get("fill_value", 0.0)
+            if fill_value != 0.0:
+                raise TensorFormatError("only a zero tensor fill value is supported")
+            levels = data["levels"]
+            levels_type = type(levels)
+            if not _derives_from(levels_type, *_SEQUENCE_BASES) or _derives_from(
+                levels_type, str, bytes, bytearray
+            ):
+                raise TensorFormatError(
+                    "serialized tensor format levels must be a list"
+                )
+            parsed = []
+            for level in levels:
+                if (
+                    not _derives_from(type(level), *_MAPPING_BASES)
+                    or "type" not in level
+                ):
+                    raise TensorFormatError(
+                        "each serialized tensor level must contain a 'type'"
+                    )
+                parsed.append(LevelFormat(level["type"], level.get("bit_width")))
+            return cls(parsed)
+        except (TensorFormatError, TensorTypeError):
+            raise
+        except Exception as error:
+            raise TensorFormatError("serialized tensor format is malformed") from error
 
 
 FormatInput = Union[
@@ -425,7 +556,15 @@ FormatInput = Union[
 
 
 def _tokenize_format_string(value: str) -> Tuple[str, ...]:
-    text = value.strip().lower()
+    value_type = type(value)
+    if value_type is str:
+        source = value
+        text = value.strip().lower()
+    elif issubclass(value_type, str):
+        source = str.__str__(value)
+        text = str.lower(str.strip(source))
+    else:
+        raise TensorTypeError("tensor format must be a string or sequence of levels")
     if not text:
         return tuple()
     if text in _STR_TO_LEVEL_TYPE:
@@ -433,7 +572,7 @@ def _tokenize_format_string(value: str) -> Tuple[str, ...]:
     if "," in text:
         tokens = tuple(token.strip() for token in text.split(","))
         if any(not token for token in tokens):
-            raise TensorFormatError(f"invalid comma-separated tensor format {value!r}")
+            raise TensorFormatError(f"invalid comma-separated tensor format {source!r}")
         return tokens
     return tuple(text)
 
@@ -450,26 +589,45 @@ def _normalize_level_formats(
 ) -> Tuple[LevelFormat, ...]:
     if value is None:
         return tuple()
-    if isinstance(value, LevelFormat):
-        return (value,)
-    if isinstance(value, LevelType):
-        return (LevelFormat(value),)
-    if isinstance(value, str):
-        value = _tokenize_format_string(value)
-    if not isinstance(value, Sequence) or isinstance(value, (bytes, bytearray)):
-        raise TensorTypeError(
-            "tensor format must be a string, level, or sequence of levels"
-        )
-    result = []
-    for level in value:
-        if isinstance(level, LevelFormat):
-            result.append(level)
-        elif isinstance(level, (LevelType, str)):
-            result.append(LevelFormat(level))
+    value_type = type(value)
+    normalized_value: Sequence[Union[LevelFormat, LevelType, str]]
+    if value_type is LevelFormat:
+        return (cast(LevelFormat, value),)
+    if value_type is LevelType:
+        return (LevelFormat(cast(LevelType, value)),)
+    if value_type is str:
+        normalized_value = _tokenize_format_string(cast(str, value))
+    elif value_type is list or value_type is tuple:
+        normalized_value = cast(Sequence[Union[LevelFormat, LevelType, str]], value)
+    elif issubclass(value_type, LevelFormat):
+        return (cast(LevelFormat, value),)
+    elif issubclass(value_type, str):
+        normalized_value = _tokenize_format_string(cast(str, value))
+    else:
+        if _derives_from(value_type, bytes, bytearray) or not _derives_from(
+            value_type, *_SEQUENCE_BASES
+        ):
+            raise TensorTypeError(
+                "tensor format must be a string, level, or sequence of levels"
+            )
+        normalized_value = cast(Sequence[Union[LevelFormat, LevelType, str]], value)
+    result: List[LevelFormat] = []
+    for level in normalized_value:
+        level_type = type(level)
+        if level_type is LevelFormat:
+            result.append(cast(LevelFormat, level))
+        elif level_type is LevelType:
+            result.append(LevelFormat(cast(LevelType, level)))
+        elif level_type is str:
+            result.append(LevelFormat(cast(str, level)))
+        elif issubclass(level_type, LevelFormat):
+            result.append(cast(LevelFormat, level))
+        elif issubclass(level_type, str):
+            result.append(LevelFormat(cast(str, level)))
         else:
             raise TensorTypeError(
                 "tensor format levels must be LevelFormat, LevelType, or string; "
-                f"got {type(level).__name__}"
+                f"got {_actual_type_name(level)}"
             )
     return tuple(result)
 
@@ -485,17 +643,128 @@ _PARSE_CACHE_MAX = 512
 
 def parse_format(fmt: FormatInput) -> TensorFormat:
     """Canonical parser used by every public format-taking API."""
-    if isinstance(fmt, TensorFormat):
+
+    # This is the overwhelmingly common internal call shape.  Keep it as the
+    # same single exact-type comparison as the historical implementation;
+    # subclass/foreign handling below is deliberately more defensive, but
+    # should not tax every ordinary dispatch by running an MRO walk.
+    if type(fmt) is TensorFormat:
         return fmt
-    # A list of aliases is a legal input and is not hashable; tuple it for the key.
-    key = tuple(fmt) if isinstance(fmt, list) else fmt
     try:
-        cached = _PARSE_CACHE.get(key)
-    except TypeError:  # unhashable even as a key: parse it and do not cache
-        return TensorFormat(fmt)
-    if cached is not None:
-        return cached
-    parsed = TensorFormat(fmt)
-    if len(_PARSE_CACHE) < _PARSE_CACHE_MAX:
-        _PARSE_CACHE[key] = parsed
-    return parsed
+        if issubclass(type(fmt), TensorFormat):
+            return cast(TensorFormat, fmt)
+        # A list of aliases is a legal input and is not hashable; tuple it for
+        # the key.  Sharing one parsed value between callers is safe because a
+        # retaining object rebuilds it through owned_format below.
+        key = tuple(fmt) if isinstance(fmt, list) else fmt
+        try:
+            cached = _PARSE_CACHE.get(key)
+        except TypeError:  # unhashable even as a key: parse it and do not cache
+            return TensorFormat(cast(Any, fmt))
+        if cached is not None:
+            return cached
+        parsed = TensorFormat(cast(Any, fmt))
+        if len(_PARSE_CACHE) < _PARSE_CACHE_MAX:
+            _PARSE_CACHE[key] = parsed
+        return parsed
+    except (TensorFormatError, TensorTypeError):
+        raise
+    except Exception as error:
+        raise TensorFormatError("tensor format is malformed") from error
+
+
+def audit_format_state(tensor_format: object) -> Optional[List["LevelFormat"]]:
+    """Structurally audit one format's stored state; rebuild its levels.
+
+    ``TensorFormat`` and ``LevelFormat`` are frozen value objects, but
+    ``object.__setattr__`` still forges or mutates their stored state, and a
+    caller who keeps a reference to a format an object retained can change
+    that object's declared layout after the fact.  This inspects the exact
+    stored fields without invoking any overridable accessor -- key types are
+    proven to be exact ``str`` before any comparison or hashing, so a hostile
+    ``str`` subclass cannot run overloaded equality here -- and returns a
+    freshly built level list.
+
+    Returns ``None`` when the argument is not a ``TensorFormat`` or when its
+    stored state is not exactly the expected base-value shape.  A subclass
+    with that exact state is safe to canonicalize as a fresh base value; no
+    subclass methods are invoked while inspecting it.
+    """
+
+    if not issubclass(type(tensor_format), TensorFormat):
+        return None
+    # Read the base class's actual instance dictionary through its descriptor.
+    # ``object.__getattribute__(value, "__dict__")`` still honors a subclass's
+    # overriding ``__dict__`` data descriptor, which could run caller code or
+    # conceal extra state at this ownership boundary.
+    state = TensorFormat.__dict__["__dict__"].__get__(tensor_format, TensorFormat)
+    state_keys = tuple(state) if type(state) is dict else ()
+    if (
+        type(state) is not dict
+        or len(state_keys) != 1
+        or type(state_keys[0]) is not str
+        or state_keys[0] != "_level_formats"
+    ):
+        return None
+    levels = state["_level_formats"]
+    if type(levels) is not tuple:
+        return None
+
+    owned_levels: List[LevelFormat] = []
+    for level_format in levels:
+        if not issubclass(type(level_format), LevelFormat):
+            return None
+        level_state = LevelFormat.__dict__["__dict__"].__get__(
+            level_format, LevelFormat
+        )
+        level_keys = tuple(level_state) if type(level_state) is dict else ()
+        if (
+            type(level_state) is not dict
+            or len(level_keys) != 2
+            or any(type(key) is not str for key in level_keys)
+            or set(level_keys) != {"_mode", "_bit_width"}
+        ):
+            return None
+        mode = level_state["_mode"]
+        bit_width = level_state["_bit_width"]
+        if type(mode) is not LevelType:
+            return None
+        if bit_width is not None:
+            bit_width_type = type(bit_width)
+            if bit_width_type is bool or not issubclass(bit_width_type, int):
+                return None
+            # ``LevelFormat.__init__`` accepts any non-bool ``int`` subclass,
+            # so an ``IntEnum`` width is a legally constructed format and must
+            # survive this boundary rather than becoming a construction error.
+            # Canonicalize it exactly the way every other retained scalar is
+            # canonicalized: the base descriptor bypasses an overridden
+            # ``__int__`` and yields an exact ``int``, so no caller arithmetic
+            # is retained or executed past this point.
+            bit_width = int.__int__(bit_width)
+            if bit_width <= 0:
+                return None
+        owned_levels.append(LevelFormat(mode, bit_width=bit_width))
+    return owned_levels
+
+
+def owned_format(tensor_format: TensorFormat) -> TensorFormat:
+    """Detach one format on the way *in* to a retaining object.
+
+    This is the construction-side half of the format-ownership boundary: an
+    object that will retain a format rebuilds it, so a caller who keeps the
+    original cannot mutate the retained metadata afterwards.  It also breaks
+    the sharing that let one process-global memoized format become several
+    unrelated tensors' declared layout.
+
+    Structurally canonical subclasses remain accepted, but are normalized to
+    the base value type.  Anything malformed fails closed: retaining it would
+    preserve mutable caller-owned state at the ownership boundary.
+
+    The read side is deliberately untouched -- rebuilding on every ``.format``
+    access measured as a double-digit regression on the live dispatch path.
+    """
+
+    owned_levels = audit_format_state(tensor_format)
+    if owned_levels is None:
+        raise TensorFormatError("tensor format has malformed stored state")
+    return TensorFormat(owned_levels)

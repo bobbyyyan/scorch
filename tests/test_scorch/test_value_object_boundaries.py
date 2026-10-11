@@ -287,6 +287,14 @@ def test_sparse_storage_rejects_csr_order_native_views_cannot_consume():
         )
 
 
+def test_sparse_storage_rejects_duplicate_compressed_coordinates():
+    with pytest.raises(TensorIndexError, match="strictly increasing"):
+        _csr_storage(
+            positions=torch.tensor([0, 2, 3], dtype=torch.int64),
+            coordinates=torch.tensor([1, 1, 2], dtype=torch.int64),
+        )
+
+
 def test_sparse_storage_dense_count_and_equality_include_value_dtype():
     float_storage = _dense_storage(value_dtype=torch.float32)
     int_storage = _dense_storage(value_dtype=torch.int64)
@@ -306,8 +314,10 @@ def test_stensor_requires_complete_runtime_state_and_validates_storage_metadata(
 
     storage = _dense_storage()
     tensor = STensor(name="x", storage=storage)
-    assert tensor.storage is storage
-    assert tensor.metadata.layout is storage.layout
+    assert tensor.storage is not storage
+    assert tensor.storage.value.data_ptr() == storage.value.data_ptr()
+    assert tensor.metadata.layout is tensor.storage.layout
+    assert tensor.storage.layout is not storage.layout
     assert tensor.shape == (2, 3)
     assert tensor.logical_shape == (2, 3)
     assert tensor.dtype == torch.float32
@@ -464,11 +474,11 @@ def test_sparse_storage_rejects_noncanonical_coo_order():
 def test_einsum_compile_only_returns_spec_without_jit_or_operand_mutation(monkeypatch):
     compiled_sources = []
 
-    def fake_load_kernel(**kwargs):
-        compiled_sources.append(kwargs["cpp_sources"])
+    def fake_load_kernel(prepared):
+        compiled_sources.append(prepared.request.cpp_sources)
         return object()
 
-    monkeypatch.setattr(ops, "_load_kernel", fake_load_kernel)
+    monkeypatch.setattr(ops, "_load_validated_prepared_kernel", fake_load_kernel)
     monkeypatch.setattr(ops, "_kernel_cache", {})
     a = TensorSpec("dd", (2, 3), mode_order=(1, 0), name="a")
     b = TensorSpec("dd", (3, 4), name="b")
@@ -497,7 +507,7 @@ def test_einsum_compile_only_validates_contraction_shapes_before_codegen(monkeyp
     def fail_if_codegen_starts(**kwargs):
         raise AssertionError("shape validation must run before native code generation")
 
-    monkeypatch.setattr(ops, "_load_kernel", fail_if_codegen_starts)
+    monkeypatch.setattr(ops, "_prepare_jit_build", fail_if_codegen_starts)
     monkeypatch.setattr(ops, "_kernel_cache", {})
     a = TensorSpec("dd", (2, 3), name="a")
     b = TensorSpec("dd", (5, 4), name="b")
@@ -510,7 +520,7 @@ def test_runtime_einsum_rejects_payload_free_spec_before_codegen(monkeypatch):
     def fail_if_codegen_starts(**kwargs):
         raise AssertionError("payload validation must run before code generation")
 
-    monkeypatch.setattr(ops, "_load_kernel", fail_if_codegen_starts)
+    monkeypatch.setattr(ops, "_prepare_jit_build", fail_if_codegen_starts)
     spec = TensorSpec("dd", (2, 3))
 
     with pytest.raises(CompileSpecError):
@@ -563,7 +573,7 @@ def test_einsum_validates_output_contract_before_codegen(monkeypatch, output_for
     def fail_if_codegen_starts(**kwargs):
         raise AssertionError("output validation must precede code generation")
 
-    monkeypatch.setattr(ops, "_load_kernel", fail_if_codegen_starts)
+    monkeypatch.setattr(ops, "_prepare_jit_build", fail_if_codegen_starts)
     a = TensorSpec("dd", (2, 3))
     b = TensorSpec("dd", (3, 4))
 

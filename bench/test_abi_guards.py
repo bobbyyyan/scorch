@@ -7,8 +7,17 @@ serial path (small nnz) and the PARALLEL path (nnz >= SCORCH_ABI_VALIDATE_GRAIN)
 since the screen only splits across threads above that grain — a screen that were
 wrong only when parallel would otherwise pass every small test.
 
-Calls scorch_ops directly so the native validator is what is under test, not the
-Python-side narrowing in prebuilt_kernels.
+Most cases call scorch_ops directly so the native validator is what is under test,
+not any Python-side narrowing. That covers the PREBUILT route.
+
+``run_generated_kernel_suite`` covers the other one, and it is not redundant on this
+branch. ``utils.py:59-63`` builds the generated preamble by substituting
+``native_abi.h``'s TEXT in place of its ``#include`` line in ``header.h``, so the
+validator is not linked into a generated kernel -- it is recompiled inside it, by the
+JIT's compiler with the JIT's flags. A screen that is right in ``scorch_ops`` and wrong
+there would pass every other case in this file. The suite drives ``validate_jit_tensor``
+through kernels that codegen emitted, with an invalid index, and demands the same
+diagnostic.
 """
 import os
 import sys
@@ -19,13 +28,25 @@ import torch
 import scorch_ops as ops
 
 
+# The fragment an ordering rejection has to carry.
+#
+# Upstream's tree requires coordinates inside a compressed span to be NON-DECREASING
+# and says "coordinates must be sorted within each CSR row" when they are not. This
+# tree requires them to be STRICTLY INCREASING -- commit 7fd9116, so that a duplicate
+# entry cannot silently miscompute a merged kernel -- and says "must be strictly
+# increasing" instead. Every case below still demands the ordering-specific message
+# rather than merely some exception, so the assertion is exactly as strong as
+# upstream's; only the wording it looks for belongs to this tree.
+ORDER_MSG = "must be strictly increasing"
+
+
 def csr_args(M, J, N, pos, crd, val, idtype=np.int32):
     B = torch.zeros((J, N), dtype=torch.float32)
     return dict(
         result_shape=[M, N],
         A_shape=[M, J],
         A_mode_indices=[[], [torch.from_numpy(pos.astype(idtype)),
-                              torch.from_numpy(crd.astype(idtype))]],
+                             torch.from_numpy(crd.astype(idtype))]],
         A_values=torch.from_numpy(val.astype(np.float32)),
         B_shape=[J, N],
         B_mode_indices=[[], []],
@@ -101,7 +122,7 @@ def run_suite(M, deg, label):
     lo = int(pos[mid])
     if deg >= 2 and bad[lo] != bad[lo + 1]:
         bad[lo], bad[lo + 1] = bad[lo + 1], bad[lo]
-        expect_raise("unsorted within a row", "must be sorted",
+        expect_raise("unsorted within a row", ORDER_MSG,
                      lambda: ops.spmm_csr_float_v2(**csr_args(M, J, N, pos, bad, val)))
 
     badpos = pos.copy()
@@ -161,7 +182,7 @@ def run_sortedness_suite(M, deg, label):
     bad = crd.copy()
     lo = int(pos[M // 2])
     bad[lo], bad[lo + 1] = bad[lo + 1], bad[lo]
-    expect_raise("internal descent among boundary descents", "must be sorted",
+    expect_raise("internal descent among boundary descents", ORDER_MSG,
                  lambda: ops.spmm_csr_float_v2(**csr_args(M, J, N, pos, bad, val)))
 
     # Empty rows: every other row is empty, so a boundary position is shared by two
@@ -182,7 +203,7 @@ def run_sortedness_suite(M, deg, label):
     mid = (k // deg // 2) * deg
     if mid + 1 < k:
         ebad[mid], ebad[mid + 1] = ebad[mid + 1], ebad[mid]
-        expect_raise("empty rows, internal descent", "must be sorted",
+        expect_raise("empty rows, internal descent", ORDER_MSG,
                      lambda: ops.spmm_csr_float_v2(**csr_args(M, J, N, epos, ebad, eval_)))
 
     # A descent in the very LAST row, and in the very first, are the positions a
@@ -191,8 +212,82 @@ def run_sortedness_suite(M, deg, label):
         bad = crd.copy()
         lo = int(pos[where])
         bad[lo], bad[lo + 1] = bad[lo + 1], bad[lo]
-        expect_raise(f"descent in {name}", "must be sorted",
+        expect_raise(f"descent in {name}", ORDER_MSG,
                      lambda b=bad: ops.spmm_csr_float_v2(**csr_args(M, J, N, pos, b, val)))
+
+    # DUPLICATES. These cases cannot exist upstream, where a repeated coordinate is a
+    # legal non-decreasing run; here they are violations, and they are the only cases
+    # that distinguish the screen this tree ships (which counts NON-INCREASES) from
+    # upstream's (which counts descents). A screen left on upstream's comparison would
+    # accept every one of them silently, at both screen sizes, and the serial fallback
+    # would never be asked. So this is the test that the one deviation is load-bearing.
+    #
+    # A duplicate at a row BOUNDARY is legal in both trees -- two rows may share a
+    # column -- so it is checked as an accept, and it is also what stops the fix being
+    # "reject every non-increase anywhere".
+    for offset, name in ((1, "inside a row"), (2, "deeper inside a row")):
+        bad = crd.copy()
+        lo = int(pos[M // 2])
+        bad[lo + offset] = bad[lo + offset - 1]
+        expect_raise(f"duplicate {name}", ORDER_MSG,
+                     lambda b=bad: ops.spmm_csr_float_v2(**csr_args(M, J, N, pos, b, val)))
+
+    for where, name in ((0, "first row"), (M - 1, "last row")):
+        bad = crd.copy()
+        lo = int(pos[where])
+        bad[lo + 1] = bad[lo]
+        expect_raise(f"duplicate in {name}", ORDER_MSG,
+                     lambda b=bad: ops.spmm_csr_float_v2(**csr_args(M, J, N, pos, b, val)))
+
+    # Row i+1 starts on the column row i ended on, so almost every row boundary carries
+    # a DUPLICATE rather than a descent, and all of it is legal -- two rows may share a
+    # column. This is the arrangement that breaks a screen which counts non-increases
+    # without subtracting the ones sitting on boundaries: it has ~M of them and zero
+    # violations, so such a screen would reject a perfectly good matrix.
+    #
+    # The starts advance by deg-1 and wrap, because making EVERY boundary a duplicate
+    # would need J >= M*(deg-1), which these sizes do not have. The wrap costs a handful
+    # of boundaries out of M; the count is asserted below rather than assumed, so this
+    # cannot quietly degenerate into a case with no boundary duplicates at all.
+    span = max(1, J - deg + 1)
+    starts = (np.arange(M, dtype=np.int64) * (deg - 1)) % span
+    bpos = np.arange(M + 1, dtype=np.int64) * deg
+    bcrd = (starts[:, None] + np.arange(deg, dtype=np.int64)[None, :]).reshape(-1)
+    boundary_dups = int(sum(1 for i in range(1, M)
+                            if bcrd[int(bpos[i]) - 1] == bcrd[int(bpos[i])]))
+    if int(bcrd.max()) < J and boundary_dups > 0:
+        print(f"  ({boundary_dups} of {M - 1} row boundaries carry a duplicate)")
+        expect_ok("duplicate at every boundary",
+                  lambda: ops.spmm_csr_float_v2(
+                      **csr_args(M, J, N, bpos, bcrd, np.ones(nnz))))
+        dbad = bcrd.copy()
+        lo = int(bpos[M // 2])
+        dbad[lo + 1] = dbad[lo]
+        expect_raise("duplicate inside a row among boundary duplicates", ORDER_MSG,
+                     lambda: ops.spmm_csr_float_v2(
+                         **csr_args(M, J, N, bpos, dbad, np.ones(nnz))))
+    else:
+        FAILS.append(f"boundary-duplicate case not constructible at M={M} deg={deg}")
+        print(f"  FAIL  boundary-duplicate case not constructible "
+              f"(max coordinate {int(bcrd.max())} vs J={J}, {boundary_dups} boundary dups)")
+
+    # Empty rows again, this time with the duplicate: a boundary position shared by
+    # several rows must not let an internal duplicate through the subtraction.
+    epos2 = np.zeros(M + 1, dtype=np.int64)
+    k2 = 0
+    for i in range(M):
+        epos2[i] = k2
+        if i % 2 == 0:
+            k2 += deg
+    epos2[M] = k2
+    ecrd2 = np.tile(np.arange(deg, dtype=np.int64), (M + 1) // 2)[:k2]
+    mid2 = (k2 // deg // 2) * deg
+    if mid2 + 1 < k2:
+        ebad2 = ecrd2.copy()
+        ebad2[mid2 + 1] = ebad2[mid2]
+        expect_raise("empty rows, internal duplicate", ORDER_MSG,
+                     lambda: ops.spmm_csr_float_v2(
+                         **csr_args(M, J, N, epos2, ebad2, np.ones(k2))))
 
 
 def run_memo_suite():
@@ -217,7 +312,7 @@ def run_memo_suite():
     bad = crd.copy()
     bad[deg], bad[deg + 1] = bad[deg + 1], bad[deg]
     for i in range(3):
-        expect_raise(f"fresh invalid tensor #{i}", "must be sorted",
+        expect_raise(f"fresh invalid tensor #{i}", ORDER_MSG,
                      lambda: ops.spmm_csr_float_v2(**csr_args(M, J, N, pos, bad, val)))
 
     # Same tensors reused: second and later calls take the memo. Still correct.
@@ -227,7 +322,7 @@ def run_memo_suite():
 
     bad_args = csr_args(M, J, N, pos, bad, val)
     for i in range(3):
-        expect_raise(f"reused invalid tensor, call {i}", "must be sorted",
+        expect_raise(f"reused invalid tensor, call {i}", ORDER_MSG,
                      lambda: ops.spmm_csr_float_v2(**bad_args))
 
     # The documented blind spot: a write straight through the numpy buffer the tensor
@@ -277,7 +372,7 @@ def run_memo_suite():
     v_ok, v_bad = shared_t[:nnz], shared_t[nnz:]
     for rnd in range(3):
         expect_ok(f"shared-storage valid view, round {rnd}", lambda: call_view(v_ok))
-        expect_raise(f"shared-storage invalid view, round {rnd}", "must be sorted",
+        expect_raise(f"shared-storage invalid view, round {rnd}", ORDER_MSG,
                      lambda: call_view(v_bad))
 
     # ...and the kill switch has to restore strict checking. Re-exec is the only way to
@@ -298,7 +393,7 @@ def run_memo_suite():
         "try:\n"
         "    ops.spmm_csr_float_v2(**a); print('ACCEPTED')\n"
         "except Exception as e:\n"
-        "    print('REJECTED' if 'must be sorted' in str(e) else 'OTHER')\n"
+        f"    print('REJECTED' if {ORDER_MSG!r} in str(e) else 'OTHER')\n"
     )
     env = dict(os.environ, SCORCH_ABI_VALIDATE_MEMO="0")
     out = subprocess.run([sys.executable, "-c", src], capture_output=True, text=True,
@@ -373,14 +468,22 @@ def run_narrow_suite(M=512, deg=8):
     # A torch-level in-place write must invalidate the cached copy. Reordering one
     # row's two columns keeps the matrix valid and changes nothing about the sum, so
     # move a nonzero to a different column instead and check the result follows.
+    #
+    # Which nonzero, and where to, has to keep the row STRICTLY increasing on this tree
+    # (7fd9116) rather than merely non-decreasing. Upstream moves row 0's FIRST entry up
+    # by one column, which on a banded matrix lands it on top of the second entry: legal
+    # there, a duplicate here, so the call is rejected and this case never runs. Move the
+    # row's LAST entry up instead -- there is nothing above it to collide with, and the
+    # column it vacates changes the row's contribution, which is what the reference
+    # comparison needs.
     moved = crd.copy()
-    moved[0] = (crd[0] + 1) % J
-    while moved[0] == crd[0]:  # deg == J would make this a no-op
-        moved[0] = (moved[0] + 1) % J
+    last = int(pos[1]) - 1
+    if last >= int(pos[0]) and int(moved[last]) + 1 < J:
+        moved[last] = int(moved[last]) + 1
     c64.copy_(torch.from_numpy(moved.astype(np.int64)))
-    # copy_ can leave a row unsorted; only compare when the write kept it valid.
+    # copy_ can leave a row out of order; only compare when the write kept it valid.
     row0 = moved[pos[0]:pos[1]]
-    if (np.diff(row0) >= 0).all():
+    if len(row0) and (np.diff(row0) > 0).all() and not (moved == crd).all():
         ref2 = dense_ref(pos, moved, val)
         out = call()
         err = float(np.abs(native_dense(out, M, N) - ref2).max() / max(np.abs(ref2).max(), 1e-30))
@@ -563,6 +666,131 @@ def run_inference_mode_suite():
                   f"{type(exc).__name__}: {exc}")
 
 
+def run_generated_kernel_suite():
+    """The same rejections, through a kernel codegen emitted rather than scorch_ops.
+
+    Two routes: ``einsum('i,i->i')`` over compressed vectors (one compressed level) and
+    a DCSR x dense product with a dense result (two levels, so the per-level loop and
+    per-level memo both run and the violation can sit under a clean level 0). Neither
+    resolves to a prebuilt symbol, so both go through lower_and_exec_cin.
+
+    TWO WAYS THIS SUITE WOULD LIE IF IT WERE WRITTEN THE OBVIOUS WAY, both producing a
+    clean "accepted" that means nothing:
+
+    * ``STensor.index`` and ``storage.mode_indices`` hand back FRESH tensors per access,
+      so a mutation through either lands in a temporary the kernel never reads. The real
+      arrays are ``storage.index._mode_indices``.
+    * A mutation can be a no-op on the index it is handed -- swapping a pair that already
+      descends, for instance. So each case reads the array back and is reported as
+      UNTESTED, not as a pass, when the write changed nothing.
+    """
+    from scorch import STensor, einsum, matmul
+
+    print("\n[generated kernels] validate_jit_tensor, compiled inside the kernel")
+
+    def vector_operands():
+        n = 12
+        da = torch.zeros(n)
+        da[0::2] = torch.arange(1, n // 2 + 1, dtype=torch.float32)
+        db = torch.zeros(n)
+        db[0:5] = 2.0
+        a = STensor.from_torch(da).to_sparse("s")
+        b = STensor.from_torch(db).to_sparse("s")
+        return a.storage.index._mode_indices[0], (
+            lambda: einsum("i,i->i", a, b, format="s").values.tolist()), n
+
+    def matrix_operands():
+        rows, cols = 6, 8
+        dense = torch.zeros(rows, cols)
+        for r in range(rows):
+            for c in (0, 3, 6):
+                dense[r, c] = float(r + c + 1)
+        a = STensor.from_torch(dense).to_sparse("ss")
+        b = torch.ones(cols, 4)
+        return a.storage.index._mode_indices[1], (
+            lambda: float(matmul(a, b).to_dense().sum().item())), cols
+
+    routes = (("vector [s]", vector_operands), ("matrix [ss]", matrix_operands))
+
+    # Does this host compile a generated kernel at all? Upstream's tree could not on
+    # macOS; this branch can. Either way, say which rather than reporting a silent pass.
+    try:
+        _, call, _ = routes[0][1]()
+        call()
+    except Exception as exc:  # noqa: BLE001
+        print(f"  skip  this host cannot run a generated kernel: "
+              f"{type(exc).__name__}: {str(exc)[:160]}")
+        return
+
+    def interior(pos, nnz):
+        """Positions that are not the first of a span -- the only place an ordering
+        violation can be planted, since a non-increase at a span start is legal."""
+        starts = set(pos[:-1])
+        return [p for p in range(1, nnz) if p not in starts]
+
+    def bad_coord(pos, crd, extent):
+        out = list(crd)
+        out[len(out) // 2] = extent + 7
+        return list(pos), out
+
+    def dup(pos, crd, extent):
+        cand = [p for p in interior(pos, len(crd)) if crd[p] != crd[p - 1]]
+        if not cand:
+            return None
+        p = cand[len(cand) // 2]
+        out = list(crd)
+        out[p] = out[p - 1]
+        return list(pos), out
+
+    def descent(pos, crd, extent):
+        cand = [p for p in interior(pos, len(crd)) if crd[p] > crd[p - 1]]
+        if not cand:
+            return None
+        p = cand[len(cand) // 2]
+        out = list(crd)
+        out[p - 1], out[p] = out[p], out[p - 1]
+        return list(pos), out
+
+    def first_pos(pos, crd, extent):
+        out = list(pos)
+        out[0] = 1
+        return out, list(crd)
+
+    def terminal(pos, crd, extent):
+        out = list(pos)
+        out[-1] = out[-1] + 5
+        return out, list(crd)
+
+    cases = (
+        ("coordinate out of range", bad_coord, "is outside [0,"),
+        ("duplicate coordinate", dup, ORDER_MSG),
+        ("descent inside a span", descent, ORDER_MSG),
+        ("positions[0] != 0", first_pos, "must start at position 0"),
+        ("terminal position past nnz", terminal, "invalid compressed span"),
+    )
+
+    for route_name, operands in routes:
+        arrays, call, extent = operands()
+        expect_ok(f"{route_name}: valid, generated kernel", call)
+        for label, mutate, fragment in cases:
+            arrays, call, extent = operands()
+            pos_t, crd_t = arrays
+            pos, crd = pos_t.tolist(), crd_t.tolist()
+            new = mutate(pos, crd, extent)
+            if new is None:
+                FAILS.append(f"{route_name}/{label} not constructible")
+                print(f"  FAIL  {route_name}: {label} not constructible on this operand")
+                continue
+            pos_t.copy_(torch.tensor(new[0], dtype=pos_t.dtype))
+            crd_t.copy_(torch.tensor(new[1], dtype=crd_t.dtype))
+            if (pos_t.tolist(), crd_t.tolist()) == (pos, crd):
+                FAILS.append(f"{route_name}/{label} write was a no-op")
+                print(f"  FAIL  {route_name}: {label} write changed nothing, so the "
+                      f"case is UNTESTED rather than passing")
+                continue
+            expect_raise(f"{route_name}: {label}", fragment, call)
+
+
 run_suite(64, 4, "serial screen")            # 256 nnz
 run_suite(40000, 16, "parallel screen")      # 640000 nnz, above the grain
 run_sortedness_suite(64, 4, "sortedness, serial")
@@ -572,6 +800,7 @@ run_narrow_suite()
 run_reclaim_suite()
 run_coo_suite()
 run_inference_mode_suite()
+run_generated_kernel_suite()
 
 print(f"\n{PASSES} passed, {len(FAILS)} failed")
 if FAILS:

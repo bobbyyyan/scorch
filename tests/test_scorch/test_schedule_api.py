@@ -1,18 +1,37 @@
+from collections import Counter
 from dataclasses import FrozenInstanceError, replace
+from typing import cast
 
 import pytest
 import torch
 
+from scorch.compiler import llir
+import scorch.compiler.schedule_lowerer as schedule_lowerer_module  # type: ignore[import-untyped]
 from scorch.compiler.cin import (
+    BinaryOp,
     ForAll,
     IndexVar,
     Operation,
     TensorAssign,
     TensorVar,
+    UnaryOp,
     Where,
 )
 from scorch.compiler.cin_lowerer import CINLowerer
 from scorch.compiler.codegen import LLIRLowerer
+from scorch.compiler.diagnostics import (
+    CompileOptionsError,
+    InvalidSchedule,
+    VerificationError,
+)
+from scorch.compiler.compile_options import CompileOptions
+from scorch.compiler.loop_plan import MAX_AFFINE_TILE_WIDTH, ScheduledCIN
+from scorch.compiler.legacy_cin_adapter import legacy_cin_working_copy
+from scorch.compiler.llir_traversal import (
+    LLIRRewriter,
+    LLIRTraversalContext,
+    LLIRWalker,
+)
 from scorch.compiler.scheduler import (
     RelayoutSpec,
     Schedule,
@@ -114,14 +133,134 @@ def _packed_schedule(
     )
 
 
+def _heap_schedule(
+    *,
+    row="i",
+    panel="j",
+    pack="k",
+    nc=4,
+) -> Schedule:
+    return Schedule(
+        loop_order=(row, panel, pack),
+        tiles=(
+            TileSpec(
+                pack,
+                nc,
+                placement="outermost",
+                accum="heap",
+                unroll=False,
+            ),
+        ),
+        tag="heap-result-tile",
+        parallel_loop=row,
+    )
+
+
 def _lower_to_cpp(stmt: ForAll) -> str:
     lowered = CINLowerer().lower_IndexStmt(stmt)
     return LLIRLowerer().lower_llir(lowered)
 
 
+def _lower_with_assignment_targets(
+    stmt: ForAll,
+) -> tuple[str, list[llir.AssignmentTarget]]:
+    lowered = CINLowerer().lower_IndexStmt(stmt)
+    targets: list[llir.AssignmentTarget] = []
+
+    class AssignmentTargetCollector(LLIRWalker):
+        def visit_assign(self, node: llir.Assign, path: tuple[str, ...]) -> None:
+            targets.append(node.var)
+            super().visit_assign(node, path)
+
+    AssignmentTargetCollector(
+        LLIRTraversalContext(
+            stage="test",
+            pass_name="collect_assignment_targets",
+        )
+    ).walk(lowered)
+    return LLIRLowerer().lower_llir(lowered), targets
+
+
+def _lower_with_assignments(stmt: ForAll) -> tuple[str, list[llir.Assign]]:
+    lowered = CINLowerer().lower_IndexStmt(stmt)
+    assignments: list[llir.Assign] = []
+
+    class AssignmentCollector(LLIRWalker):
+        def visit_assign(self, node: llir.Assign, path: tuple[str, ...]) -> None:
+            assignments.append(node)
+            super().visit_assign(node, path)
+
+    AssignmentCollector(
+        LLIRTraversalContext(
+            stage="test",
+            pass_name="collect_assignments",
+        )
+    ).walk(lowered)
+    return LLIRLowerer().lower_llir(lowered), assignments
+
+
+def _lower_with_var_initializers(stmt: ForAll) -> tuple[str, list[llir.VarInit]]:
+    lowered = CINLowerer().lower_IndexStmt(stmt)
+    initializers: list[llir.VarInit] = []
+
+    class VarInitializerCollector(LLIRWalker):
+        def visit_var_init(
+            self,
+            node: llir.VarInit,
+            path: tuple[str, ...],
+        ) -> None:
+            initializers.append(node)
+            super().visit_var_init(node, path)
+
+    VarInitializerCollector(
+        LLIRTraversalContext(
+            stage="test",
+            pass_name="collect_var_initializers",
+        )
+    ).walk(lowered)
+    return LLIRLowerer().lower_llir(lowered), initializers
+
+
+def _lower_with_direct_initializers(
+    stmt: ForAll,
+) -> tuple[str, list[llir.DirectInit], list[str]]:
+    lowered = CINLowerer().lower_IndexStmt(stmt)
+    initializers: list[llir.DirectInit] = []
+    raw_codes: list[str] = []
+
+    class DirectInitializerCollector(LLIRWalker):
+        def visit_direct_init(
+            self,
+            node: llir.DirectInit,
+            path: tuple[str, ...],
+        ) -> None:
+            initializers.append(node)
+            super().visit_direct_init(node, path)
+
+        def visit_raw_stmt(
+            self,
+            node: llir.RawStmt,
+            path: tuple[str, ...],
+        ) -> None:
+            raw_codes.append(node.code)
+            super().visit_raw_stmt(node, path)
+
+    DirectInitializerCollector(
+        LLIRTraversalContext(
+            stage="test",
+            pass_name="collect_direct_initializers",
+        )
+    ).walk(lowered)
+    return LLIRLowerer().lower_llir(lowered), initializers, raw_codes
+
+
 def _loop_chain(stmt):
     names = []
-    body = stmt
+    body = (
+        legacy_cin_working_copy(stmt.normalized_cin, stmt.verified_loop_plan)
+        if isinstance(stmt, ScheduledCIN)
+        else stmt
+    )
     while isinstance(body, ForAll):
         names.append(body.index_var.name)
         body = body.stmt
@@ -196,7 +335,10 @@ def test_tile_k_width_and_child_placement_reach_generated_cpp():
     assert producer_loop_names == ["j", "k_in"]
     assert isinstance(producer_body, TensorAssign)
 
-    tile_size_vars = scheduled.get_tile_size_vars()
+    legacy_working = legacy_cin_working_copy(
+        scheduled.normalized_cin, scheduled.verified_loop_plan
+    )
+    tile_size_vars = legacy_working.get_tile_size_vars()
     assert len(tile_size_vars) == 1
     assert tile_size_vars[0].index_var.name == "k"
     assert tile_size_vars[0].size == 4
@@ -207,6 +349,24 @@ def test_tile_k_width_and_child_placement_reach_generated_cpp():
     assert "if (k >= B1_size)" in cpp
     assert "if (k >= C1_size)" in cpp
     assert cpp.index("for (int64_t i = 0") < cpp.index("k_out = 0")
+
+
+def test_legacy_replay_only_canonicalizes_an_omitted_loop_order():
+    tile_only = Schedule(tiles=(TileSpec("k", 4, accum="direct"),))
+    scheduled = Scheduler.apply_schedule(_build_spmm(), tile_only)
+
+    canonical_options = CompileOptions.from_environment(requested_schedule=tile_only)
+    CINLowerer(compile_options=canonical_options).lower_IndexStmt(scheduled)
+
+    conflicting_options = CompileOptions.from_environment(
+        requested_schedule=Schedule(
+            loop_order=("i", "k", "j"),
+            tiles=(TileSpec("k", 4, accum="direct"),),
+        )
+    )
+    with pytest.raises(CompileOptionsError) as error:
+        CINLowerer(compile_options=conflicting_options).lower_IndexStmt(scheduled)
+    assert error.value.diagnostics[0].code == "conflicting_schedule"
 
 
 def test_schedule_cache_key_is_canonical_and_complete():
@@ -340,8 +500,309 @@ def test_panel_tile_lowers_to_windowed_sparse_iteration():
     assert "j_out_end = std::min(j_out + kTile_j, B0_size)" in cpp
     assert cpp.count("std::lower_bound") == 2
     assert "pA1 = pA1_panel_begin" in cpp
+    assert "int pA1_row_end = A1_pos[pA0 + 1];" in cpp
+    assert (
+        "int pA1_panel_begin = (int)(std::lower_bound(A1_crd + "
+        "A1_pos[pA0], A1_crd + pA1_row_end, j_out) - A1_crd);"
+    ) in cpp
+    assert (
+        "int pA1_end = (int)(std::lower_bound(A1_crd + pA1_panel_begin, "
+        "A1_crd + pA1_row_end, j_out_end) - A1_crd);"
+    ) in cpp
     assert cpp.index("j_out = 0") < cpp.index("#pragma omp parallel for")
     assert cpp.index("#pragma omp parallel for") < cpp.index("i = 0")
+
+
+def test_panel_window_bounds_are_structured_typed_detached_and_repeatable():
+    schedule = Schedule(
+        loop_order=("i", "j", "k"),
+        tiles=(TileSpec("j", 32, kind="panel", accum="direct"),),
+        tag="tile-j-panel-structured-bounds",
+        parallel_loop="i",
+    )
+    scheduled = Scheduler.apply_schedule(_build_spmm(), schedule)
+
+    def lower_and_collect() -> tuple[str, llir.Cast, llir.Cast]:
+        lowered = CINLowerer().lower_IndexStmt(scheduled)
+        assert type(lowered) is llir.Function
+        matches: dict[str, llir.Cast] = {}
+
+        class BoundCollector(LLIRWalker):
+            def visit_var_init(
+                self,
+                node: llir.VarInit,
+                path: tuple[str, ...],
+            ) -> None:
+                if node.var.name in {"pA1_panel_begin", "pA1_end"}:
+                    assert type(node.value) is llir.Cast
+                    matches[node.var.name] = node.value
+                super().visit_var_init(node, path)
+
+        BoundCollector(
+            LLIRTraversalContext(
+                stage="test",
+                pass_name="collect_panel_bounds",
+            )
+        ).walk(lowered)
+        assert set(matches) == {"pA1_panel_begin", "pA1_end"}
+        return (
+            LLIRLowerer().lower_llir(lowered),
+            matches["pA1_panel_begin"],
+            matches["pA1_end"],
+        )
+
+    first_cpp, lower, upper = lower_and_collect()
+    second_cpp, second_lower, second_upper = lower_and_collect()
+
+    def unpack(expression: llir.Cast) -> tuple[llir.FunctionCall, llir.Var]:
+        assert expression.data_type is llir.DataType.INT
+        assert type(expression.expr) is llir.BinOp
+        subtraction = expression.expr
+        assert subtraction.op == "-"
+        assert type(subtraction.left) is llir.FunctionCall
+        assert type(subtraction.right) is llir.Var
+        call = subtraction.left
+        coordinate = subtraction.right
+        assert call.name == "std::lower_bound"
+        assert type(call.args) is tuple
+        assert len(call.args) == 3
+        assert coordinate == llir.Var("A1_crd", llir.DataType.PTR_INT)
+        return call, coordinate
+
+    lower_call, lower_coordinate = unpack(lower)
+    upper_call, upper_coordinate = unpack(upper)
+
+    def collect_vars(expression: llir.Expr) -> tuple[llir.Var, ...]:
+        found: list[llir.Var] = []
+
+        class VarCollector(LLIRWalker):
+            def enter_node(self, node: llir.Node, path: tuple[str, ...]) -> None:
+                if type(node) is llir.Var:
+                    found.append(node)
+
+        VarCollector(
+            LLIRTraversalContext(
+                stage="test",
+                pass_name="collect_panel_bound_vars",
+            )
+        ).walk(expression)
+        return tuple(found)
+
+    lower_vars = collect_vars(lower)
+    upper_vars = collect_vars(upper)
+    assert Counter((var.name, var.type) for var in lower_vars) == Counter(
+        {
+            ("A1_crd", llir.DataType.PTR_INT): 3,
+            ("A1_pos", llir.DataType.PTR_INT): 1,
+            ("pA0", llir.DataType.INT): 1,
+            ("pA1_row_end", llir.DataType.INT): 1,
+            ("j_out", llir.DataType.INT64): 1,
+        }
+    )
+    assert Counter((var.name, var.type) for var in upper_vars) == Counter(
+        {
+            ("A1_crd", llir.DataType.PTR_INT): 3,
+            ("pA1_panel_begin", llir.DataType.INT): 1,
+            ("pA1_row_end", llir.DataType.INT): 1,
+            ("j_out_end", llir.DataType.INT64): 1,
+        }
+    )
+    for var in (*lower_vars, *upper_vars):
+        assert type(var.name) is str
+        assert var.name.isidentifier()
+        assert type(var.type) is llir.DataType
+        assert var.is_ptr is False
+        assert var.is_restrict is False
+        assert var.tensor_access is None
+
+    for call in (lower_call, upper_call):
+        assert type(call.args[0]) is llir.Add
+        assert type(call.args[1]) is llir.Add
+        for pointer in (call.args[0], call.args[1]):
+            assert type(pointer.left) is llir.Var
+            assert pointer.left == llir.Var("A1_crd", llir.DataType.PTR_INT)
+
+    lower_begin = cast(llir.Add, lower_call.args[0]).right
+    assert type(lower_begin) is llir.ArrayAccess
+    assert lower_begin == llir.ArrayAccess(
+        llir.Var("A1_pos", llir.DataType.PTR_INT),
+        llir.Var("pA0", llir.DataType.INT),
+    )
+    assert cast(llir.Add, lower_call.args[1]).right == llir.Var(
+        "pA1_row_end",
+        llir.DataType.INT,
+    )
+    assert lower_call.args[2] == llir.Var("j_out", llir.DataType.INT64)
+
+    assert cast(llir.Add, upper_call.args[0]).right == llir.Var(
+        "pA1_panel_begin",
+        llir.DataType.INT,
+    )
+    assert cast(llir.Add, upper_call.args[1]).right == llir.Var(
+        "pA1_row_end",
+        llir.DataType.INT,
+    )
+    assert upper_call.args[2] == llir.Var("j_out_end", llir.DataType.INT64)
+
+    def visited_ids(expression: llir.Expr) -> tuple[int, ...]:
+        found: list[int] = []
+
+        class NodeCollector(LLIRWalker):
+            def enter_node(self, node: llir.Node, path: tuple[str, ...]) -> None:
+                found.append(id(node))
+
+        NodeCollector(
+            LLIRTraversalContext(
+                stage="test",
+                pass_name="collect_panel_bound_ids",
+            )
+        ).walk(expression)
+        return tuple(found)
+
+    lower_ids = visited_ids(lower)
+    upper_ids = visited_ids(upper)
+    assert len(lower_ids) == len(set(lower_ids))
+    assert len(upper_ids) == len(set(upper_ids))
+    assert set(lower_ids).isdisjoint(upper_ids)
+    assert lower_coordinate is not upper_coordinate
+
+    assert lower == second_lower
+    assert upper == second_upper
+    assert hash(lower) == hash(second_lower)
+    assert hash(upper) == hash(second_upper)
+    assert set(lower_ids).isdisjoint(visited_ids(second_lower))
+    assert set(upper_ids).isdisjoint(visited_ids(second_upper))
+
+    rewritten_lower = cast(
+        llir.Cast,
+        LLIRRewriter(
+            LLIRTraversalContext(
+                stage="test",
+                pass_name="rewrite_panel_bound",
+            )
+        ).rewrite(lower),
+    )
+    assert rewritten_lower == lower
+    assert set(visited_ids(rewritten_lower)).isdisjoint(lower_ids)
+
+    assert LLIRLowerer().lower_llir(lower) == (
+        "(int)(std::lower_bound(A1_crd + A1_pos[pA0], "
+        "A1_crd + pA1_row_end, j_out) - A1_crd)"
+    )
+    assert LLIRLowerer().lower_llir(upper) == (
+        "(int)(std::lower_bound(A1_crd + pA1_panel_begin, "
+        "A1_crd + pA1_row_end, j_out_end) - A1_crd)"
+    )
+    assert first_cpp == second_cpp
+
+
+@pytest.mark.parametrize(
+    ("begin", "end"),
+    (
+        pytest.param(
+            llir.Var("A1_pos[pA0]", llir.DataType.INT),
+            llir.Var("A1_pos[pA0 + 1]", llir.DataType.INT),
+            id="legacy-flat",
+        ),
+        pytest.param(
+            llir.ArrayAccess(
+                llir.Var("A1_pos", llir.DataType.PTR_INT),
+                llir.Var("pA0", llir.DataType.INT),
+            ),
+            llir.ArrayAccess(
+                llir.Var("B1_pos", llir.DataType.PTR_INT),
+                llir.Add(
+                    llir.Var("pA0", llir.DataType.INT),
+                    llir.Literal(1, llir.DataType.INT),
+                ),
+            ),
+            id="different-array",
+        ),
+        pytest.param(
+            llir.ArrayAccess(
+                llir.Var("A1_pos", llir.DataType.PTR_INT),
+                llir.Var("pA0", llir.DataType.INT),
+            ),
+            llir.ArrayAccess(
+                llir.Var("A1_pos", llir.DataType.PTR_INT),
+                llir.Add(
+                    llir.Var("pOther", llir.DataType.INT),
+                    llir.Literal(1, llir.DataType.INT),
+                ),
+            ),
+            id="different-parent",
+        ),
+    ),
+)
+def test_panel_window_rejects_noncanonical_position_bounds_without_mutation(
+    begin: llir.Expr,
+    end: llir.Expr,
+) -> None:
+    def structural_snapshot(value: object) -> object:
+        if isinstance(value, llir.Node):
+            return (
+                type(value).__name__,
+                tuple(
+                    (name, structural_snapshot(child))
+                    for name, child in sorted(vars(value).items())
+                ),
+            )
+        if type(value) is list or type(value) is tuple:
+            return (
+                type(value).__name__,
+                tuple(structural_snapshot(child) for child in value),
+            )
+        return value
+
+    def mutable_ids(value: object) -> set[int]:
+        found: set[int] = set()
+        if isinstance(value, llir.Node) or type(value) is list:
+            found.add(id(value))
+        if isinstance(value, llir.Node):
+            for child in vars(value).values():
+                found.update(mutable_ids(child))
+        elif type(value) is list or type(value) is tuple:
+            for child in value:
+                found.update(mutable_ids(child))
+        return found
+
+    end_init = llir.VarInit(llir.Var("pA1_end", llir.DataType.INT), end)
+    loop = llir.ForLoop(
+        init=llir.VarInit(llir.Var("pA1", llir.DataType.INT), begin),
+        cond=llir.BinOp(
+            "<",
+            llir.Var("pA1", llir.DataType.INT),
+            llir.Var("pA1_end", llir.DataType.INT),
+        ),
+        update=llir.Increment(llir.Var("pA1", llir.DataType.INT)),
+        body=[
+            llir.VarInit(
+                llir.Var("j_A", llir.DataType.INT),
+                llir.ArrayAccess(
+                    llir.Var("A1_crd", llir.DataType.PTR_INT),
+                    llir.Var("pA1", llir.DataType.INT),
+                ),
+            )
+        ],
+    )
+    container: list[llir.Stmt] = [end_init, loop]
+    source = LLIRLowerer().lower_llir(container)
+    snapshot = structural_snapshot(container)
+    source_ids = mutable_ids(container)
+
+    with pytest.raises(
+        NotImplementedError,
+        match="matching structured CSR row bounds",
+    ):
+        schedule_lowerer_module._window_sparse_loop(
+            (container, 1, loop),
+            "j_out",
+            "j_out_end",
+        )
+
+    assert LLIRLowerer().lower_llir(container) == source
+    assert structural_snapshot(container) == snapshot
+    assert mutable_ids(container) == source_ids
 
 
 def test_panel_outermost_placement_hoists_over_affine_tile():
@@ -479,7 +940,9 @@ def test_unsupported_or_unsafe_schedule_requests_are_rejected():
         lambda: TileSpec("k", 4, unroll=1),
         lambda: TileSpec("k", 4, placement="child_of:"),
         lambda: TileSpec("k", 4, placement="at_depth:-1"),
+        lambda: TileSpec("k", MAX_AFFINE_TILE_WIDTH + 1),
         lambda: RelayoutSpec("B", "k", True),
+        lambda: RelayoutSpec("B", "k", MAX_AFFINE_TILE_WIDTH + 1),
         lambda: RelayoutSpec("B", "k", 4, scope_var=1),
         lambda: RelayoutSpec("B", "k", 4, scope_var=""),
         lambda: Schedule(parallel_loop=1),
@@ -488,6 +951,105 @@ def test_unsupported_or_unsafe_schedule_requests_are_rejected():
 def test_schedule_constructor_validation(factory):
     with pytest.raises((TypeError, ValueError)):
         factory()
+
+
+def test_schedule_rejects_hostile_scalar_subclasses_without_running_them():
+    class HostileStr(str):
+        def __bool__(self):
+            raise AssertionError("caller bool executed")
+
+        def __hash__(self):
+            raise AssertionError("caller hash executed")
+
+        def __repr__(self):
+            raise AssertionError("caller repr executed")
+
+        def startswith(self, *args, **kwargs):
+            raise AssertionError("caller startswith executed")
+
+    class HostileInt(int):
+        def __index__(self):
+            raise AssertionError("caller index executed")
+
+        def __repr__(self):
+            raise AssertionError("caller repr executed")
+
+    hostile = HostileStr("k")
+    factories = (
+        lambda: TileSpec(hostile, 4),
+        lambda: TileSpec("k", HostileInt(4)),
+        lambda: TileSpec("k", 4, placement=HostileStr("outermost")),
+        lambda: TileSpec("k", 4, kind=HostileStr("affine")),
+        lambda: TileSpec("k", 4, accum=HostileStr("direct")),
+        lambda: RelayoutSpec(hostile, "k", 4),
+        lambda: RelayoutSpec("B", hostile, 4),
+        lambda: RelayoutSpec("B", "k", HostileInt(4)),
+        lambda: RelayoutSpec("B", "k", 4, scope_var=hostile),
+        lambda: Schedule(loop_order=(hostile,)),
+        lambda: Schedule(tag=hostile),
+        lambda: Schedule(parallel_loop=hostile),
+    )
+    for factory in factories:
+        with pytest.raises((TypeError, ValueError)):
+            factory()
+
+
+def test_schedule_rejects_unowned_iterable_containers():
+    with pytest.raises(TypeError, match="owned list or tuple"):
+        Schedule(loop_order=(name for name in ("i", "j")))
+    with pytest.raises(TypeError, match="owned list or tuple"):
+        Schedule(tiles=(tile for tile in (TileSpec("i", 4),)))
+
+
+def test_schedule_revalidates_frozen_state_at_compiler_and_cache_boundaries(
+    monkeypatch,
+):
+    class HostileStr(str):
+        def __bool__(self):
+            raise AssertionError("caller bool executed")
+
+        def __hash__(self):
+            raise AssertionError("caller hash executed")
+
+        def __repr__(self):
+            raise AssertionError("caller repr executed")
+
+    hostile = Schedule(loop_order=("i", "j", "k"))
+    object.__setattr__(
+        hostile,
+        "loop_order",
+        (HostileStr("i"), HostileStr("j"), HostileStr("k")),
+    )
+    with pytest.raises(InvalidSchedule):
+        Scheduler.apply_schedule(_build_spmm(), hostile)
+    with pytest.raises(InvalidSchedule):
+        _ = hostile.cache_key
+
+    missing = Schedule()
+    object.__delattr__(missing, "tag")
+    with pytest.raises(InvalidSchedule, match="stored fields"):
+        Scheduler.apply_schedule(_build_spmm(), missing)
+    with pytest.raises(InvalidSchedule, match="stored fields"):
+        _ = missing.cache_key
+
+    divergent = Schedule()
+    monkeypatch.setattr(
+        Schedule,
+        "tag",
+        property(lambda self: "descriptor value"),
+    )
+    with pytest.raises(InvalidSchedule, match="diverges"):
+        Scheduler.apply_schedule(_build_spmm(), divergent)
+    with pytest.raises(InvalidSchedule, match="diverges"):
+        _ = divergent.cache_key
+
+
+def test_schedule_width_boundary_accepts_constexpr_int_maximum():
+    assert TileSpec("k", MAX_AFFINE_TILE_WIDTH).width == MAX_AFFINE_TILE_WIDTH
+    assert (
+        RelayoutSpec("B", "k", MAX_AFFINE_TILE_WIDTH).strip_width
+        == MAX_AFFINE_TILE_WIDTH
+    )
 
 
 def test_storage_schedule_fields_are_immutable_and_legacy_scope_is_canonical():
@@ -516,7 +1078,7 @@ def test_packed_relayout_is_structural_and_name_independent():
     )
 
     scheduled = Scheduler.apply_schedule(_build_named_spmm(), schedule)
-    cpp = _lower_to_cpp(scheduled)
+    cpp, targets = _lower_with_assignment_targets(scheduled)
 
     allocation = "std::vector<float> packed_DenseInput_storage"
     pack_loop = (
@@ -535,6 +1097,326 @@ def test_packed_relayout_is_structural_and_name_independent():
     assert cpp.index(pack_loop) < cpp.index(row_loop)
     assert cpp.count("scorch_zero_dense(Output_values, Output_capacity)") == 1
     assert "Output_values[pOutput1] +=" in cpp
+    packed_targets = [
+        target
+        for target in targets
+        if type(target) is llir.ArrayAccess
+        and type(target.array) is llir.Var
+        and target.array.name == "packed_DenseInput"
+    ]
+    assert packed_targets
+    assert all(
+        target.array.type is llir.DataType.PTR_FLOAT32 for target in packed_targets
+    )
+
+
+@pytest.mark.parametrize(
+    ("dtype", "pointer_type", "vector_type", "cpp_scalar"),
+    [
+        (
+            torch.float32,
+            llir.DataType.PTR_FLOAT32,
+            llir.DataType.STD_VECTOR_FLOAT32,
+            "float",
+        ),
+        (
+            torch.float64,
+            llir.DataType.PTR_FLOAT64,
+            llir.DataType.STD_VECTOR_FLOAT64,
+            "double",
+        ),
+    ],
+)
+def test_packed_relayout_data_call_is_typed_owned_and_byte_exact(
+    dtype: torch.dtype,
+    pointer_type: llir.DataType,
+    vector_type: llir.DataType,
+    cpp_scalar: str,
+):
+    schedule = _packed_schedule(
+        row="row",
+        panel="reduce",
+        pack="free",
+        operand="DenseInput",
+    )
+    scheduled = Scheduler.apply_schedule(
+        _build_named_spmm(dtype=dtype),
+        schedule,
+    )
+
+    first_cpp, first_initializers = _lower_with_var_initializers(scheduled)
+    second_cpp, second_initializers = _lower_with_var_initializers(scheduled)
+
+    def packed_pointer(initializers: list[llir.VarInit]) -> llir.VarInit:
+        matches = [
+            node for node in initializers if node.var.name == "packed_DenseInput"
+        ]
+        assert len(matches) == 1
+        return matches[0]
+
+    first = packed_pointer(first_initializers)
+    second = packed_pointer(second_initializers)
+    assert type(first.value) is llir.MemberCall
+    assert type(second.value) is llir.MemberCall
+    first_call = cast(llir.MemberCall, first.value)
+    second_call = cast(llir.MemberCall, second.value)
+
+    assert first.var == llir.Var(
+        "packed_DenseInput",
+        pointer_type,
+        is_restrict=True,
+    )
+    assert first.var.type is pointer_type
+    assert first_call.base == llir.Var(
+        "packed_DenseInput_storage",
+        vector_type,
+    )
+    assert type(first_call.base) is llir.Var
+    assert first_call.base.type is vector_type
+    assert first_call.member == "data"
+    assert first_call.template_args == ()
+    assert first_call.args == ()
+    assert first == second
+    assert first is not second
+    assert first.var is not second.var
+    assert first_call is not second_call
+    assert first_call.base is not second_call.base
+
+    expected = (
+        f"{cpp_scalar}* __restrict__ packed_DenseInput = "
+        "packed_DenseInput_storage.data();"
+    )
+    assert LLIRLowerer().lower_llir(first) == expected
+    assert first_cpp == second_cpp
+    assert first_cpp.count(expected) == 1
+
+
+@pytest.mark.parametrize(
+    ("dtype", "vector_type", "cpp_scalar"),
+    [
+        (torch.float32, llir.DataType.STD_VECTOR_FLOAT32, "float"),
+        (torch.float64, llir.DataType.STD_VECTOR_FLOAT64, "double"),
+    ],
+)
+@pytest.mark.parametrize(
+    ("scope", "stage_rows", "stage_rows_type"),
+    [
+        ("reduce", "kTile_reduce", llir.DataType.CONSTEXPR_INT),
+        ("free", "DenseInput0_size", llir.DataType.INT64),
+    ],
+)
+def test_packed_storage_owner_is_direct_typed_fresh_and_byte_exact(
+    dtype: torch.dtype,
+    vector_type: llir.DataType,
+    cpp_scalar: str,
+    scope: str,
+    stage_rows: str,
+    stage_rows_type: llir.DataType,
+) -> None:
+    schedule = _packed_schedule(
+        row="row",
+        panel="reduce",
+        pack="free",
+        operand="DenseInput",
+        scope=scope,
+        accum="direct",
+    )
+    scheduled = Scheduler.apply_schedule(
+        _build_named_spmm(dtype=dtype),
+        schedule,
+    )
+
+    first_cpp, first_initializers, first_raw_codes = _lower_with_direct_initializers(
+        scheduled
+    )
+    second_cpp, second_initializers, second_raw_codes = _lower_with_direct_initializers(
+        scheduled
+    )
+
+    first_matches = [
+        node
+        for node in first_initializers
+        if node.var.name == "packed_DenseInput_storage"
+    ]
+    second_matches = [
+        node
+        for node in second_initializers
+        if node.var.name == "packed_DenseInput_storage"
+    ]
+    assert len(first_matches) == len(second_matches) == 1
+    first = first_matches[0]
+    second = second_matches[0]
+
+    assert first.var == llir.Var("packed_DenseInput_storage", vector_type)
+    assert first.var.type is vector_type
+    assert first.var.is_ptr is False
+    assert first.var.is_restrict is False
+    assert first.var.tensor_access is None
+    assert type(first.args) is tuple
+    assert len(first.args) == 1
+    extent = cast(llir.Mul, first.args[0])
+    assert type(extent) is llir.Mul
+    assert type(extent.left) is llir.Cast
+    assert type(extent.right) is llir.Cast
+    left = cast(llir.Cast, extent.left)
+    right = cast(llir.Cast, extent.right)
+    assert left.data_type is llir.DataType.SIZE_T
+    assert right.data_type is llir.DataType.SIZE_T
+    assert left.expr == llir.Var(stage_rows, stage_rows_type)
+    assert right.expr == llir.Var("kTile_free", llir.DataType.CONSTEXPR_INT)
+    assert type(left.expr) is type(right.expr) is llir.Var
+
+    assert first == second
+    assert hash(first) == hash(second)
+    assert first is not second
+    assert first.var is not second.var
+    second_extent = cast(llir.Mul, second.args[0])
+    assert extent is not second_extent
+    assert left is not cast(llir.Cast, second_extent.left)
+    assert left.expr is not cast(llir.Cast, second_extent.left).expr
+    assert right.expr is not cast(llir.Cast, second_extent.right).expr
+
+    expected = (
+        f"std::vector<{cpp_scalar}> packed_DenseInput_storage("
+        f"(size_t){stage_rows} * (size_t)kTile_free);"
+    )
+    assert LLIRLowerer().lower_llir(first) == expected
+    assert first_cpp == second_cpp
+    assert first_cpp.count(expected) == 1
+    assert all("packed_DenseInput_storage" not in code for code in first_raw_codes)
+    assert all("packed_DenseInput_storage" not in code for code in second_raw_codes)
+
+    _, pointer_initializers = _lower_with_var_initializers(scheduled)
+    pointer = next(
+        node for node in pointer_initializers if node.var.name == "packed_DenseInput"
+    )
+    assert type(pointer.value) is llir.MemberCall
+    receiver = cast(llir.MemberCall, pointer.value).base
+    assert receiver == first.var
+    assert receiver is not first.var
+
+
+@pytest.mark.parametrize(
+    ("dtype", "vector_type", "pointer_type", "cpp_scalar"),
+    [
+        (
+            torch.float32,
+            llir.DataType.STD_VECTOR_FLOAT32,
+            llir.DataType.PTR_FLOAT32,
+            "float",
+        ),
+        (
+            torch.float64,
+            llir.DataType.STD_VECTOR_FLOAT64,
+            llir.DataType.PTR_FLOAT64,
+            "double",
+        ),
+    ],
+)
+def test_heap_result_storage_owner_is_direct_typed_fresh_and_byte_exact(
+    dtype: torch.dtype,
+    vector_type: llir.DataType,
+    pointer_type: llir.DataType,
+    cpp_scalar: str,
+) -> None:
+    schedule = _heap_schedule(row="row", panel="reduce", pack="free")
+    scheduled = Scheduler.apply_schedule(
+        _build_named_spmm(dtype=dtype),
+        schedule,
+    )
+
+    first_cpp, first_initializers, first_raw_codes = _lower_with_direct_initializers(
+        scheduled
+    )
+    second_cpp, second_initializers, second_raw_codes = _lower_with_direct_initializers(
+        scheduled
+    )
+
+    first_matches = [
+        node for node in first_initializers if node.var.name == "tiled_Output_storage"
+    ]
+    second_matches = [
+        node for node in second_initializers if node.var.name == "tiled_Output_storage"
+    ]
+    assert len(first_matches) == len(second_matches) == 1
+    first = first_matches[0]
+    second = second_matches[0]
+    assert first.var == llir.Var("tiled_Output_storage", vector_type)
+    assert first.var.type is vector_type
+    assert first.var.is_ptr is False
+    assert first.var.is_restrict is False
+    assert first.var.tensor_access is None
+    assert type(first.args) is tuple
+    assert len(first.args) == 1
+
+    extent = cast(llir.Mul, first.args[0])
+    assert type(extent) is llir.Mul
+    assert type(extent.left) is llir.Cast
+    assert type(extent.right) is llir.Cast
+    prefix = cast(llir.Cast, extent.left)
+    tile = cast(llir.Cast, extent.right)
+    assert prefix.data_type is llir.DataType.SIZE_T
+    assert tile.data_type is llir.DataType.SIZE_T
+    assert prefix.expr == llir.Var("Output0_size", llir.DataType.INT64)
+    assert tile.expr == llir.Var("kTile_free", llir.DataType.CONSTEXPR_INT)
+    assert type(prefix.expr) is type(tile.expr) is llir.Var
+
+    assert first == second
+    assert hash(first) == hash(second)
+    assert first is not second
+    assert first.var is not second.var
+    assert first.args is not second.args
+    second_extent = cast(llir.Mul, second.args[0])
+    assert extent is not second_extent
+    assert prefix is not cast(llir.Cast, second_extent.left)
+    assert prefix.expr is not cast(llir.Cast, second_extent.left).expr
+    assert tile is not cast(llir.Cast, second_extent.right)
+    assert tile.expr is not cast(llir.Cast, second_extent.right).expr
+
+    expected = (
+        f"std::vector<{cpp_scalar}> tiled_Output_storage("
+        "(size_t)Output0_size * (size_t)kTile_free);"
+    )
+    assert LLIRLowerer().lower_llir(first) == expected
+    assert first_cpp == second_cpp
+    assert first_cpp.count(expected) == 1
+    assert "packed_" not in first_cpp
+    assert all("tiled_Output_storage" not in code for code in first_raw_codes)
+    assert all("tiled_Output_storage" not in code for code in second_raw_codes)
+
+    _, pointer_initializers = _lower_with_var_initializers(scheduled)
+    pointer = next(
+        node for node in pointer_initializers if node.var.name == "tiled_Output"
+    )
+    assert pointer.var.type is pointer_type
+    assert type(pointer.value) is llir.MemberCall
+    receiver = cast(llir.MemberCall, pointer.value).base
+    assert receiver == first.var
+    assert receiver is not first.var
+
+
+def test_direct_result_tile_does_not_allocate_heap_storage() -> None:
+    schedule = Schedule(
+        loop_order=("row", "reduce", "free"),
+        tiles=(
+            TileSpec(
+                "free",
+                4,
+                placement="outermost",
+                accum="direct",
+                unroll=False,
+            ),
+        ),
+        tag="direct-result-tile-control",
+        parallel_loop="row",
+    )
+    scheduled = Scheduler.apply_schedule(_build_named_spmm(), schedule)
+
+    cpp, initializers, raw_codes = _lower_with_direct_initializers(scheduled)
+
+    assert all(node.var.name != "tiled_Output_storage" for node in initializers)
+    assert "tiled_Output_storage" not in cpp
+    assert all("tiled_Output_storage" not in code for code in raw_codes)
 
 
 def test_full_stage_and_heap_result_are_structural_and_name_independent():
@@ -547,15 +1429,17 @@ def test_full_stage_and_heap_result_are_structural_and_name_independent():
         accum="heap",
     )
 
-    cpp = _lower_to_cpp(Scheduler.apply_schedule(_build_named_spmm(), schedule))
+    cpp, targets = _lower_with_assignment_targets(
+        Scheduler.apply_schedule(_build_named_spmm(), schedule)
+    )
 
     full_stage = (
         "std::vector<float> packed_DenseInput_storage("
-        "(size_t) DenseInput0_size * (size_t) kTile_free);"
+        "(size_t)DenseInput0_size * (size_t)kTile_free);"
     )
     compact_result = (
         "std::vector<float> tiled_Output_storage("
-        "(size_t) (Output0_size) * (size_t) kTile_free);"
+        "(size_t)Output0_size * (size_t)kTile_free);"
     )
     pack_loop = (
         "for (int64_t reduce_pack = 0; "
@@ -572,6 +1456,205 @@ def test_full_stage_and_heap_result_are_structural_and_name_independent():
     assert "tiled_Output[pOutput0 * kTile_free + free_in] +=" in cpp
     assert "Output_values[pOutput1] +=" not in cpp
     assert "scorch_zero_dense(Output_values, Output_capacity)" not in cpp
+    storage_types = {
+        target.array.name: target.array.type
+        for target in targets
+        if type(target) is llir.ArrayAccess
+        and type(target.array) is llir.Var
+        and target.array.name in {"packed_DenseInput", "tiled_Output", "Output_values"}
+    }
+    assert storage_types == {
+        "packed_DenseInput": llir.DataType.PTR_FLOAT32,
+        "tiled_Output": llir.DataType.PTR_FLOAT32,
+        "Output_values": llir.DataType.PTR_FLOAT32,
+    }
+
+
+@pytest.mark.parametrize(
+    ("dtype", "pointer_type", "vector_type", "cpp_scalar"),
+    [
+        (
+            torch.float32,
+            llir.DataType.PTR_FLOAT32,
+            llir.DataType.STD_VECTOR_FLOAT32,
+            "float",
+        ),
+        (
+            torch.float64,
+            llir.DataType.PTR_FLOAT64,
+            llir.DataType.STD_VECTOR_FLOAT64,
+            "double",
+        ),
+    ],
+)
+def test_heap_result_data_call_is_typed_owned_and_byte_exact(
+    dtype: torch.dtype,
+    pointer_type: llir.DataType,
+    vector_type: llir.DataType,
+    cpp_scalar: str,
+):
+    schedule = _packed_schedule(
+        row="row",
+        panel="reduce",
+        pack="free",
+        operand="DenseInput",
+        scope="free",
+        accum="heap",
+    )
+    scheduled = Scheduler.apply_schedule(
+        _build_named_spmm(dtype=dtype),
+        schedule,
+    )
+
+    first_cpp, first_initializers = _lower_with_var_initializers(scheduled)
+    second_cpp, second_initializers = _lower_with_var_initializers(scheduled)
+
+    def compact_pointer(initializers: list[llir.VarInit]) -> llir.VarInit:
+        matches = [node for node in initializers if node.var.name == "tiled_Output"]
+        assert len(matches) == 1
+        return matches[0]
+
+    first = compact_pointer(first_initializers)
+    second = compact_pointer(second_initializers)
+    assert type(first.value) is llir.MemberCall
+    assert type(second.value) is llir.MemberCall
+    first_call = cast(llir.MemberCall, first.value)
+    second_call = cast(llir.MemberCall, second.value)
+
+    assert first.var == llir.Var(
+        "tiled_Output",
+        pointer_type,
+        is_restrict=True,
+    )
+    assert first.var.type is pointer_type
+    assert first_call.base == llir.Var(
+        "tiled_Output_storage",
+        vector_type,
+    )
+    assert type(first_call.base) is llir.Var
+    assert first_call.base.type is vector_type
+    assert first_call.member == "data"
+    assert first_call.template_args == ()
+    assert first_call.args == ()
+    assert first == second
+    assert first is not second
+    assert first.var is not second.var
+    assert first_call is not second_call
+    assert first_call.base is not second_call.base
+
+    expected = (
+        f"{cpp_scalar}* __restrict__ tiled_Output = " "tiled_Output_storage.data();"
+    )
+    assert LLIRLowerer().lower_llir(first) == expected
+    assert first_cpp == second_cpp
+    assert first_cpp.count(expected) == 1
+
+
+def test_heap_result_copy_read_is_frozen_structured_and_independently_owned():
+    schedule = _packed_schedule(
+        row="row",
+        panel="reduce",
+        pack="free",
+        operand="DenseInput",
+        scope="free",
+        accum="heap",
+    )
+    scheduled = Scheduler.apply_schedule(_build_named_spmm(), schedule)
+
+    def compact_copy_read(assignments: list[llir.Assign]) -> llir.ArrayAccess:
+        matches = [
+            node.value
+            for node in assignments
+            if type(node.value) is llir.ArrayAccess
+            and type(node.value.array) is llir.Var
+            and node.value.array.name == "tiled_Output"
+        ]
+        assert len(matches) == 1
+        match = matches[0]
+        assert isinstance(match, llir.ArrayAccess)
+        return match
+
+    first_cpp, first_assignments = _lower_with_assignments(scheduled)
+    second_cpp, second_assignments = _lower_with_assignments(scheduled)
+    first = compact_copy_read(first_assignments)
+    second = compact_copy_read(second_assignments)
+
+    assert first is not second
+    assert first.array is not second.array
+    assert first.index is not second.index
+    assert first.tensor_access is None
+    assert first.array == llir.Var(
+        "tiled_Output",
+        llir.DataType.PTR_FLOAT32,
+    )
+    assert first.array.type is llir.DataType.PTR_FLOAT32
+    assert type(first.index) is llir.Add
+    assert type(first.index.left) is llir.Mul
+    assert first.index.left.left == llir.Var(
+        "Output_tile_copy",
+        llir.DataType.INT64,
+    )
+    assert first.index.left.right == llir.Var(
+        "kTile_free",
+        llir.DataType.INT64,
+    )
+    assert first.index.right == llir.Var(
+        "free_tile_copy",
+        llir.DataType.INT64,
+    )
+    assert LLIRLowerer().lower_llir(first) == (
+        "tiled_Output[Output_tile_copy * kTile_free + free_tile_copy]"
+    )
+    assert first_cpp == second_cpp
+    assert (
+        "Output_values[Output_tile_copy * Output1_size + free_copy_logical] = "
+        "tiled_Output[Output_tile_copy * kTile_free + free_tile_copy];"
+    ) in first_cpp
+
+    with pytest.raises(FrozenInstanceError):
+        first.index = llir.Literal(0)
+
+
+def test_structured_schedule_targets_track_float64_storage_types():
+    schedule = _packed_schedule(
+        row="row",
+        panel="reduce",
+        pack="free",
+        operand="DenseInput",
+        scope="free",
+        accum="heap",
+    )
+
+    scheduled = Scheduler.apply_schedule(
+        _build_named_spmm(dtype=torch.float64),
+        schedule,
+    )
+    _, targets = _lower_with_assignment_targets(scheduled)
+    _, assignments = _lower_with_assignments(scheduled)
+
+    storage_types = {
+        target.array.name: target.array.type
+        for target in targets
+        if type(target) is llir.ArrayAccess
+        and type(target.array) is llir.Var
+        and target.array.name in {"packed_DenseInput", "tiled_Output", "Output_values"}
+    }
+    assert storage_types == {
+        "packed_DenseInput": llir.DataType.PTR_FLOAT64,
+        "tiled_Output": llir.DataType.PTR_FLOAT64,
+        "Output_values": llir.DataType.PTR_FLOAT64,
+    }
+    compact_reads = [
+        node.value
+        for node in assignments
+        if type(node.value) is llir.ArrayAccess
+        and type(node.value.array) is llir.Var
+        and node.value.array.name == "tiled_Output"
+    ]
+    assert len(compact_reads) == 1
+    compact_read = compact_reads[0]
+    assert isinstance(compact_read, llir.ArrayAccess)
+    assert compact_read.array.type is llir.DataType.PTR_FLOAT64
 
 
 def test_packed_relayout_generates_hygienic_staging_names():
@@ -609,6 +1692,94 @@ def test_packed_relayout_generates_hygienic_staging_names():
 
     assert "for (int64_t k_pack_1 = 0; k_pack_1 < kTile_k; k_pack_1++)" in loop_cpp
     assert "(k_pack - k_pack_out) * kTile_k + k_in" in loop_cpp
+
+
+def test_heap_result_storage_uses_a_hygienic_owner_name() -> None:
+    pack = "tiled_Output_storage"
+    scheduled = Scheduler.apply_schedule(
+        _build_named_spmm(pack_name=pack),
+        _heap_schedule(row="row", panel="reduce", pack=pack),
+    )
+
+    cpp, initializers, raw_codes = _lower_with_direct_initializers(scheduled)
+
+    owners = [
+        initializer
+        for initializer in initializers
+        if initializer.var.name.startswith("tiled_Output_storage")
+    ]
+    assert [owner.var.name for owner in owners] == ["tiled_Output_storage_1"]
+    assert (
+        "std::vector<float> tiled_Output_storage_1("
+        "(size_t)Output0_size * (size_t)kTile_tiled_Output_storage);"
+    ) in cpp
+    assert "tiled_Output_storage_1.data()" in cpp
+    assert all("tiled_Output_storage_1" not in code for code in raw_codes)
+
+
+def test_fixed_stack_array_name_participates_in_schedule_name_hygiene():
+    declaration = llir.FixedStackArrayDecl(
+        name="packed_DenseInput",
+        element_type=llir.DataType.FLOAT32,
+        extent=llir.Var("kTile_free", llir.DataType.CONSTEXPR_INT),
+        initializer=llir.Array([], llir.DataType.FLOAT32),
+    )
+    function = llir.Function(
+        return_type=llir.DataType.VOID,
+        name="kernel",
+        args=[],
+        body=[
+            llir.IfThenElse(
+                cond=llir.Var("condition", llir.DataType.BOOL),
+                then_body=[declaration],
+            )
+        ],
+    )
+
+    used_names = schedule_lowerer_module._declared_names(function)
+
+    assert used_names == {"packed_DenseInput"}
+    assert (
+        schedule_lowerer_module._unique_name("packed_DenseInput", used_names)
+        == "packed_DenseInput_1"
+    )
+    assert used_names == {"packed_DenseInput", "packed_DenseInput_1"}
+
+
+def test_direct_init_name_participates_in_schedule_name_hygiene():
+    declaration = llir.DirectInit(
+        var=llir.Var(
+            "packed_DenseInput_storage",
+            llir.DataType.STD_VECTOR_FLOAT32,
+        ),
+        args=(llir.Literal(4),),
+    )
+    function = llir.Function(
+        return_type=llir.DataType.VOID,
+        name="kernel",
+        args=[],
+        body=[
+            llir.IfThenElse(
+                cond=llir.Var("condition", llir.DataType.BOOL),
+                then_body=[declaration],
+            )
+        ],
+    )
+
+    used_names = schedule_lowerer_module._declared_names(function)
+
+    assert used_names == {"packed_DenseInput_storage"}
+    assert (
+        schedule_lowerer_module._unique_name(
+            "packed_DenseInput_storage",
+            used_names,
+        )
+        == "packed_DenseInput_storage_1"
+    )
+    assert used_names == {
+        "packed_DenseInput_storage",
+        "packed_DenseInput_storage_1",
+    }
 
 
 def test_packed_and_unpacked_schedules_cannot_alias_either_cache():
@@ -875,4 +2046,220 @@ def test_packed_relayout_rejects_non_additive_assignment():
                 pack="free",
                 operand="DenseInput",
             ),
+        )
+
+
+def _build_conflicting_names_spmm() -> ForAll:
+    """One display name, two distinct SymbolId tensors: a legacy-name conflict."""
+
+    i, j, k = IndexVar("i"), IndexVar("j"), IndexVar("k")
+    c = TensorVar("C", fmt="dd")
+    a = TensorVar("A", fmt="ds")
+    b = TensorVar("A", fmt="dd")
+    c[i, k] = a[i, j] * b[j, k]
+
+    stmt = c._assignment
+    for index_var in (k, j, i):
+        stmt = ForAll(index_var, stmt)
+    assert isinstance(stmt, ForAll)
+    return stmt
+
+
+def test_apply_schedule_rejects_malformed_structure_before_legacy_surgery(
+    monkeypatch,
+):
+    """A forged cycle fails closed before any legacy scheduling surgery runs."""
+
+    program = _build_spmm()
+    program.stmt = program
+
+    def forbidden(*args, **kwargs):
+        raise AssertionError("malformed CIN reached legacy schedule surgery")
+
+    monkeypatch.setattr(Scheduler, "_apply_schedule_legacy", forbidden)
+
+    with pytest.raises(VerificationError) as error:
+        Scheduler.apply_schedule(program, Schedule())
+    assert error.value.diagnostics[0].code == "cyclic_cin_structure"
+
+
+def test_apply_schedule_structural_failure_precedes_display_name_conflicts():
+    """Normalization owns the structural boundary ahead of the name walk.
+
+    The display-name validator traverses stored forward edges recursively, so
+    it must only ever see a structurally verified graph; a program carrying
+    both defects reports the structural diagnostic.
+    """
+
+    program = _build_conflicting_names_spmm()
+    del program.parallel
+
+    with pytest.raises(VerificationError) as error:
+        Scheduler.apply_schedule(program, Schedule())
+    assert error.value.diagnostics[0].code == "missing_cin_field"
+
+
+def test_apply_schedule_still_rejects_display_name_conflicts():
+    """The reordered boundary keeps the legacy display-name failure intact."""
+
+    with pytest.raises(VerificationError, match="display name"):
+        Scheduler.apply_schedule(_build_conflicting_names_spmm(), Schedule())
+
+
+def test_apply_schedule_option_mismatch_precedes_structural_preflight():
+    """The options boundary stays first: it never touches the CIN graph."""
+
+    program = _build_spmm()
+    program.stmt = program
+    options = CompileOptions.from_environment(
+        environ={},
+        requested_schedule=Schedule(tag="recorded"),
+    )
+
+    with pytest.raises(CompileOptionsError):
+        Scheduler.apply_schedule(
+            program,
+            Schedule(tag="conflicting"),
+            compile_options=options,
+        )
+
+
+def test_apply_schedule_debug_verification_reports_missing_fields():
+    """Full debug verification can no longer be preempted by a raw name walk."""
+
+    from scorch.compiler.cin_analysis import full_cin_verification
+
+    program = _build_spmm()
+    del program.stmt
+
+    with full_cin_verification():
+        with pytest.raises(VerificationError) as error:
+            Scheduler.apply_schedule(program, Schedule())
+    assert error.value.diagnostics[0].code == "missing_cin_field"
+
+
+@pytest.mark.parametrize("entry", ("auto_schedule", "auto_schedule_plan"))
+def test_auto_schedule_boundaries_reject_malformed_structure(entry):
+    """Both automatic entries fail closed on forged structure, like apply."""
+
+    program = _build_spmm()
+    program.stmt = program
+
+    with pytest.raises(VerificationError) as error:
+        getattr(Scheduler, entry)(program)
+    assert error.value.diagnostics[0].code == "cyclic_cin_structure"
+
+
+@pytest.mark.parametrize("entry", ("auto_schedule", "auto_schedule_plan"))
+def test_auto_schedule_rejects_nonstatement_cin_before_copying(entry):
+    """Automatic scheduling accepts statements, never generic CIN metadata."""
+
+    i = IndexVar("i")
+    expression = TensorVar("A", fmt="d")[i]
+    for _ in range(300):
+        expression = BinaryOp(Operation.ADD, expression, TensorVar("B", fmt="d")[i])
+
+    class HostileMetadata:
+        def __deepcopy__(self, memo):
+            raise RuntimeError("hostile ignored metadata")
+
+    object.__setattr__(expression, "no_tile_list", [HostileMetadata()])
+
+    with pytest.raises(TypeError, match=rf"{entry} expects an IndexStmt"):
+        getattr(Scheduler, entry)(expression)
+
+
+def test_cost_model_reads_permuted_extents_from_physical_levels():
+    """Logical loop extents are resolved through physical mode_order."""
+
+    k, j = IndexVar("k"), IndexVar("j")
+    operand = TensorVar(
+        "B",
+        shape=(11, 3),
+        fmt="dd",
+        mode_order=[1, 0],
+    )
+    access = operand[k, j]
+
+    assert (
+        Scheduler._estimate_index_extent(
+            k,
+            [access],
+            Scheduler._DEFAULT_COSTS,
+        )
+        == 3.0
+    )
+    assert (
+        Scheduler._estimate_index_extent(
+            j,
+            [access],
+            Scheduler._DEFAULT_COSTS,
+        )
+        == 11.0
+    )
+
+
+@pytest.mark.parametrize("entry", ("auto_schedule", "auto_schedule_plan"))
+def test_auto_schedule_rejects_malformed_mode_order_before_costing(entry):
+    """A missing logical mode cannot leak from the cost model's lookup."""
+
+    i, j = IndexVar("i"), IndexVar("j")
+    operand = TensorVar("A", fmt="dd")
+    operand.mode_order = [0, 0]
+    result = TensorVar("C", fmt="dd")
+    program = ForAll(i, ForAll(j, TensorAssign(result[i, j], operand[i, j])))
+
+    with pytest.raises(VerificationError) as error:
+        getattr(Scheduler, entry)(program)
+    assert error.value.diagnostics[0].code == "invalid_cin_field"
+
+
+@pytest.mark.parametrize("entry", ("auto_schedule", "auto_schedule_plan"))
+def test_auto_schedule_traverses_unsupported_unary_expression(entry):
+    """Unsupported unary CIN remains traversable until target admission."""
+
+    i = IndexVar("i")
+    operand = TensorVar("A", fmt="d")
+    result = TensorVar("C", fmt="d")
+    program = ForAll(
+        i,
+        TensorAssign(result[i], UnaryOp(Operation.SUB, operand[i])),
+    )
+
+    scheduled = getattr(Scheduler, entry)(program)
+
+    if entry == "auto_schedule_plan":
+        assert isinstance(scheduled, ScheduledCIN)
+    else:
+        assert isinstance(scheduled, ForAll)
+
+
+def test_schedule_requires_exact_tile_and_relayout_types() -> None:
+    """Subclass instances are caller code that would execute inside
+    compiler-trusted scopes; admission is exact-type only."""
+
+    from scorch.compiler.scheduler import RelayoutSpec, Schedule, TileSpec
+
+    class HostileTile(TileSpec):
+        pass
+
+    class HostileRelayout(RelayoutSpec):
+        pass
+
+    with pytest.raises(TypeError):
+        Schedule(
+            loop_order=("i", "j", "k"),
+            tiles=(
+                HostileTile(
+                    index_var="k",
+                    width=4,
+                    placement="child_of:i",
+                    accum="stack",
+                ),
+            ),
+        )
+    with pytest.raises(TypeError):
+        Schedule(
+            loop_order=("i", "j", "k"),
+            relayout=HostileRelayout(tensor="B"),
         )

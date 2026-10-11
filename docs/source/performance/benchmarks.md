@@ -10,7 +10,7 @@ inventory of every harness so you can rerun the numbers on your own machine.
 ## Headline result
 
 In the benchmarks reported in the [Scorch CGO 2026
-paper](https://fredrikbk.com/cgo26scorch.html), Scorch achieved
+paper](https://ieeexplore.ieee.org/abstract/document/11394842), Scorch achieved
 **1.05–5.80× speedups over PyTorch Sparse** across sparse-matrix and graph
 neural network workloads.
 
@@ -104,7 +104,7 @@ datasets, framework dependencies, and any per-framework setup gotchas.
 | `bench_spmv.py` | SpMV `A_sparse @ v_dense`. | `python bench/bench_spmv.py` |
 | `bench_spmspm.py` | SpMSpM `A_sparse @ A_sparseᵀ` (CSR, OpenMP-parallel). | `python bench/bench_spmspm.py` |
 | `bench_sddmm.py` | SDDMM `S ⊙ (A_dense @ B_dense)`. | `python bench/bench_sddmm.py` |
-| `bench_spmm_variants.py` | All SpMM kernel variants (tiled / untiled / direct) + PyTorch MKL across SuiteSparse; each matrix in a subprocess for crash isolation. | `python bench/bench_spmm_variants.py` |
+| `bench_spmm_variants.py` | Native SpMM kernel variants (tiled / untiled / direct) + PyTorch MKL across SuiteSparse; each matrix in a subprocess for crash isolation. | `python bench/bench_spmm_variants.py` |
 
 ### Tiling & autotune studies
 

@@ -1,0 +1,1019 @@
+"""Test/debug LoopIR strangler pipeline and curated shadow comparison.
+
+This module is the executable end of the Phase-4/5/6 vertical slices: it
+carries one normalized supported-family CIN program through
+
+``normalized CIN -> LoopPlan -> LoopIR -> scheduled LoopIR ->
+structured LLIR -> C++ -> compiled kernel -> execution``
+
+using the same JIT build, cache, and execution helpers as the legacy public
+entry (:func:`scorch.ops.lower_and_exec_cin`).  When the compile options
+carry a requested :class:`~scorch.compiler.scheduler.Schedule`, the shared
+``Scheduler.apply_schedule`` boundary validates it and produces the
+verified ``LoopPlan``; the migrated explicit families (loop reorder,
+affine ``accum='direct'`` tiles, and ``accum='stack'`` workspace
+accumulation) are then applied as typed LoopIR passes,
+and every other schedule family fails closed with a stable code —
+nothing silently ignores a requested schedule.  Kernel cache identity
+remains source-derived, exactly as on the legacy path: the schedule
+affects the generated source, identical source is the identical kernel
+artifact, and no LoopIR- or plan-level artifact is ever cached.
+
+It exists for dedicated LoopIR tests and curated shadow comparison only:
+
+- production never imports it, so the legacy default path, its stage
+  sequences, and its cache keys are untouched;
+- kernel cache identity remains derived from the generated source exactly as
+  before.  For the migrated families the LoopIR path generates byte-identical
+  source, so it shares the legacy kernel artifact honestly — identical source
+  is identical kernel — while LoopIR-level artifacts (programs, dumps) are
+  never cached at all;
+- shadow comparison (:func:`compare_generated_sources`,
+  :func:`execute_shadow`) is invoked explicitly by curated differential
+  tests; nothing turns it on globally, so ordinary pytest and release JIT do
+  not double compile.
+
+Stage timing: the LoopIR stages are recorded through the same
+:class:`~scorch.compiler.compilation_context.CompilationContext` mechanism
+under the new ``CIN_TO_LOOPIR_LOWERING`` and ``LOOPIR_TO_LLIR_LOWERING``
+identities; downstream C++ generation and build-request assembly reuse the
+existing canonical stage identities.
+"""
+
+from __future__ import annotations
+
+import copy
+import hashlib
+import time
+from dataclasses import dataclass, replace
+from typing import Dict, List, Optional, Sequence, Tuple, Union
+
+import torch
+
+from ...exceptions import CompileSpecError
+from ...utils import parse_format
+from .. import llir
+from ..cin import IndexStmt
+from ..cin_analysis import (
+    _trusted_normalized_cin,
+    normalize_cin,
+    verify_cin_structure,
+)
+from ..cin_lowerer import CINLowerer
+from ..compilation_context import CompilationContext, CompilerStageId
+from ..compile_options import CompileOptions
+from ..diagnostics import VerificationError
+from ..identity import SymbolId
+from ..loop_plan import LoopPlan, ScheduledCIN
+from .lower_cin import LoopIRLoweringResult, lower_normalized_cin_to_loopir
+from .lower_llir import lower_loopir_to_llir
+from .nodes import LevelKind as LoopIRLevelKind, LoopProgram
+from .printer import canonical_program_dump, print_program
+from .schedule_passes import ScheduledLoopIR, apply_schedule_plan
+
+
+@dataclass(frozen=True)
+class LoopIRCompiledKernel:
+    """One compiled supported-family kernel and its LoopIR provenance.
+
+    For scheduled compilations ``schedule`` retains the full scheduling
+    artifact (base program, exact plan, scheduled program, provenance) and
+    ``program_text``/``program_dump`` describe the scheduled program — the
+    artifact the target lowering consumed.  ``request_dump`` and
+    ``request_identity`` are the canonical strangler request serialization
+    and its SHA-256 content key, computed at the compile/shadow request
+    boundary from the canonical normalized CIN, the canonical verified plan
+    (or the explicit unscheduled marker), the result shape, runtime input
+    bindings, and exact canonical CompileOptions state; no cache consumes
+    them yet, and the release source-derived cache is untouched.
+    """
+
+    lowering: LoopIRLoweringResult
+    program_text: str
+    program_dump: str
+    llir_function: llir.Function
+    cpp_source: str
+    schedule: Optional[ScheduledLoopIR]
+    request_dump: str
+    request_identity: str
+
+    def __post_init__(self) -> None:
+        if type(self.request_dump) is not str or not self.request_dump:
+            raise TypeError("request_dump must be a non-empty canonical string")
+        if (
+            type(self.request_identity) is not str
+            or len(self.request_identity) != 64
+            or any(
+                character not in "0123456789abcdef"
+                for character in self.request_identity
+            )
+        ):
+            raise TypeError("request_identity must be a lowercase SHA-256 digest")
+        expected = hashlib.sha256(self.request_dump.encode("utf-8")).hexdigest()
+        if self.request_identity != expected:
+            raise TypeError("request_identity must hash the retained request_dump")
+
+
+@dataclass(frozen=True)
+class ShadowSourceComparison:
+    """Curated legacy-versus-LoopIR generated-source comparison."""
+
+    loopir_cpp: str
+    legacy_cpp: str
+
+    @property
+    def identical(self) -> bool:
+        return self.loopir_cpp == self.legacy_cpp
+
+
+def _resolve_options(
+    compile_options: Optional[CompileOptions],
+    compilation_context: Optional[CompilationContext] = None,
+) -> CompileOptions:
+    if (
+        compilation_context is not None
+        and type(compilation_context) is not CompilationContext
+    ):
+        raise TypeError("compilation_context must be a CompilationContext")
+    if compile_options is None:
+        options = (
+            compilation_context.compile_options
+            if compilation_context is not None
+            else CompileOptions.from_environment()
+        )
+    elif type(compile_options) is not CompileOptions:
+        raise TypeError("compile_options must be a CompileOptions snapshot")
+    else:
+        options = compile_options
+    if compilation_context is not None:
+        compilation_context.require_compile_options(options)
+    return options
+
+
+def _plan_mode_orders_to_planned_order(
+    normalized: IndexStmt,
+    args: Sequence[object],
+    plan: LoopPlan,
+):
+    """The scheduled-path twin of ``ops._plan_mode_orders_to_loop_order``.
+
+    The legacy helper reads the iteration order from the CIN's own ForAll
+    chain; a scheduled compilation iterates in the plan's logical order
+    instead, so runtime mode-order alignment must target that order — the
+    same storage-vs-iteration consistency the reorder pass and the target
+    boundary enforce.  Only the order source differs; the relayout executor
+    and CIN alignment application are the shared production helpers.
+    """
+
+    from ..loop_plan import entity_display_names
+
+    index_names, _ = entity_display_names(normalized)
+    loop_order_names = [index_names[index_id] for index_id in plan.loop_order]
+    if not loop_order_names:
+        return tuple(None for _ in args), None
+
+    rhs_accesses = normalized.get_rhs_tensor_accesses()
+    if len(rhs_accesses) != len(args):
+        return tuple(None for _ in args), None
+
+    rhs_mode_orders: List[Optional[Tuple[int, ...]]] = []
+    for access in rhs_accesses:
+        tensor_var = access.get_tensor()
+        access_names = [index_var.name for index_var in access.get_index_vars()]
+        desired_names = [name for name in loop_order_names if name in access_names]
+        desired = tuple(access_names.index(name) for name in desired_names)
+        mode_order = tensor_var.mode_order
+        if mode_order is None or len(desired) != len(mode_order):
+            rhs_mode_orders.append(None)
+            continue
+        rhs_mode_orders.append(desired)
+
+    lhs_mode_order: Optional[Tuple[int, ...]] = None
+    leaf: IndexStmt = normalized
+    while hasattr(leaf, "stmt"):
+        leaf = leaf.stmt
+    lhs_access = getattr(leaf, "lhs", None)
+    if lhs_access is not None:
+        lhs_tensor = lhs_access.get_tensor()
+        lhs_names = [index_var.name for index_var in lhs_access.get_index_vars()]
+        desired_names = [name for name in loop_order_names if name in lhs_names]
+        desired = tuple(lhs_names.index(name) for name in desired_names)
+        lhs_modes = lhs_tensor.mode_order
+        if lhs_modes is not None and len(desired) == len(lhs_modes):
+            lhs_mode_order = desired
+    return tuple(rhs_mode_orders), lhs_mode_order
+
+
+def _execute_mode_order_alignment(
+    normalized: IndexStmt,
+    args: tuple,
+    alignment_plan,
+    options: CompileOptions,
+    context: Optional[CompilationContext],
+    *,
+    runtime_snapshots,
+) -> tuple:
+    """Apply one alignment and return validated post-relayout snapshots.
+
+    A storage relayout may compile an auxiliary kernel.  That prerequisite is
+    not the scheduled operation, so it receives a schedule-free copy of the
+    already-resolved options and a matching independent instrumentation owner.
+    Every other build and compiler option remains identical.
+    """
+
+    from ...ops import (
+        _apply_mode_order_alignment,
+        _relayout_mode_order_args,
+        _snapshot_runtime_tensors,
+    )
+
+    relayout_options = options
+    relayout_context = context
+    if options.requested_schedule is not None:
+        relayout_options = replace(options, requested_schedule=None)
+        relayout_context = CompilationContext(relayout_options)
+    aligned = _relayout_mode_order_args(
+        args,
+        alignment_plan,
+        relayout_options,
+        relayout_context,
+        snapshots=runtime_snapshots,
+    )
+    aligned_snapshots = _snapshot_runtime_tensors(
+        aligned,
+        expected_count=len(runtime_snapshots),
+    )
+    _apply_mode_order_alignment(normalized, alignment_plan)
+    return aligned_snapshots
+
+
+def _apply_requested_schedule(
+    cin_stmt: IndexStmt,
+    options: CompileOptions,
+    context: Optional[CompilationContext],
+) -> Tuple[IndexStmt, LoopPlan]:
+    """Adapt the public Schedule through the shared scheduler boundary.
+
+    ``Scheduler.apply_schedule`` is the single owner of Schedule validation
+    and Schedule-to-LoopPlan translation for both pipelines; the paths only
+    diverge downstream (legacy replays CIN tree surgery, the LoopIR path
+    applies typed passes to the verified base program).  It normalizes the
+    CIN and records the scheduling stage itself.
+    """
+
+    from ..scheduler import Scheduler
+
+    schedule = options.requested_schedule
+    assert schedule is not None
+    # This public entry owns malformed-input ordering: no scheduler hook,
+    # metadata binder, or build preparation may observe a structurally invalid
+    # caller graph.  The narrow trust context lets the scheduler's immediately
+    # following normalization reuse this exact successful scan.
+    verify_cin_structure(cin_stmt)
+    with _trusted_normalized_cin(cin_stmt):
+        scheduled = Scheduler.apply_schedule(
+            cin_stmt,
+            schedule,
+            compile_options=options,
+            compilation_context=context,
+        )
+    return scheduled.normalized_cin, scheduled.verified_loop_plan
+
+
+def _bind_runtime_metadata(
+    cin_stmt: IndexStmt,
+    input_bindings: Sequence[Tuple[Sequence[int], torch.dtype]],
+    result_shape: Sequence[int],
+    input_formats: Optional[Sequence[object]] = None,
+) -> Tuple[
+    Tuple[Tuple[Tuple[int, ...], torch.dtype], ...],
+    Tuple[int, ...],
+]:
+    """Validate, snapshot, and bind public runtime metadata atomically."""
+
+    max_int64 = (1 << 63) - 1
+
+    def checked_shape(shape: object, owner: str) -> Tuple[int, ...]:
+        if (
+            type(shape) is not tuple
+            and type(shape) is not list
+            and type(shape) is not torch.Size
+            and type(shape) is not range
+        ):
+            raise VerificationError(
+                f"{owner} must be a tuple, list, torch.Size, or range of exact ints"
+            )
+        try:
+            rank = len(shape)
+        except OverflowError as error:
+            raise VerificationError(
+                f"{owner} rank exceeds the supported limit"
+            ) from error
+        if rank > 64:
+            raise VerificationError(f"{owner} rank must not exceed 64")
+        result: List[int] = []
+        product = 1
+        for extent in shape:
+            if type(extent) is not int or extent < 0 or extent > max_int64:
+                raise VerificationError(
+                    f"{owner} must contain nonnegative int64 extents"
+                )
+            if extent and product > max_int64 // extent:
+                raise VerificationError(f"{owner} element count exceeds signed int64")
+            product *= extent
+            result.append(extent)
+        return tuple(result)
+
+    if type(input_bindings) is not tuple and type(input_bindings) is not list:
+        raise VerificationError("runtime input bindings must be a tuple or list")
+    rhs_tensor_vars = cin_stmt.get_rhs_tensor_vars()
+    if len(rhs_tensor_vars) != len(input_bindings):
+        raise CompileSpecError(
+            f"CIN expects {len(rhs_tensor_vars)} runtime tensors, got "
+            f"{len(input_bindings)}"
+        )
+    if input_formats is not None:
+        if type(input_formats) is not tuple and type(input_formats) is not list:
+            raise CompileSpecError("runtime tensor formats must be a tuple or list")
+        if len(input_formats) != len(input_bindings):
+            raise CompileSpecError(
+                "runtime tensor formats must match the input binding count"
+            )
+    checked_bindings: List[Tuple[Tuple[int, ...], torch.dtype]] = []
+    for position, binding in enumerate(input_bindings):
+        if (type(binding) is not tuple and type(binding) is not list) or len(
+            binding
+        ) != 2:
+            raise VerificationError(
+                f"runtime input binding {position} must be a shape/dtype pair"
+            )
+        shape, dtype = binding
+        checked_input_shape = checked_shape(
+            shape,
+            f"runtime input binding {position} shape",
+        )
+        if type(dtype) is not torch.dtype:
+            raise VerificationError(
+                f"runtime input binding {position} dtype must be an exact "
+                "torch.dtype"
+            )
+        checked_bindings.append((checked_input_shape, dtype))
+
+    checked_result_shape = checked_shape(result_shape, "runtime result shape")
+    if input_formats is not None:
+        for position, (tensor_var, actual_format) in enumerate(
+            zip(rhs_tensor_vars, input_formats)
+        ):
+            if tensor_var.format != actual_format:
+                raise CompileSpecError(
+                    f"CIN tensor {tensor_var.name!r} expects format "
+                    f"{tensor_var.format}, got {input_formats[position]}"
+                )
+    for position, (tensor_var, (shape, dtype)) in enumerate(
+        zip(rhs_tensor_vars, checked_bindings)
+    ):
+        tensor_var.shape = shape
+        tensor_var.dtype = dtype
+        if tensor_var.mode_order is None:
+            tensor_var.mode_order = list(range(len(shape)))
+    output_dtype = checked_bindings[0][1] if checked_bindings else torch.float32
+    for tensor_var in cin_stmt.get_result_tensor_vars():
+        tensor_var.shape = checked_result_shape
+        tensor_var.dtype = output_dtype
+    return tuple(checked_bindings), checked_result_shape
+
+
+def _validate_runtime_formats(
+    cin_stmt: IndexStmt,
+    input_formats: Sequence[object],
+) -> None:
+    """Reject storage-format mismatches before any runtime relayout work."""
+
+    rhs_tensor_vars = cin_stmt.get_rhs_tensor_vars()
+    if len(rhs_tensor_vars) != len(input_formats):
+        raise CompileSpecError(
+            f"CIN expects {len(rhs_tensor_vars)} runtime tensors, got "
+            f"{len(input_formats)}"
+        )
+    for tensor_var, actual_format in zip(rhs_tensor_vars, input_formats):
+        if tensor_var.format != actual_format:
+            raise CompileSpecError(
+                f"CIN tensor {tensor_var.name!r} expects format "
+                f"{tensor_var.format}, got {actual_format}"
+            )
+
+
+def _compile_normalized_cin_via_loopir(
+    normalized: IndexStmt,
+    result_shape: Sequence[int],
+    input_bindings: Sequence[Tuple[Sequence[int], torch.dtype]],
+    *,
+    options: CompileOptions,
+    context: CompilationContext,
+    input_formats: Optional[Sequence[object]] = None,
+    plan: Optional[LoopPlan] = None,
+) -> LoopIRCompiledKernel:
+    """Lower one privately owned normalized CIN root through LoopIR."""
+
+    with _trusted_normalized_cin(normalized):
+        return _compile_normalized_cin_via_loopir_owned(
+            normalized,
+            result_shape,
+            input_bindings,
+            options=options,
+            context=context,
+            input_formats=input_formats,
+            plan=plan,
+        )
+
+
+def _compile_normalized_cin_via_loopir_owned(
+    normalized: IndexStmt,
+    result_shape: Sequence[int],
+    input_bindings: Sequence[Tuple[Sequence[int], torch.dtype]],
+    *,
+    options: CompileOptions,
+    context: CompilationContext,
+    input_formats: Optional[Sequence[object]] = None,
+    plan: Optional[LoopPlan] = None,
+) -> LoopIRCompiledKernel:
+    """Implementation under the private normalized-CIN trust context."""
+
+    binding_token = context.begin_stage(
+        CompilerStageId.FRONTEND_VALIDATED_OPERATION_CONSTRUCTION,
+        compile_options=options,
+    )
+    try:
+        checked_input_bindings, checked_result_shape = _bind_runtime_metadata(
+            normalized,
+            input_bindings,
+            result_shape,
+            input_formats,
+        )
+        # Request identity belongs to the validated request boundary.  Keep
+        # malformed shape/dtype/CIN/options failures owned by this stage rather
+        # than running serialization between two completed stage records.
+        from .plan_identity import loopir_request_dump
+
+        request_dump = loopir_request_dump(
+            normalized,
+            plan,
+            checked_result_shape,
+            checked_input_bindings,
+            compile_options=options,
+        )
+        request_identity = hashlib.sha256(request_dump.encode("utf-8")).hexdigest()
+    except Exception:
+        context.fail_stage(binding_token)
+        raise
+    context.complete_stage(binding_token)
+
+    lowering_token = context.begin_stage(
+        CompilerStageId.CIN_TO_LOOPIR_LOWERING,
+        compile_options=options,
+    )
+    try:
+        lowering = lower_normalized_cin_to_loopir(
+            normalized,
+            planned_loop_order=None if plan is None else plan.loop_order,
+        )
+    except Exception:
+        context.fail_stage(lowering_token)
+        raise
+    context.complete_stage(lowering_token)
+
+    schedule: Optional[ScheduledLoopIR] = None
+    program: LoopProgram = lowering.program
+    if plan is not None:
+        schedule_token = context.begin_stage(
+            CompilerStageId.LOOPIR_SCHEDULE_APPLICATION,
+            compile_options=options,
+        )
+        try:
+            schedule = apply_schedule_plan(lowering.program, plan)
+        except Exception:
+            context.fail_stage(schedule_token)
+            raise
+        context.complete_stage(schedule_token)
+        program = schedule.program
+
+    program_text = print_program(program)
+    program_dump = canonical_program_dump(program)
+
+    input_shapes: Dict[SymbolId, Tuple[int, ...]] = {}
+    rhs_tensor_vars = normalized.get_rhs_tensor_vars()
+    for tensor_var in rhs_tensor_vars:
+        assert tensor_var.shape is not None
+        input_shapes[tensor_var.symbol_id] = tuple(tensor_var.shape)
+
+    llir_function = lower_loopir_to_llir(
+        program,
+        input_shapes=input_shapes,
+        result_shape=checked_result_shape,
+        compile_options=options,
+        compilation_context=context,
+    )
+
+    from ...ops import _lower_generated_llir
+
+    cpp_source = _lower_generated_llir(llir_function, options, context)
+    return LoopIRCompiledKernel(
+        lowering=lowering,
+        program_text=program_text,
+        program_dump=program_dump,
+        llir_function=llir_function,
+        cpp_source=cpp_source,
+        schedule=schedule,
+        request_dump=request_dump,
+        request_identity=request_identity,
+    )
+
+
+def compile_cin_via_loopir(
+    cin_stmt: IndexStmt,
+    result_shape: Sequence[int],
+    input_bindings: Sequence[Tuple[Sequence[int], torch.dtype]],
+    *,
+    compile_options: Optional[CompileOptions] = None,
+    compilation_context: Optional[CompilationContext] = None,
+) -> LoopIRCompiledKernel:
+    """Lower one supported-family CIN program to C++ through LoopIR."""
+
+    options = _resolve_options(compile_options, compilation_context)
+    context = compilation_context
+    if context is None:
+        context = CompilationContext(options)
+    plan: Optional[LoopPlan] = None
+    if options.requested_schedule is not None:
+        normalized, plan = _apply_requested_schedule(cin_stmt, options, context)
+    else:
+        normalized = normalize_cin(
+            cin_stmt,
+            compile_options=options,
+            compilation_context=context,
+        )
+    return _compile_normalized_cin_via_loopir(
+        normalized,
+        result_shape,
+        input_bindings,
+        options=options,
+        context=context,
+        plan=plan,
+    )
+
+
+def legacy_generated_cpp(
+    cin_stmt: IndexStmt,
+    result_shape: Sequence[int],
+    input_bindings: Sequence[Tuple[Sequence[int], torch.dtype]],
+    *,
+    compile_options: Optional[CompileOptions] = None,
+) -> str:
+    """Generate the legacy pipeline's C++ for the same program, untouched.
+
+    When the options carry a requested schedule, the legacy side is the
+    scheduled route production uses: ``Scheduler.apply_schedule`` followed
+    by the legacy lowering of the verified ``ScheduledCIN`` (which replays
+    the legacy tree surgery inside the lowering adapter).
+    """
+
+    options = _resolve_options(compile_options)
+    context = CompilationContext(options)
+    lowering_stmt: Union[IndexStmt, ScheduledCIN]
+    if options.requested_schedule is not None:
+        from ..scheduler import Scheduler
+
+        scheduled = Scheduler.apply_schedule(
+            cin_stmt,
+            options.requested_schedule,
+            compile_options=options,
+            compilation_context=context,
+        )
+        _bind_runtime_metadata(scheduled.normalized_cin, input_bindings, result_shape)
+        lowering_stmt = scheduled
+    else:
+        normalized = normalize_cin(cin_stmt, compile_options=options)
+        _bind_runtime_metadata(normalized, input_bindings, result_shape)
+        lowering_stmt = normalized
+    lowerer = CINLowerer(compile_options=options, compilation_context=context)
+    lowered = lowerer._lower_owned_IndexStmt(lowering_stmt)
+
+    from ...ops import _lower_generated_llir
+
+    return _lower_generated_llir(lowered, options, context)
+
+
+def compare_generated_sources(
+    cin_stmt: IndexStmt,
+    result_shape: Sequence[int],
+    input_bindings: Sequence[Tuple[Sequence[int], torch.dtype]],
+    *,
+    compile_options: Optional[CompileOptions] = None,
+) -> ShadowSourceComparison:
+    """Curated shadow comparison of generated sources; never on by default.
+
+    Both pipelines consume independent detached normalizations of the same
+    semantic CIN, so neither can observe the other's working state.
+    """
+
+    options = _resolve_options(compile_options)
+    loopir_kernel = compile_cin_via_loopir(
+        cin_stmt,
+        result_shape,
+        input_bindings,
+        compile_options=options,
+    )
+    legacy_cpp = legacy_generated_cpp(
+        cin_stmt,
+        result_shape,
+        input_bindings,
+        compile_options=options,
+    )
+    return ShadowSourceComparison(
+        loopir_cpp=loopir_kernel.cpp_source,
+        legacy_cpp=legacy_cpp,
+    )
+
+
+def execute_cin_via_loopir(
+    cin_stmt: IndexStmt,
+    result_shape: Sequence[int],
+    *args,
+    compile_options: Optional[CompileOptions] = None,
+    time_dict: Optional[dict] = None,
+    _compilation_context: Optional[CompilationContext] = None,
+):
+    """Compile through LoopIR and execute on ``args`` (STensor inputs).
+
+    Mirrors ``scorch.ops.lower_and_exec_cin`` for the migrated families:
+    the same public argument marshalling and JIT build/caching helpers,
+    with result wrapping derived from the verified LoopIR declaration.
+    """
+
+    from ...stensor import STensor
+    from ...storage import TensorIndex
+    from ...ops import (
+        _checked_runtime_shape,
+        _finalize_generated_mode_indices,
+        _load_validated_prepared_kernel,
+        _plan_mode_orders_to_loop_order,
+        _prepare_generated_kernel_build,
+        _snapshot_runtime_tensors,
+    )
+
+    options = _resolve_options(compile_options, _compilation_context)
+    context = _compilation_context
+    if context is None:
+        context = CompilationContext(options)
+    plan: Optional[LoopPlan] = None
+    if options.requested_schedule is not None:
+        normalized, plan = _apply_requested_schedule(cin_stmt, options, context)
+    else:
+        normalized = normalize_cin(
+            cin_stmt,
+            compile_options=options,
+            compilation_context=context,
+        )
+    planning_token = context.begin_stage(
+        CompilerStageId.FRONTEND_VALIDATED_OPERATION_CONSTRUCTION,
+        compile_options=options,
+    )
+    try:
+        result_shape = _checked_runtime_shape(result_shape, "result shape")
+        runtime_args = _snapshot_runtime_tensors(
+            args,
+            expected_count=len(normalized.get_rhs_tensor_vars()),
+        )
+        _validate_runtime_formats(
+            normalized,
+            tuple(snapshot.tensor_format for snapshot in runtime_args),
+        )
+        if plan is not None:
+            alignment_plan = _plan_mode_orders_to_planned_order(
+                normalized,
+                runtime_args,
+                plan,
+            )
+            # A scheduled relayout executes with an independent schedule-free
+            # context, but its success or failure still belongs to this
+            # compilation's frontend binding stage.  Keep the parent token
+            # active so elapsed time includes the prerequisite and a child
+            # failure makes the caller-owned context terminal.
+            runtime_args = _execute_mode_order_alignment(
+                normalized,
+                tuple(snapshot.tensor for snapshot in runtime_args),
+                alignment_plan,
+                options,
+                context,
+                runtime_snapshots=runtime_args,
+            )
+        else:
+            alignment_plan = _plan_mode_orders_to_loop_order(
+                normalized,
+                runtime_args,
+            )
+    except Exception:
+        context.fail_stage(planning_token)
+        raise
+    context.complete_stage(planning_token)
+    if plan is None:
+        # The unscheduled route shares its context with nested relayout
+        # compilation, so its root frontend stage must finish first.
+        try:
+            runtime_args = _execute_mode_order_alignment(
+                normalized,
+                tuple(snapshot.tensor for snapshot in runtime_args),
+                alignment_plan,
+                options,
+                context,
+                runtime_snapshots=runtime_args,
+            )
+        except Exception:
+            if context._failed_stage_id is None:
+                relayout_failure_token = context.begin_stage(
+                    CompilerStageId.FRONTEND_VALIDATED_OPERATION_CONSTRUCTION,
+                    compile_options=options,
+                )
+                context.fail_stage(relayout_failure_token)
+            raise
+    input_bindings = tuple(
+        (snapshot.shape, snapshot.dtype) for snapshot in runtime_args
+    )
+    kernel = _compile_normalized_cin_via_loopir(
+        normalized,
+        result_shape,
+        input_bindings,
+        options=options,
+        context=context,
+        input_formats=tuple(snapshot.tensor_format for snapshot in runtime_args),
+        plan=plan,
+    )
+    header_cpp_code = options.build.preamble_source
+    prepared_build = _prepare_generated_kernel_build(
+        header_cpp_code,
+        kernel.cpp_source,
+        options,
+        context,
+    )
+    module = _load_validated_prepared_kernel(prepared_build)
+
+    module_args: List[object] = [result_shape]
+    for snapshot in runtime_args:
+        module_args.append(snapshot.shape)
+        module_args.append(snapshot.native_mode_indices)
+        module_args.append(snapshot.values)
+
+    start_time = time.time()
+    result_cpp = module.evaluate(*module_args)
+    end_time = time.time()
+    if time_dict is not None:
+        time_dict["eval_time"] = end_time - start_time
+
+    result_decl = next(
+        decl
+        for decl in kernel.lowering.program.tensors
+        if decl.symbol == kernel.lowering.result_symbol
+    )
+    result_format = "".join(
+        "d" if level.kind is LoopIRLevelKind.DENSE else "s"
+        for level in result_decl.levels
+    )
+    result_mode_order = tuple(level.mode for level in result_decl.levels)
+    result = STensor(
+        shape=tuple(result_shape),
+        index=TensorIndex(
+            mode_indices=_finalize_generated_mode_indices(
+                parse_format(result_format),
+                result_cpp.storage.index.mode_indices,
+            ),
+            tensor_format=result_format,
+            mode_order=result_mode_order,
+        ),
+        value=result_cpp.storage.value,
+    )
+    return result, kernel
+
+
+def _execute_legacy_scheduled(
+    cin_stmt: IndexStmt,
+    result_shape: Sequence[int],
+    *args,
+    compile_options: CompileOptions,
+):
+    """Execute the legacy scheduled route on ``args`` (dense outputs only).
+
+    The untouched low-level entry rejects requested schedules, so scheduled
+    shadow execution drives the same production components directly:
+    ``Scheduler.apply_schedule``, the legacy lowering of the verified
+    ``ScheduledCIN``, and the shared JIT build/cache/execution helpers.
+    Runtime mode-order prerequisites are aligned to the verified plan, and
+    the dense result wrapper is derived from the normalized result rank.
+    """
+
+    from ...stensor import STensor
+    from ...storage import TensorIndex
+    from ...ops import (
+        _checked_runtime_shape,
+        _finalize_generated_mode_indices,
+        _load_validated_prepared_kernel,
+        _lower_generated_llir,
+        _prepare_generated_kernel_build,
+        _snapshot_runtime_tensors,
+    )
+    from ..scheduler import Scheduler
+
+    options = compile_options
+    assert options.requested_schedule is not None
+    context = CompilationContext(options)
+    scheduled = Scheduler.apply_schedule(
+        cin_stmt,
+        options.requested_schedule,
+        compile_options=options,
+        compilation_context=context,
+    )
+    result_shape = _checked_runtime_shape(result_shape, "result shape")
+    runtime_args = _snapshot_runtime_tensors(
+        args,
+        expected_count=len(scheduled.normalized_cin.get_rhs_tensor_vars()),
+    )
+    _validate_runtime_formats(
+        scheduled.normalized_cin,
+        tuple(snapshot.tensor_format for snapshot in runtime_args),
+    )
+    alignment_plan = _plan_mode_orders_to_planned_order(
+        scheduled.normalized_cin,
+        runtime_args,
+        scheduled.verified_loop_plan,
+    )
+    runtime_args = _execute_mode_order_alignment(
+        scheduled.normalized_cin,
+        tuple(snapshot.tensor for snapshot in runtime_args),
+        alignment_plan,
+        options,
+        context,
+        runtime_snapshots=runtime_args,
+    )
+    _bind_runtime_metadata(
+        scheduled.normalized_cin,
+        tuple((snapshot.shape, snapshot.dtype) for snapshot in runtime_args),
+        result_shape,
+        tuple(snapshot.tensor_format for snapshot in runtime_args),
+    )
+    lowerer = CINLowerer(compile_options=options, compilation_context=context)
+    lowered = lowerer._lower_owned_IndexStmt(scheduled)
+    cpp_source = _lower_generated_llir(lowered, options, context)
+    prepared_build = _prepare_generated_kernel_build(
+        options.build.preamble_source,
+        cpp_source,
+        options,
+        context,
+    )
+    module = _load_validated_prepared_kernel(prepared_build)
+
+    module_args: List[object] = [result_shape]
+    for snapshot in runtime_args:
+        module_args.append(snapshot.shape)
+        module_args.append(snapshot.native_mode_indices)
+        module_args.append(snapshot.values)
+    result_cpp = module.evaluate(*module_args)
+    result_vars = scheduled.normalized_cin.get_result_tensor_vars()
+    if len(result_vars) != 1 or result_vars[0].format is None:
+        raise CompileSpecError(
+            "legacy scheduled shadow execution requires one formatted result"
+        )
+    result_format = result_vars[0].format
+    if not result_format.is_dense():
+        raise CompileSpecError(
+            "legacy scheduled shadow execution requires a dense result"
+        )
+    return STensor(
+        shape=tuple(result_shape),
+        index=TensorIndex(
+            mode_indices=_finalize_generated_mode_indices(
+                result_format, result_cpp.storage.index.mode_indices
+            ),
+            tensor_format=result_format,
+            mode_order=(
+                None
+                if result_vars[0].mode_order is None
+                else tuple(result_vars[0].mode_order)
+            ),
+        ),
+        value=result_cpp.storage.value,
+    )
+
+
+def execute_shadow(
+    cin_stmt: IndexStmt,
+    result_shape: Sequence[int],
+    *args,
+    compile_options: Optional[CompileOptions] = None,
+):
+    """Execute both pipelines on ``args`` for curated differential tests.
+
+    Returns ``(loopir_result, legacy_result, source_comparison)``.  The
+    legacy execution uses the untouched low-level entry (or, when the
+    options request a schedule, the legacy scheduled route through
+    ``Scheduler.apply_schedule``); both wrappers support dense outputs.
+    Sparse-output comparisons must use source parity plus direct
+    LoopIR/PyTorch/oracle execution instead.
+    """
+
+    from ...ops import (
+        _checked_runtime_shape,
+        _plan_mode_orders_to_loop_order,
+        _snapshot_runtime_tensors,
+        lower_and_exec_cin,
+    )
+
+    options = _resolve_options(compile_options)
+    shadow_plan: Optional[LoopPlan] = None
+    downstream_options = options
+    if options.requested_schedule is not None:
+        normalized, shadow_plan = _apply_requested_schedule(
+            cin_stmt,
+            options,
+            CompilationContext(options),
+        )
+        # Freeze any policy-selected shorthand (notably
+        # ``Schedule.loop_order=None``) to the verified plan before the
+        # comparison invokes either pipeline again.  Runtime alignment below
+        # may update compiler-owned mode-order metadata; it must not cause a
+        # second policy selection to reinterpret the same shadow request.
+        from ..scheduler import materialize_legacy_schedule
+
+        canonical_schedule, _, _, _ = materialize_legacy_schedule(
+            normalized,
+            shadow_plan,
+        )
+        if canonical_schedule != options.requested_schedule:
+            downstream_options = replace(
+                options,
+                requested_schedule=canonical_schedule,
+            )
+    else:
+        normalized = normalize_cin(cin_stmt, compile_options=options)
+    result_shape = _checked_runtime_shape(result_shape, "result shape")
+    runtime_args = _snapshot_runtime_tensors(
+        args,
+        expected_count=len(normalized.get_rhs_tensor_vars()),
+    )
+    if any(
+        tensor_var.format is None or not tensor_var.format.is_dense()
+        for tensor_var in normalized.get_result_tensor_vars()
+    ):
+        raise CompileSpecError(
+            "execute_shadow requires dense outputs because the legacy "
+            "low-level result wrapper does not preserve sparse indices"
+        )
+    _validate_runtime_formats(
+        normalized,
+        tuple(snapshot.tensor_format for snapshot in runtime_args),
+    )
+    if shadow_plan is None:
+        alignment_plan = _plan_mode_orders_to_loop_order(normalized, runtime_args)
+    else:
+        alignment_plan = _plan_mode_orders_to_planned_order(
+            normalized,
+            runtime_args,
+            shadow_plan,
+        )
+    # Align once before source comparison so compile-only bindings describe
+    # logical storage, then both execution routes independently observe the
+    # same already-aligned inputs.
+    runtime_args = _execute_mode_order_alignment(
+        normalized,
+        tuple(snapshot.tensor for snapshot in runtime_args),
+        alignment_plan,
+        downstream_options,
+        None,
+        runtime_snapshots=runtime_args,
+    )
+
+    comparison = compare_generated_sources(
+        normalized,
+        result_shape,
+        tuple((snapshot.shape, snapshot.dtype) for snapshot in runtime_args),
+        compile_options=downstream_options,
+    )
+    loopir_result, _ = execute_cin_via_loopir(
+        copy.deepcopy(normalized),
+        result_shape,
+        *(snapshot.tensor for snapshot in runtime_args),
+        compile_options=downstream_options,
+    )
+    if downstream_options.requested_schedule is not None:
+        legacy_result = _execute_legacy_scheduled(
+            copy.deepcopy(normalized),
+            result_shape,
+            *(snapshot.tensor for snapshot in runtime_args),
+            compile_options=downstream_options,
+        )
+    else:
+        legacy_result = lower_and_exec_cin(
+            copy.deepcopy(normalized),
+            result_shape,
+            *(snapshot.tensor for snapshot in runtime_args),
+            _compile_options=downstream_options,
+        )
+    return loopir_result, legacy_result, comparison

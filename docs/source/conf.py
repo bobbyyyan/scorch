@@ -182,7 +182,7 @@ html_copy_source = False
 html_last_updated_fmt = "%b %d, %Y"
 
 GITHUB_URL = "https://github.com/bobbyyyan/scorch"
-PAPER_URL = "https://fredrikbk.com/cgo26scorch.html"
+PAPER_URL = "https://ieeexplore.ieee.org/abstract/document/11394842"
 
 html_theme_options = {
     "logo": {
