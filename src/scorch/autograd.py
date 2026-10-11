@@ -53,9 +53,10 @@ import scorch_ops as _native
 
 from .exceptions import TensorIndexError
 from .format import LevelType
+from .layout import TensorLayout
 from .plan import GRAD_ATTR, torch_object_state
 from .stensor import STensor
-from .storage import tensor_version
+from .storage import _canonical_index, _first_unsorted_parent, tensor_version
 
 _Stamp = Tuple[int, int, int, int]
 
@@ -165,20 +166,45 @@ class _Structure:
         # operand's plans, in an entry that must die with the arrays.)
         positions = positions.detach().contiguous()
         coordinates = coordinates.detach().contiguous()
+        given = (positions, coordinates)
+        # One screen for a well-formed structure: in range, and each row's columns strictly
+        # increasing. Only when it finds something is the range checked on its own, so a row
+        # whose columns are out of order or repeated -- which torch accepts and sums -- is
+        # told apart from a structure that is invalid.
+        destination: Optional[torch.Tensor] = None
         if positions.numel() != rows + 1 or _native.abi_screen_compressed_level(
-            positions, coordinates, cols, False
+            positions, coordinates, cols, True
         ):
-            raise TensorIndexError(
-                "the sparse operand's index arrays do not describe a valid "
-                f"{rows} x {cols} CSR structure"
-            )
+            if positions.numel() != rows + 1 or _native.abi_screen_compressed_level(
+                positions, coordinates, cols, False
+            ):
+                raise TensorIndexError(
+                    "the sparse operand's index arrays do not describe a valid "
+                    f"{rows} x {cols} CSR structure"
+                )
+            if _first_unsorted_parent(positions, coordinates) is not None:
+                # Kept in canonical form, as an STensor over these arrays would be
+                # (storage._canonical_index), with the map that sums the operand's values
+                # into it and carries gradients back to the operand's own entries.
+                layout = TensorLayout.from_physical_shape(
+                    (rows, cols), "ds", index_dtype=positions.dtype
+                )
+                index, _, destination = _canonical_index(
+                    layout, ((), (positions, coordinates)), coordinates.numel()
+                )
+                positions, coordinates = index[1]
         self.positions = positions
         self.coordinates = coordinates
         self.rows = rows
         self.cols = cols
         self.nnz = coordinates.numel()
+        # Where each of the operand's stored values lands in this structure, when the
+        # operand's rows were not in canonical form; None when the structure is the
+        # operand's own.
+        self.destination = destination
         # Detached for the reason above.
-        self.sources = tuple(t.detach() for t in sources) or (positions, coordinates)
+        # The operand's arrays, also when the structure holds a canonical copy of them.
+        self.sources = tuple(t.detach() for t in sources) or given
         self.source = tuple(_stamp(t) for t in self.sources)
         self._transpose: Optional[Tuple[_Structure, torch.Tensor]] = None
         # dtype -> (STensor over these arrays, its values buffer)
@@ -188,6 +214,14 @@ class _Structure:
     def describes(self, *arrays: torch.Tensor) -> bool:
         return self.source == tuple(_stamp(a) for a in arrays)
 
+    def canonical(self, values: torch.Tensor) -> torch.Tensor:
+        """The operand's ``values``, in its storage order, as this structure stores them:
+        the values at one coordinate summed (see ``destination``)."""
+        if self.destination is None:
+            return values
+        summed = torch.zeros(self.nnz, dtype=values.dtype)
+        return summed.index_add_(0, self.destination, values)
+
     def transpose(self) -> Tuple["_Structure", torch.Tensor]:
         """The ``cols x rows`` transpose and ``perm``: its values are ``values[perm]``."""
         held = self._transpose
@@ -196,9 +230,11 @@ class _Structure:
         return held
 
     def sddmm(self, x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
-        """``out[q] = x[i, :] . y[j, :]`` for each stored ``q = (i, j)``."""
+        """``out[q] = x[i, :] . y[j, :]`` for each of the operand's stored ``q = (i, j)``,
+        in the operand's storage order: a repeated entry gets the value of its coordinate.
+        """
         nthreads = _nthreads()  # binds _ATPARALLEL on first use
-        return _native.sddmm_csr(
+        out = _native.sddmm_csr(
             self.positions,
             self.coordinates,
             _plain(x),
@@ -206,6 +242,7 @@ class _Structure:
             nthreads,
             _ATPARALLEL,
         )
+        return out if self.destination is None else out[self.destination]
 
     def mm(
         self,
@@ -214,7 +251,8 @@ class _Structure:
         perm: Optional[torch.Tensor] = None,
         owner: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        """This structure with ``values`` (or ``values[perm]``) times ``b``.
+        """This structure with ``values`` (or ``values[perm]``) times ``b``. ``values`` are
+        in this structure's storage order (``canonical``).
 
         ``owner``, with ``perm``, is the torch CSR operand this structure is the transpose of,
         when the product is its ``x @ A``: a planned product then records itself in the
@@ -376,6 +414,7 @@ class _Operand:
         """``A @ b``."""
         if self.direct and self._owns(values):
             return _matmul(self.owner, _plain(b))
+        values = self.stored.canonical(values)
         if self.transposed:
             structure, perm = self.stored.transpose()
             return structure.mm(values, b, perm)
@@ -385,12 +424,21 @@ class _Operand:
         self, values: torch.Tensor, b: torch.Tensor, right: bool = False
     ) -> torch.Tensor:
         """``A^T @ b``. ``right`` when it is computed as ``x @ A`` with ``b = x^T``: for a torch
-        CSR operand the product then records itself for the C entry (``_Structure.mm``).
+        CSR operand the product then records itself for the C entry (``_Structure.mm``),
+        unless the structure is not the operand's own (``_Structure.destination``): the C
+        entry gathers the operand's values through ``perm`` and would not sum them first.
         """
+        values = self.stored.canonical(values)
         if self.transposed:
             return self.stored.mm(values, b)
         structure, perm = self.stored.transpose()
-        owner = self.owner if right and type(self.owner) is torch.Tensor else None
+        owner = (
+            self.owner
+            if right
+            and type(self.owner) is torch.Tensor
+            and self.stored.destination is None
+            else None
+        )
         return structure.mm(values, b, perm, owner)
 
     def sddmm(self, x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:

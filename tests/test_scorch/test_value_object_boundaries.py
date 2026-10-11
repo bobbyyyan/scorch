@@ -279,19 +279,58 @@ def test_sparse_storage_rejects_invalid_csr_invariants(
         )
 
 
-def test_sparse_storage_rejects_csr_order_native_views_cannot_consume():
-    with pytest.raises(TensorIndexError):
-        _csr_storage(
-            positions=torch.tensor([0, 2, 3], dtype=torch.int64),
-            coordinates=torch.tensor([2, 0, 1], dtype=torch.int64),
-        )
+def test_sparse_storage_sorts_a_caller_row_the_native_views_cannot_consume():
+    """Out-of-order columns in a caller's row, which torch accepts: the storage holds the
+    row sorted, with each value moved along with its column, and not the caller's arrays."""
+    coordinates = torch.tensor([2, 0, 1], dtype=torch.int64)
+    values = torch.tensor([1.0, 2.0, 3.0])
+    storage = _csr_storage(
+        positions=torch.tensor([0, 2, 3], dtype=torch.int64),
+        coordinates=coordinates,
+        values=values,
+    )
+    positions, held = storage._mode_indices[1]
+    assert positions.tolist() == [0, 2, 3]
+    assert held.tolist() == [0, 2, 1]
+    assert storage._value.tolist() == [2.0, 1.0, 3.0]
+    assert held.data_ptr() != coordinates.data_ptr()
+    assert coordinates.tolist() == [2, 0, 1] and values.tolist() == [1.0, 2.0, 3.0]
 
 
-def test_sparse_storage_rejects_duplicate_compressed_coordinates():
+def test_sparse_storage_sums_repeated_compressed_coordinates():
+    """A column repeated inside a caller's row is one entry holding the sum, as torch
+    computes it."""
+    storage = _csr_storage(
+        positions=torch.tensor([0, 2, 3], dtype=torch.int64),
+        coordinates=torch.tensor([1, 1, 2], dtype=torch.int64),
+        values=torch.tensor([1.0, 2.0, 3.0]),
+    )
+    positions, held = storage._mode_indices[1]
+    assert positions.tolist() == [0, 1, 2]
+    assert held.tolist() == [1, 2]
+    assert storage._value.tolist() == [3.0, 3.0]
+
+
+def test_a_kernel_result_with_repeated_coordinates_is_still_rejected():
+    """Only a caller's storage is repaired. The same defect in a kernel's result means the
+    compiler emitted something wrong, so with result validation on -- as the suite runs,
+    tests/conftest.py -- it is an error."""
+    from scorch import storage as storage_module
+
+    assert storage_module._VALIDATE_KERNEL_RESULTS[0] is True
+    layout = TensorLayout.from_physical_shape((2, 3), "ds", index_dtype=torch.int64)
     with pytest.raises(TensorIndexError, match="strictly increasing"):
-        _csr_storage(
-            positions=torch.tensor([0, 2, 3], dtype=torch.int64),
-            coordinates=torch.tensor([1, 1, 2], dtype=torch.int64),
+        SparseStorage(
+            layout,
+            torch.tensor([1.0, 2.0, 3.0]),
+            mode_indices=[
+                [],
+                [
+                    torch.tensor([0, 2, 3], dtype=torch.int64),
+                    torch.tensor([1, 1, 2], dtype=torch.int64),
+                ],
+            ],
+            _trusted_index=True,
         )
 
 

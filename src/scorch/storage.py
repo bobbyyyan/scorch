@@ -587,10 +587,10 @@ def _screen_compressed_level(
         return True
 
 
-def _check_sorted_within_parents(
-    positions: torch.Tensor, coordinates: torch.Tensor, mode: int
-) -> None:
-    """Every parent's coordinates must be strictly increasing within that parent.
+def _first_unsorted_parent(
+    positions: torch.Tensor, coordinates: torch.Tensor
+) -> Optional[int]:
+    """The first parent whose coordinates are not strictly increasing, or None.
 
     Whole-array, in a handful of kernels. The obvious formulation of this predicate --
     "no entry is smaller than the one before it" -- is wrong, because coordinates
@@ -608,12 +608,12 @@ def _check_sorted_within_parents(
     with identical verdicts -- a differential test against the old implementation, kept
     verbatim as the oracle, pins that.
 
-    The message names the offending parent, so the reporting path recovers it. That
-    costs two more kernels and only runs when the storage is actually malformed.
+    It returns the offending parent so that the error can name it. That costs two more
+    kernels and only runs when the storage is actually malformed.
     """
     count = coordinates.numel()
     if count < 2:
-        return
+        return None
     # Strict: a repeated coordinate within a parent is as invalid as a descent (the
     # compiler's co-iteration and torch's own CSR invariant both assume distinct ones).
     descends = coordinates[1:] <= coordinates[:-1]
@@ -626,21 +626,30 @@ def _check_sorted_within_parents(
     if starts.numel():
         descends[starts - 1] = False
     if not bool(descends.any()):
-        return
+        return None
     # Parents are contiguous and ordered, so the first offending position lies in the
     # first offending parent -- which is the one the row loop reported.
     first = int(torch.nonzero(descends)[0].item())
     boundaries = positions.to(torch.long)
-    parent = int(torch.searchsorted(boundaries, first, right=True).item()) - 1
-    raise TensorIndexError(
-        f"compressed mode {mode} coordinates must be strictly increasing within "
-        f"parent {parent}"
-    )
+    return int(torch.searchsorted(boundaries, first, right=True).item()) - 1
 
 
 def _validate_index_storage(
-    layout: TensorLayout, mode_indices: IndexModes, values: torch.Tensor
-) -> None:
+    layout: TensorLayout,
+    mode_indices: IndexModes,
+    values: torch.Tensor,
+    *,
+    allow_unordered: bool = False,
+) -> bool:
+    """Raise unless the index arrays describe well-formed storage for ``values``.
+
+    ``allow_unordered`` is for a caller's arrays (see ``SparseStorage.__init__``): a
+    compressed level whose coordinates are out of order or repeated inside a parent is
+    then reported by returning True instead of raised, provided every level is dense or
+    compressed and nothing else is wrong. The caller replaces the storage with its
+    canonical form (``_canonical_storage``). Every other defect still raises, and so
+    does an unordered level in any other format. Returns False for well-formed storage.
+    """
     nnz = values.numel()
     level_types = layout.format.level_types
 
@@ -663,7 +672,7 @@ def _validate_index_storage(
                 f"dense values contain {nnz} elements, expected {expected} for shape "
                 f"{layout.physical_shape}"
             )
-        return
+        return False
 
     if level_types and all(
         level_type == LevelType.COORDINATE for level_type in level_types
@@ -687,7 +696,7 @@ def _validate_index_storage(
         # one thread-split pass, and clears the tensor without allocating anything.
         # Only when it declines does any of that happen, and then it reports.
         if _screen_lex_levels(coordinates_per_mode, nnz) is False:
-            return
+            return False
         coordinate_values = [c.tolist() for c in coordinates_per_mode]
         for position in range(1, nnz):
             previous = tuple(
@@ -702,8 +711,9 @@ def _validate_index_storage(
                 raise TensorIndexError(
                     "COO coordinates must be lexicographically ordered"
                 )
-        return
+        return False
 
+    unordered = False
     parent_positions = 1
     for mode, (level_type, arrays, extent) in enumerate(
         zip(level_types, mode_indices, layout.physical_shape)
@@ -750,7 +760,22 @@ def _validate_index_storage(
                     )
             if suspect:
                 _check_coordinate_bounds(coordinates, extent, f"compressed mode {mode}")
-                _check_sorted_within_parents(positions, coordinates, mode)
+                parent = _first_unsorted_parent(positions, coordinates)
+                # An unordered level can be repaired only where the canonical form is
+                # defined for every level: dense and compressed ones (_canonical_index).
+                # Asked here, so that well-formed storage never pays for the question.
+                if parent is not None and not (
+                    allow_unordered
+                    and all(
+                        level in (LevelType.DENSE, LevelType.COMPRESSED)
+                        for level in level_types
+                    )
+                ):
+                    raise TensorIndexError(
+                        f"compressed mode {mode} coordinates must be strictly "
+                        f"increasing within parent {parent}"
+                    )
+                unordered = unordered or parent is not None
             parent_positions = coordinates.numel()
             continue
         coordinate = arrays[0]
@@ -770,6 +795,151 @@ def _validate_index_storage(
         raise TensorStorageError(
             f"layout describes {parent_positions} stored positions, but values has {nnz} elements"
         )
+    return unordered
+
+
+def _canonical_index(
+    layout: TensorLayout, mode_indices: IndexModes, value_count: int
+) -> Tuple[IndexModes, int, Optional[torch.Tensor]]:
+    """The canonical form of an index whose levels are all dense or compressed.
+
+    Every parent's coordinates sorted and each coordinate stored once: for an index with a
+    compressed level whose coordinates are out of order or repeated inside a parent, which
+    torch accepts in a CSR tensor and sums in every operation on it, but which Scorch's
+    kernels cannot read, since co-iterating two sparse operands assumes distinct,
+    increasing coordinates. Every stored entry's full coordinate is recovered, the entries
+    are sorted lexicographically, and the levels are rebuilt in the same format from the
+    distinct coordinates.
+
+    Returns the rebuilt index arrays, the number of values they store, and the map from
+    each of the given index's value positions to its position in the rebuilt one
+    (``None`` when nothing is stored), so that ``values`` in the given layout become
+    ``zeros(count).index_add_(0, map, values)`` in the new one: entries at one coordinate
+    are summed, and an explicitly stored zero is kept, as torch's ``coalesce`` does. The
+    given arrays are read and never written, and the rebuilt ones share nothing with them.
+
+    Only called once a defect has been found, so a well-formed index never pays for it.
+    """
+    level_types = layout.format.level_types
+    extents = layout.physical_shape
+    index_dtype = layout.index_dtype
+    count = value_count
+
+    def arange(n: int) -> torch.Tensor:
+        return torch.arange(n, dtype=torch.int64)
+
+    if count == 0:
+        # Nothing is stored below some level, so there is nothing to sort or sum: the
+        # canonical form of an empty tensor stores no coordinates at all. (Any extent of
+        # zero leads here, which keeps the divisions below away from it.)
+        empty: List[Tuple[torch.Tensor, ...]] = []
+        parent_count = 1
+        for level_type, extent in zip(level_types, extents):
+            if level_type == LevelType.DENSE:
+                empty.append(())
+                parent_count *= extent
+            else:
+                empty.append(
+                    (
+                        torch.zeros(parent_count + 1, dtype=index_dtype),
+                        torch.zeros(0, dtype=index_dtype),
+                    )
+                )
+                parent_count = 0
+        return tuple(empty), parent_count, None
+
+    # Each stored value's coordinate at every level, walking up from the value's own
+    # position. A dense level's coordinate and parent follow from the position
+    # arithmetically; a compressed level's come from its arrays.
+    parents_of: List[Optional[torch.Tensor]] = []
+    parent_count = 1
+    for level_type, arrays, extent in zip(level_types, mode_indices, extents):
+        if level_type == LevelType.DENSE:
+            parents_of.append(None)
+            parent_count *= extent
+        else:
+            positions, coordinates = arrays
+            lengths = (positions[1:] - positions[:-1]).to(torch.int64)
+            parents_of.append(torch.repeat_interleave(arange(parent_count), lengths))
+            parent_count = coordinates.numel()
+    coordinate_at: List[torch.Tensor] = [arange(0)] * len(level_types)
+    position = arange(count)
+    for level in reversed(range(len(level_types))):
+        extent = extents[level]
+        parents = parents_of[level]
+        if parents is None:
+            coordinate_at[level] = position % extent
+            position = torch.div(position, extent, rounding_mode="floor")
+        else:
+            coordinate_at[level] = mode_indices[level][1][position].to(torch.int64)
+            position = parents[position]
+
+    # Sort on the row-major linear index. It cannot overflow: a layout's element count
+    # is checked to fit in a signed int64 (layout._normalize_shape). Stable, so entries
+    # at one coordinate keep their order and are summed in it.
+    key = torch.zeros(count, dtype=torch.int64)
+    for level, extent in enumerate(extents):
+        key = key * extent + coordinate_at[level]
+    key, order = torch.sort(key, stable=True)
+    starts = torch.ones(count, dtype=torch.bool)
+    if count > 1:
+        starts[1:] = key[1:] != key[:-1]
+    entry = torch.cumsum(starts.to(torch.int64), 0) - 1
+    unique_count = int(entry[-1].item()) + 1
+    key = key[starts]
+
+    # Rebuild the levels from the sorted, distinct coordinates.
+    unique_at: List[torch.Tensor] = [arange(0)] * len(level_types)
+    for level in reversed(range(len(level_types))):
+        extent = extents[level]
+        unique_at[level] = key % extent
+        key = torch.div(key, extent, rounding_mode="floor")
+    rebuilt: List[Tuple[torch.Tensor, ...]] = []
+    new_prefix = torch.zeros(unique_count, dtype=torch.bool)
+    new_prefix[0] = True
+    position = torch.zeros(unique_count, dtype=torch.int64)
+    parent_count = 1
+    for level_type, extent, coordinate in zip(level_types, extents, unique_at):
+        if unique_count > 1:
+            new_prefix[1:] |= coordinate[1:] != coordinate[:-1]
+        if level_type == LevelType.DENSE:
+            rebuilt.append(())
+            position = position * extent + coordinate
+            parent_count *= extent
+            continue
+        # One stored coordinate per distinct prefix through this level, grouped under
+        # the position of its parent.
+        kept_parent = position[new_prefix]
+        kept_coordinate = coordinate[new_prefix]
+        level_positions = torch.zeros(parent_count + 1, dtype=torch.int64)
+        level_positions[1:] = torch.cumsum(
+            torch.bincount(kept_parent, minlength=parent_count), 0
+        )
+        rebuilt.append(
+            (
+                level_positions.to(index_dtype),
+                kept_coordinate.to(index_dtype).contiguous(),
+            )
+        )
+        position = torch.cumsum(new_prefix.to(torch.int64), 0) - 1
+        parent_count = kept_coordinate.numel()
+    # `position` is each distinct entry's value position in the rebuilt index; `entry`,
+    # in sorted order, is each given value's distinct entry.
+    destination = torch.empty(count, dtype=torch.int64)
+    destination[order] = position[entry]
+    return tuple(rebuilt), parent_count, destination
+
+
+def _canonical_storage(
+    layout: TensorLayout, mode_indices: IndexModes, values: torch.Tensor
+) -> Tuple[IndexModes, torch.Tensor]:
+    """A private copy of the storage in canonical form (``_canonical_index``), values
+    included: entries at one coordinate summed."""
+    index, count, destination = _canonical_index(layout, mode_indices, values.numel())
+    canonical_values = torch.zeros(count, dtype=values.dtype)
+    if destination is not None:
+        canonical_values.index_add_(0, destination, values)
+    return index, canonical_values
 
 
 def tensor_version(array: torch.Tensor) -> int:
@@ -918,7 +1088,23 @@ class SparseStorage:
         # level -- have already run inside `_normalize_mode_indices` for every caller,
         # trusted or not. They are O(1) each and adopting a kernel's arrays depends on
         # them. What `_trusted_index` skips is only the O(nnz) structural walk.
-        if not _trusted_index or _VALIDATE_KERNEL_RESULTS[0]:
+        if not _trusted_index:
+            # A caller's arrays may hold a compressed level whose coordinates are out of
+            # order or repeated inside a parent, which torch accepts in a CSR tensor and
+            # sums. The storage then holds a sorted, repeat-summed private copy instead
+            # (_canonical_storage), so it shares no arrays with the caller and a later
+            # write to theirs does not reach it, as with an uncoalesced COO tensor, which
+            # `from_torch` coalesces into a new one. A kernel's result is never repaired:
+            # the branch below makes the same defect in one an error, because it means
+            # the compiler emitted something wrong.
+            if _validate_index_storage(
+                layout, normalized, owned_value, allow_unordered=True
+            ):
+                normalized, owned_value = _canonical_storage(
+                    layout, normalized, owned_value
+                )
+                _validate_index_storage(layout, normalized, owned_value)
+        elif _VALIDATE_KERNEL_RESULTS[0]:
             _validate_index_storage(layout, normalized, owned_value)
         object.__setattr__(self, "_layout", layout)
         object.__setattr__(self, "_mode_indices", normalized)

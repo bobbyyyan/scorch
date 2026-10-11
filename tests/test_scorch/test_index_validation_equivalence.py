@@ -461,9 +461,9 @@ def validation_counter(monkeypatch):
     calls = []
     real = storage_module._validate_index_storage
 
-    def counting(layout, mode_indices, values):
+    def counting(layout, mode_indices, values, **options):
         calls.append(1)
-        return real(layout, mode_indices, values)
+        return real(layout, mode_indices, values, **options)
 
     monkeypatch.setattr(storage_module, "_validate_index_storage", counting)
     return calls
@@ -735,13 +735,13 @@ def test_screen_never_clears_fuzzed_corruption(seed):
 def test_the_screen_is_actually_being_consulted(monkeypatch):
     """Pin the wiring: if the screen clears a level, the Python walks do not run."""
     calls = []
-    real = storage_module._check_sorted_within_parents
+    real = storage_module._first_unsorted_parent
 
-    def counting(positions, coordinates, mode):
+    def counting(positions, coordinates):
         calls.append(1)
-        return real(positions, coordinates, mode)
+        return real(positions, coordinates)
 
-    monkeypatch.setattr(storage_module, "_check_sorted_within_parents", counting)
+    monkeypatch.setattr(storage_module, "_first_unsorted_parent", counting)
     positions, coordinates, values = csr_parts(32, 16, 3)
     STensor.from_components((32, 16), "ds", [[], [positions, coordinates]], values)
     if storage_module._NATIVE_SCREEN is None:
