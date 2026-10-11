@@ -722,6 +722,75 @@ def _ordered_key_family(
     return _SparseOutputReduction.ORDERED_KEY_WORKSPACE
 
 
+def _multi_compressed_assembly_family(
+    lhs_index_ids: Tuple[IndexId, ...],
+    domains: Dict[IndexId, LoopIterationDomain],
+    prefix: int,
+) -> _SparseOutputReduction:
+    """Decide an ordered sparse assembly by its domains, or refuse with a code.
+
+    The receiver is ``prefix`` dense levels over compressed levels, written
+    without a reduction.  The per-level domain rules below are the whole
+    decision, so every receiver branch that assembles this way calls this one
+    function rather than keeping its own copy of the rules.
+    """
+
+    suffix_kinds = []
+    for position, index_id in enumerate(lhs_index_ids):
+        domain_kind = domains[index_id].kind
+        if position < prefix:
+            if domain_kind not in (DomainKind.DENSE, DomainKind.SPARSE):
+                # A dense prefix level stores no coordinates; the only
+                # obligation a stored stream driving it owes is that
+                # the child position array be closed at every cell it
+                # skips, which the target's row-scope catch-up
+                # discharges -- the same rule, and the same mechanism,
+                # as the ordered-key family's dense prefix above.  A
+                # merged domain has no single cursor to advance the
+                # catch-up and is refused.
+                _fail(
+                    "unsupported_sparse_output_domain",
+                    "the dense-prefix coordinates of a multi-"
+                    "compressed output must iterate dense domains or "
+                    "one stored sparse level in the migrated families",
+                )
+        else:
+            suffix_kinds.append(domain_kind)
+    if any(kind is DomainKind.UNION for kind in suffix_kinds):
+        if not all(kind is DomainKind.UNION for kind in suffix_kinds):
+            # A union level cannot descend through a non-united
+            # child stream: the one-sided branches would need a
+            # child iterator the other operand does not carry.
+            _fail(
+                "unsupported_sparse_output",
+                "a united multi-compressed output must unite every "
+                "compressed-suffix coordinate in the migrated "
+                "families",
+            )
+        return _SparseOutputReduction.MULTI_COMPRESSED_UNION
+    for kind in suffix_kinds:
+        if kind not in (
+            DomainKind.DENSE,
+            DomainKind.SPARSE,
+            DomainKind.INTERSECTION,
+        ):
+            # A suffix coordinate iterates a dense domain, one stored
+            # stream, or a two-stream intersection.  A dense domain
+            # visits cells the operands may not store under; the
+            # target guards such a level by its compressed child's
+            # append, and a dense-domain leaf level appends every cell
+            # because every operand is dense there and dense storage
+            # holds every cell.  A union below a non-united level is
+            # refused above.
+            _fail(
+                "unsupported_sparse_output",
+                "a multi-compressed output is assembled only by "
+                "dense domains, stored coordinate streams, or "
+                "intersections in the migrated families",
+            )
+    return _SparseOutputReduction.MULTI_COMPRESSED_ASSEMBLY
+
+
 def _classify_sparse_output_family(
     result_sparse: bool,
     reduce_update: bool,
@@ -842,61 +911,11 @@ def _classify_sparse_output_family(
             # on byte parity.  The several-dense-parent comparand closes by
             # only one coordinate and is malformed, so that form gates on the
             # LoopIR oracle and compiled PyTorch differentials instead.
-            prefix = len(result_levels) - compressed_suffix
-            suffix_kinds = []
-            for position, index_id in enumerate(lhs_index_ids):
-                domain_kind = domains[index_id].kind
-                if position < prefix:
-                    if domain_kind not in (DomainKind.DENSE, DomainKind.SPARSE):
-                        # A dense prefix level stores no coordinates; the only
-                        # obligation a stored stream driving it owes is that
-                        # the child position array be closed at every cell it
-                        # skips, which the target's row-scope catch-up
-                        # discharges -- the same rule, and the same mechanism,
-                        # as the ordered-key family's dense prefix above.  A
-                        # merged domain has no single cursor to advance the
-                        # catch-up and is refused.
-                        _fail(
-                            "unsupported_sparse_output_domain",
-                            "the dense-prefix coordinates of a multi-"
-                            "compressed output must iterate dense domains or "
-                            "one stored sparse level in the migrated families",
-                        )
-                else:
-                    suffix_kinds.append(domain_kind)
-            if any(kind is DomainKind.UNION for kind in suffix_kinds):
-                if not all(kind is DomainKind.UNION for kind in suffix_kinds):
-                    # A union level cannot descend through a non-united
-                    # child stream: the one-sided branches would need a
-                    # child iterator the other operand does not carry.
-                    _fail(
-                        "unsupported_sparse_output",
-                        "a united multi-compressed output must unite every "
-                        "compressed-suffix coordinate in the migrated "
-                        "families",
-                    )
-                return _SparseOutputReduction.MULTI_COMPRESSED_UNION
-            for kind in suffix_kinds:
-                if kind not in (
-                    DomainKind.DENSE,
-                    DomainKind.SPARSE,
-                    DomainKind.INTERSECTION,
-                ):
-                    # A suffix coordinate iterates a dense domain, one stored
-                    # stream, or a two-stream intersection.  A dense domain
-                    # visits cells the operands may not store under; the
-                    # target guards such a level by its compressed child's
-                    # append, and a dense-domain leaf level appends every cell
-                    # because every operand is dense there and dense storage
-                    # holds every cell.  A union below a non-united level is
-                    # refused above.
-                    _fail(
-                        "unsupported_sparse_output",
-                        "a multi-compressed output is assembled only by "
-                        "dense domains, stored coordinate streams, or "
-                        "intersections in the migrated families",
-                    )
-            return _SparseOutputReduction.MULTI_COMPRESSED_ASSEMBLY
+            return _multi_compressed_assembly_family(
+                lhs_index_ids,
+                domains,
+                len(result_levels) - compressed_suffix,
+            )
         if result_levels != (LevelType.DENSE, LevelType.COMPRESSED):
             _fail(
                 "unsupported_sparse_output",

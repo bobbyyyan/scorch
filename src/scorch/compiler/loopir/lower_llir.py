@@ -11735,6 +11735,24 @@ class _DenseDomainMixedLowering(_TargetLowering):
         ]
 
 
+def _canonical_csr_copy_leaves_its_route(
+    row_loop_is_dense: bool, column_loop_is_dense: bool
+) -> bool:
+    """Whether a CSR-result assembly takes the multi-compressed target.
+
+    The canonical-CSR route assembles one dense level over one compressed
+    level from a dense row loop and a stored or merged column loop.  The two
+    other drivers are the multi-compressed target's own rules at rank 2: a
+    stored stream over the row skips rows whose position entries the target's
+    row-scope catch-up closes, and a dense loop over the column is a leaf
+    level that appends every cell, because every operand is dense there.
+    Every assembly the canonical route takes stays on it; routing and the
+    target both ask this one function, so they cannot disagree.
+    """
+
+    return not row_loop_is_dense or column_loop_is_dense
+
+
 def _multi_compressed_assembly_chain(program: LoopProgram) -> bool:
     """Whether the program is a multi-compressed assembly chain.
 
@@ -11743,8 +11761,10 @@ def _multi_compressed_assembly_chain(program: LoopProgram) -> bool:
     appending into a dense-prefix/multi-compressed-suffix result, where the
     suffix is two-or-more compressed levels, the degenerate rank-1
     all-compressed result (one stream, no dense prefix, no parent level), or
-    one compressed level below at least two dense parents.  Everything else
-    stays on its existing route and keeps its fail-closed boundaries.
+    one compressed level below at least two dense parents.  A canonical-CSR
+    result joins when its drivers are ones the canonical route does not take
+    (``_canonical_csr_copy_leaves_its_route``).  Everything else stays on its
+    existing route and keeps its fail-closed boundaries.
     """
 
     if len(program.outputs) != 1:
@@ -11772,12 +11792,13 @@ def _multi_compressed_assembly_chain(program: LoopProgram) -> bool:
         or len(kinds) == compressed_suffix == 1
         or (compressed_suffix == 1 and len(kinds) - compressed_suffix >= 2)
     )
-    if not ordered_compressed_suffix or any(
+    canonical_csr = kinds == (LevelKind.DENSE, LevelKind.COMPRESSED)
+    if not (ordered_compressed_suffix or canonical_csr) or any(
         kind is not LevelKind.DENSE for kind in kinds[: len(kinds) - compressed_suffix]
     ):
         return False
     body: Stmt = program.body
-    loops = 0
+    drivers: List[Stmt] = []
     while type(body) is Block and len(body.statements) == 1:
         only = body.statements[0]
         if type(only) in (DenseFor, SparseFor, MergedSparseFor):
@@ -11786,10 +11807,14 @@ def _multi_compressed_assembly_chain(program: LoopProgram) -> bool:
             # take is the target's admission question, not routing's: a dense
             # domain over a compressed level is guarded there by its child's
             # append, and over the leaf appends every cell.
-            loops += 1
+            drivers.append(only)
             body = cast(Union[DenseFor, SparseFor, MergedSparseFor], only).body
             continue
-        return type(only) is AppendEntry and loops == len(kinds)
+        if type(only) is not AppendEntry or len(drivers) != len(kinds):
+            return False
+        return not canonical_csr or _canonical_csr_copy_leaves_its_route(
+            type(drivers[0]) is DenseFor, type(drivers[1]) is DenseFor
+        )
     return False
 
 
@@ -12035,8 +12060,10 @@ class _MultiCompressedAssemblyLowering(_TargetLowering):
         prefix = len(result_levels) - compressed_suffix
         # The degenerate rank-1 all-compressed result is one stored stream
         # with no dense prefix and no parent level to close.  Canonical CSR is
-        # admitted for the bound-prefix reduction form only; its assembly form
-        # keeps its own family, which the append leaf below re-checks.
+        # admitted for the bound-prefix reduction form, and for the assembly
+        # form only with drivers the canonical route does not take
+        # (``_canonical_csr_copy_leaves_its_route``), which the append leaf
+        # below re-checks.
         ordered_compressed_suffix = (
             compressed_suffix >= 2
             or len(result_levels) == compressed_suffix == 1
@@ -12174,9 +12201,16 @@ class _MultiCompressedAssemblyLowering(_TargetLowering):
                 "an ordered append leaf",
             )
             require(
-                ordered_compressed_suffix,
-                "an assembly receiver other than canonical CSR, which keeps its "
-                "own family",
+                ordered_compressed_suffix
+                or (
+                    canonical_csr
+                    and len(loops) == 2
+                    and _canonical_csr_copy_leaves_its_route(
+                        loops[0].kind is _DENSE, loops[1].kind is _DENSE
+                    )
+                ),
+                "an assembly receiver other than a canonical-CSR one the "
+                "canonical route takes, which keeps its own family",
             )
             require(
                 len(loops) == len(result_levels)
