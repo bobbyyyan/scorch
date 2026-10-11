@@ -414,6 +414,27 @@ def lower_normalized_cin_to_loopir(
     }
     level_types = {symbol: levels for symbol, (_, levels, _) in checked_tensors.items()}
     storage_modes = {symbol: modes for symbol, (_, _, modes) in checked_tensors.items()}
+    if (
+        reduce_update
+        and not has_reduction_loops
+        and any(
+            level_type is not LevelType.DENSE
+            for level_type in level_types[result_symbol]
+        )
+    ):
+        # An ADD update with no reduction loop accumulates nothing.  Every
+        # loop variable binds a result coordinate, and an access may not
+        # repeat one (refused above), so the nest visits each result cell at
+        # most once and writes it into a result the kernel builds from empty:
+        # the update is plain assignment.  For a sparse result the operator
+        # is not inert -- it selects the accumulation families, whose
+        # workspaces and coordinate merges exist to combine several
+        # contributions per cell, and none of which owns a copy -- so it is
+        # normalized here, once, at this ownership boundary, and the program
+        # lowers as the assembly it is.  A dense result's ``+=`` and ``=``
+        # are both direct stores into a zeroed array and keep the operator as
+        # written, which is the emission legacy parity is measured on.
+        reduce_update = False
     if len(set(scalar_types.values())) > 1:
         _fail(
             "mixed_dtype",
@@ -645,12 +666,20 @@ def _classify_sparse_output_family(
             level_type is LevelType.COMPRESSED
             for level_type in result_levels[dense_prefix_length:]
         )
-        and result_levels
-        not in (
-            (LevelType.COMPRESSED, LevelType.COMPRESSED),
-            (LevelType.DENSE, LevelType.COMPRESSED),
-        )
+        and result_levels != (LevelType.DENSE, LevelType.COMPRESSED)
     )
+    if ordered_key_shape and sparse_reduction_family:
+        # The doubly-compressed receiver keeps its own workspace family for a
+        # drained key.  When every result coordinate is bound above the
+        # outermost reduction there is no key to drain, and the program is the
+        # bound-prefix accumulation every other receiver of this shape takes:
+        # classify it by the same split rather than by its layout.
+        split = _ordered_key_split(
+            result_levels, lhs_index_ids, reduction_index_ids, loop_positions
+        )
+        ordered_key_shape = split is not None and split[1] == 0
+        if ordered_key_shape:
+            sparse_reduction_family = False
     if ordered_key_shape:
         # Two families share this receiver shape -- a dense prefix, then one
         # or more compressed levels, reduced under ADD -- and the split's key
@@ -717,12 +746,12 @@ def _classify_sparse_output_family(
                         "sparse reduction must iterate a dense domain or one "
                         "stored sparse level",
                     )
-            elif domain_kind is not DomainKind.SPARSE:
+            elif domain_kind not in (DomainKind.DENSE, DomainKind.SPARSE):
                 _fail(
                     "unsupported_sparse_output_domain",
                     "a compressed result prefix level of an ordered-key "
-                    "sparse reduction must be driven by one stored sparse "
-                    "level",
+                    "sparse reduction must be driven by a dense domain or one "
+                    "stored sparse level",
                 )
         if key_rank == 0:
             # Every result coordinate binds a prefix level under the rules
@@ -802,12 +831,20 @@ def _classify_sparse_output_family(
             for position, index_id in enumerate(lhs_index_ids):
                 domain_kind = domains[index_id].kind
                 if position < prefix:
-                    if domain_kind is not DomainKind.DENSE:
+                    if domain_kind not in (DomainKind.DENSE, DomainKind.SPARSE):
+                        # A dense prefix level stores no coordinates; the only
+                        # obligation a stored stream driving it owes is that
+                        # the child position array be closed at every cell it
+                        # skips, which the target's row-scope catch-up
+                        # discharges -- the same rule, and the same mechanism,
+                        # as the ordered-key family's dense prefix above.  A
+                        # merged domain has no single cursor to advance the
+                        # catch-up and is refused.
                         _fail(
                             "unsupported_sparse_output_domain",
                             "the dense-prefix coordinates of a multi-"
-                            "compressed output must iterate dense domains "
-                            "in the migrated families",
+                            "compressed output must iterate dense domains or "
+                            "one stored sparse level in the migrated families",
                         )
                 else:
                     suffix_kinds.append(domain_kind)
@@ -824,15 +861,24 @@ def _classify_sparse_output_family(
                     )
                 return _SparseOutputReduction.MULTI_COMPRESSED_UNION
             for kind in suffix_kinds:
-                if kind not in (DomainKind.SPARSE, DomainKind.INTERSECTION):
-                    # Dense-domain suffix coordinates keep the historical
-                    # layout seam: only stored coordinate streams assemble
-                    # a multi-compressed output in the migrated families.
+                if kind not in (
+                    DomainKind.DENSE,
+                    DomainKind.SPARSE,
+                    DomainKind.INTERSECTION,
+                ):
+                    # A suffix coordinate iterates a dense domain, one stored
+                    # stream, or a two-stream intersection.  A dense domain
+                    # visits cells the operands may not store under; the
+                    # target guards such a level by its compressed child's
+                    # append, and a dense-domain leaf level appends every cell
+                    # because every operand is dense there and dense storage
+                    # holds every cell.  A union below a non-united level is
+                    # refused above.
                     _fail(
                         "unsupported_sparse_output",
                         "a multi-compressed output is assembled only by "
-                        "stored coordinate streams in the migrated "
-                        "families",
+                        "dense domains, stored coordinate streams, or "
+                        "intersections in the migrated families",
                     )
             return _SparseOutputReduction.MULTI_COMPRESSED_ASSEMBLY
         if result_levels != (LevelType.DENSE, LevelType.COMPRESSED):
@@ -904,17 +950,12 @@ def _classify_sparse_output_family(
         # and target lowering refuses the unscheduled form.
         row_domain = domains[lhs_index_ids[0]]
         column_domain = domains[lhs_index_ids[1]]
-        if row_domain.kind is not DomainKind.SPARSE:
+        if row_domain.kind not in (DomainKind.DENSE, DomainKind.SPARSE):
             _fail(
                 "unsupported_sparse_output_domain",
-                "the doubly-compressed row coordinate must be driven by one "
-                "stored sparse level in the migrated families",
-            )
-        if column_domain.kind is DomainKind.DENSE:
-            _fail(
-                "unsupported_sparse_output_domain",
-                "the doubly-compressed column coordinate must be driven by "
-                "stored sparse coordinates in the migrated families",
+                "the doubly-compressed row coordinate must be driven by a "
+                "dense domain or one stored sparse level in the migrated "
+                "families",
             )
     return (
         _SparseOutputReduction.DOUBLY_COMPRESSED

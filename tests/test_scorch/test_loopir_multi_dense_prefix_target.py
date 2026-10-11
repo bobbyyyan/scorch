@@ -521,18 +521,23 @@ def test_trailing_dense_output_families_keep_their_codes(fmt, shape, arm):
 
 
 @pytest.mark.parametrize("arm", [False, True])
-def test_dense_domain_suffix_stays_fail_closed(arm):
-    """A dense-domain suffix coordinate still cannot assemble this result."""
+def test_a_dense_domain_suffix_coordinate_assembles_every_cell(arm):
+    """A dense-domain suffix coordinate assembles this result since 2026-10-11.
+
+    Every operand is dense at the suffix level, and dense storage holds every
+    cell, so the leaf appends each one -- structure, not value -- and no
+    conditional is emitted for it.  The flattened prefix catch-up is unchanged.
+    """
 
     shape = (3, 4, 5)
-    with pytest.raises(LoopIRLoweringError) as error:
-        compile_cin_via_loopir(
-            build("dds", ("ddd", "ddd"), "mul"),
-            shape,
-            ((shape, torch.float32), (shape, torch.float32)),
-            compile_options=auto_options(arm),
-        )
-    assert error.value.defect.code == "unsupported_sparse_output"
+    kernel = compile_cin_via_loopir(
+        build("dds", ("ddd", "ddd"), "mul"),
+        shape,
+        ((shape, torch.float32), (shape, torch.float32)),
+        compile_options=auto_options(arm),
+    )
+    assert "for (int64_t k = 0;" in kernel.cpp_source
+    assert "C2_crd.emplace_back(k);" in kernel.cpp_source
 
 
 @pytest.mark.parametrize("arm", [False, True])

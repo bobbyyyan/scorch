@@ -850,15 +850,11 @@ def _build_boundary_cin(fmt_result, result_indices, operands, nest):
         # dense loop that used to sit here is the admitted ordered-key
         # workspace family (``test_loopir_ordered_key_workspace_target.py``) --
         # a workspace owns ordering, so a key coordinate driven by a dense
-        # domain is ordinary.  Its neighbour on the same seam keeps the
-        # boundary: a sparse-output root with NO reduction below its
-        # coordinates, so there is no key to drain and no stored stream to
-        # assemble from either.
-        (
-            "sparse_output_root",
-            ("ss", "ij", (("dd", "ij"), ("d", "j")), "ij"),
-            "unsupported_sparse_output_domain",
-        ),
+        # domain is ordinary.  Its neighbour on the same seam, a sparse-output
+        # root with NO reduction below its coordinates (``dd*d -> ss``), moved
+        # too on 2026-10-11: with no reduction loop its ADD update is plain
+        # assignment, and a dense domain may drive a compressed assembly level
+        # (``test_loopir_dense_domain_sparse_result.py`` executes it).
         (
             "dense_domain_to_csr",
             ("ds", "ij", (("dd", "ij"),), "ij"),

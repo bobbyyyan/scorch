@@ -794,20 +794,12 @@ def _seam_cells():
         ),
     )
     del ell
-    dense_domains = ForAll(
-        i,
-        ForAll(
-            j,
-            TensorAssign(
-                TensorVar("C", fmt="ss")[i, j],
-                CINBinaryOp(
-                    Operation.MUL,
-                    TensorVar("A", fmt="dd")[i, j],
-                    TensorVar("B", fmt="dd")[i, j],
-                ),
-            ),
-        ),
-    )
+    # Recorded seam move: the all-dense-domain product into an ``ss`` result
+    # (``dd*dd -> ss``) that sat here is admitted since 2026-10-11 -- a dense
+    # domain may drive a compressed assembly level, guarded by its child's
+    # append, and a dense-driven leaf stores every cell because dense storage
+    # holds every cell.  ``test_loopir_dense_domain_sparse_result.py`` executes
+    # it.
     # Recorded seam move (second time on this seam).  The rank-1 compressed
     # output that first sat here became the degenerate ordered-stream family
     # (``test_loopir_rank1_assembly_target.py``); its replacement -- a single
@@ -836,13 +828,6 @@ def _seam_cells():
             (3, 4, 5),
             (((3, 4, 5), f32),),
             "unsupported_sparse_output_domain",
-        ),
-        (
-            "dense_domain_suffix",
-            dense_domains,
-            (4, 5),
-            (((4, 5), f32), ((4, 5), f32)),
-            "unsupported_sparse_output",
         ),
         (
             "interleaved_dense_sparse_output",

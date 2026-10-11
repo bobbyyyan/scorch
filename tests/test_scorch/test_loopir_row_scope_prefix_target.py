@@ -278,25 +278,27 @@ def test_a_merged_prefix_domain_stays_refused_at_cin():
 @pytest.mark.parametrize(
     "cell",
     [
-        # A rank-1 COMPRESSED receiver driven by a DENSE domain: the deliberate
-        # dense-domain assembly seam, and the mirror image of this family.  It
-        # is NOT what this change admits, and admitting it would append one
-        # entry per row of a dense iteration space.
+        # A COMPRESSED receiver level driven by a DENSE domain: the mirror image
+        # of this family.  It used to be refused here on the ground that
+        # admitting it would append one entry per row of a dense iteration
+        # space.  Since 2026-10-11 it is admitted under a structural guard that
+        # answers that objection: the dense-driven leaf appends only when its
+        # reduction sub-nest ran, so a row with nothing stored gets no entry.
+        # ``test_loopir_dense_domain_sparse_result.py`` executes the storage.
         ("ds", "s", "ij", "i"),
         ("dss", "s", "ijk", "i"),
-        # A doubly-compressed prefix level driven by a dense domain keeps the
-        # same seam at rank 3.
         ("sds", "ss", "ijk", "ij"),
     ],
     ids=lambda c: f"{c[0]} {c[2]}->{c[3]}",
 )
 @pytest.mark.parametrize("arm", [False, True], ids=["direct", "regblock"])
-def test_a_dense_domain_still_may_not_assemble_a_compressed_level(cell, arm):
-    """The seam this change does NOT move stays exactly where it was."""
+def test_a_dense_domain_assembles_a_compressed_level_only_under_its_guard(cell, arm):
+    """The mirror seam is admitted, and the append it feared is guarded."""
 
-    with pytest.raises(LoopIRLoweringError) as raised:
-        compiled(cell, arm)
-    assert raised.value.defect.code == "unsupported_sparse_output_domain"
+    source = compiled(cell, arm).cpp_source
+    assert "bool C_nonempty = false;" in source
+    assert "C_nonempty = true;" in source
+    assert "if (C_nonempty) {" in source
 
 
 def test_the_csr_receiver_cells_are_gated_at_the_target_not_at_cin():

@@ -68,6 +68,7 @@ from typing import (
     Set,
     Tuple,
     TypeGuard,
+    Union,
     cast,
 )
 from weakref import ReferenceType, ref as weakref_ref
@@ -8962,9 +8963,24 @@ class _OrderedKeySparseWorkspaceLowering(_TargetLowering):
             )
             if type(only) is DenseFor:
                 dense_for = cast(DenseFor, only)
+                # A dense loop visits every cell of its level, including cells
+                # under which the operands stored nothing.  Above a dense
+                # result level that is the level's own storage.  Above a
+                # compressed one the coordinate must materialize only when the
+                # compressed result level directly below it gained entries --
+                # the structural guard ``_parent_append_statements`` emits
+                # (``C{l+1}_pos.back() < pC{l+1}``), which is exact for any
+                # producer because it asks whether the child appended.  Every
+                # level below the bound prefix is a drained compressed level,
+                # so that child exists exactly when this level is not the last.
                 require(
-                    result_levels[level].kind is LevelKind.DENSE,
-                    "a dense prefix loop only above a dense result level",
+                    result_levels[level].kind is LevelKind.DENSE
+                    or (
+                        level + 1 < len(result_levels)
+                        and result_levels[level + 1].kind is LevelKind.COMPRESSED
+                    ),
+                    "a dense prefix loop above a compressed result level only "
+                    "when a compressed result level below it guards the append",
                 )
                 loops.append(
                     _Loop(_DENSE, dense_for.index, dense_for.dimension, dense_for, ())
@@ -11749,25 +11765,19 @@ def _multi_compressed_assembly_chain(program: LoopProgram) -> bool:
     ):
         return False
     body: Stmt = program.body
-    streams = 0
+    loops = 0
     while type(body) is Block and len(body.statements) == 1:
         only = body.statements[0]
-        if type(only) is DenseFor and streams == 0:
-            body = only.body
+        if type(only) in (DenseFor, SparseFor, MergedSparseFor):
+            # One loop per result level, each driven by a dense domain, one
+            # stored stream, or a two-stream merge.  Which driver a level may
+            # take is the target's admission question, not routing's: a dense
+            # domain over a compressed level is guarded there by its child's
+            # append, and over the leaf appends every cell.
+            loops += 1
+            body = cast(Union[DenseFor, SparseFor, MergedSparseFor], only).body
             continue
-        if type(only) is MergedSparseFor:
-            streams += 1
-            body = only.body
-            continue
-        if type(only) is SparseFor:
-            streams += 1
-            body = only.body
-            continue
-        return type(only) is AppendEntry and (
-            streams >= 2
-            or streams == len(kinds) == 1
-            or (streams == 1 and compressed_suffix == 1 and len(kinds) >= 3)
-        )
+        return type(only) is AppendEntry and loops == len(kinds)
     return False
 
 
@@ -11776,12 +11786,17 @@ def _bound_prefix_assembly_chain(program: LoopProgram) -> bool:
 
     Routing is purely structural, and independently re-derives the receiver
     shape CIN's bound-prefix family owns: a dense prefix over an all-compressed
-    suffix, excluding the canonical-CSR ``(DENSE, COMPRESSED)`` and
-    doubly-compressed ``(COMPRESSED, COMPRESSED)`` receivers that keep their own
-    families.  One loop per result level -- dense loops for the prefix, one
-    single-cursor stream loop per compressed level -- then a non-empty sub-nest
-    of dense and single-cursor sparse reduction loops, then one ``StoreReduce``
-    leaf.  Everything else stays on its existing route and keeps its
+    suffix.  One dense or single-cursor loop per
+    result level, binding exactly that level's coordinate, then a non-empty
+    sub-nest of dense and single-cursor sparse reduction loops, then one
+    ``StoreReduce`` leaf whose coordinates are the assembly loops' own, in
+    order.  The doubly-compressed receiver is admitted here exactly when no
+    key is drained, which the binding check also states: a drained key is
+    bound below a reduction, so its loop is not an assembly loop.  The binding
+    check is what keeps a nest whose reduction encloses a
+    result loop -- canonical CSR's ``i, k, j`` before its workspace rewrite --
+    off this route: counting loops by position alone would read ``k`` as the
+    column.  Everything else stays on its existing route and keeps its
     fail-closed boundaries.
     """
 
@@ -11801,46 +11816,36 @@ def _bound_prefix_assembly_chain(program: LoopProgram) -> bool:
     ):
         compressed_suffix += 1
     prefix = len(kinds) - compressed_suffix
-    if (
-        compressed_suffix < 1
-        or any(kind is not LevelKind.DENSE for kind in kinds[:prefix])
-        or kinds == (LevelKind.DENSE, LevelKind.COMPRESSED)
-        or kinds == (LevelKind.COMPRESSED, LevelKind.COMPRESSED)
+    if compressed_suffix < 1 or any(
+        kind is not LevelKind.DENSE for kind in kinds[:prefix]
     ):
         return False
     body: Stmt = program.body
-    assembled = 0
-    streams = 0
+    assembly: List[IndexId] = []
     reductions = 0
     while type(body) is Block and len(body.statements) == 1:
         only = body.statements[0]
-        if assembled < len(kinds):
-            if assembled < prefix:
-                # A dense result prefix level admits either driver: a dense loop
-                # visits every cell, and a stored loop visits a monotone
-                # subsequence whose skipped cells the target catches up.  Only
-                # the compressed suffix is counted as a stream, so the leaf's
-                # stream tally stays a statement about the suffix alone.
-                if type(only) is DenseFor or type(only) is SparseFor:
-                    assembled += 1
-                    body = only.body
-                    continue
-                return False
-            if type(only) is SparseFor:
-                assembled += 1
-                streams += 1
-                body = only.body
-                continue
-            return False
         if type(only) is DenseFor or type(only) is SparseFor:
-            reductions += 1
+            # Any result level admits either driver: over a dense level a
+            # stored loop visits a monotone subsequence whose skipped cells the
+            # target catches up; over a compressed level a dense loop visits
+            # cells the operands may store nothing under, which the target
+            # guards structurally.  Loops past the last result level reduce.
+            if len(assembly) < len(kinds):
+                assembly.append(
+                    only.index if type(only) is DenseFor else only.coord_index
+                )
+            else:
+                reductions += 1
             body = only.body
             continue
         return (
             type(only) is StoreReduce
             and reductions >= 1
-            and streams == compressed_suffix
-            and assembled == len(kinds)
+            and len(assembly) == len(kinds)
+            and all(type(coordinate) is IndexValue for coordinate in only.indices)
+            and [cast(IndexValue, coordinate).index for coordinate in only.indices]
+            == assembly
         )
     return False
 
@@ -12017,14 +12022,17 @@ class _MultiCompressedAssemblyLowering(_TargetLowering):
             compressed_suffix += 1
         prefix = len(result_levels) - compressed_suffix
         # The degenerate rank-1 all-compressed result is one stored stream
-        # with no dense prefix and no parent level to close.
+        # with no dense prefix and no parent level to close.  Canonical CSR is
+        # admitted for the bound-prefix reduction form only; its assembly form
+        # keeps its own family, which the append leaf below re-checks.
         ordered_compressed_suffix = (
             compressed_suffix >= 2
             or len(result_levels) == compressed_suffix == 1
             or (compressed_suffix == 1 and prefix >= 2)
         )
+        canonical_csr = compressed_suffix == 1 and prefix == 1
         require(
-            ordered_compressed_suffix
+            (ordered_compressed_suffix or canonical_csr)
             and all(level.kind is LevelKind.DENSE for level in result_levels[:prefix]),
             "a dense-prefix/multi-compressed-suffix result",
         )
@@ -12075,21 +12083,21 @@ class _MultiCompressedAssemblyLowering(_TargetLowering):
                     "single-cursor sparse loops above its accumulating leaf",
                 )
             if type(only) is DenseFor:
-                require(prefix >= 1, "no dense loop over an all-compressed result")
                 require(
-                    len(loops) < prefix,
-                    "exactly one dense loop per dense result prefix level",
+                    len(loops) < len(result_levels),
+                    "no more assembly loops than result levels",
                 )
-                # A dense loop occurs only at a prefix position, and a suffix
-                # stream only at a position at or past the prefix, so the
-                # inherited "dense prefix precedes every stream loop" property
-                # is implied by these two bounds rather than restated -- and it
-                # has to be, because a stored prefix level now puts a stream
-                # loop above a dense prefix loop legitimately.
-                require(
-                    result_levels[len(loops)].kind is LevelKind.DENSE,
-                    "a dense assembly loop only above a dense result level",
-                )
+                # A dense loop over a dense prefix level is that level's own
+                # storage.  Over a compressed level it visits every cell,
+                # including cells the operands stored nothing under, so the
+                # level is guarded structurally: a non-leaf level appends its
+                # coordinate only when its compressed child appended (the
+                # conditional ``_parent_append_statements`` every compressed
+                # level already owns), and a leaf level appends every cell,
+                # because a dense domain there means every operand is dense at
+                # that level and dense storage holds every cell.  Values never
+                # decide structure.  The bound-prefix reduction sub-nest takes
+                # its own branch above, so this loop assembles a level.
                 loops.append(_Loop(_DENSE, only.index, only.dimension, only, ()))
                 body = only.body
                 continue
@@ -12154,16 +12162,15 @@ class _MultiCompressedAssemblyLowering(_TargetLowering):
                 "an ordered append leaf",
             )
             require(
+                ordered_compressed_suffix,
+                "an assembly receiver other than canonical CSR, which keeps its "
+                "own family",
+            )
+            require(
                 len(loops) == len(result_levels)
-                and sum(
-                    1
-                    for position, loop in enumerate(loops)
-                    if position >= prefix and loop.kind in (_MERGED, _SPARSE)
-                )
-                == compressed_suffix
-                and all(loop.kind is _DENSE for loop in loops[:prefix]),
-                "one loop per result level with one stream loop per "
-                "compressed level, over a dense-driven prefix",
+                and all(loop.kind is not _MERGED for loop in loops[:prefix]),
+                "one loop per result level, with a dense domain or one stored "
+                "stream driving each dense prefix level",
             )
             self._assembly_depth = len(loops)
             union_pairs = {
@@ -12183,8 +12190,7 @@ class _MultiCompressedAssemblyLowering(_TargetLowering):
                     and all(
                         loop.kind is _MERGED
                         and cast(MergedSparseFor, loop.node).mode is MergeMode.UNION
-                        for loop in loops
-                        if loop.kind is not _DENSE
+                        for loop in loops[prefix:]
                     ),
                     "united assemblies to unite the same two operands at "
                     "every compressed level",
@@ -12220,30 +12226,18 @@ class _MultiCompressedAssemblyLowering(_TargetLowering):
         one additive :class:`StoreReduce` into the result, whose coordinates are
         exactly the assembly loops' own coordinates in order -- which is the
         statement that every result coordinate is bound above the outermost
-        reduction -- over a receiver outside the doubly-compressed shape that
-        keeps its own family.
+        reduction, so no key is drained.  Any receiver of the dense-prefix/
+        compressed-suffix shape qualifies, the doubly-compressed one included:
+        its workspace family exists for a drained key, and this form has none.
         """
 
         require(
-            len(loops) == self._assembly_depth + self._reduction_depth
-            and sum(
-                1
-                for position, loop in enumerate(loops[: self._assembly_depth])
-                if position >= self._dense_prefix and loop.kind in (_MERGED, _SPARSE)
-            )
-            == compressed_suffix,
-            "one loop per result level with one stream loop per compressed "
-            "level above the reduction sub-nest",
+            len(loops) == self._assembly_depth + self._reduction_depth,
+            "one loop per result level above the reduction sub-nest",
         )
         require(
             all(loop.kind is not _MERGED for loop in loops[: self._assembly_depth]),
             "single-cursor stream loops above a reduction sub-nest",
-        )
-        require(
-            tuple(level.kind for level in result_levels)
-            != (LevelKind.COMPRESSED, LevelKind.COMPRESSED),
-            "a receiver outside the doubly-compressed reduction shape, which "
-            "keeps its own family",
         )
         require(
             type(leaf) is StoreReduce
@@ -12264,7 +12258,11 @@ class _MultiCompressedAssemblyLowering(_TargetLowering):
         )
 
     def _reserve_reduction_accumulator_name(self) -> None:
-        """Reserve the scalar this family's reduction sub-nest accumulates in."""
+        """Reserve the scalar this family's reduction sub-nest accumulates in.
+
+        A dense-driven leaf level also reserves the structural flag its append
+        is guarded by (see :meth:`_leaf_needs_structural_guard`).
+        """
 
         if not self._reduction_depth:
             return
@@ -12272,6 +12270,37 @@ class _MultiCompressedAssemblyLowering(_TargetLowering):
             self._reduction_accumulator_name(),
             f"reduction accumulator of output tensor {self.result_decl.name!r}",
         )
+        if self._leaf_needs_structural_guard():
+            self._reserve_generated_name(
+                self._structural_guard_name(),
+                f"structural guard of output tensor {self.result_decl.name!r}",
+            )
+
+    def _leaf_needs_structural_guard(self) -> bool:
+        """Whether the innermost result level is driven by a dense domain.
+
+        A stored stream over the leaf level visits only coordinates its operand
+        stored, so the domain itself carries the answer and the append is
+        unconditional.  A dense domain visits every coordinate, including ones
+        no operand stored anything under, so the coordinate must be appended
+        exactly when the reduction sub-nest below it ran at least once -- that
+        is, when the operands' intersected stored structure under the
+        coordinate is non-empty.  That covers one operand's position range,
+        dense levels flattened between stored ones, a zero-extent dense level,
+        and coordinate intersections alike, and it never inspects a value: a
+        stored zero, or contributions cancelling exactly, keep the key.
+        """
+
+        return (
+            self._reduction_depth > 0
+            and self.loops[self._assembly_depth - 1].kind is _DENSE
+        )
+
+    def _structural_guard_name(self) -> str:
+        return f"{self.result_decl.name}_nonempty"
+
+    def _structural_guard_var(self) -> llir.Var:
+        return llir.Var(name=self._structural_guard_name(), type=llir.DataType.BOOL)
 
     def _reduction_accumulator_name(self) -> str:
         return f"{self.result_decl.name}_reduction"
@@ -12299,18 +12328,8 @@ class _MultiCompressedAssemblyLowering(_TargetLowering):
         result_name = self.result_decl.name
         leaf_level = len(self.result_decl.levels) - 1
         position_name = f"p{result_name}{leaf_level}"
-        return [
-            llir.Comment("Initialize the reduction accumulator"),
-            llir.VarInit(
-                var=accumulator,
-                value=llir.Literal(0.0, accumulator.type),
-            ),
-            llir.BlankLine(),
-            # The shared child dispatch owns the reduction sub-nest: its loops
-            # assemble nothing, so they need this family's assembly overrides
-            # no more than the generic target's loops do.
-            *_TargetLowering._loop_children(self, position),
-            llir.BlankLine(),
+        guarded = self._leaf_needs_structural_guard()
+        appends: List[llir.Stmt] = [
             llir.FunctionCallStmt(
                 name=f"{result_name}_values.emplace_back",
                 args=[llir.Var(name=accumulator.name, type=accumulator.type)],
@@ -12333,6 +12352,33 @@ class _MultiCompressedAssemblyLowering(_TargetLowering):
             ),
             llir.Increment(var=llir.Var(name=position_name, type=llir.DataType.INT64)),
         ]
+        guard_init: List[llir.Stmt] = []
+        if guarded:
+            guard = self._structural_guard_var()
+            guard_init = [
+                llir.VarInit(var=guard, value=llir.Literal(False, llir.DataType.BOOL))
+            ]
+            appends = [
+                llir.IfThenElse(
+                    cond=llir.Var(name=guard.name, type=llir.DataType.BOOL),
+                    then_body=appends,
+                )
+            ]
+        return [
+            llir.Comment("Initialize the reduction accumulator"),
+            llir.VarInit(
+                var=accumulator,
+                value=llir.Literal(0.0, accumulator.type),
+            ),
+            *guard_init,
+            llir.BlankLine(),
+            # The shared child dispatch owns the reduction sub-nest: its loops
+            # assemble nothing, so they need this family's assembly overrides
+            # no more than the generic target's loops do.
+            *_TargetLowering._loop_children(self, position),
+            llir.BlankLine(),
+            *appends,
+        ]
 
     def _lower_leaf(self) -> List[llir.Stmt]:
         """``C_reduction += <value>;`` at the bottom of the reduction sub-nest."""
@@ -12340,7 +12386,7 @@ class _MultiCompressedAssemblyLowering(_TargetLowering):
         if not self._reduction_depth:
             return _TargetLowering._lower_leaf(self)
         accumulator = self._reduction_accumulator_var()
-        return [
+        stmts: List[llir.Stmt] = [
             llir.Assign(
                 var=llir.Var(name=accumulator.name, type=llir.DataType.NO_TYPE),
                 value=self._lower_value(
@@ -12349,6 +12395,17 @@ class _MultiCompressedAssemblyLowering(_TargetLowering):
                 op=llir.AssignOp.ADD_ASSIGN,
             )
         ]
+        if self._leaf_needs_structural_guard():
+            stmts.append(
+                llir.Assign(
+                    var=llir.Var(
+                        name=self._structural_guard_name(),
+                        type=llir.DataType.NO_TYPE,
+                    ),
+                    value=llir.Literal(True, llir.DataType.BOOL),
+                )
+            )
+        return stmts
 
     def _parent_append_statements(self, level: int) -> List[llir.Stmt]:
         """One conditional parent append plus child position close.
@@ -12497,11 +12554,11 @@ class _MultiCompressedAssemblyLowering(_TargetLowering):
         """
 
         child = self.loops[position + 1]
-        if child.kind is _DENSE and position + 1 < self._dense_prefix:
-            # A dense child inside the dense prefix nests the next prefix loop.
-            # Keyed on the child's own position rather than on this loop's
-            # driver, because a stored prefix level legitimately nests a dense
-            # prefix level below it.
+        if child.kind is _DENSE:
+            # A dense child nests a dense loop: the next prefix loop inside the
+            # dense prefix, keyed on the child's own position because a stored
+            # prefix level legitimately nests a dense prefix level below it, or
+            # a dense-domain compressed level, which ``_loop_children`` guards.
             return [llir.BlankLine(), self._lower_dense(position + 1)]
         if child.kind is _SPARSE:
             return self._lower_sparse(position + 1)
@@ -12879,6 +12936,17 @@ class _MultiCompressedAssemblyLowering(_TargetLowering):
             else:
                 stmts.extend(_stored_prefix_final_statements(self, self._dense_prefix))
             return stmts
+        if self.result_decl.levels[0].kind is LevelKind.COMPRESSED:
+            # A dense domain over a compressed first level: the same one root
+            # segment as the stored driver above, closed once after the nest.
+            # Each cell's coordinate was appended under its child's guard.
+            return [
+                llir.BlankLine(),
+                self._lower_dense(0),
+                llir.BlankLine(),
+                llir.Comment("Assembly compressed _level indices"),
+                self._assembly_result_pos_set(0),
+            ]
         if _needs_stored_prefix_final_catch_up(self, self._dense_prefix):
             # A dense-driven outermost prefix level over a stored inner one:
             # the inner stream still stops short of the prefix's cell count.

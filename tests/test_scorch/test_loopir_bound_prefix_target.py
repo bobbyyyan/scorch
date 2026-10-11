@@ -91,6 +91,30 @@ MIGRATED = [
     ("sdss", "s", "ijkl", "i"),
 ]
 
+# Cells admitted once a compressed result level may be driven by a dense
+# domain, and once the doubly-compressed and canonical-CSR receivers take this
+# family whenever no key is drained (2026-10-11).  Each was a refused neighbour
+# below until then, and each is arm-invariant.  A dense-driven leaf level
+# appends exactly when its reduction sub-nest ran, so ``ds ij->i [s]`` stores
+# only the rows that hold an entry, and the oracle comparison below proves that
+# storage cell by cell.
+WIDENED = [
+    ("ds", "s", "ij", "i"),
+    ("dss", "s", "ijk", "i"),
+    ("dds", "s", "ijk", "i"),
+    ("dsd", "s", "ijk", "i"),
+    ("dsss", "sss", "ijkl", "ijk"),
+    ("sss", "ss", "ijk", "ij"),
+    ("ssd", "ss", "ijk", "ij"),
+    ("dss", "ss", "ijk", "ij"),
+    ("dds", "ss", "ijk", "ij"),
+    ("dsd", "ss", "ijk", "ij"),
+    ("sds", "ss", "ijk", "ij"),
+    ("sss", "ds", "ijk", "ij"),
+    ("ssd", "ds", "ijk", "ij"),
+]
+ADMITTED = MIGRATED + WIDENED
+
 
 def auto_options(regblock_enabled, *, jit=False):
     base = (
@@ -197,7 +221,7 @@ def test_the_family_is_its_own_member_not_an_ordered_key_workspace():
 # -- routing -----------------------------------------------------------------
 
 
-@pytest.mark.parametrize("cell", MIGRATED, ids=lambda c: f"{c[0]} {c[2]}->{c[3]}")
+@pytest.mark.parametrize("cell", ADMITTED, ids=lambda c: f"{c[0]} {c[2]}->{c[3]} [{c[1]}]")
 @pytest.mark.parametrize("arm", [False, True], ids=["direct", "regblock"])
 def test_routing_claims_the_family_for_the_assembly_target(cell, arm):
     kernel = compiled(cell, arm)
@@ -270,22 +294,69 @@ def test_the_legacy_comparand_still_refuses_this_family(cell):
     ]
 
 
-def test_the_doubly_compressed_receiver_is_not_claimed():
-    """``(C, C)`` keeps the doubly-compressed family and its own refusal."""
+def test_the_doubly_compressed_receiver_is_claimed_exactly_when_no_key_is_drained():
+    """``(C, C)`` joins this family without a drained key, and only then.
 
-    cin = reduction_cin("sss", "ss", "ijk", "ij", torch.float32)
-    normalized = normalize_cin(cin, compile_options=declared_options("ijk"))
-    program = lower_normalized_cin_to_loopir(normalized).program
+    With every result coordinate bound above the reduction there is nothing for
+    the doubly-compressed workspace family to drain, so the program is this
+    family's.  A coordinate bound below the reduction is a drained key: its loop
+    is not an assembly loop, the leaf's coordinates are not the first loops'
+    own, and routing declines it by binding -- not by layout.
+    """
+
+    key_free = lower_normalized_cin_to_loopir(
+        normalize_cin(
+            reduction_cin("sss", "ss", "ijk", "ij", torch.float32),
+            compile_options=declared_options("ijk"),
+        )
+    ).program
+    assert _bound_prefix_assembly_chain(key_free)
+    compiled(("sss", "ss", "ijk", "ij"), False)
+
+    drained = lower_normalized_cin_to_loopir(
+        normalize_cin(
+            reduction_cin("sss", "ss", "ijk", "ik", torch.float32),
+            compile_options=declared_options("ijk"),
+        )
+    ).program
+    assert not _bound_prefix_assembly_chain(drained)
+
+
+def test_routing_reads_bindings_not_positions_for_canonical_csr():
+    """A reduction enclosing the column loop is not read as the column.
+
+    Canonical CSR's ``i, k, j`` nest before its workspace rewrite puts a single
+    cursor loop in the second position, where this family expects the column.
+    Counting loops would claim it; the leaf's coordinates ``(i, j)`` are not the
+    first two loops' ``(i, k)``, so routing declines it.
+    """
+
+    i, j, k = IndexVar("i"), IndexVar("j"), IndexVar("k")
+    left = TensorVar("A", fmt="ds", dtype=torch.float32)[i, k]
+    right = TensorVar("B", fmt="ds", dtype=torch.float32)[k, j]
+    result = TensorVar("C", fmt="ds", dtype=torch.float32)[i, j]
+    cin = ForAll(
+        i,
+        ForAll(
+            k,
+            ForAll(
+                j,
+                TensorAssign(
+                    result, CINBinaryOp(Operation.MUL, left, right), op=Operation.ADD
+                ),
+            ),
+        ),
+    )
+    program = lower_normalized_cin_to_loopir(
+        normalize_cin(cin, compile_options=declared_options("ikj"))
+    ).program
     assert not _bound_prefix_assembly_chain(program)
-    with pytest.raises(LoopIRTargetError) as error:
-        compiled(("sss", "ss", "ijk", "ij"), False)
-    assert error.value.defect.code == "unsupported_program_shape"
 
 
 # -- correctness -------------------------------------------------------------
 
 
-@pytest.mark.parametrize("cell", MIGRATED, ids=lambda c: f"{c[0]} {c[2]}->{c[3]}")
+@pytest.mark.parametrize("cell", ADMITTED, ids=lambda c: f"{c[0]} {c[2]}->{c[3]} [{c[1]}]")
 @pytest.mark.parametrize("arm", [False, True], ids=["direct", "regblock"])
 @pytest.mark.parametrize("dtype", [torch.float32, torch.float64], ids=["f32", "f64"])
 def test_execution_matches_the_oracle_and_pytorch(cell, arm, dtype):
@@ -383,24 +454,12 @@ def test_exact_cancellation_still_stores_its_entry():
 @pytest.mark.parametrize(
     "cell,code,fragment",
     [
-        # A COMPRESSED result prefix level driven by a DENSE domain: this
-        # family assembles stored streams only, exactly as its ordered-key
-        # sibling does.  These two are §49.5's cells that do NOT migrate.
-        (
-            ("ds", "s", "ij", "i"),
-            "unsupported_sparse_output_domain",
-            "must be driven by one stored sparse level",
-        ),
-        (
-            ("dss", "s", "ijk", "i"),
-            "unsupported_sparse_output_domain",
-            "must be driven by one stored sparse level",
-        ),
-        (
-            ("dsss", "sss", "ijkl", "ijk"),
-            "unsupported_sparse_output_domain",
-            "must be driven by one stored sparse level",
-        ),
+        # A COMPRESSED result prefix level driven by a DENSE domain used to sit
+        # here (``ds ij->i``, ``dss ijk->i``, ``dsss ijkl->ijk``); those cells
+        # are ``WIDENED`` now and proven above.  The residue of that rule is a
+        # compressed prefix level driven by a MERGED domain, which needs two
+        # operands and cannot be spelled by this list's single-operand builder.
+        #
         # A result coordinate interleaved between two reductions: no split.
         (
             ("sss", "s", "ijk", "j"),
@@ -486,6 +545,11 @@ def test_the_generated_accumulator_identifier_is_name_reserved():
         # point: the repair's generality is what makes three distinct
         # shape-specific diagnoses reachable instead of one order complaint.
         #
+        # Twelve of the original 28 are admitted since 2026-10-11 (the
+        # ``WIDENED`` cells above): the four ``unsupported_program_shape`` ones
+        # and the eight dense-driven ``unsupported_sparse_output_domain`` ones.
+        # What remains is the interleaved-key and CSR-reduction residue.
+        #
         # This is the whole lockable set at this tip, enumerated rather than
         # sampled: every rank-2 and rank-3 reduction cell for which the repair
         # precondition holds (forced order differs from pre-forced), whose code
@@ -493,21 +557,9 @@ def test_the_generated_accumulator_identifier_is_name_reserved():
         # ``unsupported_union_with_dense``, needs a two-operand combiner and so
         # cannot be expressed through ``reduction_cin``; it stays uncovered here
         # and that is stated rather than left to look complete.
-        (("ssd", "ss", "ijk", "ij"), "unsupported_program_shape"),
-        (("ssd", "ds", "ijk", "ij"), "unsupported_program_shape"),
-        (("sss", "ss", "ijk", "ij"), "unsupported_program_shape"),
-        (("sss", "ds", "ijk", "ij"), "unsupported_program_shape"),
-        (("dds", "s", "ijk", "i"), "unsupported_sparse_output_domain"),
-        (("dds", "ss", "ijk", "ij"), "unsupported_sparse_output_domain"),
         (("dds", "s", "ijk", "j"), "unsupported_sparse_output_domain"),
-        (("ds", "s", "ij", "i"), "unsupported_sparse_output_domain"),
-        (("dsd", "s", "ijk", "i"), "unsupported_sparse_output_domain"),
-        (("dsd", "ss", "ijk", "ij"), "unsupported_sparse_output_domain"),
         (("dsd", "s", "ijk", "j"), "unsupported_sparse_output_domain"),
-        (("dss", "s", "ijk", "i"), "unsupported_sparse_output_domain"),
-        (("dss", "ss", "ijk", "ij"), "unsupported_sparse_output_domain"),
         (("dss", "s", "ijk", "j"), "unsupported_sparse_output_domain"),
-        (("sds", "ss", "ijk", "ij"), "unsupported_sparse_output_domain"),
         (("sds", "s", "ijk", "j"), "unsupported_sparse_output_domain"),
         (("ssd", "s", "ijk", "j"), "unsupported_sparse_output_domain"),
         (("sss", "s", "ijk", "j"), "unsupported_sparse_output_domain"),

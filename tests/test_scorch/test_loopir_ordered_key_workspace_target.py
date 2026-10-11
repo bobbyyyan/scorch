@@ -2066,13 +2066,16 @@ def test_reorder_blocked_neighbours_carry_a_plan_diagnostic_not_a_defect_code(
 @pytest.mark.parametrize(
     ("operand_fmt", "result_fmt", "operand_indices", "result_indices", "code"),
     [
-        # A stored result prefix level driven by a DENSE domain has no
-        # coordinate stream to append, and CIN says so.
-        ("dds", "ss", "ijk", "ik", "unsupported_sparse_output_domain"),
+        # A compressed result prefix level driven by a DENSE domain used to sit
+        # here (``dds ijk->ik [ss]``).  It is admitted since 2026-10-11: the
+        # level appends under its drained child's position counter, and
+        # ``test_loopir_dense_domain_sparse_result.py`` proves its storage
+        # against the operand's own structure.
+        #
         # A compressed-parent/dense-leaf result keeps its own reduction seam.
         ("sss", "sd", "ijk", "ik", "unsupported_sparse_output_reduction"),
     ],
-    ids=["dense-driven-prefix", "dense-leaf"],
+    ids=["dense-leaf"],
 )
 def test_unmigrated_neighbours_keep_precise_domain_codes(
     operand_fmt, result_fmt, operand_indices, result_indices, code, arm

@@ -473,17 +473,17 @@ def test_generated_program_matches_the_loopir_oracle(name, result_fmt, operand_f
         ("ss", ("sd", "ss"), "add", "unsupported_union_with_dense"),
         ("sd", ("sd",), "mul", "unsupported_sparse_output_domain"),
         ("sdd", ("sdd",), "mul", "unsupported_sparse_output_domain"),
-        # Recorded seam move: the ``dds`` copy that used to sit here is the
-        # admitted flattened-prefix family
-        # (``test_loopir_multi_dense_prefix_target.py``).  Its neighbour on
-        # the same seam -- a multi-dense-prefix result whose dense-prefix
-        # coordinate is driven by a dense-leaf operand's COMPRESSED level, so
-        # no static flattened segment number exists -- keeps a stable code,
-        # now naming the domain rather than the layout.
-        ("dds", ("dsd",), "mul", "unsupported_sparse_output_domain"),
+        # Recorded seam move, twice: the ``dds`` copy that used to sit here is
+        # the admitted flattened-prefix family
+        # (``test_loopir_multi_dense_prefix_target.py``), and its neighbour --
+        # a ``dds`` result whose dense-prefix coordinate is driven by a
+        # dense-leaf operand's COMPRESSED level (``dsd``) -- is admitted since
+        # 2026-10-11: the stored stream drives the dense prefix level, and the
+        # row-scope catch-up closes the flattened segments it skips with the
+        # segment number computed from the loop coordinates at run time.
         ("sds", ("sds",), "mul", "unsupported_sparse_output"),
     ],
-    ids=["ss+sd", "sd+ss", "sd-copy", "sdd-copy", "dds-from-dsd", "sds-copy"],
+    ids=["ss+sd", "sd+ss", "sd-copy", "sdd-copy", "sds-copy"],
 )
 def test_excluded_neighbours_keep_their_exact_codes(
     result_fmt, operand_fmts, op, code, regblock_enabled

@@ -154,9 +154,13 @@ REORDER_BLOCKED = [
 BOUND_PREFIX_MIGRATED = [
     (_reduction_cell("sss ijk->i", "sss", "s", "ijk", "i"), True),
     (_reduction_cell("ss ij->i", "ss", "s", "ij", "i"), True),
-    (_reduction_cell("ds ij->i", "ds", "s", "ij", "i"), False),
+    # ``ds ij->i`` (a compressed result level driven by a dense domain) and
+    # ``sss ijk->ij`` (a doubly-compressed receiver with no drained key) are
+    # admitted since 2026-10-11; ``sss ijk->j`` interleaves its result
+    # coordinate between two reductions and has no split.
+    (_reduction_cell("ds ij->i", "ds", "s", "ij", "i"), True),
     (_reduction_cell("sss ijk->j", "sss", "s", "ijk", "j"), False),
-    (_reduction_cell("sss ijk->ij", "sss", "ss", "ijk", "ij"), False),
+    (_reduction_cell("sss ijk->ij", "sss", "ss", "ijk", "ij"), True),
 ]
 
 # Legal plan order, supported target shape: the ordered-key vertical lowers
@@ -221,47 +225,33 @@ def test_reorder_blocked_cells_stop_at_parent_dominance(cell, arm):
 
 
 @pytest.mark.parametrize(
-    ("cell", "loop_order", "exception", "expected_code"),
+    ("cell", "loop_order"),
     [
-        (
-            _reduction_cell("sss ijk->ij", "sss", "ss", "ijk", "ij"),
-            ("i", "j", "k"),
-            LoopIRTargetError,
-            "unsupported_program_shape",
-        ),
-        (
-            _reduction_cell("ds ij->i", "ds", "s", "ij", "i"),
-            ("i", "j"),
-            LoopIRLoweringError,
-            "unsupported_sparse_output_domain",
-        ),
+        (_reduction_cell("sss ijk->ij", "sss", "ss", "ijk", "ij"), ("i", "j", "k")),
+        (_reduction_cell("ds ij->i", "ds", "s", "ij", "i"), ("i", "j")),
     ],
     ids=("sss-legal-explicit-order", "ds-legal-explicit-order"),
 )
-def test_the_legal_explicit_order_is_where_each_cell_meets_its_own_boundary(
-    cell, loop_order, exception, expected_code
-):
-    """A legal explicit order reaches a later seam -- and these two stop there.
+def test_the_legal_explicit_order_reaches_the_bound_prefix_family(cell, loop_order):
+    """A legal explicit order binds every result coordinate above the reduction.
 
-    Both controls bind every result coordinate ABOVE the outermost reduction, so
-    the ordered key is empty.  That shape is no longer unowned: the bound-prefix
-    family owns it, which is what makes ``ss ij->i`` and ``sss ijk->i`` compile
-    here now.  These two do not migrate with them, and for different reasons --
-    ``ds ij->i`` has a COMPRESSED result level driven by a DENSE domain, and
-    ``sss ijk->ij`` has a doubly-compressed receiver that never reaches the
-    ordered-key branch.  So the "necessary but not sufficient" claim §49.5 made
-    about a LoopIR-only repair is settled by construction rather than by
-    argument: the repair and the family are both in, gated together, and these
-    two still stop at their own boundaries.
+    The ordered key is then empty, and the bound-prefix family owns the shape.
+    These two controls used to stop at their own boundaries even so --
+    ``ds ij->i`` because a dense domain drove a compressed result level,
+    ``sss ijk->ij`` because the doubly-compressed receiver never reached the
+    ordered-key branch -- and both boundaries moved on 2026-10-11: the dense-driven
+    leaf appends when its reduction ran, and a doubly-compressed receiver with no
+    drained key is classified by its split rather than by its layout.  The
+    explicit order and the automatic one now agree on the family.
     """
 
     name, cin, result_shape, bindings = cell
     options = CompileOptions.from_environment(
         environ={}, requested_schedule=Schedule(loop_order=loop_order)
     )
-    with pytest.raises(exception) as error:
-        compile_cin_via_loopir(cin, result_shape, bindings, compile_options=options)
-    assert error.value.defect.code == expected_code, (name, error.value.defect)
+    kernel = compile_cin_via_loopir(cin, result_shape, bindings, compile_options=options)
+    assert "wksp" not in kernel.cpp_source, name
+    assert "_reduction = 0.0;" in kernel.cpp_source, name
 
 
 @pytest.mark.parametrize(
