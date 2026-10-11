@@ -2,7 +2,7 @@ import os
 import sys
 import time
 from contextlib import contextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Any, Dict, Iterator, List, Optional, Sequence, Tuple, Union, cast
 
 import scorch_ops as _scorch_ops
@@ -505,6 +505,27 @@ def _select_and_bind_einsum_operand_mode_orders(
     return desired_mode_orders
 
 
+def _conversion_compile_inputs(
+    compile_options: CompileOptions,
+    compilation_context: Optional[CompilationContext],
+) -> Tuple[CompileOptions, Optional[CompilationContext]]:
+    """The options and timing owner for a conversion kernel inside a compile call.
+
+    A requested schedule belongs to the caller's own kernel.  A mode-order or
+    format conversion the call performs on an operand or result is a separate
+    kernel with no schedule of its own, and plain CIN lowering refuses -- by
+    design -- to ignore a requested schedule.  So the conversion lowers with the
+    schedule removed, under its own timing owner, exactly as the typed
+    pipeline's mode-order relayout prerequisite does.  Without a requested
+    schedule the caller's pair is returned unchanged.
+    """
+
+    if compile_options.requested_schedule is None:
+        return compile_options, compilation_context
+    conversion_options = replace(compile_options, requested_schedule=None)
+    return conversion_options, CompilationContext(compile_options=conversion_options)
+
+
 def _with_compiler_mode_order(
     tensor: Union[STensor, TensorSpec],
     mode_order: Sequence[int],
@@ -515,10 +536,13 @@ def _with_compiler_mode_order(
     if isinstance(tensor, TensorSpec):
         return tensor.with_mode_order(mode_order)
     result = tensor.copy()
+    conversion_options, conversion_context = _conversion_compile_inputs(
+        compile_options, compilation_context
+    )
     result.change_mode_order(
         list(mode_order),
-        _compile_options=compile_options,
-        _compilation_context=compilation_context,
+        _compile_options=conversion_options,
+        _compilation_context=conversion_context,
     )
     return result
 
@@ -1219,10 +1243,13 @@ def matmul(
             compilation_context,
             compile_options,
         )
+        conversion_options, conversion_context = _conversion_compile_inputs(
+            compile_options, compilation_context
+        )
         return STensor.from_torch(result_torch).to_sparse(
             output_format,
-            _compile_options=compile_options,
-            _compilation_context=compilation_context,
+            _compile_options=conversion_options,
+            _compilation_context=conversion_context,
         )
 
     # Never silently swallow a codegen schedule in a prebuilt dispatch.
@@ -1252,10 +1279,13 @@ def matmul(
                 compilation_context,
                 compile_options,
             )
+            conversion_options, conversion_context = _conversion_compile_inputs(
+                compile_options, compilation_context
+            )
             a.change_mode_order(
                 default_mode_order,
-                _compile_options=compile_options,
-                _compilation_context=compilation_context,
+                _compile_options=conversion_options,
+                _compilation_context=conversion_context,
             )
 
         if use_cache:
@@ -1310,10 +1340,13 @@ def matmul(
                     compilation_context,
                     compile_options,
                 )
+                conversion_options, conversion_context = _conversion_compile_inputs(
+                    compile_options, compilation_context
+                )
                 a.change_mode_order(
                     default_mode_order,
-                    _compile_options=compile_options,
-                    _compilation_context=compilation_context,
+                    _compile_options=conversion_options,
+                    _compilation_context=conversion_context,
                 )
             if b.storage.index.mode_order != default_mode_order:
                 b = b.copy()
@@ -1326,10 +1359,13 @@ def matmul(
                     compilation_context,
                     compile_options,
                 )
+                conversion_options, conversion_context = _conversion_compile_inputs(
+                    compile_options, compilation_context
+                )
                 b.change_mode_order(
                     default_mode_order,
-                    _compile_options=compile_options,
-                    _compilation_context=compilation_context,
+                    _compile_options=conversion_options,
+                    _compilation_context=conversion_context,
                 )
 
     if use_cache:
@@ -2463,10 +2499,13 @@ def _einsum_owned(
             # the permutation, takes a defensive copy of the result's own mode order and
             # sorts it, all to discover there is nothing to do. 1.0 us of a 15 us call.
             if _temp_mo and _temp_mo != _final_mo:
+                conversion_options, conversion_context = _conversion_compile_inputs(
+                    compile_options, compilation_context
+                )
                 _result.change_mode_order(
                     _final_mo,
-                    _compile_options=compile_options,
-                    _compilation_context=compilation_context,
+                    _compile_options=conversion_options,
+                    _compilation_context=conversion_context,
                 )
 
             return _result
@@ -2902,10 +2941,13 @@ def _einsum_owned(
 
     # Convert to final mode order if it differs from temporary mode order
     if temp_mode_order:
+        conversion_options, conversion_context = _conversion_compile_inputs(
+            compile_options, compilation_context
+        )
         result.change_mode_order(
             final_mode_order,
-            _compile_options=compile_options,
-            _compilation_context=compilation_context,
+            _compile_options=conversion_options,
+            _compilation_context=conversion_context,
         )
 
     return result
@@ -3363,11 +3405,14 @@ def _relayout_mode_order_args(
             and snapshot.has_index
         ):
             aligned = STensor.copy(snapshot.tensor)
+            conversion_options, conversion_context = _conversion_compile_inputs(
+                compile_options, compilation_context
+            )
             STensor.change_mode_order(
                 aligned,
                 list(desired_mode_order),
-                _compile_options=compile_options,
-                _compilation_context=compilation_context,
+                _compile_options=conversion_options,
+                _compilation_context=conversion_context,
             )
             aligned_args[position] = aligned
     return tuple(aligned_args)
