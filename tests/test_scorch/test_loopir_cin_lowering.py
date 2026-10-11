@@ -493,8 +493,12 @@ def test_implicit_bridge_cannot_manufacture_elementwise_updates():
     ]
     assert len(stores) == 1
     assert isinstance(stores[0], Store)
+    # The explicit ``+=`` form has no reduction loop either, so it accumulates
+    # nothing into a zeroed result and normalizes to the same overwrite store
+    # (legacy emits ``=`` for it too); it must not, however, turn the implicit
+    # form into an update.
     explicit = lower_normalized_cin_to_loopir(normalize_cin(build(Operation.ADD)))
-    assert canonical_program_dump(implicit.program) != canonical_program_dump(
+    assert canonical_program_dump(implicit.program) == canonical_program_dump(
         explicit.program
     )
 
@@ -853,6 +857,25 @@ def test_unsupported_merged_reduction():
 
 
 def test_unsupported_merged_update():
+    """A merged RESULT coordinate under a reduction elsewhere stays refused.
+
+    ``C[j] += A[i, j] + B[i, j]`` sums over ``i`` while ``j`` is a union.  The
+    shape this test used to hold, ``C[i, j] += A[i, j] + B[i, j]``, has no
+    reduction loop, so its update is plain assignment (see
+    ``test_a_merged_add_copy_is_plain_assignment``).
+    """
+
+    i, j = IndexVar("i"), IndexVar("j")
+    c = TensorVar("C", fmt="d")
+    a = TensorVar("A", fmt="ds")
+    b = TensorVar("B", fmt="ds")
+    assign = TensorAssign(
+        c[j], CINBinaryOp(Operation.ADD, a[i, j], b[i, j]), op=Operation.ADD
+    )
+    expect_code("unsupported_merged_update", ForAll(i, ForAll(j, assign)))
+
+
+def test_a_merged_add_copy_is_plain_assignment():
     i, j = IndexVar("i"), IndexVar("j")
     c = TensorVar("C", fmt="dd")
     a = TensorVar("A", fmt="ds")
@@ -860,7 +883,13 @@ def test_unsupported_merged_update():
     assign = TensorAssign(
         c[i, j], CINBinaryOp(Operation.ADD, a[i, j], b[i, j]), op=Operation.ADD
     )
-    expect_code("unsupported_merged_update", ForAll(i, ForAll(j, assign)))
+    lowered = lower_normalized_cin_to_loopir(normalize_cin(ForAll(i, ForAll(j, assign))))
+    stores = [
+        node
+        for node in _walk_statements(lowered.program.body)
+        if isinstance(node, (Store, StoreReduce))
+    ]
+    assert len(stores) == 1 and isinstance(stores[0], Store)
 
 
 def test_analysis_codes_surface_through_the_lowering():

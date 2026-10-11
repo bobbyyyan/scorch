@@ -841,9 +841,13 @@ def _build_boundary_cin(fmt_result, result_indices, operands, nest):
             ("dd", "ik", (("ss", "ij"), ("ss", "jk")), "ijk"),
             "unsupported_merged_reduction",
         ),
+        # ``merged_update_dense_out`` was ``C[i,j] += A[i,j] * B[i,j]``; with no
+        # reduction loop its ADD update is plain assignment since 2026-10-11,
+        # and the intersection emits legacy's kernel.  The code itself is still
+        # reached by a merged RESULT coordinate under a reduction elsewhere.
         (
             "merged_update_dense_out",
-            ("dd", "ij", (("ds", "ij"), ("ds", "ij")), "ij"),
+            ("d", "j", (("ds", "ij"), ("ds", "ij")), "ij"),
             "unsupported_merged_update",
         ),
         # Recorded seam move: the rank-1 sparse root reduced over an OUTER

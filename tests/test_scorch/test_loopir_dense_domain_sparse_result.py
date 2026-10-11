@@ -42,7 +42,7 @@ from scorch.compiler.loopir.lower_cin import (
     lower_normalized_cin_to_loopir,
 )
 from scorch.compiler.loopir.lower_llir import LoopIRTargetError
-from scorch.compiler.loopir.nodes import AppendEntry, Block, StoreReduce
+from scorch.compiler.loopir.nodes import AppendEntry, Block, Store, StoreReduce
 from scorch.compiler.loopir.pipeline import (
     compile_cin_via_loopir,
     execute_cin_via_loopir,
@@ -446,23 +446,19 @@ def _leaf(program):
     while True:
         assert type(body) is Block and len(body.statements) == 1
         only = body.statements[0]
-        if type(only) in (AppendEntry, StoreReduce):
+        if type(only) in (AppendEntry, Store, StoreReduce):
             return only
         body = only.body
 
 
-@pytest.mark.parametrize(
-    "result_fmt,leaf_type", [("ss", AppendEntry), ("dd", StoreReduce)]
-)
-def test_an_add_copy_is_assignment_only_where_the_operator_picks_a_family(
-    result_fmt, leaf_type
-):
-    """``+=`` with no reduction loop: assembly for a sparse result, kept for dense.
+@pytest.mark.parametrize("result_fmt,leaf_type", [("ss", AppendEntry), ("dd", Store)])
+def test_an_add_copy_is_assignment_for_every_result(result_fmt, leaf_type):
+    """``+=`` with no reduction loop is plain assignment, sparse or dense.
 
-    A sparse result's update operator selects the accumulation families, none of
-    which owns a copy, so it is normalized away.  A dense result's ``+=`` is a
-    direct store into a zeroed array either way and keeps the operator, which is
-    the emission legacy parity is measured on.
+    A sparse result's update operator would select the accumulation families,
+    none of which owns a copy.  A dense result's ``+=`` would read each zeroed
+    cell before writing it; legacy emits ``=`` for it on both automatic arms,
+    and the normalization makes this route emit the same kernel.
     """
 
     program = lower_normalized_cin_to_loopir(

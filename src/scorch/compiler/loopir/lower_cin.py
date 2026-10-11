@@ -414,26 +414,18 @@ def lower_normalized_cin_to_loopir(
     }
     level_types = {symbol: levels for symbol, (_, levels, _) in checked_tensors.items()}
     storage_modes = {symbol: modes for symbol, (_, _, modes) in checked_tensors.items()}
-    if (
-        reduce_update
-        and not has_reduction_loops
-        and any(
-            level_type is not LevelType.DENSE
-            for level_type in level_types[result_symbol]
-        )
-    ):
+    if reduce_update and not has_reduction_loops:
         # An ADD update with no reduction loop accumulates nothing.  Every
         # loop variable binds a result coordinate, and an access may not
         # repeat one (refused above), so the nest visits each result cell at
-        # most once and writes it into a result the kernel builds from empty:
-        # the update is plain assignment.  For a sparse result the operator
-        # is not inert -- it selects the accumulation families, whose
-        # workspaces and coordinate merges exist to combine several
-        # contributions per cell, and none of which owns a copy -- so it is
-        # normalized here, once, at this ownership boundary, and the program
-        # lowers as the assembly it is.  A dense result's ``+=`` and ``=``
-        # are both direct stores into a zeroed array and keep the operator as
-        # written, which is the emission legacy parity is measured on.
+        # most once, and every result starts empty (sparse) or zeroed (dense):
+        # the update is plain assignment, normalized here once, at this
+        # ownership boundary.  For a sparse result the operator would select
+        # the accumulation families, whose workspaces and coordinate merges
+        # exist to combine several contributions per cell and none of which
+        # owns a copy.  For a dense result ``+=`` would read every zeroed cell
+        # before writing it; legacy lowers the same program as ``=`` on both
+        # automatic arms, and so does this.
         reduce_update = False
     if len(set(scalar_types.values())) > 1:
         _fail(
