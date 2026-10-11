@@ -2147,7 +2147,7 @@ def test_the_migrated_row_scope_prefix_no_longer_stops_here(arm):
     ).cpp_source
 
 
-def test_the_explicitly_ordered_route_stops_at_the_operand_not_the_prefix():
+def test_the_explicitly_ordered_route_stops_at_the_missing_workspace():
     """Corrected: this cell no longer stops where its name used to say.
 
     It was ``test_row_scope_dense_prefix_is_rejected_by_the_target``, asserting
@@ -2159,6 +2159,12 @@ def test_the_explicitly_ordered_route_stops_at_the_operand_not_the_prefix():
     prefix rule is consulted.  A test that passes for the wrong reason is worse
     than one that fails, so the boundary it actually proves is named here and
     the message is asserted, not just the code.
+
+    Since 2026-10-11 the generic target descends a compressed level under a
+    compressed level, so that input rule is gone too.  The program now stops at
+    the rule that describes it: a reduction into sparse result storage with no
+    workspace region, which only the verified sparse-workspace schedule may
+    lower.
     """
 
     options = CompileOptions.from_environment(
@@ -2172,7 +2178,7 @@ def test_the_explicitly_ordered_route_stops_at_the_operand_not_the_prefix():
             compile_options=options,
         )
     assert error.value.defect.code == "unsupported_program_shape"
-    assert "hierarchical compressed" in str(error.value)
+    assert "requires the verified sparse-workspace schedule" in str(error.value)
 
 
 # -- the post-assembly window ------------------------------------------------

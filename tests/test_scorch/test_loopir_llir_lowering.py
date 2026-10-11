@@ -729,8 +729,13 @@ def union_shapes(program):
     return {a_symbol: (3, 4), b_symbol: (3, 4)}
 
 
-def test_level_zero_cursors_fail_at_target_boundary():
-    """DCSR descent verifies and lowers, but the target fails closed."""
+def test_level_zero_cursors_lower_at_target_boundary():
+    """DCSR descent verifies, lowers, and emits legacy's kernel.
+
+    The target used to fail closed here: it refused any input with more than
+    one compressed level.  Since 2026-10-11 it descends level 1 from level 0's
+    bound position, and the SpMV kernel is byte-identical to legacy's.
+    """
 
     i, j = IndexVar("i"), IndexVar("j")
     y = TensorVar("y", fmt="d")
@@ -740,9 +745,8 @@ def test_level_zero_cursors_fail_at_target_boundary():
         y[i], CINBinaryOp(Operation.MUL, a[i, j], x[j]), op=Operation.ADD
     )
     cin = ForAll(i, ForAll(j, assign))
-    with pytest.raises(LoopIRTargetError) as error:
-        compile_cin_via_loopir(cin, (5,), [((5, 7), F32), ((7,), F32)])
-    assert error.value.defect.code == "unsupported_program_shape"
+    comparison = compare_generated_sources(cin, (5,), [((5, 7), F32), ((7,), F32)])
+    assert comparison.identical
 
 
 def test_three_cursor_merge_fails_at_target_boundary():

@@ -1786,23 +1786,14 @@ class _TargetLowering:
                     f"tensor {decl.name!r} permutes compressed structure, "
                     "which the migrated families do not cover",
                 )
-        for symbol in self._input_symbols:
-            decl = self.decls[symbol]
-            compressed = [
-                level
-                for level, level_decl in enumerate(decl.levels)
-                if level_decl.kind is LevelKind.COMPRESSED
-            ]
-            if len(compressed) > 1:
-                # One compressed level descends by a single bound cursor:
-                # at the leaf it owns the value read, above the leaf the
-                # dense sub-tree loads through its physical position.
-                _fail(
-                    "unsupported_program_shape",
-                    f"input {decl.name!r} declares hierarchical compressed "
-                    "structure; hierarchical compressed descent is outside "
-                    "the migrated families",
-                )
+        # An input may carry any number of compressed levels.  Each one is
+        # descended by its own single-cursor loop whose parent is the position
+        # of the same tensor one level up -- the dominance rule
+        # ``verify_program`` enforces -- so a compressed level under a
+        # compressed level reads ``pos[parent]`` exactly as one under a dense
+        # level does, and the leaf owns the value read.  A merged loop cannot
+        # anchor such a descent here: ``_collect_loop_nest`` admits a merge
+        # only as the innermost loop, so no compressed child sits below one.
 
     def _validate_shapes(
         self,

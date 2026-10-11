@@ -872,34 +872,49 @@ def build_hierarchical_mixed_program():
     )
 
 
-def test_hierarchical_descent_fails_closed_at_the_target():
-    """The verifier admits the ssd descent; the target owns the rejection."""
+def test_hierarchical_descent_lowers_at_the_target():
+    """The verifier admits the ssd descent, and so does the target now.
 
-    program, sym_a = build_hierarchical_mixed_program()
-    options = CompileOptions.from_environment(environ={})
-    with pytest.raises(LoopIRTargetError) as error:
-        lower_loopir_to_llir(
-            program,
-            input_shapes={sym_a: (3, 4, 5)},
-            result_shape=(3, 4, 5),
-            compile_options=options,
-            compilation_context=CompilationContext(options),
-        )
-    assert error.value.defect.code == "unsupported_program_shape"
+    This used to lock the target's refusal of any input with more than one
+    compressed level.  Since 2026-10-11 the target descends level 1 from level
+    0's bound position and reads the dense leaf block through level 1's, the
+    chain the verifier already enforces; the emitted C++ is byte-identical to
+    legacy's for the same CIN (``test_loopir_hierarchical_compressed_operand``).
+    """
 
+    from scorch.ops import _lower_generated_llir
 
-def test_target_failure_is_a_recorded_stage_loss():
     program, sym_a = build_hierarchical_mixed_program()
     options = CompileOptions.from_environment(environ={})
     context = CompilationContext(options)
-    with pytest.raises(LoopIRTargetError):
+    function = lower_loopir_to_llir(
+        program,
+        input_shapes={sym_a: (3, 4, 5)},
+        result_shape=(3, 4, 5),
+        compile_options=options,
+        compilation_context=context,
+    )
+    source = _lower_generated_llir(function, options, context)
+    assert "int pA1_end = A1_pos[pA0 + 1];" in source
+    assert "for (int pA1 = A1_pos[pA0]; pA1 < pA1_end; pA1++)" in source
+    assert "&A_val[pA1 * A2_size]" in source
+
+
+def test_target_failure_is_a_recorded_stage_loss():
+    """A shape the target refuses is a recorded loss of its own stage."""
+
+    program, sym_a = build_hierarchical_mixed_program()
+    options = CompileOptions.from_environment(environ={})
+    context = CompilationContext(options)
+    with pytest.raises(LoopIRTargetError) as error:
         lower_loopir_to_llir(
             program,
-            input_shapes={sym_a: (3, 4, 5)},
+            input_shapes={sym_a: (3, 4, 6)},
             result_shape=(3, 4, 5),
             compile_options=options,
             compilation_context=context,
         )
+    assert error.value.defect.code == "dimension_extent_mismatch"
     assert context._failed_stage_id is CompilerStageId.LOOPIR_TO_LLIR_LOWERING
     assert CompilerStageId.LOOPIR_TO_LLIR_LOWERING not in {
         record.stage_id for record in context.stage_run_records
@@ -911,7 +926,6 @@ def test_target_failure_is_a_recorded_stage_loss():
 
 def _seam_cells():
     i, j = IndexVar("i"), IndexVar("j")
-    i3, j3, k3 = IndexVar("i"), IndexVar("j"), IndexVar("k")
 
     merged = ForAll(
         i,
@@ -937,19 +951,6 @@ def _seam_cells():
                     Operation.ADD,
                     TensorVar("A", fmt="sd")[i, j],
                     TensorVar("B", fmt="sd")[i, j],
-                ),
-            ),
-        ),
-    )
-    hierarchical = ForAll(
-        i3,
-        ForAll(
-            j3,
-            ForAll(
-                k3,
-                TensorAssign(
-                    TensorVar("C", fmt="ddd")[i3, j3, k3],
-                    TensorVar("A", fmt="ssd")[i3, j3, k3],
                 ),
             ),
         ),
@@ -1000,13 +1001,9 @@ def _seam_cells():
             (((4, 5), torch.float32), ((4, 5), torch.float32)),
             "unsupported_sparse_hierarchy",
         ),
-        (
-            "hierarchical_compressed_above_dense_leaf",
-            hierarchical,
-            (3, 4, 5),
-            (((3, 4, 5), torch.float32),),
-            "unsupported_program_shape",
-        ),
+        # ``hierarchical_compressed_above_dense_leaf`` (an ssd copy into ddd)
+        # sat here until 2026-10-11; it is admitted and byte-identical to
+        # legacy, proven in test_loopir_hierarchical_compressed_operand.py.
         (
             "mixed_operand_into_sparse_domain_result",
             sparse_result,

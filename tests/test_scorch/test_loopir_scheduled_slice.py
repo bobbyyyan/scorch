@@ -3469,8 +3469,15 @@ def test_root_reduction_auto_shadow_execution():
     )
 
 
-def test_auto_stack_form_ss_family_fails_closed_at_target_lowering():
-    """The doubly-compressed operand stays outside the migrated families."""
+def test_auto_stack_form_ss_family_is_byte_identical_to_legacy():
+    """The doubly-compressed operand is admitted, and its kernel is legacy's.
+
+    This used to lock the refusal: the generic target rejected any input with
+    more than one compressed level.  Since 2026-10-11 it descends a compressed
+    level under a compressed level through the same parent-position chain it
+    uses under a dense level, and the regblock automatic arm reproduces the
+    legacy kernel byte for byte.
+    """
 
     ivs = {name: IndexVar(name) for name in ("i", "j", "k")}
     c = TensorVar("C", fmt="dd", dtype=F32)
@@ -3483,11 +3490,10 @@ def test_auto_stack_form_ss_family_fails_closed_at_target_lowering():
     )
     for name in reversed(("i", "j", "k")):
         stmt = ForAll(ivs[name], stmt)
-    with pytest.raises(LoopIRTargetError) as error:
-        compile_cin_via_loopir(
-            stmt,
-            (4, 6),
-            SPMM_BINDINGS,
-            compile_options=regblock_auto_options(),
-        )
-    assert error.value.defect.code == "unsupported_program_shape"
+    comparison = compare_generated_sources(
+        stmt,
+        (4, 6),
+        SPMM_BINDINGS,
+        compile_options=regblock_auto_options(),
+    )
+    assert comparison.identical
