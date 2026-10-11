@@ -634,6 +634,102 @@ def _ordered_key_split(
     return prefix, len(lhs_index_ids) - prefix
 
 
+def _ordered_key_family(
+    result_levels: Tuple[LevelType, ...],
+    lhs_index_ids: Tuple[IndexId, ...],
+    domains: Dict[IndexId, LoopIterationDomain],
+    reduction_index_ids: Tuple[IndexId, ...],
+    loop_positions: Dict[IndexId, int],
+    dense_prefix_length: int,
+) -> _SparseOutputReduction:
+    """Decide an ordered sparse reduction by its split, or refuse with a code.
+
+    The receiver is a run of ``dense_prefix_length`` dense levels followed by
+    compressed levels, updated under ADD.  The split and the per-level domain
+    rules below are the whole decision, so every receiver branch that decides
+    an ordered reduction this way calls this one function rather than keeping
+    its own copy of the rules.
+    """
+
+    # Two families share this receiver shape -- a dense prefix, then one
+    # or more compressed levels, reduced under ADD -- and the split's key
+    # rank selects between them.  The key is every result coordinate
+    # bound below the outermost reduction, whether after the innermost
+    # one or between two of them; every coordinate above the outermost
+    # reduction binds a result prefix level directly.  Both runs are
+    # derived from loop and level identities -- no layout string, rank
+    # table, or format spelling participates.
+    #
+    # ``key_rank >= 1`` is the ordered-key sparse-workspace family: one
+    # workspace region owns the key domain and drains it in order.
+    # ``key_rank == 0`` is the bound-prefix accumulation family: the
+    # prefix loops already visit result cells in lexicographic order (the
+    # split's strictly-increasing test, plus the per-level domain rules
+    # below), so the reduction accumulates into a scalar that the ordered
+    # append reads and no workspace region exists to own.
+    split = _ordered_key_split(
+        result_levels, lhs_index_ids, reduction_index_ids, loop_positions
+    )
+    if split is None:
+        _fail(
+            "unsupported_sparse_output_domain",
+            "an ordered sparse reduction needs every result coordinate "
+            "bound by the nest, in result level order",
+        )
+    prefix, key_rank = cast(Tuple[int, int], split)
+    if prefix != dense_prefix_length and any(
+        result_levels[position] is LevelType.DENSE
+        for position in range(prefix, len(result_levels))
+    ):
+        _fail(
+            "unsupported_sparse_output_domain",
+            "every dense result level of an ordered-key sparse "
+            "reduction must be bound above the outermost reduction",
+        )
+    for position, index_id in enumerate(lhs_index_ids):
+        domain_kind = domains[index_id].kind
+        if position >= len(result_levels) - key_rank:
+            # A drained key coordinate may iterate any domain: the
+            # workspace merges and orders its entries, so the assembly
+            # does not depend on the insertion order.
+            continue
+        if result_levels[position] is LevelType.DENSE:
+            if domain_kind not in (DomainKind.DENSE, DomainKind.SPARSE):
+                # A dense result level stores no coordinates, so the only
+                # obligation a prefix loop owes it is that its child's
+                # position array be closed at EVERY logical cell of the
+                # level, not merely at the cells the loop visits.  A dense
+                # domain visits them all and owes nothing further.  One
+                # stored stream visits a monotone subsequence, and the
+                # target closes the cells it skips with the row-scope
+                # catch-up -- the same obligation, and the same mechanism,
+                # the canonical-CSR row-scope family already discharges at
+                # rank 2.  A merged domain is refused rather than caught
+                # up: it has no single cursor whose coordinate advances the
+                # catch-up, and neither family's prefix chain admits a
+                # merged loop above a result level.
+                _fail(
+                    "unsupported_sparse_output_domain",
+                    "a dense result prefix level of an ordered-key "
+                    "sparse reduction must iterate a dense domain or one "
+                    "stored sparse level",
+                )
+        elif domain_kind not in (DomainKind.DENSE, DomainKind.SPARSE):
+            _fail(
+                "unsupported_sparse_output_domain",
+                "a compressed result prefix level of an ordered-key "
+                "sparse reduction must be driven by a dense domain or one "
+                "stored sparse level",
+            )
+    if key_rank == 0:
+        # Every result coordinate binds a prefix level under the rules
+        # just applied, so the whole result access is complete before the
+        # outermost reduction opens.  That is the bound-prefix family; it
+        # needs no workspace and therefore no workspace node.
+        return _SparseOutputReduction.BOUND_PREFIX_ACCUMULATION
+    return _SparseOutputReduction.ORDERED_KEY_WORKSPACE
+
+
 def _classify_sparse_output_family(
     result_sparse: bool,
     reduce_update: bool,
@@ -680,83 +776,14 @@ def _classify_sparse_output_family(
         if ordered_key_shape:
             sparse_reduction_family = False
     if ordered_key_shape:
-        # Two families share this receiver shape -- a dense prefix, then one
-        # or more compressed levels, reduced under ADD -- and the split's key
-        # rank selects between them.  The key is every result coordinate
-        # bound below the outermost reduction, whether after the innermost
-        # one or between two of them; every coordinate above the outermost
-        # reduction binds a result prefix level directly.  Both runs are
-        # derived from loop and level identities -- no layout string, rank
-        # table, or format spelling participates.
-        #
-        # ``key_rank >= 1`` is the ordered-key sparse-workspace family: one
-        # workspace region owns the key domain and drains it in order.
-        # ``key_rank == 0`` is the bound-prefix accumulation family: the
-        # prefix loops already visit result cells in lexicographic order (the
-        # split's strictly-increasing test, plus the per-level domain rules
-        # below), so the reduction accumulates into a scalar that the ordered
-        # append reads and no workspace region exists to own.
-        split = _ordered_key_split(
-            result_levels, lhs_index_ids, reduction_index_ids, loop_positions
+        return _ordered_key_family(
+            result_levels,
+            lhs_index_ids,
+            domains,
+            reduction_index_ids,
+            loop_positions,
+            dense_prefix_length,
         )
-        if split is None:
-            _fail(
-                "unsupported_sparse_output_domain",
-                "an ordered sparse reduction needs every result coordinate "
-                "bound by the nest, in result level order",
-            )
-        prefix, key_rank = cast(Tuple[int, int], split)
-        if prefix != dense_prefix_length and any(
-            result_levels[position] is LevelType.DENSE
-            for position in range(prefix, len(result_levels))
-        ):
-            _fail(
-                "unsupported_sparse_output_domain",
-                "every dense result level of an ordered-key sparse "
-                "reduction must be bound above the outermost reduction",
-            )
-        for position, index_id in enumerate(lhs_index_ids):
-            domain_kind = domains[index_id].kind
-            if position >= len(result_levels) - key_rank:
-                # A drained key coordinate may iterate any domain: the
-                # workspace merges and orders its entries, so the assembly
-                # does not depend on the insertion order.
-                continue
-            if result_levels[position] is LevelType.DENSE:
-                if domain_kind not in (DomainKind.DENSE, DomainKind.SPARSE):
-                    # A dense result level stores no coordinates, so the only
-                    # obligation a prefix loop owes it is that its child's
-                    # position array be closed at EVERY logical cell of the
-                    # level, not merely at the cells the loop visits.  A dense
-                    # domain visits them all and owes nothing further.  One
-                    # stored stream visits a monotone subsequence, and the
-                    # target closes the cells it skips with the row-scope
-                    # catch-up -- the same obligation, and the same mechanism,
-                    # the canonical-CSR row-scope family already discharges at
-                    # rank 2.  A merged domain is refused rather than caught
-                    # up: it has no single cursor whose coordinate advances the
-                    # catch-up, and neither family's prefix chain admits a
-                    # merged loop above a result level.
-                    _fail(
-                        "unsupported_sparse_output_domain",
-                        "a dense result prefix level of an ordered-key "
-                        "sparse reduction must iterate a dense domain or one "
-                        "stored sparse level",
-                    )
-            elif domain_kind not in (DomainKind.DENSE, DomainKind.SPARSE):
-                _fail(
-                    "unsupported_sparse_output_domain",
-                    "a compressed result prefix level of an ordered-key "
-                    "sparse reduction must be driven by a dense domain or one "
-                    "stored sparse level",
-                )
-        if key_rank == 0:
-            # Every result coordinate binds a prefix level under the rules
-            # just applied, so the whole result access is complete before the
-            # outermost reduction opens.  That is the bound-prefix family; it
-            # needs no workspace and therefore no workspace node.
-            return _SparseOutputReduction.BOUND_PREFIX_ACCUMULATION
-        return _SparseOutputReduction.ORDERED_KEY_WORKSPACE
     mixed_leaf_family = (
         len(result_levels) >= 2
         and result_levels[0] is LevelType.COMPRESSED
