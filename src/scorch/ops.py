@@ -2211,11 +2211,13 @@ def _einsum_owned(
     -----
     **Output-format inference** (when ``format=`` is omitted) is decided per level:
     *sparse * anything = sparse; dense + anything = dense; otherwise compressed*,
-    with ties preferring coordinate over compressed. A sparse level may not precede
+    with ties preferring compressed over coordinate. A sparse level may not precede
     a dense level (a preceding sparse level is forced dense). As a special case,
     an SDDMM pattern (sparse output with reduction vars plus an input mirroring the
     output sparsity) yields an all-COO output to enable the scalar-accum codegen
-    path — and there is a dedicated prebuilt fast path inside ``einsum`` for exactly
+    path. An output that would still mix coordinate levels with dense or compressed
+    ones takes compressed levels in their place, since such a tensor cannot be lowered
+    (see ``_without_mixed_coordinate_levels``) — and there is a dedicated prebuilt fast path inside ``einsum`` for exactly
     ``"ij,ik,jk->ij"`` with ``S`` (COO), ``A`` (dense), ``B`` (dense) float32.
 
     For the qualifying pattern (dense output, sparse contraction, tileable free dim,
