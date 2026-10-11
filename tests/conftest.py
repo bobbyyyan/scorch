@@ -33,14 +33,25 @@ def _validate_kernel_results():
     produces a malformed result -- rather than as unchecked pointer arithmetic in a kernel
     on a user's machine. It costs the suite a walk per generated result and is worth it.
 
-    Set at the cell rather than through the environment because `scorch.storage` reads the
-    variable once, at import, and pytest may already have imported it.
+    Set at the cell, because `scorch.storage` reads the variable once, at import, and
+    pytest may already have imported it -- AND in the environment, because the cell is
+    per-process. A test that runs scorch in a subprocess (a disposable worker, an
+    import-isolation probe) imports it fresh, reads `SCORCH_VALIDATE_KERNEL_RESULTS`, and
+    without the variable runs with the walk off. That hole let the characterization of the
+    defective legacy routes in test_loopir_ordered_key_workspace_target.py, whose worker
+    is a subprocess, read a malformed result as "ok".
     """
     from scorch import storage as storage_module
 
     old_value = storage_module._VALIDATE_KERNEL_RESULTS[0]
+    old_env = os.environ.get("SCORCH_VALIDATE_KERNEL_RESULTS")
     storage_module._VALIDATE_KERNEL_RESULTS[0] = True
+    os.environ["SCORCH_VALIDATE_KERNEL_RESULTS"] = "1"
     try:
         yield
     finally:
         storage_module._VALIDATE_KERNEL_RESULTS[0] = old_value
+        if old_env is None:
+            os.environ.pop("SCORCH_VALIDATE_KERNEL_RESULTS", None)
+        else:
+            os.environ["SCORCH_VALIDATE_KERNEL_RESULTS"] = old_env
