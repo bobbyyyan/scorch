@@ -425,6 +425,26 @@ def test_invalid_compiler_environment_fails_with_typed_diagnostics(
     _assert_compile_options_error(error, code=code, field=field)
 
 
+def _a_developer_dir_this_process_does_not_build_with() -> str:
+    """A real, different Darwin developer dir, so the mismatch check is what fires.
+
+    Which toolchain is "supported" is decided per host: compile_options resolves the
+    ACTIVE developer dir (`xcode-select -p`) once per process, and any DEVELOPER_DIR that
+    differs from it fails closed. A hardcoded path is therefore the supported value on
+    some hosts -- the Xcode path was, on an Xcode-selected Mac, and the test stopped
+    raising. Returning the OTHER standard toolchain keeps the case that matters: a
+    directory that exists, so every isdir check passes, but whose headers would not
+    match the libc++ the kernels are compiled against.
+    """
+    from scorch.compiler import compile_options as _compile_options_module
+
+    xcode = "/Applications/Xcode.app/Contents/Developer"
+    command_line_tools = "/Library/Developer/CommandLineTools"
+    if _compile_options_module._DARWIN_DEVELOPER_DIR == xcode:
+        return command_line_tools
+    return xcode
+
+
 @pytest.mark.parametrize(
     ("key", "value", "code", "field"),
     (
@@ -466,7 +486,7 @@ def test_invalid_compiler_environment_fails_with_typed_diagnostics(
         ),
         (
             "DEVELOPER_DIR",
-            "/Applications/Xcode.app/Contents/Developer",
+            _a_developer_dir_this_process_does_not_build_with(),
             "unsupported_darwin_toolchain",
             "build.darwin_toolchain.developer_dir",
         ),

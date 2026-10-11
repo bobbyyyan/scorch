@@ -203,7 +203,9 @@ def test_a_pair_past_the_boundary_grain_is_narrowed_by_split_scans(
     rows, cols, deg = 150000, 1000, 8
     generator = torch.Generator().manual_seed(0)
     crow = torch.arange(rows + 1, dtype=torch.int64) * deg
-    col = torch.randint(0, cols, (rows, deg), generator=generator).sort(dim=1).values
+    # strictly increasing within each row: cumulative gaps of 1..cols // deg
+    gaps = torch.randint(1, cols // deg + 1, (rows, deg), generator=generator)
+    col = gaps.cumsum(dim=1) - 1
     if defect == "unsorted":
         col[140001] = torch.arange(deg - 1, -1, -1)
     elif defect == "column_past_the_end":

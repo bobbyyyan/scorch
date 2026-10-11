@@ -16,13 +16,17 @@ import torch
 
 scorch_ops = pytest.importorskip("scorch_ops")
 
-LIMIT = 1000
+# Wide enough that the longest span (a worker range in the empty-span test, 12289 coordinates at
+# int32) can hold strictly increasing coordinates.
+LIMIT = 1 << 15
 BLOCK_BYTES = 16384
 
 
 def reference(pos, crd, limit, require_sorted):
     """True when the level is malformed: a span outside [0, nnz] or running backwards, a
-    coordinate outside [0, limit), or (when required) a descent inside a span."""
+    coordinate outside [0, limit), or (when required) a coordinate inside a span that does not
+    exceed the one before it: within a span coordinates must be strictly increasing, as torch's
+    sparse CSR invariant requires ("sorted and distinct")."""
     nnz = len(crd)
     starts, stops = pos[:-1], pos[1:]
     if ((starts < 0) | (stops < starts) | (stops > nnz)).any():
@@ -33,13 +37,18 @@ def reference(pos, crd, limit, require_sorted):
         return True
     if not require_sorted:
         return False
-    descents = np.nonzero(crd[1:] < crd[:-1])[0] + 1
+    descents = np.nonzero(crd[1:] <= crd[:-1])[0] + 1
     return bool(np.setdiff1d(descents, pos[1:-1]).size)
 
 
+def strictly_increasing(rng, n):
+    """n coordinates in [0, LIMIT), strictly increasing: cumulative gaps of 1..LIMIT // n."""
+    return np.cumsum(rng.integers(1, LIMIT // n + 1, n)) - 1
+
+
 def structure(rng, nnz, empty_fraction):
-    """Positions and per-span sorted coordinates: spans of 1-6, empty ones, and a few long
-    enough to cross several blocks."""
+    """Positions and per-span strictly increasing coordinates: spans of 1-6, empty ones, and a
+    few long enough to cross several blocks."""
     lengths, total = [], 0
     while total < nnz:
         u = rng.random()
@@ -56,7 +65,7 @@ def structure(rng, nnz, empty_fraction):
             lengths.extend([0] * int(rng.integers(2, 6)))
     pos = np.concatenate([[0], np.cumsum(lengths)]).astype(np.int64)
     crd = np.concatenate(
-        [np.sort(rng.integers(0, LIMIT, n)) for n in lengths if n] or [np.zeros(0)]
+        [strictly_increasing(rng, n) for n in lengths if n] or [np.zeros(0)]
     ).astype(np.int64)
     return pos, crd
 
@@ -111,6 +120,12 @@ def inject(kind, pos, crd, p, rng):
         else:
             crd[q - 1], crd[q] = LIMIT - 1, 0
         return pos, crd
+    if kind == "repeat_inside":  # a coordinate equal to the one before it, inside a span
+        q = inside(p, set(pos[1:-1].tolist()), nnz)
+        if q is None:
+            return None
+        crd[q] = crd[q - 1]
+        return pos, crd
     if kind == "descent_at_boundary":  # legal
         b = boundaries(pos, nnz)
         if not b.size:
@@ -150,7 +165,7 @@ def threads():
 @pytest.mark.parametrize("nthreads", [1, 2, 3, 5])
 @pytest.mark.parametrize(
     "kind",
-    ["clean", "descent_inside", "descent_at_boundary", "above_limit", "negative"],
+    ["clean", "descent_inside", "repeat_inside", "descent_at_boundary", "above_limit", "negative"],
 )
 @pytest.mark.parametrize("empty_fraction", [0.0, 0.4])
 def test_coordinate_defects_at_block_and_range_edges(
@@ -174,7 +189,7 @@ def test_coordinate_defects_at_block_and_range_edges(
         for require_sorted in (True, False):
             want = reference(cp, cc, LIMIT, require_sorted)
             if kind in ("above_limit", "negative") or (
-                kind == "descent_inside" and require_sorted
+                kind in ("descent_inside", "repeat_inside") and require_sorted
             ):
                 assert want, (kind, p)  # the injection made a defect
             if kind in ("clean", "descent_at_boundary"):
@@ -224,7 +239,7 @@ def test_a_range_that_starts_on_a_run_of_empty_spans(threads, dtype, nthreads):
     starts = [0] + cuts
     stops = cuts + [nnz]
     for s, e in zip(starts, stops):
-        crd[s:e] = np.sort(np.random.default_rng(s).integers(0, LIMIT, e - s))
+        crd[s:e] = strictly_increasing(np.random.default_rng(s), e - s)
     for c in cuts:
         crd[c - 1], crd[c] = LIMIT - 1, 0
     assert not reference(pos, crd, LIMIT, True)

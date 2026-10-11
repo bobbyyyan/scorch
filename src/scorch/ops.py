@@ -69,7 +69,7 @@ from .stensor import (
     _compilation_context_at_boundary,
 )
 
-# Re-exported, not used here: compiler/loopir/pipeline.py imports this name from `ops`
+# Re-exported, not used here: the LoopIR pipeline module imports this name from `ops`
 # at four sites, though it is defined in stensor.py. Dropping it because `ops` itself
 # has no caller is what broke 351 tests in the merge -- "unused in this file" and
 # "unused" are different claims for a module other modules import through. Kept on its
@@ -2112,6 +2112,41 @@ def _trusted_compiler_built_cin(
         yield
 
 
+def _without_mixed_coordinate_levels(
+    output_level_formats: List[LevelFormat],
+) -> List[LevelFormat]:
+    """Replace coordinate levels by compressed ones when the output would mix them.
+
+    Per-level inference copies each output index's level type from the inputs, so a
+    product of a compressed operand and a coordinate one infers a mixed output -- CSR x
+    COO gives dense rows over coordinate columns. Code generation cannot lower that: a
+    coordinate level under a dense or compressed parent needs per-parent grouping that
+    the iterator model does not represent, and `CINLowerer` refuses such a tensor
+    (`unsupported_mixed_coordinate_hierarchy`). The performance line had no refusal and
+    returned the product in that format with the row grouping missing, so the result
+    could not be interpreted -- its own `to_dense` failed to compile.
+
+    A compressed level stores the same coordinates and composes with dense and
+    compressed parents, so substituting it keeps every level sparse that inference made
+    sparse and yields CSR or doubly-compressed CSR. An output that is entirely
+    coordinate (COO) is coherent and kept. This only changes outputs that would
+    otherwise be refused, and an explicitly requested format is never passed here.
+    """
+    level_types = [lf.get_level_type() for lf in output_level_formats]
+    if LevelType.COORDINATE not in level_types or all(
+        level_type is LevelType.COORDINATE for level_type in level_types
+    ):
+        return output_level_formats
+    return [
+        (
+            LevelFormat(LevelType.COMPRESSED)
+            if level_format.get_level_type() is LevelType.COORDINATE
+            else level_format
+        )
+        for level_format in output_level_formats
+    ]
+
+
 def _einsum_owned(
     expression: str,
     *tensors: Optional[Union[torch.Tensor, STensor, TensorSpec]],
@@ -2549,8 +2584,7 @@ def _einsum_owned(
         #     dense + anything = dense
         # Note that LevelType.COMPRESSED and LevelType.COORDINATE are both "sparse"
         # levels
-        # To break ties, we use the following priority: we always prefer coordinate
-        # over compressed
+        # To break ties, compressed wins over coordinate (it is checked first below)
 
         # Create a list of LevelFormat objects
         output_level_formats = []
@@ -2615,6 +2649,7 @@ def _einsum_owned(
                             ]
                             break
 
+        output_level_formats = _without_mixed_coordinate_levels(output_level_formats)
         output_format = TensorFormat(output_level_formats)
         # print(f"\nUnspecified output format, using inferred {output_format}")
     result_index_sizes = _logical_index_sizes(input_index_strs, tensors)

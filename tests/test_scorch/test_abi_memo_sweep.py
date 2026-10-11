@@ -22,11 +22,10 @@ SWEEP_BYTES = 1 << 20
 def _int64_csr(rows, cols, nnz_per_row, seed):
     g = torch.Generator().manual_seed(seed)
     crow = torch.arange(rows + 1, dtype=torch.int64) * nnz_per_row
-    col = (
-        torch.randint(0, cols, (rows, nnz_per_row), generator=g)
-        .sort(dim=1)
-        .values.reshape(-1)
-    )
+    # Strictly increasing within each row (torch's CSR invariant): cumulative gaps of
+    # 1..cols // nnz_per_row, so the last coordinate stays below cols.
+    gaps = torch.randint(1, cols // nnz_per_row + 1, (rows, nnz_per_row), generator=g)
+    col = (gaps.cumsum(dim=1) - 1).reshape(-1)
     values = torch.rand(rows * nnz_per_row, generator=g)
     return torch.sparse_csr_tensor(crow, col, values, size=(rows, cols))
 
