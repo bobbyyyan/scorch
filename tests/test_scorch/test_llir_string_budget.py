@@ -137,8 +137,12 @@ def test_direct_string_encoded_var_expression_budget_is_explicit() -> None:
     assert constructor_counts == {
         "cin.py": 9,
         # 153 after the shared one-dimensional workspace-key reader replaced
-        # two duplicated key expressions with one helper.
-        "cin_lowerer.py": 153,
+        # two duplicated key expressions with one helper; 172 after the
+        # sparse-result workspace drain (the post-merge repair), whose 19 new
+        # Vars all carry plain identifiers -- the drain iterator, the drained
+        # key components and value, the result's position counters and
+        # pos/crd/values arrays -- and add no string-encoded expression.
+        "cin_lowerer.py": 172,
         "compressed_where_openmp_pass.py": 32,
         "dense_pointer_hoist_pass.py": 7,
         "dynamic_vector_access_pass.py": 1,
@@ -153,10 +157,10 @@ def test_direct_string_encoded_var_expression_budget_is_explicit() -> None:
         "sparse_prefetch_pass.py": 1,
         "torch_cpp_abi.py": 81,
     }
-    assert sum(constructor_counts.values()) == 469
+    assert sum(constructor_counts.values()) == 488
     assert unclassified_counts == {
         "cin.py": 9,
-        "cin_lowerer.py": 145,
+        "cin_lowerer.py": 164,
         "compressed_where_openmp_pass.py": 32,
         "dense_pointer_hoist_pass.py": 7,
         "dynamic_vector_access_pass.py": 1,
@@ -171,7 +175,7 @@ def test_direct_string_encoded_var_expression_budget_is_explicit() -> None:
         "sparse_prefetch_pass.py": 1,
         "torch_cpp_abi.py": 81,
     }
-    assert sum(unclassified_counts.values()) == 459
+    assert sum(unclassified_counts.values()) == 478
     assert known_indirect == {
         ("cin_lowerer.py", "actual_size"): 2,
         ("cin_lowerer.py", "expr.name.replace(old, new)"): 1,

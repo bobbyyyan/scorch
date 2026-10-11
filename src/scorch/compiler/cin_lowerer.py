@@ -774,6 +774,29 @@ class CINLowerer:
                 last_ivar = self.defined_index_vars[-1]
                 last_level_type = self.result_tensor_access.level_types()[-1]
                 if last_level_type in [LevelType.COMPRESSED, LevelType.COORDINATE]:
+                    if not self.result_tensor_access.has_index_var(last_ivar):
+                        # The innermost loop sums over a variable the result
+                        # does not have, so appending here would store one
+                        # partial sum per iteration of it.  Only the scheduler's
+                        # accumulation workspace makes such a program lowerable.
+                        diagnostic = CINDiagnostic(
+                            code="unscheduled_sparse_result_reduction",
+                            message=(
+                                f"the innermost loop sums over {last_ivar.name}, "
+                                "which the sparse result does not have; lower the "
+                                "scheduled program (scorch.einsum or "
+                                "Scheduler.auto_schedule), whose workspace "
+                                "accumulates it"
+                            ),
+                            path=("root",),
+                            stage="legacy_cin_lowering",
+                            pass_name="lower_TensorAssign",
+                        )
+                        raise UnsupportedFeature(
+                            "stage=legacy CIN lowering: "
+                            "unscheduled_sparse_result_reduction",
+                            diagnostics=(diagnostic,),
+                        )
                     llir_stmts.append(llir.Comment("Set coordinates"))
                     result_tensor_name = self.result_tensor_var.get_name()
                     result_index_name = (
@@ -1057,10 +1080,7 @@ class CINLowerer:
                                 value="1024",
                                 data_type=llir.DataType.INT,
                             ),
-                            llir.Var(
-                                name="result_shape",
-                                type=llir.DataType.STD_VECTOR_INT,
-                            ),
+                            self._sparse_workspace_extents(stmt, wksp),
                         ],
                     ),
                 )
@@ -1087,6 +1107,50 @@ class CINLowerer:
             *consumer_stmts,
             *workspace_cleanup_stmts,
         ]
+
+    @staticmethod
+    def _sparse_workspace_extents(stmt: Where, wksp: Workspace) -> llir.Expr:
+        """The extents ``coo_workspace`` flattens its keys by, one per key component.
+
+        ``coo_workspace<T, N>`` requires exactly ``N`` extents, in key order.  A
+        workspace keyed on the whole result in index order is given the kernel's
+        ``result_shape`` itself.  One keyed on fewer or reordered result variables
+        -- a drain under an enclosing result loop, such as ``einsum('ijkl->ikl')``
+        keyed on ``(k, l)`` -- is given those variables' own entries of
+        ``result_shape``; the whole shape would fail the workspace's rank check on
+        the first insert.
+        """
+
+        result_shape = llir.Var(name="result_shape", type=llir.DataType.STD_VECTOR_INT)
+        results = [
+            access
+            for access in stmt.consumer.get_result_tensor_accesses()
+            if not isinstance(access.tensor, Workspace)
+        ]
+        keyed = [
+            access
+            for access in wksp.workspace_accesses
+            if len(access.get_index_vars()) == wksp.dim
+        ]
+        if len(results) != 1 or not keyed:
+            return result_shape
+        logical = list(results[0].get_index_vars())
+        key = list(keyed[0].get_index_vars())
+        if any(index_var not in logical for index_var in key):
+            return result_shape
+        positions = [logical.index(index_var) for index_var in key]
+        if positions == list(range(len(logical))):
+            return result_shape
+        return llir.Array(
+            values=[
+                llir.ArrayAccess(
+                    array=result_shape,
+                    index=llir.Literal(position, llir.DataType.INT64),
+                )
+                for position in positions
+            ],
+            data_type=llir.DataType.INT64,
+        )
 
     def lower_ProducerIndexStmt(self, stmt: IndexStmt) -> List[llir.Stmt]:
         """
@@ -1915,6 +1979,14 @@ class CINLowerer:
                 for_loop,
             ]
 
+        first_key_level = self._nested_ordered_key_level(
+            wksp_access, result_tensor_access
+        )
+        if first_key_level is not None:
+            return self._lower_nested_ordered_key_drain(
+                wksp, wksp_access, result_tensor_access, first_key_level
+            )
+
         # For loop
         # for (const auto& pair : <wksp's name>) {
         #    <body statement>
@@ -2081,6 +2153,306 @@ class CINLowerer:
             body=loop_body,
         )
 
+        assembly_stmts = self._drained_segment_assembly(
+            result_tensor_access,
+            level,
+            level_type,
+            parent_index_var,
+            parent_level_type,
+        )
+
+        return [
+            llir.BlankLine(),
+            llir.Comment("Lower consumer CIN"),
+            wksp_sort_stmt,
+            loop_stmt,
+            llir.BlankLine(),
+            *assembly_stmts,
+        ]
+
+    @staticmethod
+    def _nested_ordered_key_level(
+        wksp_access: WorkspaceAccess, result_tensor_access: TensorAccess
+    ) -> Optional[int]:
+        """First result level of a nested drain whose key spans several levels.
+
+        The drain under :meth:`_lower_nested_ordered_key_drain` handles a sparse
+        workspace keyed on two or more unsplit index variables that are, in
+        order, the result's trailing compressed levels, below at least one
+        result level bound by an enclosing loop.  None for every other drain,
+        which keeps its existing lowering.
+        """
+
+        key = list(wksp_access.get_index_vars())
+        if len(key) < 2 or wksp_access.is_dense():
+            return None
+        if any(index_var.has_parent for index_var in key):
+            return None
+        levels = result_tensor_access.get_sorted_index_vars()
+        first = len(levels) - len(key)
+        if first < 1 or list(levels[first:]) != key:
+            return None
+        if any(
+            result_tensor_access.level_type_of_index_var(index_var)
+            != LevelType.COMPRESSED
+            for index_var in key
+        ):
+            return None
+        return first
+
+    def _lower_nested_ordered_key_drain(
+        self,
+        wksp: Workspace,
+        wksp_access: WorkspaceAccess,
+        result_tensor_access: TensorAccess,
+        first_level: int,
+    ) -> List[llir.Stmt]:
+        """Drain a multi-level sparse workspace into nested compressed levels.
+
+        The sorted workspace visits its keys in result level order, so each run
+        of keys that share a prefix is one segment of the level below that
+        prefix.  Every entry appends its leaf coordinate and value.  When the key
+        changes at some level, the runs that ended are closed deepest first,
+        exactly as the loop over a compressed level closes it
+        (``SparseLattice.get_lattice_loops``): the finished segment's parent
+        coordinate is appended if the segment is non-empty, and the segment's
+        end position is written.  After the last entry every run is closed, and
+        :meth:`_drained_segment_assembly` closes the outermost key level against
+        the coordinate of the loop that encloses the drain.
+
+        Keeping the closing step in the conditional form the ordinary assembly
+        emits keeps it recognizable to the two-phase parallel assembly
+        (``result_write_pass._rewrite_if_statement``).
+        """
+
+        result_tensor_name = result_tensor_access.get_tensor().get_name()
+        result_value_metadata = self._tensor_access_metadata(
+            result_tensor_access,
+            llir.TensorAccessRole.RESULT_WRITE,
+        )
+        key = list(wksp_access.get_index_vars())
+        leaf_level = first_level + len(key) - 1
+        wksp_name = wksp.get_name()
+        loop_var = llir.Var(name="it", type=llir.DataType.CONST_AUTO_REF)
+
+        def level_count(level: int) -> llir.Var:
+            return llir.Var(
+                name=f"p{result_tensor_name}{level}", type=llir.DataType.INT64
+            )
+
+        def previous(position: int) -> llir.Var:
+            return llir.Var(
+                name=f"{wksp_name}_prev{position}", type=llir.DataType.INT64
+            )
+
+        def close_segment(level: int) -> List[llir.Stmt]:
+            # The segment of ``level`` under the previous key's parent coordinate
+            # has ended: append that coordinate if the segment is non-empty, then
+            # write where the segment ends.
+            position = level - 1 - first_level
+            return [
+                llir.IfThenElse(
+                    cond=llir.BinOp(
+                        op="<",
+                        left=llir.FunctionCall(
+                            name=f"{result_tensor_name}{level}_pos.back",
+                            args=[],
+                        ),
+                        right=level_count(level),
+                    ),
+                    then_body=[
+                        llir.FunctionCallStmt(
+                            name=f"{result_tensor_name}{level - 1}_crd.push_back",
+                            args=[previous(position)],
+                            result_storage=self._result_storage(
+                                result_tensor_access,
+                                (RESULT_CRD, level - 1, STORAGE_WRITE),
+                            ),
+                        ),
+                        llir.Increment(var=level_count(level - 1)),
+                    ],
+                    result_storage=self._result_storage(
+                        result_tensor_access,
+                        (RESULT_POS, level, STORAGE_READ),
+                    ),
+                ),
+                llir.Assign(
+                    var=llir.ArrayAccess(
+                        array=llir.Var(
+                            name=f"{result_tensor_name}{level}_pos",
+                            type=llir.DataType.STD_VECTOR_C_INT,
+                        ),
+                        index=llir.FunctionCall(
+                            name=f"{result_tensor_name}{level - 1}_crd.size",
+                            args=[],
+                        ),
+                    ),
+                    value=llir.FunctionCall(
+                        name=f"{result_tensor_name}{level}_crd.size",
+                        args=[],
+                    ),
+                    result_storage=self._result_storage(
+                        result_tensor_access,
+                        (RESULT_POS, level, STORAGE_WRITE),
+                        (RESULT_CRD, level - 1, STORAGE_READ),
+                        (RESULT_CRD, level, STORAGE_READ),
+                    ),
+                ),
+            ]
+
+        # Coordinates are non-negative, so -1 differs from every first key.
+        previous_inits: List[llir.Stmt] = [
+            llir.VarInit(var=previous(position), value=llir.Literal(-1))
+            for position in range(len(key) - 1)
+        ]
+
+        loop_body: List[llir.Stmt] = []
+        for position, index_var in enumerate(key):
+            loop_body.append(
+                llir.VarInit(
+                    var=llir.Var(name=index_var.name, type=llir.DataType.INT64),
+                    value=llir.ArrayAccess(
+                        array=llir.MemberAccess(
+                            base=llir.Var(name=loop_var.name, type=loop_var.type),
+                            member="first",
+                        ),
+                        index=llir.Literal(position, llir.DataType.INT64),
+                    ),
+                )
+            )
+        loop_body.append(
+            llir.VarInit(
+                var=llir.Var(
+                    name=f"{wksp_name}_value",
+                    type=dtype_to_c_datatype(wksp.dtype),
+                ),
+                value=llir.MemberAccess(
+                    base=llir.Var(name=loop_var.name, type=loop_var.type),
+                    member="second",
+                ),
+            )
+        )
+        loop_body.append(llir.BlankLine())
+
+        # Close, deepest first, every segment whose parent prefix changed.
+        for level in range(leaf_level, first_level, -1):
+            changed: Optional[llir.Expr] = None
+            for position in range(level - first_level):
+                differs = llir.BinOp(
+                    op="!=",
+                    left=llir.Var(name=key[position].name, type=llir.DataType.INT64),
+                    right=previous(position),
+                )
+                changed = (
+                    differs
+                    if changed is None
+                    else llir.BinOp(op="||", left=changed, right=differs)
+                )
+            assert changed is not None
+            loop_body.append(
+                llir.IfThenElse(cond=changed, then_body=close_segment(level))
+            )
+        for position in range(len(key) - 1):
+            loop_body.append(
+                llir.Assign(
+                    var=previous(position),
+                    value=llir.Var(name=key[position].name, type=llir.DataType.INT64),
+                )
+            )
+
+        # The leaf entry, written exactly as the one-level drain writes it.
+        loop_body.append(
+            llir.Assign(
+                var=llir.ArrayAccess(
+                    array=llir.Var(
+                        name=f"{result_tensor_name}_values",
+                        type=llir.DataType.NO_TYPE,
+                    ),
+                    index=llir.Var(
+                        name=f"p{result_tensor_name}{leaf_level}",
+                        type=llir.DataType.INT64,
+                    ),
+                    tensor_access=result_value_metadata,
+                ),
+                value=llir.Var(name=f"{wksp_name}_value", type=llir.DataType.NO_TYPE),
+                result_storage=self._result_storage(
+                    result_tensor_access,
+                    (RESULT_VALUES, None, STORAGE_WRITE),
+                ),
+            )
+        )
+        loop_body.append(
+            llir.Assign(
+                var=llir.ArrayAccess(
+                    array=llir.Var(
+                        name=f"{result_tensor_name}{leaf_level}_crd",
+                        type=llir.DataType.NO_TYPE,
+                    ),
+                    index=llir.Var(
+                        name=f"p{result_tensor_name}{leaf_level}",
+                        type=llir.DataType.INT64,
+                    ),
+                ),
+                value=llir.Var(name=key[-1].name, type=llir.DataType.NO_TYPE),
+                result_storage=self._result_storage(
+                    result_tensor_access,
+                    (RESULT_CRD, leaf_level, STORAGE_WRITE),
+                ),
+            )
+        )
+        loop_body.append(
+            llir.Increment(
+                var=llir.Var(
+                    name=f"p{result_tensor_name}{leaf_level}",
+                    type=llir.DataType.NO_TYPE,
+                )
+            )
+        )
+
+        closing: List[llir.Stmt] = []
+        for level in range(leaf_level, first_level, -1):
+            closing.extend(close_segment(level))
+
+        parent_index_var = result_tensor_access.get_parent_index_var(key[0])
+        assert parent_index_var is not None, "a nested drain has an enclosing level"
+        return [
+            llir.BlankLine(),
+            llir.Comment("Lower consumer CIN"),
+            llir.FunctionCallStmt(name=f"{wksp_name}.sort", args=[]),
+            *previous_inits,
+            llir.ForLoopAuto(
+                var=loop_var,
+                array=llir.Var(name=wksp_name, type=llir.DataType.AUTO),
+                body=loop_body,
+            ),
+            *closing,
+            llir.BlankLine(),
+            *self._drained_segment_assembly(
+                result_tensor_access,
+                first_level,
+                LevelType.COMPRESSED,
+                parent_index_var,
+                result_tensor_access.level_type_of_index_var(parent_index_var),
+            ),
+        ]
+
+    def _drained_segment_assembly(
+        self,
+        result_tensor_access: TensorAccess,
+        level: int,
+        level_type: Optional[LevelType],
+        parent_index_var: Optional[IndexVar],
+        parent_level_type: Optional[LevelType],
+    ) -> List[llir.Stmt]:
+        """Close the result level a nested workspace drain has just appended to.
+
+        ``level`` is the outermost result level the drain writes; the loop over
+        its parent's variable encloses the drain.  For a compressed level this
+        appends the parent's coordinate when the drain produced anything and
+        writes the level's position for that parent.
+        """
+
+        result_tensor_name = result_tensor_access.get_tensor().get_name()
         assembly_stmts: List[llir.Stmt] = []
 
         if level_type == LevelType.COMPRESSED:
@@ -2096,6 +2468,35 @@ class CINLowerer:
             if level > 0:
                 assert parent_index_var is not None, "Parent index var is None"
                 if parent_level_type == LevelType.COMPRESSED:
+                    # The enclosing loop over the parent's variable closes the
+                    # parent's level with ``if ({R}{L-1}_pos.back() < p{R}{L-1})``
+                    # (``SparseLattice.get_lattice_loops``) when the parent itself
+                    # has a compressed parent, so the count that test reads must
+                    # advance with every coordinate appended here.  Without it an
+                    # output with three compressed levels above one drain never
+                    # records its outermost coordinates (``einsum('ijkl->ijl')``,
+                    # ``sss`` tensor-times-matrix).  Nothing else reads the count.
+                    grandparent_index_var = (
+                        result_tensor_access.get_parent_index_var(parent_index_var)
+                        if level > 1
+                        else None
+                    )
+                    parent_count_stmts: List[llir.Stmt] = (
+                        [
+                            llir.Increment(
+                                var=llir.Var(
+                                    name=f"p{result_tensor_name}{level - 1}",
+                                    type=llir.DataType.INT64,
+                                )
+                            )
+                        ]
+                        if grandparent_index_var is not None
+                        and result_tensor_access.level_type_of_index_var(
+                            grandparent_index_var
+                        )
+                        == LevelType.COMPRESSED
+                        else []
+                    )
                     assembly_stmts.append(
                         # e.g.
                         # if (A1_pos.back() < pA1) {
@@ -2127,6 +2528,7 @@ class CINLowerer:
                                         (RESULT_CRD, level - 1, STORAGE_WRITE),
                                     ),
                                 ),
+                                *parent_count_stmts,
                             ],
                             # This is the position-boundary conditional
                             # ``result_write_pass._rewrite_if_statement``
@@ -2236,14 +2638,7 @@ class CINLowerer:
                 #     )
                 # )
 
-        return [
-            llir.BlankLine(),
-            llir.Comment("Lower consumer CIN"),
-            wksp_sort_stmt,
-            loop_stmt,
-            llir.BlankLine(),
-            *assembly_stmts,
-        ]
+        return assembly_stmts
 
     def _prepare_scheduled_cin(
         self,

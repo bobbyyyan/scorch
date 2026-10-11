@@ -118,13 +118,19 @@ class OperandRelayout:
 class WorkspaceInsertion:
     """The automatic scheduler's standalone workspace decision, made explicit.
 
-    The legacy auto scheduler inserts an accumulation workspace at the last
-    reduction loop before applying its tiling heuristics; replay previously
-    re-derived that hidden decision from scheduler policy instead of reading
-    it from the plan.  This fact records the decision itself: the reduction
-    loop the region wraps, the trailing free axis loops whose cells the
-    workspace stores (in loop order), and whether the materialized workspace
-    is the 1-D dense accumulator or the sparse fallback representation.  It
+    The legacy auto scheduler inserts an accumulation workspace before
+    applying its tiling heuristics; replay previously re-derived that hidden
+    decision from scheduler policy instead of reading it from the plan.  This
+    fact records the decision itself: the innermost reduction loop the region
+    contains, the free axis loops inside the region whose cells the workspace
+    stores (in loop order), and whether the materialized workspace is the 1-D
+    dense accumulator or the sparse fallback representation.  Where the region
+    begins is derived, not recorded: for a dense result it is that reduction
+    loop; for a sparse result it is the first loop after the longest loop-order
+    prefix that walks the result's levels in storage order, so every reduction
+    loop is inside the region and each result coordinate is drained once
+    (``Scheduler._sparse_result_workspace_loop``).  With one reduction loop the
+    two coincide.  It
     records a workspace that replay must materialize; ``None`` records the
     elision contract, including the dense root-scope reduction family where
     both the plan-free production surgery and the empty-Schedule replay now

@@ -1877,6 +1877,53 @@ class Scheduler:
         )
 
     @staticmethod
+    def _sparse_result_workspace_loop(
+        cin: CIN, loop_order: Sequence[IndexVar], reduction_vars: Sequence[IndexVar]
+    ) -> Optional[IndexVar]:
+        """The reduction loop a sparse result's workspace ``Where`` must replace.
+
+        A compressed result is appended to in iteration order, so each of its
+        coordinates must be written once, after everything that contributes to it
+        has been summed. That holds when the workspace's ``Where`` replaces the first
+        loop after the longest prefix of ``loop_order`` that walks the result's levels
+        in storage order: every loop outside it then fixes one result prefix, and
+        every reduction loop is inside it. Wrapping only the last reduction loop --
+        the rule for a dense result, which is written by random access -- leaves any
+        earlier reduction loop outside the ``Where``, which then drains the same
+        coordinates once per iteration of that loop (``einsum('ijk->k')`` over a
+        compressed tensor stored each ``k`` once per ``i``). With a single reduction
+        loop the two rules pick the same loop.
+
+        None for a dense result, and when the first loop after the prefix is not a
+        reduction loop (the loop order visits the result's own variables out of
+        storage order, which this rule does not decide); the caller then keeps the
+        last reduction loop.
+        """
+
+        result_access = next(
+            (
+                access
+                for access in cin.get_result_tensor_accesses()
+                if not isinstance(access.tensor, Workspace)
+            ),
+            None,
+        )
+        if result_access is None or result_access.get_tensor().is_dense():
+            return None
+        levels = result_access.get_sorted_index_vars()
+        depth = 0
+        while (
+            depth < len(loop_order)
+            and depth < len(levels)
+            and loop_order[depth] == levels[depth]
+        ):
+            depth += 1
+        if depth == len(loop_order):
+            return None
+        enclosed = loop_order[depth]
+        return enclosed if enclosed in reduction_vars else None
+
+    @staticmethod
     def should_insert_workspace(
         cin: CIN,
         loop_order: List[IndexVar],
@@ -1909,6 +1956,11 @@ class Scheduler:
         last_reduction_pos = max(
             loop_pos[index_var] for index_var in reductions_in_loop
         )
+        enclosed = Scheduler._sparse_result_workspace_loop(
+            cin, loop_order, reductions_in_loop
+        )
+        if enclosed is not None:
+            last_reduction_pos = loop_pos[enclosed]
         free_after_last_reduction = [
             index_var
             for index_var in free_vars
@@ -1946,7 +1998,8 @@ class Scheduler:
 
         This is the recording twin of the derivation inside
         :meth:`insert_workspace` — the last in-order reduction variable, the
-        trailing free variables after it, and the dense-versus-sparse
+        free variables inside the region (after the loop the region replaces,
+        see :meth:`_sparse_result_workspace_loop`), and the dense-versus-sparse
         representation (dense only for a single all-dense trailing axis).  It
         is computed on the pre-insertion nest so the automatic scheduler can
         record its standalone workspace decision as an explicit, replayable
@@ -1971,8 +2024,15 @@ class Scheduler:
         if not reduction_vars_todo:
             return None
         next_reduction_var = reduction_vars_todo[-1]
-        last_reduction_var_index = index_vars_ordered.index(next_reduction_var)
-        vars_after_last_reduction = index_vars_ordered[last_reduction_var_index + 1 :]
+        # The region may begin at an earlier reduction loop than the one the
+        # fact records (a sparse result); its key is the free loops inside it.
+        region_var = Scheduler._sparse_result_workspace_loop(
+            cin, index_vars_ordered, reduction_vars_todo
+        )
+        if region_var is None:
+            region_var = next_reduction_var
+        region_index = index_vars_ordered.index(region_var)
+        vars_after_last_reduction = index_vars_ordered[region_index + 1 :]
         free_vars_after_last_reduction = [
             var for var in vars_after_last_reduction if var in free_vars
         ]
@@ -2356,7 +2416,11 @@ class Scheduler:
         if len(reduction_vars_todo) == 0:
             return cin
 
-        next_reduction_var = reduction_vars_todo[-1]
+        next_reduction_var = Scheduler._sparse_result_workspace_loop(
+            cin, index_vars_ordered, reduction_vars_todo
+        )
+        if next_reduction_var is None:
+            next_reduction_var = reduction_vars_todo[-1]
 
         last_reduction_var_index = index_vars_ordered.index(next_reduction_var)
 

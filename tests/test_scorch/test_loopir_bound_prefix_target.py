@@ -244,18 +244,19 @@ def test_the_legacy_comparand_still_refuses_this_family(cell):
     the reductions has no legacy form) -- so no program that produced legacy C++
     produces different C++, which is the neutrality property that matters.
 
-    The cost is recorded rather than hidden: the *kind* of refusal degrades on
-    that surface from a structured ``InvalidSchedule`` diagnostic to an
-    unstructured ``ValueError`` from inside the legacy lowerer.  This test pins
-    the property (no emission) and not the message, which is an internal detail
-    of a route this family is not migrating.
+    The refusal inside the legacy lowerer used to escape as an unstructured
+    ``ValueError`` from ``list.index``.  It is now the structured
+    ``unscheduled_sparse_result_reduction`` refusal, so the kind of refusal no
+    longer degrades on this surface: it was a structured ``InvalidSchedule``
+    before the repair and is a structured ``UnsupportedFeature`` after it.
     """
 
+    from scorch.compiler.diagnostics import UnsupportedFeature
     from scorch.compiler.loopir.pipeline import legacy_generated_cpp
 
     operand_fmt, result_fmt, operand_indices, result_indices = cell
     shape, result_shape = shapes_for(operand_indices, result_indices)
-    with pytest.raises(ValueError):
+    with pytest.raises(UnsupportedFeature) as error:
         legacy_generated_cpp(
             reduction_cin(
                 operand_fmt, result_fmt, operand_indices, result_indices, torch.float32
@@ -264,6 +265,9 @@ def test_the_legacy_comparand_still_refuses_this_family(cell):
             ((shape, torch.float32),),
             compile_options=auto_options(False),
         )
+    assert [d.code for d in error.value.diagnostics] == [
+        "unscheduled_sparse_result_reduction"
+    ]
 
 
 def test_the_doubly_compressed_receiver_is_not_claimed():
@@ -559,33 +563,32 @@ def test_redispositioned_neighbours_keep_their_shape_specific_codes(cell, code):
     assert error.value.defect.code == code
 
 
-def test_the_legacy_unstructured_refusal_is_not_repair_induced():
-    """``ValueError: ivar_* is not in list`` is legacy's OWN default-path limit.
+def test_the_legacy_refusal_is_structured_and_not_repair_induced():
+    """Legacy's own default-path limit, refused with a code at its own site.
 
     §53.8 records this refusal as a degradation the plan-replay boundary
     introduced: ``apply_schedule`` propagates only the plan, the legacy lowering
     replays it, and the repaired order has no legacy form.  That mechanism is
-    not what happens.  The same ``ValueError`` is raised from the same frame
-    with **no requested schedule at all** -- that is, on plain default dispatch,
+    not what happens.  The same refusal is raised from the same frame with
+    **no requested schedule at all** -- that is, on plain default dispatch,
     which never consults ``apply_schedule`` and so cannot be replaying anything.
 
-    The refusal therefore belongs to the legacy CIN lowerer, not to the replay
-    boundary: ``lower_TensorAssign`` asks ``level_of_index_var`` for the level of
-    a REDUCED index variable, which by construction is absent from the result's
-    sorted index vars, and ``list.index`` raises.  It is a standing limit of the
-    legacy route rather than a regression this branch caused, which is why the
-    honest disposition is to record it deliberately instead of repairing a
-    boundary that is not the defect site.
+    The refusal belongs to the legacy CIN lowerer, not to the replay boundary:
+    ``lower_TensorAssign`` reaches a compressed result's coordinate write with a
+    REDUCED index variable innermost, which has no result level.  That used to
+    escape as ``list.index``'s unstructured ``ValueError`` from
+    ``level_of_index_var``; it is now refused there with the structured
+    ``unscheduled_sparse_result_reduction`` code, so every legacy outcome on
+    this surface is classified.
 
-    The frame is asserted structurally rather than by message text, exactly as
-    every other disposition on this branch is read.  The cell is chosen so the
-    contrast is visible in one test: the TYPED route admits this program, so a
-    cutover would replace an unstructured legacy ``ValueError`` with a working
-    kernel here, not merely with a better diagnostic.
+    The cell is chosen so the contrast is visible in one test: the TYPED route
+    admits this program, so a cutover would replace a legacy refusal with a
+    working kernel here, not merely with a different diagnostic.
     """
 
     import traceback
 
+    from scorch.compiler.diagnostics import UnsupportedFeature
     from scorch.compiler.loopir.pipeline import legacy_generated_cpp
 
     cell = ("ss", "s", "ij", "i")
@@ -593,7 +596,7 @@ def test_the_legacy_unstructured_refusal_is_not_repair_induced():
     shape, result_shape = shapes_for(operand_indices, result_indices)
 
     def legacy_frame(options):
-        with pytest.raises(ValueError) as error:
+        with pytest.raises(UnsupportedFeature) as error:
             legacy_generated_cpp(
                 reduction_cin(
                     operand_fmt,
@@ -606,9 +609,9 @@ def test_the_legacy_unstructured_refusal_is_not_repair_induced():
                 ((shape, torch.float32),),
                 compile_options=options,
             )
-        # Unstructured: an InvalidSchedule would carry LoopPlanDiagnostics.
-        assert not isinstance(error.value, InvalidSchedule)
-        assert not getattr(error.value, "diagnostics", ())
+        assert [d.code for d in error.value.diagnostics] == [
+            "unscheduled_sparse_result_reduction"
+        ]
         return traceback.extract_tb(error.tb)[-1]
 
     default_dispatch = CompileOptions.from_environment(
@@ -620,10 +623,10 @@ def test_the_legacy_unstructured_refusal_is_not_repair_induced():
     with_empty_schedule = legacy_frame(auto_options(False))
 
     # Same raising frame with and without a schedule: the boundary is not the
-    # cause.  ``level_of_index_var`` lives in CIN, below the scheduler entirely.
-    assert without_schedule.name == "level_of_index_var"
-    assert with_empty_schedule.name == "level_of_index_var"
-    assert without_schedule.filename.endswith("compiler/cin.py")
+    # cause.  The refusal is raised by the legacy lowerer itself.
+    assert without_schedule.name == "lower_TensorAssign"
+    assert with_empty_schedule.name == "lower_TensorAssign"
+    assert without_schedule.filename.endswith("compiler/cin_lowerer.py")
     assert with_empty_schedule.filename == without_schedule.filename
 
     # And the typed route does not merely diagnose this shape better: it

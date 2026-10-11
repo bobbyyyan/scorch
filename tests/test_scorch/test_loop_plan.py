@@ -2623,10 +2623,17 @@ def test_auto_origin_candidate_order_ignores_physical_mode_permutation(
         ids["j"],
         ids["m"],
     )
+    # WAS ``axis_loops=(m,), dense=True``: a dense workspace over ``m`` inside
+    # ``j``.  The receiver is ``dsd`` and the order is ``i, k, ell, j, m``, so the
+    # reduction ``i`` encloses every result coordinate; a region inside ``j``
+    # would append each stored ``ell`` once per ``i``.  The sparse-result region
+    # now starts at ``i`` -- the first loop after the (empty) prefix that walks
+    # the result's levels in storage order -- and its key is every free loop
+    # inside it.  The recorded reduction is still the innermost one.
     assert plan.workspace == WorkspaceInsertion(
         reduction_loop=LoopRef(ids["j"]),
-        axis_loops=(LoopRef(ids["m"]),),
-        dense=True,
+        axis_loops=(LoopRef(ids["k"]), LoopRef(ids["ell"]), LoopRef(ids["m"])),
+        dense=False,
     )
     # WAS ``== (m, j, k)``.  The receiver here is ``dsd`` -- non-dense -- and the
     # automatic origin no longer emits an affine tile over a non-dense receiver,

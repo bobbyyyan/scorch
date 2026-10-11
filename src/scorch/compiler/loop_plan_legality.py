@@ -319,6 +319,38 @@ def _all_dense_results(facts: LoopPlanLegalityFacts) -> bool:
     )
 
 
+def _workspace_region_position(
+    facts: LoopPlanLegalityFacts,
+    plan: LoopPlan,
+    last_reduction: int,
+) -> int:
+    """Loop-order position of the loop the workspace's ``Where`` replaces.
+
+    The typed twin of ``Scheduler._sparse_result_workspace_loop``.  A dense
+    result's region is the last reduction loop.  A sparse result's region is
+    the first loop after the longest loop-order prefix that walks the result's
+    levels in storage order, when that loop is a reduction: every reduction
+    loop is then inside the region, so each appended result coordinate is
+    drained once.  Otherwise the last reduction loop, as for a dense result.
+    """
+
+    if _all_dense_results(facts) or len(facts.result_accesses) != 1:
+        return last_reduction
+    levels = facts.result_accesses[0].storage_index_ids
+    depth = 0
+    while (
+        depth < len(plan.loop_order)
+        and depth < len(levels)
+        and plan.loop_order[depth] == levels[depth]
+    ):
+        depth += 1
+    if depth < len(plan.loop_order) and (
+        plan.loop_order[depth] in facts.reduction_index_ids
+    ):
+        return depth
+    return last_reduction
+
+
 def _workspace_domain(
     facts: LoopPlanLegalityFacts,
     plan: LoopPlan,
@@ -328,10 +360,10 @@ def _workspace_domain(
     )
     if not reduction_positions or not facts.free_index_ids:
         return ()
-    last_reduction = max(reduction_positions)
+    region = _workspace_region_position(facts, plan, max(reduction_positions))
     free_after = tuple(
         index_id
-        for index_id in plan.loop_order[last_reduction + 1 :]
+        for index_id in plan.loop_order[region + 1 :]
         if index_id in facts.free_index_ids
     )
     if not free_after:
@@ -770,7 +802,8 @@ def _initial_placement_state(
         last_reduction = max(
             facts.loop_positions[index_id] for index_id in facts.reduction_index_ids
         )
-        prefix_ids = plan.loop_order[:last_reduction]
+        region = _workspace_region_position(facts, plan, last_reduction)
+        prefix_ids = plan.loop_order[:region]
     return _PlacementState(tuple(LoopRef(index_id) for index_id in prefix_ids))
 
 

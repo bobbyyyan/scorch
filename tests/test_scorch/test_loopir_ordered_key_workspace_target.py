@@ -21,19 +21,16 @@ position array is written at its own parent's coordinate count.  Zipping the
 coordinate arrays would pass a numeric check and still be wrong, so the locks
 compare exact ``(pos, crd)`` storage against the format-neutral oracle.
 
-**Legacy evidence is cell-specific, and every cell has some.**  The LoopIR
-oracle plus a dense PyTorch reference gate all twenty migrated cells.  The
-inherited claim that the legacy assembler "rejects, corrupts or terminates on"
-every one of them is wrong: the legacy generator emits C++ for all twenty in
-both automatic arms, and for **nine** of them that C++ is sound -- the
-``ss``/``ds``/``sd`` rank-one reductions, ``sss ijk->ik``, ``sss ijk->jk``,
-``dss ijk->jk``, ``ssss ijkl->jkl``, and the two ``dss`` tensor-times-matrix
-cases.  Those nine additionally require exact runtime and sparse-storage
-equality, in both arms, at f32 and f64, and under cancellation.  The remaining
-**eleven** are unsound in exactly three measured ways -- duplicate drained
-coordinates, C++ that does not compile, and a malformed child position array
--- and are characterized as such rather than waved away.  Every legacy source
-differs from ours: the nine locks are semantic parity, never byte parity.
+**Every cell has a sound legacy comparand.**  The LoopIR oracle plus a dense
+PyTorch reference gate all twenty migrated cells, and the legacy generator
+emits C++ for all twenty in both automatic arms.  Eleven of those legacy
+routes were unsound in three measured ways -- duplicate drained coordinates,
+C++ that did not compile, and a malformed child position array -- until the
+legacy workspace placement and nested drain assembly were repaired.  All
+twenty now require exact runtime and sparse-storage equality with the LoopIR
+route, in both arms, at f32 and f64, and under cancellation.  Every legacy
+source still differs from ours: the locks are semantic parity, never byte
+parity.
 """
 
 from copy import deepcopy
@@ -1511,17 +1508,7 @@ def test_rank_one_reduction_matches_the_sound_legacy_route(
     assert kernel.cpp_source != legacy_source
 
 
-_HONEST_HIGHER_REDUCTIONS = [
-    cell
-    for cell in REDUCTION_CELLS
-    if cell[0]
-    in {
-        "sss ijk->ik",
-        "sss ijk->jk",
-        "dss ijk->jk",
-        "ssss ijkl->jkl",
-    }
-]
+_HIGHER_REDUCTIONS = [cell for cell in REDUCTION_CELLS if len(cell[3]) > 2]
 
 
 def cancelling_dense(shape, seed, dtype, reduced_axis):
@@ -1545,16 +1532,21 @@ def cancelling_dense(shape, seed, dtype, reduced_axis):
 
 @pytest.mark.parametrize(
     "cell",
-    _HONEST_HIGHER_REDUCTIONS,
-    ids=[cell[0] for cell in _HONEST_HIGHER_REDUCTIONS],
+    _HIGHER_REDUCTIONS,
+    ids=[cell[0] for cell in _HIGHER_REDUCTIONS],
 )
 @pytest.mark.parametrize("pattern", ["random", "cancelling"])
 @pytest.mark.parametrize("dtype", [torch.float32, torch.float64])
 @pytest.mark.parametrize("arm", [False, True])
-def test_higher_rank_reduction_matches_the_sound_legacy_route(
-    cell, pattern, dtype, arm
-):
-    """Every measured-correct higher-rank reduction keeps a legacy shadow."""
+def test_higher_rank_reduction_matches_the_legacy_route(cell, pattern, dtype, arm):
+    """Every higher-rank reduction has exact storage parity with the legacy route.
+
+    Seven of these eleven were unsound on the legacy route until its workspace
+    placement and nested drain assembly were repaired (duplicate drained
+    coordinates, C++ that did not compile, a malformed child position array);
+    exact ``(pos, crd)`` and value equality with the LoopIR route, under
+    cancellation too, is what shows the repair is complete.
+    """
 
     import scorch
 
@@ -1605,14 +1597,20 @@ def test_higher_rank_reduction_matches_the_sound_legacy_route(
     )
 
 
-@pytest.mark.parametrize("b_fmt", ["dd", "ss"])
+@pytest.mark.parametrize("cell", TTM_CELLS, ids=[cell[0] for cell in TTM_CELLS])
 @pytest.mark.parametrize("pattern", ["random", "cancelling"])
 @pytest.mark.parametrize("dtype", [torch.float32, torch.float64])
 @pytest.mark.parametrize("arm", [False, True])
-def test_dss_ttm_matches_the_sound_legacy_route(b_fmt, pattern, dtype, arm):
-    """The two measured-correct TTM cells keep exact sparse-storage parity."""
+def test_ttm_matches_the_legacy_route(cell, pattern, dtype, arm):
+    """Every TTM cell keeps exact sparse-storage parity with the legacy route.
+
+    The four ``sss`` cells were unsound on the legacy route until its nested
+    drain advanced the count its enclosing compressed level reads.
+    """
 
     import scorch
+
+    _, a_fmt, b_fmt, c_fmt = cell
 
     a_shape, b_shape = (4, 5, 6), (6, 3)
     result_shape = (4, 5, 3)
@@ -1623,23 +1621,23 @@ def test_dss_ttm_matches_the_sound_legacy_route(b_fmt, pattern, dtype, arm):
         # ``k`` is the contracted axis; mirroring its leading two slabs makes
         # whole reduced entries cancel to an exact zero that was still keyed.
         b_dense = cancelling_dense(b_shape, 7373, dtype, 0)
-    cin = ttm_cin("dss", b_fmt, "dss", dtype)
+    cin = ttm_cin(a_fmt, b_fmt, c_fmt, dtype)
     result, kernel = execute_cin_via_loopir(
         cin,
         result_shape,
-        sparse(a_dense, "dss", "A"),
+        sparse(a_dense, a_fmt, "A"),
         sparse(b_dense, b_fmt, "B"),
         compile_options=auto_options(arm, jit=True),
     )
     legacy = scorch.einsum(
         "ijk,kl->ijl",
-        sparse(a_dense, "dss", "A"),
+        sparse(a_dense, a_fmt, "A"),
         sparse(b_dense, b_fmt, "B"),
-        format="dss",
+        format=c_fmt,
         _compile_options=auto_options(arm, jit=True),
     )
 
-    assert str(result.format) == str(legacy.format) == "d,s,s"
+    assert str(result.format) == str(legacy.format) == ",".join(c_fmt)
     assert compiled_storage(result) == compiled_storage(legacy)
     assert torch.equal(
         result.to_torch(in_place=False),
@@ -1659,11 +1657,10 @@ def test_every_migrated_cell_has_a_legacy_source_route_that_is_not_identical(arm
 
     The inherited claim that "the legacy comparand is not a gate here" was
     read as "there is no legacy comparand".  There is one for every cell: the
-    legacy generator produces a source for all twenty in both arms.  What
-    varies is whether that source is *sound* -- the nine honest cells are
-    locked against it above, and the eleven defective ones are characterized
-    below.  Recording that the sources always differ keeps the honest cells'
-    parity claim unambiguous: it is semantic, never byte parity.
+    legacy generator produces a source for all twenty in both arms, and every
+    one is locked against the LoopIR route above.  Recording that the sources
+    always differ keeps that parity claim unambiguous: it is semantic, never
+    byte parity.
     """
 
     for (
@@ -1707,256 +1704,6 @@ def test_every_migrated_cell_has_a_legacy_source_route_that_is_not_identical(arm
         )
         assert legacy_source.strip(), name
         assert kernel.cpp_source != legacy_source, name
-
-
-# -- the defective legacy comparands, characterized ---------------------------
-
-# The eleven cells whose legacy route generates C++ that is not sound.  Each
-# entry names the measured disposition, not a guess: three distinct defect
-# classes, arm-invariant, every one reproduced below in a disposable process.
-DEFECTIVE_LEGACY_CELLS = [
-    ("sss ijk->k", "duplicate_coordinates"),
-    ("dss ijk->k", "duplicate_coordinates"),
-    ("ssss ijkl->l", "duplicate_coordinates"),
-    ("ssss ijkl->il", "duplicate_coordinates"),
-    ("ssss ijkl->kl", "uncompilable_source"),
-    ("ssss ijkl->ikl", "uncompilable_source"),
-    ("ssss ijkl->ijl", "malformed_child_positions"),
-    ("sss x dd", "malformed_child_positions"),
-    ("sss x ss", "malformed_child_positions"),
-    ("sss x ds", "malformed_child_positions"),
-    ("sss x sd", "malformed_child_positions"),
-]
-
-_DEFECTIVE_LEGACY_WORKER = '''
-"""Characterize each defective legacy route in one disposable process."""
-
-import json
-import resource
-import sys
-from dataclasses import replace
-
-resource.setrlimit(resource.RLIMIT_CPU, (1800, 1800))
-resource.setrlimit(resource.RLIMIT_CORE, (0, 0))
-
-import torch
-
-from scorch.compiler.cin import (
-    BinaryOp as CINBinaryOp,
-    ForAll,
-    IndexVar,
-    Operation,
-    TensorAssign,
-    TensorVar,
-)
-from scorch.compiler.compile_options import CompileOptions
-from scorch.compiler.loopir.pipeline import execute_cin_via_loopir
-from scorch.compiler.scheduler import Schedule
-from scorch.stensor import STensor
-import scorch
-
-F32 = torch.float32
-
-
-def auto_options(arm, jit):
-    base = (
-        CompileOptions.from_environment()
-        if jit
-        else CompileOptions.from_environment(environ={})
-    )
-    return replace(
-        base.with_regblock_enabled(arm), requested_schedule=Schedule()
-    )
-
-
-def reduction_cin(operand_fmt, result_fmt, operand_indices, result_indices):
-    ivars = {name: IndexVar(name) for name in operand_indices}
-    operand = TensorVar("A", fmt=operand_fmt, dtype=F32)[
-        tuple(ivars[name] for name in operand_indices)
-    ]
-    result = TensorVar("C", fmt=result_fmt, dtype=F32)[
-        tuple(ivars[name] for name in result_indices)
-    ]
-    statement = TensorAssign(result, operand, op=Operation.ADD)
-    for name in reversed(operand_indices):
-        statement = ForAll(ivars[name], statement)
-    return statement
-
-
-def ttm_cin(a_fmt, b_fmt, c_fmt):
-    ivars = {name: IndexVar(name) for name in "ijkl"}
-    a = TensorVar("A", fmt=a_fmt, dtype=F32)[ivars["i"], ivars["j"], ivars["k"]]
-    b = TensorVar("B", fmt=b_fmt, dtype=F32)[ivars["k"], ivars["l"]]
-    c = TensorVar("C", fmt=c_fmt, dtype=F32)[ivars["i"], ivars["j"], ivars["l"]]
-    statement = TensorAssign(
-        c, CINBinaryOp(Operation.MUL, a, b), op=Operation.ADD
-    )
-    for name in reversed("ijkl"):
-        statement = ForAll(ivars[name], statement)
-    return statement
-
-
-def sparse(dense, fmt, name):
-    return STensor.from_torch(dense.clone(), name).to_sparse(fmt)
-
-
-def random_dense(shape, seed, density):
-    generator = torch.Generator().manual_seed(seed)
-    values = torch.rand(shape, generator=generator, dtype=torch.float64)
-    mask = torch.rand(shape, generator=generator, dtype=torch.float64) < density
-    return (values * mask).to(F32)
-
-
-def classify(error):
-    name = type(error).__name__
-    message = str(error)
-    if name == "TensorIndexError":
-        if "coordinates must be strictly increasing" in message:
-            return "duplicate_coordinates"
-        if "position array must start at zero" in message:
-            return "malformed_child_positions"
-        return "other_malformed_storage:" + message[:80]
-    if name == "CalledProcessError":
-        return "uncompilable_source"
-    return name + ":" + message[:80]
-
-
-CELLS = json.loads(sys.argv[1])
-
-for cell in CELLS:
-    for arm in (False, True):
-        record = {"name": cell["name"], "arm": arm}
-        try:
-            if cell["kind"] == "reduction":
-                shape = tuple(cell["shape"])
-                operand_indices = cell["operand"]
-                result_indices = cell["result"]
-                result_shape = tuple(
-                    shape[operand_indices.index(c)] for c in result_indices
-                )
-                dense = random_dense(shape, 5151 + len(operand_indices), 0.55)
-                make_operands = lambda: [sparse(dense, cell["operand_fmt"], "A")]
-                subscripts = operand_indices + "->" + result_indices
-                legacy_fmt = cell["result_fmt"]
-                builder = lambda: reduction_cin(
-                    cell["operand_fmt"],
-                    cell["result_fmt"],
-                    operand_indices,
-                    result_indices,
-                )
-            else:
-                a_shape, b_shape = (4, 5, 6), (6, 3)
-                result_shape = (4, 5, 3)
-                a_dense = random_dense(a_shape, 6262, 0.45)
-                b_dense = random_dense(b_shape, 7373, 0.65)
-                make_operands = lambda: [
-                    sparse(a_dense, cell["a_fmt"], "A"),
-                    sparse(b_dense, cell["b_fmt"], "B"),
-                ]
-                subscripts = "ijk,kl->ijl"
-                legacy_fmt = cell["c_fmt"]
-                builder = lambda: ttm_cin(
-                    cell["a_fmt"], cell["b_fmt"], cell["c_fmt"]
-                )
-
-            loopir_result, _ = execute_cin_via_loopir(
-                builder(),
-                result_shape,
-                *make_operands(),
-                compile_options=auto_options(arm, True),
-            )
-            record["loopir"] = "ok"
-            record["loopir_nnz"] = int(loopir_result.storage.value.numel())
-            try:
-                scorch.einsum(
-                    subscripts,
-                    *make_operands(),
-                    format=legacy_fmt,
-                    _compile_options=auto_options(arm, True),
-                )
-                record["legacy"] = "ok"
-            except Exception as error:  # noqa: BLE001
-                record["legacy"] = classify(error)
-        except Exception as error:  # noqa: BLE001
-            record["harness"] = type(error).__name__ + ": " + str(error)[:200]
-        print("@@CELL@@" + json.dumps(record), flush=True)
-'''
-
-
-def test_defective_legacy_routes_keep_their_measured_disposition(tmp_path):
-    """The eleven unsound legacy comparands, characterized rather than waved off.
-
-    Every cell here generates legacy C++ (see the twenty-route lock above),
-    so "there is no comparand" was the wrong claim; the right one is that
-    these eleven comparands are unsound, in exactly three measured ways.  Each
-    is reproduced in a disposable process with ``RLIMIT_CPU``/``RLIMIT_CORE``
-    and a wall-clock timeout, and each cell's verdict streams out as it is
-    produced -- so a route that terminated the interpreter would be *named*
-    rather than swallowing the whole table.  The LoopIR route is required to
-    succeed on every one of them in both arms.
-    """
-
-    import json
-    import subprocess
-    import sys
-
-    reduction_by_name = {cell[0]: cell for cell in REDUCTION_CELLS}
-    ttm_by_name = {cell[0]: cell for cell in TTM_CELLS}
-    specs = []
-    for name, _ in DEFECTIVE_LEGACY_CELLS:
-        if name in reduction_by_name:
-            _, operand_fmt, result_fmt, operand_indices, result_indices, shape = (
-                reduction_by_name[name]
-            )
-            specs.append(
-                {
-                    "name": name,
-                    "kind": "reduction",
-                    "operand_fmt": operand_fmt,
-                    "result_fmt": result_fmt,
-                    "operand": operand_indices,
-                    "result": result_indices,
-                    "shape": list(shape),
-                }
-            )
-        else:
-            _, a_fmt, b_fmt, c_fmt = ttm_by_name[name]
-            specs.append(
-                {
-                    "name": name,
-                    "kind": "ttm",
-                    "a_fmt": a_fmt,
-                    "b_fmt": b_fmt,
-                    "c_fmt": c_fmt,
-                }
-            )
-
-    worker = tmp_path / "characterize_defective_legacy.py"
-    worker.write_text(_DEFECTIVE_LEGACY_WORKER)
-    completed = subprocess.run(
-        [sys.executable, str(worker), json.dumps(specs)],
-        capture_output=True,
-        text=True,
-        timeout=5400,
-    )
-    measured = [
-        json.loads(line[len("@@CELL@@") :])
-        for line in completed.stdout.splitlines()
-        if line.startswith("@@CELL@@")
-    ]
-    expected_pairs = [
-        (name, arm) for name, _ in DEFECTIVE_LEGACY_CELLS for arm in (False, True)
-    ]
-    got_pairs = [(record["name"], record["arm"]) for record in measured]
-    assert got_pairs == expected_pairs, (
-        f"characterization stopped early (rc={completed.returncode}); "
-        f"last measured {got_pairs[-1:]}\n{completed.stderr[-2000:]}"
-    )
-    dispositions = dict(DEFECTIVE_LEGACY_CELLS)
-    for record in measured:
-        assert "harness" not in record, record
-        assert record["loopir"] == "ok", record
-        assert record["legacy"] == dispositions[record["name"]], record
 
 
 @pytest.mark.parametrize("dtype", [torch.float32, torch.float64])
