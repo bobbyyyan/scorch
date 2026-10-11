@@ -187,8 +187,8 @@ def oracle_bindings(program, dense, operand_fmt):
 # -- the split itself --------------------------------------------------------
 
 
-def test_rank_zero_key_is_a_split_and_interleaving_is_not():
-    """The split's two refusals are distinct, and only one survives."""
+def test_rank_zero_key_is_a_split_and_so_is_an_interleaved_key():
+    """The key is every result coordinate below the outermost reduction."""
 
     i, j, k = IndexId(1), IndexId(2), IndexId(3)
 
@@ -197,16 +197,26 @@ def test_rank_zero_key_is_a_split_and_interleaving_is_not():
         1,
         0,
     )
-    # ``C[j] += A[i, j, k]`` under ``ijk``: the result coordinate is interleaved
-    # between reductions at 0 and 2, so no split exists at all.
-    assert (
-        _ordered_key_split((LevelType.COMPRESSED,), (j,), (i, k), {i: 0, j: 1, k: 2})
-        is None
-    )
-    # A rank->=1 key still splits exactly as before.
+    # ``C[j] += A[i, j, k]`` under ``ijk``: the result coordinate sits between
+    # reductions at 0 and 2.  It is a key of the region that starts at the
+    # outermost reduction, not a refusal and not a bound prefix.
+    assert _ordered_key_split(
+        (LevelType.COMPRESSED,), (j,), (i, k), {i: 0, j: 1, k: 2}
+    ) == (0, 1)
+    # A key below the innermost reduction splits exactly as before.
     assert _ordered_key_split(
         (LevelType.COMPRESSED,), (k,), (i, j), {i: 0, j: 1, k: 2}
     ) == (0, 1)
+    # What still has no split: result modes bound out of result level order.
+    assert (
+        _ordered_key_split(
+            (LevelType.COMPRESSED, LevelType.COMPRESSED),
+            (k, j),
+            (i,),
+            {i: 0, j: 1, k: 2},
+        )
+        is None
+    )
 
 
 def test_the_family_is_its_own_member_not_an_ordered_key_workspace():
@@ -451,38 +461,20 @@ def test_exact_cancellation_still_stores_its_entry():
 # -- the refused neighbours, each at its own code ----------------------------
 
 
-@pytest.mark.parametrize(
-    "cell,code,fragment",
-    [
-        # A COMPRESSED result prefix level driven by a DENSE domain used to sit
-        # here (``ds ij->i``, ``dss ijk->i``, ``dsss ijkl->ijk``); those cells
-        # are ``WIDENED`` now and proven above.  The residue of that rule is a
-        # compressed prefix level driven by a MERGED domain, which needs two
-        # operands and cannot be spelled by this list's single-operand builder.
-        #
-        # A result coordinate interleaved between two reductions: no split.
-        (
-            ("sss", "s", "ijk", "j"),
-            "unsupported_sparse_output_domain",
-            "interleaved between two reduction loops",
-        ),
-        # Recorded seam move: a DENSE result prefix level driven by a stored
-        # stream used to sit here, and blocker 3 migrates it -- see
-        # ``test_loopir_row_scope_prefix_target.py``, which owns that cell and
-        # proves it against the oracle and PyTorch.  The residue of the rule is
-        # a dense prefix level driven by a MERGED domain, which needs two
-        # operands and so cannot be spelled by this list's single-operand
-        # builder; it is locked by
-        # ``test_a_merged_prefix_domain_stays_refused_at_cin`` in that module.
-    ],
-    ids=lambda value: value if isinstance(value, str) else "cell",
-)
-@pytest.mark.parametrize("arm", [False, True], ids=["direct", "regblock"])
-def test_the_refused_neighbours_keep_their_own_codes(cell, code, fragment, arm):
-    with pytest.raises(LoopIRLoweringError) as error:
-        compiled(cell, arm)
-    assert error.value.defect.code == code
-    assert fragment in error.value.defect.message
+# The single-operand refused neighbours this section used to lock have all
+# moved, and each is proven where it went rather than locked here:
+#
+# - a COMPRESSED result prefix level driven by a DENSE domain (``ds ij->i``,
+#   ``dss ijk->i``, ``dsss ijkl->ijk``) is ``WIDENED`` above;
+# - a DENSE result prefix level driven by a stored stream is migrated by
+#   blocker 3 -- ``test_loopir_row_scope_prefix_target.py`` owns that cell;
+# - a result coordinate interleaved between two reductions (``sss ijk->j``) is
+#   a key of the ordered-key workspace region since 2026-10-11 --
+#   ``test_loopir_interleaved_workspace_key.py`` executes it.
+#
+# The residue of the first two rules is a prefix level driven by a MERGED
+# domain, which needs two operands; it is locked by
+# ``test_a_merged_prefix_domain_stays_refused_at_cin`` in the row-scope module.
 
 
 @pytest.mark.parametrize("arm", [False, True], ids=["direct", "regblock"])
@@ -545,10 +537,12 @@ def test_the_generated_accumulator_identifier_is_name_reserved():
         # point: the repair's generality is what makes three distinct
         # shape-specific diagnoses reachable instead of one order complaint.
         #
-        # Twelve of the original 28 are admitted since 2026-10-11 (the
-        # ``WIDENED`` cells above): the four ``unsupported_program_shape`` ones
-        # and the eight dense-driven ``unsupported_sparse_output_domain`` ones.
-        # What remains is the interleaved-key and CSR-reduction residue.
+        # Eighteen of the original 28 are admitted since 2026-10-11: the four
+        # ``unsupported_program_shape`` ones and the eight dense-driven
+        # ``unsupported_sparse_output_domain`` ones (the ``WIDENED`` cells
+        # above), and the six interleaved-key ``ijk->j`` ones, which
+        # ``test_loopir_interleaved_workspace_key.py`` executes.  What remains
+        # is the CSR-reduction residue.
         #
         # This is the whole lockable set at this tip, enumerated rather than
         # sampled: every rank-2 and rank-3 reduction cell for which the repair
@@ -557,12 +551,6 @@ def test_the_generated_accumulator_identifier_is_name_reserved():
         # ``unsupported_union_with_dense``, needs a two-operand combiner and so
         # cannot be expressed through ``reduction_cin``; it stays uncovered here
         # and that is stated rather than left to look complete.
-        (("dds", "s", "ijk", "j"), "unsupported_sparse_output_domain"),
-        (("dsd", "s", "ijk", "j"), "unsupported_sparse_output_domain"),
-        (("dss", "s", "ijk", "j"), "unsupported_sparse_output_domain"),
-        (("sds", "s", "ijk", "j"), "unsupported_sparse_output_domain"),
-        (("ssd", "s", "ijk", "j"), "unsupported_sparse_output_domain"),
-        (("sss", "s", "ijk", "j"), "unsupported_sparse_output_domain"),
         (("dds", "ds", "ijk", "ij"), "unsupported_sparse_output_reduction"),
         (("dds", "sd", "ijk", "ij"), "unsupported_sparse_output_reduction"),
         (("dsd", "ds", "ijk", "ij"), "unsupported_sparse_output_reduction"),
@@ -589,7 +577,8 @@ def test_redispositioned_neighbours_keep_their_shape_specific_codes(cell, code):
     does differ from its pre-forced one; a cell where the two agree cannot be in
     the moved set at all.
 
-    Blocker 3 has since ADMITTED part of §53.7's original 57, so this set is the
+    Blocker 3 and the 2026-10-11 dense-domain and interleaved-key changes have
+    since ADMITTED part of §53.7's original 57, so this set is the
     lockable remainder at this tip rather than a subset of that historical
     number -- which is why each cell's code is asserted rather than assumed from
     the §53.7 split.

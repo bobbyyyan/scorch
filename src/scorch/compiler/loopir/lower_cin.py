@@ -595,12 +595,17 @@ def _ordered_key_split(
 ) -> Optional[Tuple[int, int]]:
     """The ``(prefix, key_rank)`` split of one ordered sparse reduction result.
 
-    Derived from identities alone: the key is exactly the run of result
-    coordinates bound strictly below the innermost reduction, and the prefix is
-    exactly the run bound above the outermost reduction.  Returns ``None`` when
-    no such split exists -- that is, when some result coordinate is interleaved
-    between two reduction loops -- which is the shape's own definition of "not
-    this family" rather than a layout guess.
+    Derived from identities alone: the prefix is exactly the run of result
+    coordinates bound above the outermost reduction, and the key is every
+    result coordinate bound below it -- after the innermost reduction or
+    between two reductions alike.  A key coordinate interleaved with the
+    reductions is still owned by the one workspace region that starts at the
+    outermost reduction: the region accumulates every contribution to a key
+    before its drain appends it, and the drain orders keys itself, so the
+    order in which the producer visits them does not matter.  Returns ``None``
+    when the program is not an ordered reduction at all: no reduction, a
+    result coordinate the nest does not bind, or result modes bound out of
+    result level order.
 
     ``key_rank == 0`` is a legitimate split, not a degenerate one: every result
     coordinate is then bound above the outermost reduction, so the reduction is
@@ -625,14 +630,8 @@ def _ordered_key_split(
         return None
     reduction_positions = [loop_positions[index_id] for index_id in reduction_index_ids]
     first_reduction = min(reduction_positions)
-    last_reduction = max(reduction_positions)
     prefix = sum(1 for position in ordered_positions if position < first_reduction)
-    key_rank = sum(1 for position in ordered_positions if position > last_reduction)
-    if prefix + key_rank != len(lhs_index_ids):
-        # Some result coordinate is interleaved between two reduction loops;
-        # neither one workspace region nor a bound prefix can own it.
-        return None
-    return prefix, key_rank
+    return prefix, len(lhs_index_ids) - prefix
 
 
 def _classify_sparse_output_family(
@@ -683,11 +682,12 @@ def _classify_sparse_output_family(
     if ordered_key_shape:
         # Two families share this receiver shape -- a dense prefix, then one
         # or more compressed levels, reduced under ADD -- and the split's key
-        # rank selects between them.  The key is the trailing run of result
-        # coordinates below the innermost reduction; every coordinate above
-        # the outermost reduction binds a result prefix level directly.  Both
-        # runs are derived from loop and level identities -- no layout string,
-        # rank table, or format spelling participates.
+        # rank selects between them.  The key is every result coordinate
+        # bound below the outermost reduction, whether after the innermost
+        # one or between two of them; every coordinate above the outermost
+        # reduction binds a result prefix level directly.  Both runs are
+        # derived from loop and level identities -- no layout string, rank
+        # table, or format spelling participates.
         #
         # ``key_rank >= 1`` is the ordered-key sparse-workspace family: one
         # workspace region owns the key domain and drains it in order.
@@ -702,11 +702,8 @@ def _classify_sparse_output_family(
         if split is None:
             _fail(
                 "unsupported_sparse_output_domain",
-                "an ordered sparse reduction needs its result coordinates "
-                "split into a prefix bound above the outermost reduction and "
-                "a key bound below the innermost one, in result level order; "
-                "no result coordinate may be interleaved between two "
-                "reduction loops",
+                "an ordered sparse reduction needs every result coordinate "
+                "bound by the nest, in result level order",
             )
         prefix, key_rank = cast(Tuple[int, int], split)
         if prefix != dense_prefix_length and any(

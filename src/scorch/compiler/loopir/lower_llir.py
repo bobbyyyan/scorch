@@ -9094,19 +9094,39 @@ class _OrderedKeySparseWorkspaceLowering(_TargetLowering):
                 "a dense, single-cursor sparse, or two-cursor merged producer " "loop",
             )
         require(
-            len(loops) >= prefix + key_rank + 1,
-            "at least one reduction loop between the prefix and the key",
-        )
-        key_loops = loops[len(loops) - key_rank :]
-        require(
             insert.workspace == workspace_decl.workspace
             and insert.op is ReduceOp.ADD
             and len(insert.coords) == key_rank
-            and all(type(coord) is IndexValue for coord in insert.coords)
-            and [cast(IndexValue, coord).index for coord in insert.coords]
-            == [loop.index for loop in key_loops],
-            "an ADD insertion at the innermost producer coordinates, in key " "order",
+            and all(type(coord) is IndexValue for coord in insert.coords),
+            "an ADD insertion of the region's own workspace at plain "
+            "coordinates, one per key dimension",
         )
+        # The key loops are the producer loops that bind the insertion's
+        # coordinates.  They may sit below the innermost reduction or between
+        # two reductions: the drain orders keys itself, so only their
+        # nesting order (key order) and the reduction at the region's top are
+        # structural obligations.
+        producer_positions = {
+            loop.index: position
+            for position, loop in enumerate(loops)
+            if position >= prefix
+        }
+        insert_indices = [cast(IndexValue, coord).index for coord in insert.coords]
+        require(
+            all(index in producer_positions for index in insert_indices),
+            "each insertion coordinate bound by a producer loop",
+        )
+        key_positions = [producer_positions[index] for index in insert_indices]
+        require(
+            all(
+                earlier < later
+                for earlier, later in zip(key_positions, key_positions[1:])
+            )
+            and key_positions[0] > prefix,
+            "key loops nested in key order below a reduction loop at the "
+            "region's top",
+        )
+        key_loops = [loops[position] for position in key_positions]
         require(
             tuple(loop.dimension for loop in key_loops)
             == tuple(workspace_decl.key_dimensions),
@@ -9159,6 +9179,7 @@ class _OrderedKeySparseWorkspaceLowering(_TargetLowering):
         self.sparse_drain = drain
         self.sparse_append = append
         self.key_rank = key_rank
+        self.key_loops = key_loops
         self.prefix_depth = prefix
         self.leaf = insert
         return loops
@@ -9717,7 +9738,7 @@ class _OrderedKeySparseWorkspaceLowering(_TargetLowering):
                             name=self._loop_var_name(loop),
                             type=llir.DataType.INT64,
                         )
-                        for loop in self.loops[len(self.loops) - self.key_rank :]
+                        for loop in self.key_loops
                     ],
                     data_type=llir.DataType.INT64,
                 ),

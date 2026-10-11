@@ -63,8 +63,6 @@ from scorch.compiler.cin import (
 )
 from scorch.compiler.compile_options import CompileOptions
 from scorch.compiler.loop_plan_legality import InvalidSchedule
-from scorch.compiler.loopir.lower_cin import LoopIRLoweringError
-from scorch.compiler.loopir.lower_llir import LoopIRTargetError
 from scorch.compiler.loopir.pipeline import compile_cin_via_loopir
 from scorch.compiler.scheduler import Schedule
 from tests.test_scorch.test_loopir_sparse_workspace_target import auto_options
@@ -138,7 +136,7 @@ def _ttm_cell(name, a_fmt, b_fmt, c_fmt):
 # order the composition started from is itself legal, and for a permuted result
 # it is not: ``result_storage_order`` refuses both.  The cells this list used to
 # name (``sss ijk->{i,j,ij}``, ``ss ij->i``, ``ds ij->i``) moved when the
-# bound-prefix family landed; ``BOUND_PREFIX_MIGRATED`` below records where each
+# bound-prefix family landed; ``FORMER_REORDER_BLOCKED`` below records where each
 # went, and ``test_loopir_bound_prefix_target`` owns the family.
 REORDER_BLOCKED = [
     _reduction_cell("ss ij->ji", "ss", "ss", "ij", "ji"),
@@ -147,20 +145,19 @@ REORDER_BLOCKED = [
     _reduction_cell("sss ijk->ki", "sss", "ds", "ijk", "ki"),
 ]
 
-# Where the five cells this census used to lock as reorder-blocked now go.
-# Three are admitted by the bound-prefix family; two are refused by that
-# family's own prefix domain rule (a COMPRESSED result level driven by a DENSE
-# domain), and ``sss ijk->{j,ij}`` by interleaving and the target respectively.
-BOUND_PREFIX_MIGRATED = [
-    (_reduction_cell("sss ijk->i", "sss", "s", "ijk", "i"), True),
-    (_reduction_cell("ss ij->i", "ss", "s", "ij", "i"), True),
-    # ``ds ij->i`` (a compressed result level driven by a dense domain) and
-    # ``sss ijk->ij`` (a doubly-compressed receiver with no drained key) are
-    # admitted since 2026-10-11; ``sss ijk->j`` interleaves its result
-    # coordinate between two reductions and has no split.
-    (_reduction_cell("ds ij->i", "ds", "s", "ij", "i"), True),
-    (_reduction_cell("sss ijk->j", "sss", "s", "ijk", "j"), False),
-    (_reduction_cell("sss ijk->ij", "sss", "ss", "ijk", "ij"), True),
+# Where the five cells this census used to lock as reorder-blocked now go, by
+# family.  All five are admitted since 2026-10-11: ``ds ij->i`` (a compressed
+# result level driven by a dense domain) and ``sss ijk->ij`` (a doubly-compressed
+# receiver with no drained key) joined the bound-prefix family, and
+# ``sss ijk->j`` -- whose result coordinate sits between two reductions -- is a
+# rank-1 key of the ordered-key workspace region that starts at the outermost
+# reduction.
+FORMER_REORDER_BLOCKED = [
+    (_reduction_cell("sss ijk->i", "sss", "s", "ijk", "i"), "bound_prefix"),
+    (_reduction_cell("ss ij->i", "ss", "s", "ij", "i"), "bound_prefix"),
+    (_reduction_cell("ds ij->i", "ds", "s", "ij", "i"), "bound_prefix"),
+    (_reduction_cell("sss ijk->j", "sss", "s", "ijk", "j"), "ordered_key"),
+    (_reduction_cell("sss ijk->ij", "sss", "ss", "ijk", "ij"), "bound_prefix"),
 ]
 
 # Legal plan order, supported target shape: the ordered-key vertical lowers
@@ -255,32 +252,26 @@ def test_the_legal_explicit_order_reaches_the_bound_prefix_family(cell, loop_ord
 
 
 @pytest.mark.parametrize(
-    ("cell", "admitted"),
-    BOUND_PREFIX_MIGRATED,
-    ids=[cell[0][0] for cell in BOUND_PREFIX_MIGRATED],
+    ("cell", "family"),
+    FORMER_REORDER_BLOCKED,
+    ids=[cell[0][0] for cell in FORMER_REORDER_BLOCKED],
 )
 @pytest.mark.parametrize("arm", [False, True])
-def test_the_former_reorder_blocked_cells_split_three_ways(cell, admitted, arm):
-    """Each of the five now reaches a decision, and the record says which."""
+def test_the_former_reorder_blocked_cells_reach_their_family(cell, family, arm):
+    """Each of the five now compiles, and the record says through which family."""
 
     name, cin, result_shape, bindings = cell
-    if admitted:
-        kernel = compile_cin_via_loopir(
-            cin, result_shape, bindings, compile_options=auto_options(arm)
-        )
+    kernel = compile_cin_via_loopir(
+        cin, result_shape, bindings, compile_options=auto_options(arm)
+    )
+    if family == "bound_prefix":
         # The bound-prefix family accumulates into a scalar; no workspace
         # region of either representation participates.
         assert "wksp" not in kernel.cpp_source, name
         assert "_reduction = 0.0;" in kernel.cpp_source, name
-        return
-    with pytest.raises((LoopIRLoweringError, LoopIRTargetError)) as error:
-        compile_cin_via_loopir(
-            cin, result_shape, bindings, compile_options=auto_options(arm)
-        )
-    assert error.value.defect.code in (
-        "unsupported_sparse_output_domain",
-        "unsupported_program_shape",
-    ), (name, error.value.defect)
+    else:
+        assert family == "ordered_key"
+        assert "wksp.sort();" in kernel.cpp_source, name
 
 
 @pytest.mark.parametrize("arm", [False, True])
@@ -359,14 +350,14 @@ def test_census_covers_the_declared_representative_matrix():
     """Pin the finite review matrix without claiming layout exhaustiveness."""
 
     assert len(REORDER_BLOCKED) == 4
-    assert len(BOUND_PREFIX_MIGRATED) == 5
+    assert len(FORMER_REORDER_BLOCKED) == 5
     # 9 -> 11 and 2 -> 0: the two ``TTM dds`` cells moved lists rather than
     # leaving the matrix, so the 20-name total below is unchanged.
     assert len(MIGRATED) == 11
     assert len(AUTO_TILE_BLOCKED) == 0
     names = (
         [cell[0] for cell in REORDER_BLOCKED]
-        + [cell[0][0] for cell in BOUND_PREFIX_MIGRATED]
+        + [cell[0][0] for cell in FORMER_REORDER_BLOCKED]
         + [cell[0] for cell in MIGRATED]
         + [cell[0] for cell in AUTO_TILE_BLOCKED]
     )

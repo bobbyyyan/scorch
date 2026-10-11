@@ -1049,12 +1049,13 @@ def apply_sparse_workspace(
     nothing else:
 
     - the **key** is exactly the recorded ``axis_loops``, which the automatic
-      origin defines as every free variable below the innermost reduction,
-      and which must therefore be the trailing run of both the loop chain and
-      the result's own coordinate list;
+      origin defines as every free variable inside the region, and which must
+      therefore be the trailing run of the result's own coordinate list.  Its
+      loops may sit below the innermost reduction or between two reductions:
+      the drain orders keys itself, so the producer's visiting order is free;
     - the **anchor** is exactly the first loop below the result's bound
-      prefix, i.e. the OUTERMOST reduction, so one region accumulates every
-      contraction outer to the key.
+      prefix, which must be a reduction -- the OUTERMOST one -- so one region
+      accumulates every contribution to every key before the drain runs.
 
     Everything from the anchor down becomes the producer, with the reduction
     leaf rewritten into a merging ADD insertion at the key coordinates; the
@@ -1152,8 +1153,8 @@ def apply_sparse_workspace(
             "the recorded reduction loop must not bind a result coordinate",
         )
     # Every result coordinate is bound exactly once, in result level order,
-    # and the key occupies the trailing loops of the chain: those two facts
-    # place the region without consulting any layout spelling.
+    # and the prefix occupies the outermost loops of the chain: those two
+    # facts place the region without consulting any layout spelling.
     binder_positions: List[int] = []
     for index_id in result_indices:
         positions = [
@@ -1182,35 +1183,27 @@ def apply_sparse_workspace(
             "result prefix coordinates must be bound by the outermost loops, "
             "above the workspace region",
         )
-    if binder_positions[prefix:] != list(range(len(loops) - key_rank, len(loops))):
-        _fail(
-            "sparse_workspace_target_invalid",
-            "the drained key coordinates must be bound by the innermost "
-            "loops of the chain",
-        )
     anchor = prefix
-    reduction_nodes = loops[anchor : len(loops) - key_rank]
-    if not reduction_nodes:
+    key_positions = binder_positions[prefix:]
+    if key_positions[0] == anchor:
         _fail(
             "sparse_workspace_target_invalid",
-            "the sparse workspace requires at least one reduction loop "
-            "between the result prefix and the drained key",
+            "the workspace region must begin at a reduction loop below the "
+            "result prefix",
         )
-    result_index_set = set(result_indices)
-    if any(_loop_key(node)[0] in result_index_set for node in reduction_nodes):
-        _fail(
-            "sparse_workspace_target_invalid",
-            "no result coordinate may be bound between the region anchor and "
-            "the drained key",
-        )
+    reduction_nodes = [
+        node
+        for position, node in enumerate(loops)
+        if position >= anchor and position not in key_positions
+    ]
     if _loop_key(reduction_nodes[-1]) != (reduction_index, LoopPart.LOGICAL):
         _fail(
             "sparse_workspace_target_invalid",
             "the recorded reduction loop must be the innermost reduction "
-            "above the drained key",
+            "in the workspace region",
         )
     key_dimensions = tuple(
-        _loop_bound_dimension(program, node) for node in loops[len(loops) - key_rank :]
+        _loop_bound_dimension(program, loops[position]) for position in key_positions
     )
     if len(set(key_dimensions)) != key_rank:
         _fail(
