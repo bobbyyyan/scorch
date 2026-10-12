@@ -388,17 +388,21 @@ def test_execution_matches_the_oracle_and_pytorch(cell, arm, dtype):
         {program.outputs[0]: result_shape},
     )[program.outputs[0]]
 
-    # Exact (pos, crd) storage against the oracle, level by level.
-    for level in range(len(oracle.level_kinds)):
-        if oracle.positions[level] is None:
-            continue
+    # Exact (pos, crd) storage against the oracle, level by level.  A
+    # (DENSE, COMPRESSED) receiver is materialized by the oracle's dedicated CSR
+    # builder, which carries ``indptr``/``indices`` instead of per-level arrays.
+    if type(oracle).__name__ == "CsrMatrix":
+        expected_levels = {1: (oracle.indptr, oracle.indices)}
+    else:
+        expected_levels = {
+            level: (oracle.positions[level], oracle.coordinates[level])
+            for level in range(len(oracle.level_kinds))
+            if oracle.positions[level] is not None
+        }
+    for level, (positions, coordinates) in expected_levels.items():
         got = result.storage.index.mode_indices[level]
-        assert [int(x) for x in got[0].tolist()] == [
-            int(x) for x in oracle.positions[level]
-        ]
-        assert [int(x) for x in got[1].tolist()] == [
-            int(x) for x in oracle.coordinates[level]
-        ]
+        assert [int(x) for x in got[0].tolist()] == [int(x) for x in positions]
+        assert [int(x) for x in got[1].tolist()] == [int(x) for x in coordinates]
     assert len(result.values.tolist()) == len(oracle.values)
 
     axes = tuple(

@@ -30,8 +30,10 @@ from scorch.compiler.cin import ForAll, IndexVar, Operation, TensorAssign, Tenso
 from scorch.compiler.cin_lowerer import CINLowerer
 from scorch.compiler.codegen import LLIRLowerer
 from scorch.compiler.compile_options import CompileOptions
-from scorch.compiler.loopir.lower_llir import LoopIRTargetError
-from scorch.compiler.loopir.pipeline import compile_cin_via_loopir
+from scorch.compiler.loopir.pipeline import (
+    compare_generated_sources,
+    compile_cin_via_loopir,
+)
 from scorch.compiler.scheduler import (
     Schedule,
     Scheduler,
@@ -299,11 +301,6 @@ def test_dense_dual_constituents_compose_from_actual_loopir_arms(family):
     ("family", "spec", "expected"),
     [
         (
-            "spmm_ss",
-            ("dd", "ik", (("ss", "ij"), ("dd", "jk")), "ijk"),
-            "unsupported_program_shape",
-        ),
-        (
             "spmm_coo",
             ("dd", "ik", (("oo", "ij"), ("dd", "jk")), "ijk"),
             "unsupported_format",
@@ -334,9 +331,11 @@ def test_dual_domain_census_locks_open_boundaries(family, spec, expected):
     """Qualifying dual families outside the migrated arms fail closed.
 
     This representative production census locks the known format-family
-    boundaries: hierarchical-compressed ``ss`` operands still fail target
-    parent-position descent
-    (``unsupported_program_shape``); COO operands fail level lowering
+    boundaries.  Hierarchical-compressed ``ss`` operands left this list when
+    the generic target began descending a compressed level under a compressed
+    level; their arm is locked as legacy-identical in
+    ``test_dual_path_hierarchical_ss_arm_lowers_the_legacy_kernel``.  COO
+    operands fail level lowering
     (``unsupported_format``); trailing-compressed operands derive
     sparse-workspace-adjacent automatic plans that the family gate keeps on
     the legacy path (``unsupported_schedule_auto_family``).  Production
@@ -561,8 +560,17 @@ def test_dual_path_dense_arms_are_migrated_through_reduce_out(
 
 
 @pytest.mark.parametrize("explicit_update", [False, True])
-def test_dual_path_phase6_scope_keeps_hierarchical_ss_open(explicit_update):
-    """The hierarchical-compressed ss dual arm remains an open boundary."""
+def test_dual_path_hierarchical_ss_arm_lowers_the_legacy_kernel(explicit_update):
+    """The hierarchical-compressed ss dual arm lowers, byte-identical to legacy.
+
+    This was an open boundary while the generic target refused any input
+    with more than one compressed level -- a migration-scope limit, not a
+    defect.  Each compressed level is now descended by its own single-cursor
+    loop whose parent is the same tensor one level up, which the program
+    verifier already guarantees; the arm's kernel is the legacy one.  Its
+    execution against float64 on both arms is in
+    ``test_loopir_hierarchical_compressed_operand.py``.
+    """
 
     options = CompileOptions.from_environment(environ={})
     assert (
@@ -580,17 +588,16 @@ def test_dual_path_phase6_scope_keeps_hierarchical_ss_open(explicit_update):
         options.with_regblock_enabled(True),
         requested_schedule=Schedule(),
     )
-    with pytest.raises(LoopIRTargetError) as error:
-        compile_cin_via_loopir(
-            _build_spmm_cin(
-                sparse_format="ss",
-                explicit_update=explicit_update,
-            ),
-            (4, 6),
-            (
-                ((4, 5), torch.float32),
-                ((5, 6), torch.float32),
-            ),
-            compile_options=arm_options,
-        )
-    assert error.value.defect.code == "unsupported_program_shape"
+    comparison = compare_generated_sources(
+        _build_spmm_cin(
+            sparse_format="ss",
+            explicit_update=explicit_update,
+        ),
+        (4, 6),
+        (
+            ((4, 5), torch.float32),
+            ((5, 6), torch.float32),
+        ),
+        compile_options=arm_options,
+    )
+    assert comparison.identical

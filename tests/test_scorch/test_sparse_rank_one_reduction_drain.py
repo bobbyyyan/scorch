@@ -17,7 +17,6 @@ import pytest
 import torch
 
 import scorch
-from scorch.exceptions import TensorIndexError
 from scorch.stensor import STensor
 
 
@@ -44,27 +43,28 @@ def test_column_reduction_into_a_sparse_vector_matches(fmt):
     assert torch.allclose(result.to_torch(), dense.sum(dim=0), atol=1e-5, rtol=1e-5)
 
 
-def test_two_contraction_reduction_into_a_vector_is_still_defective():
-    """CHARACTERIZATION -- a SECOND, distinct pre-existing defect, now reachable.
+@pytest.mark.parametrize(
+    ("subscripts", "summed"), [("ijk->i", (1, 2)), ("ijk->j", (0, 2))]
+)
+def test_two_contraction_reduction_into_a_vector_matches(subscripts, summed):
+    """A reduction over TWO indices into a rank-1 sparse vector is correct.
 
-    This fix closes the *compile* failure, so a reduction with ONE contracted
-    index (``ij->i``, ``ij->j``) now works.  Reducing TWO indices into a rank-1
-    sparse vector (``ijk->i``, ``ijk->j``) still produces malformed storage:
-    the workspace is rebuilt inside the second contraction loop, so the drain
-    emits one entry per (surviving coordinate, outer contracted coordinate)
-    pair instead of one per surviving coordinate.  Storage validation catches
-    it -- the result is rejected, never silently wrong.
-
-    This is a workspace *placement* defect in the legacy lowering, not the
-    key-arity defect this change fixes.  Update this test when it is closed.
+    This was characterized here as a second, distinct legacy defect: the
+    workspace was rebuilt inside the second contraction loop, so the drain
+    emitted one entry per (surviving coordinate, outer contracted coordinate)
+    pair and storage validation rejected the result.  The workspace now
+    wraps every reduction loop below the result prefix and drains once (the
+    sparse-result workspace placement fix, swept over every order-preserving
+    reduction in ``test_sparse_output_reduction_sweep.py``); the suite
+    validates the result's storage, and its values must match PyTorch.
     """
 
     torch.manual_seed(5)
     dense = (torch.rand(3, 4, 5) < 0.4) * torch.randn(3, 4, 5)
-    for subscripts in ("ijk->i", "ijk->j"):
-        with pytest.raises(TensorIndexError) as error:
-            scorch.einsum(subscripts, sparse(dense, "A", "sss"))
-        assert "strictly increasing" in str(error.value)
+    result = scorch.einsum(subscripts, sparse(dense, "A", "sss"))
+    assert torch.allclose(
+        result.to_torch(), dense.sum(dim=summed), atol=1e-5, rtol=1e-5
+    )
 
 
 def test_float64_reduction_into_a_sparse_vector_matches():

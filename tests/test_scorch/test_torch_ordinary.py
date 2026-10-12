@@ -192,7 +192,30 @@ def _bad(case):
 
 
 @pytest.mark.parametrize("index", [torch.int64, torch.int32])
-@pytest.mark.parametrize("case", ["unsorted", "out_of_range", "negative", "decreasing"])
+def test_unsorted_columns_are_a_legal_operand(plans_on, index):
+    """Columns out of order inside a row are legal CSR, as in ``torch.matmul``.
+
+    This case used to sit among the malformed operands below.  The merge made
+    unordered and repeated CSR coordinates legal input (Bobby, 2026-10-11:
+    "if duplicate CSR coordinates is legal in torch.matmul, we should support
+    too"), so both the Python function and the public entry point must return
+    the product, equal to the dense reference.
+    """
+
+    crow, col, values = _bad("unsorted")
+    crow, col = crow.to(index), col.to(index)
+    b = rhs(4, 3)
+    with torch.sparse.check_sparse_tensor_invariants(False):
+        a = csr(crow.clone(), col.clone(), values, 3, 4)
+        want = a.to_dense() @ b
+        python = ops._matmul_python(csr(crow.clone(), col.clone(), values, 3, 4), b)
+        public = scorch.matmul(csr(crow.clone(), col.clone(), values, 3, 4), b)
+    torch.testing.assert_close(python.detach(), want, atol=1e-5, rtol=1e-5)
+    torch.testing.assert_close(public.detach(), want, atol=1e-5, rtol=1e-5)
+
+
+@pytest.mark.parametrize("index", [torch.int64, torch.int32])
+@pytest.mark.parametrize("case", ["out_of_range", "negative", "decreasing"])
 def test_a_malformed_operand_is_reported_by_the_python_function(plans_on, index, case):
     crow, col, values = _bad(case)
     crow, col = crow.to(index), col.to(index)

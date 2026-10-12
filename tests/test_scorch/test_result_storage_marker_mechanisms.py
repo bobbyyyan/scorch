@@ -839,10 +839,16 @@ def test_every_llir_rewriter_subclass_is_classified() -> None:
     frontier = [LLIRRewriter]
     while frontier:
         current = frontier.pop()
-        module_path = current.__module__.replace(".", "/")
-        assert module_path.startswith("scorch/"), module_path
-        discovered.add(f"{module_path[len('scorch/'):]}.py::{current.__qualname__}")
         frontier.extend(current.__subclasses__())
+        module_path = current.__module__.replace(".", "/")
+        if not module_path.startswith("scorch/"):
+            # A test module's own rewriter (several test files subclass
+            # LLIRRewriter to exercise a pass) is not production code.  It
+            # appears in the hierarchy only when that module was imported
+            # earlier in the same process, so asserting on it made this test
+            # depend on which tests shared its worker.
+            continue
+        discovered.add(f"{module_path[len('scorch/'):]}.py::{current.__qualname__}")
 
     registered = set(_registry_by_kind(KIND_REWRITER))
     unclassified = sorted(discovered - registered)

@@ -82,10 +82,39 @@ def _operand(operand, seed):
 
 
 def _sparse(dense, fmt):
-    tensor = STensor.from_torch(dense.clone(), "A")
-    if set(fmt) != {"d"}:
-        tensor.to_sparse(fmt)
-    return tensor
+    """The operand in ``fmt``, built level by level from its own nonzeros.
+
+    Not through ``to_sparse``: a conversion into a layout with a dense level
+    below a compressed one (``sdss``, ``dsd``, ...) or a compressed level below
+    two dense ones (``dds``) runs a shipped assembly kernel with its own known
+    defects, and this sweep is about reductions.  Building the levels directly
+    keeps a conversion defect from failing a reduction cell.
+    """
+
+    nonzeros = {tuple(int(t) for t in index) for index in dense.nonzero()}
+    mode_indices, parents = [], [()]
+    for level, kind in enumerate(fmt):
+        if kind == "d":
+            mode_indices.append([])
+            parents = [p + (c,) for p in parents for c in range(dense.shape[level])]
+            continue
+        positions, coordinates, children = [0], [], []
+        for parent in parents:
+            stored = sorted({c[level] for c in nonzeros if c[:level] == parent})
+            coordinates += stored
+            children += [parent + (c,) for c in stored]
+            positions.append(len(coordinates))
+        mode_indices.append(
+            [
+                torch.tensor(positions, dtype=torch.int64),
+                torch.tensor(coordinates, dtype=torch.int64),
+            ]
+        )
+        parents = children
+    values = torch.tensor([float(dense[c]) for c in parents], dtype=dense.dtype)
+    return STensor.from_components(
+        tuple(dense.shape), fmt, mode_indices, values, name="A"
+    )
 
 
 def _reduction_cin(operand, result, operand_fmt, result_fmt):
