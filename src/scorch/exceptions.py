@@ -287,6 +287,25 @@ class IndexCapacityError(TensorValidationError, RuntimeError):
     code = "index_position_exceeds_int32"
 
 
+class IndexExtentMismatchError(CompileSpecError, RuntimeError):
+    """A product's operands give one index two different extents.
+
+    A kernel bounds an index's loop by one operand's extent and reads every other operand
+    that carries the index by it, so a shorter operand would be read past its end.
+    ``einsum`` and ``spmv`` refuse an index whose operands give it different extents
+    before any kernel is built, and the prebuilt kernels refuse the same operands in their
+    native entry checks before they read anything, with this code in the text
+    (:func:`raise_if_native_coded`).  ``matmul`` reaches one of the three on every route
+    but two dense layouts, where it gives torch's refusal this class.  PyTorch raises
+    ``RuntimeError`` for the same mistake in ``matmul``, ``mv``, ``mm``, ``@`` and
+    ``einsum``, and so did the prebuilt kernels' native checks, so this is a
+    ``RuntimeError`` as well as the ``CompileSpecError`` ``einsum`` raised.  ``code``
+    names the defect.
+    """
+
+    code = "einsum_index_extent_mismatch"
+
+
 class GeneratedKernelCacheError(ScorchError, RuntimeError):
     """A kept generated kernel is not the kernel its call builds.
 
@@ -416,19 +435,24 @@ _NATIVE_REPEAT = re.compile(
 # position bound ends its line with this code.
 _NATIVE_CAPACITY_CODE = " [index_position_exceeds_int32]"
 
+# csrc/native_abi.h, SCORCH_EXTENT_MISMATCH_CODE: a prebuilt kernel's refusal of operands
+# that give one index two extents ends its line with this code.
+_NATIVE_EXTENT_CODE = " [einsum_index_extent_mismatch]"
+
 
 def raise_if_native_coded(error: BaseException) -> None:
     """Raise the structured form of a native refusal whose text carries a code.
 
     A kernel's checks can only raise ``c10::Error``, which reaches Python as a
-    ``RuntimeError`` carrying text.  Two refusals mark that text with a code: a repeated
-    COO coordinate, which becomes :class:`RepeatedCoordinateError`, and an index past the
-    32-bit position bound, which becomes :class:`IndexCapacityError`.  Every Python call
-    site of a kernel calls this inside ``except RuntimeError`` and re-raises the original
-    error when it returns, so a coded refusal leaves Scorch as its structured error and
-    every other error is unchanged.  The structured message is the native line without
-    the code, which the error's ``code`` attribute carries.  The ``try`` costs nothing
-    when nothing is raised (CPython 3.11+).
+    ``RuntimeError`` carrying text.  Three refusals mark that text with a code: a repeated
+    COO coordinate, which becomes :class:`RepeatedCoordinateError`, an index past the
+    32-bit position bound, which becomes :class:`IndexCapacityError`, and operands that
+    give one index two extents, which becomes :class:`IndexExtentMismatchError`.  Every
+    Python call site of a kernel calls this inside ``except RuntimeError`` and re-raises
+    the original error when it returns, so a coded refusal leaves Scorch as its
+    structured error and every other error is unchanged.  The structured message is the
+    native line without the code, which the error's ``code`` attribute carries.  The
+    ``try`` costs nothing when nothing is raised (CPython 3.11+).
     """
     text = str(error)
     match = _NATIVE_REPEAT.search(text)
@@ -445,6 +469,9 @@ def raise_if_native_coded(error: BaseException) -> None:
         # follows it.
         line = next(part for part in text.splitlines() if _NATIVE_CAPACITY_CODE in part)
         raise IndexCapacityError(line.replace(_NATIVE_CAPACITY_CODE, "")) from error
+    if _NATIVE_EXTENT_CODE in text:
+        line = next(part for part in text.splitlines() if _NATIVE_EXTENT_CODE in part)
+        raise IndexExtentMismatchError(line.replace(_NATIVE_EXTENT_CODE, "")) from error
 
 
 def defect_code(error: Optional[BaseException]) -> Optional[str]:

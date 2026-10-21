@@ -75,6 +75,7 @@ from .exceptions import (
     CompileSpecError,
     EinsumRepeatedIndexError,
     EinsumScalarResultError,
+    IndexExtentMismatchError,
     MatmulOperandRankError,
     ScheduleWithoutSparseOperandError,
     ScorchAssertionError,
@@ -747,10 +748,9 @@ def _logical_index_sizes(
             size = tensor.shape[physical_axis]
             previous = index_to_size.get(index_str)
             if previous is not None and previous != size:
-                raise CompileSpecError(
+                raise IndexExtentMismatchError(
                     f"einsum index {index_str!r} has incompatible dimensions "
-                    f"{previous} and {size}",
-                    code="einsum_index_extent_mismatch",
+                    f"{previous} and {size}"
                 )
             index_to_size[index_str] = size
     return index_to_size
@@ -1329,6 +1329,7 @@ def _spmv_owned(
     one snapshot, and a warm one makes none.
     """
 
+    _require_matrix_vector_operands(a, b)
     # Every spelling of a schedule lands in requested_schedule, a schedule_force context
     # included.  The SpMV path takes none yet: the refusal matmul's SpMV branch makes.
     if options.requested_schedule is not None:
@@ -1678,12 +1679,153 @@ def _run_torch_operand_plan(a: torch.Tensor, b: torch.Tensor, key: Any) -> Any:
 def _require_one_product_dtype(a: object, b: object) -> None:
     """Raise ``OperandDtypeMismatchError`` when ``matmul``'s operands differ in dtype.
 
+    ``matmul`` calls it for every pair its inline test did not admit.  That test admits
+    only exact types, so every other pair comes here: an ``nn.Parameter`` or another
+    tensor subclass, a dense left operand of an STensor, a ``TensorSpec``, and every
+    mistake.  An operand that is not an STensor, a ``torch.Tensor`` or a ``TensorSpec``
+    is refused first, by code (``matmul_operand_type_invalid``, from
+    ``_product_operand_extents``), as ``einsum`` refuses one.
+
+    Each operand's type is tested once, by the test that reads its dtype: an STensor's
+    from its metadata, as the inline test reads it, and a tensor's as its attribute.  So
+    a correct call reads no extents and calls no property.  On the M5 that costs 20 ns
+    more than reading both dtypes with ``getattr``, which refused nothing; refusing
+    through ``_product_operand_extents`` on every call cost 140 ns, 1.8-2.3% of a 9 us
+    call with an ``nn.Parameter`` operand (fd3).  The two operands' tests are written
+    out because a helper's call would cost more than the test.
+
     A separate function so ``matmul`` stays within the project's complexity bound.
     """
 
-    a_dtype, b_dtype = getattr(a, "dtype", None), getattr(b, "dtype", None)
+    a_dtype: Optional[torch.dtype]
+    b_dtype: Optional[torch.dtype]
+    if isinstance(a, STensor):
+        a_dtype = a._metadata.dtype
+    elif isinstance(a, torch.Tensor):
+        a_dtype = a.dtype
+    else:
+        _product_operand_extents(a, "first")
+        a_dtype = getattr(a, "dtype", None)
+    if isinstance(b, STensor):
+        b_dtype = b._metadata.dtype
+    elif isinstance(b, torch.Tensor):
+        b_dtype = b.dtype
+    else:
+        _product_operand_extents(b, "second")
+        b_dtype = getattr(b, "dtype", None)
     if a_dtype != b_dtype and a_dtype is not None and b_dtype is not None:
         require_same_value_dtype(a_dtype, b_dtype, operation="matmul")
+
+
+def _product_operand_extents(
+    operand: object, position: str
+) -> Optional[Tuple[int, ...]]:
+    """``operand``'s logical extents, or ``None`` for a ``TensorSpec`` (``einsum``
+    checks a spec's extents itself).  Anything else is refused with a code, as
+    ``einsum`` refuses an operand of a type it does not take.
+    """
+
+    if isinstance(operand, STensor):
+        return operand._metadata.layout.logical_shape
+    if isinstance(operand, torch.Tensor):
+        return operand.shape
+    if isinstance(operand, TensorSpec):
+        return None
+    raise TensorTypeError(
+        f"matmul's {position} operand must be a torch.Tensor or an STensor, "
+        f"got {type(operand).__name__}",
+        code="matmul_operand_type_invalid",
+    )
+
+
+def _require_product_operands(a: object, b: object) -> None:
+    """Refuse a ``matmul`` whose operands cannot be multiplied, by ``torch.matmul``'s
+    rule: the last extent of ``a`` meets the first extent of a vector ``b`` and the
+    second-to-last extent of any other ``b``.
+
+    Batched ranks and rank 0 are left to the rank rules further on, which refuse them
+    by code.  A separate function so ``matmul`` stays within the project's complexity
+    bound.
+    """
+
+    a_shape = _product_operand_extents(a, "first")
+    b_shape = _product_operand_extents(b, "second")
+    if not a_shape or not b_shape:
+        return
+    contracted = b_shape[0] if len(b_shape) == 1 else b_shape[-2]
+    if a_shape[-1] != contracted:
+        raise IndexExtentMismatchError(
+            f"matmul operands of shapes {tuple(a_shape)} and {tuple(b_shape)} cannot "
+            f"be multiplied: contracted extents {a_shape[-1]} and {contracted}"
+        )
+
+
+def _dense_layouts_product(a: STensor, b: STensor) -> torch.Tensor:
+    """``torch.matmul`` of two dense STensors, its refusal of operands that cannot be
+    multiplied raised under the class every other route raises.  A separate function so
+    ``matmul`` stays within the project's complexity bound.
+    """
+
+    try:
+        return torch.matmul(a.to_torch(in_place=False), b.to_torch(in_place=False))
+    except RuntimeError:
+        _require_product_operands(a, b)
+        raise
+
+
+def _require_matrix_vector_operands(a: object, b: object) -> None:
+    """Refuse an ``spmv`` whose operands are not a matrix and a vector of its width,
+    with the codes ``einsum("ij,j->i", a, b)`` gives the same mistakes, before any CIN
+    exists.  The CIN compiler checked only each operand's rank against its access
+    (at a stage boundary, with its own code) and no extent: its kernel bounds ``j`` by
+    ``a`` and read a shorter vector past its end.
+
+    Every correct call passes one condition; the refusal is formed out of line
+    (``_refuse_matrix_vector_operands``), so a correct call builds no tuple and runs no
+    loop: 50 ns on the M5, where checking each part in turn cost 120 ns.
+    """
+
+    if isinstance(a, STensor) and isinstance(b, STensor):
+        a_shape = a._metadata.layout.logical_shape
+        b_shape = b._metadata.layout.logical_shape
+        if len(a_shape) == 2 and len(b_shape) == 1 and a_shape[1] == b_shape[0]:
+            return
+    _refuse_matrix_vector_operands(a, b)
+    # Not reached: the condition above fails only on a mistake the refusal names.
+    raise ScorchAssertionError(
+        "spmv operands were refused but no mistake was found",
+        code="spmv_operand_refusal_unfounded",
+    )
+
+
+def _refuse_matrix_vector_operands(a: object, b: object) -> None:
+    """The refusal ``_require_matrix_vector_operands`` makes for operands that failed its
+    condition: the first mistake, in the order type, rank, extent.  It returns only for
+    operands with no mistake, which its caller then refuses as an internal error.
+    """
+
+    if not isinstance(a, STensor) or not isinstance(b, STensor):
+        position, operand = (
+            ("first", a) if not isinstance(a, STensor) else ("second", b)
+        )
+        raise TensorTypeError(
+            f"spmv's {position} operand must be an STensor, "
+            f"got {type(operand).__name__}",
+            code="spmv_operand_type_invalid",
+        )
+    a_shape = a._metadata.layout.logical_shape
+    b_shape = b._metadata.layout.logical_shape
+    for operand, (shape, rank) in enumerate(((a_shape, 2), (b_shape, 1))):
+        if len(shape) != rank:
+            raise CompileSpecError(
+                f"spmv operand {operand} has rank {len(shape)}, not {rank}",
+                code="einsum_operand_rank_mismatch",
+            )
+    if a_shape[1] != b_shape[0]:
+        raise IndexExtentMismatchError(
+            f"spmv operands of shapes {tuple(a_shape)} and {tuple(b_shape)} cannot be "
+            f"multiplied: contracted extents {a_shape[1]} and {b_shape[0]}"
+        )
 
 
 def _dense_result_as_tensor(
@@ -1950,6 +2092,15 @@ def matmul(
         )
     ):
         _require_one_product_dtype(a, b)
+    # Operands whose contracted extents differ are refused where the product is computed,
+    # with IndexExtentMismatchError (einsum_index_extent_mismatch) on every route, and
+    # nothing reads either operand first: a prebuilt kernel's native entry check carries
+    # the code (raise_if_native_coded), einsum checks its index extents before it builds
+    # a kernel, spmv checks its operands before its CIN exists, and two dense layouts get
+    # torch's refusal under the same class.  A check here instead cost every call
+    # (0.2-0.4 us of a warm call on the M5, fd1) to refuse what those checks refuse.  The
+    # C entry (planned_matmul.h) never serves a mismatch: a plan is installed only for a
+    # product computed here, under the dense operand's shape.
 
     plan_via = None
     # autograd.py next (autograd.serve): a product a gradient is wanted through is recorded
@@ -2043,10 +2194,7 @@ def matmul(
         if effective_schedule is not None:
             raise ScheduleWithoutSparseOperandError()
         start_time = time.time()
-        result_torch = torch.matmul(
-            a.to_torch(in_place=False),
-            b.to_torch(in_place=False),
-        )
+        result_torch = _dense_layouts_product(a, b)
         end_time = time.time()
         eval_time = end_time - start_time
         if "time_dict" in kwargs:

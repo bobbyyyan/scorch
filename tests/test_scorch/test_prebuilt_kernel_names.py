@@ -9,7 +9,8 @@ in place of the ``RuntimeError`` when the bytes were not UTF-8, which also hid a
 refusal from ``raise_if_native_coded``.  The binders now keep their own copy.
 
 1. Each of the twelve entries, called repeatedly with a contraction mismatch, raises a
-   ``RuntimeError`` whose first line is the native check's, with the entry's own name.
+   ``RuntimeError`` whose first line is the native check's, with the entry's own name and
+   the code ``raise_if_native_coded`` reads (patch 0074b).
 2. Each of the twelve, called with a result past the 32-bit position bound, reaches
    Python as text ``raise_if_native_coded`` turns into ``IndexCapacityError``, whose
    message still names the entry.
@@ -67,7 +68,10 @@ def _arguments(entry: str, b_rows: int, result_shape=None) -> Tuple[list, List[i
 @pytest.mark.parametrize("entry", ENTRIES)
 def test_a_refusal_names_its_kernel(entry):
     args, _ = _arguments(entry, COLS + 1)
-    expected = f"{entry}: contraction mismatch: A.shape[1]={COLS} but B.shape[0]={COLS + 1}"
+    expected = (
+        f"{entry}: contraction mismatch: A.shape[1]={COLS} but B.shape[0]={COLS + 1}"
+        " [einsum_index_extent_mismatch]"
+    )
     for _ in range(20):
         # Strings made and dropped between calls, so freed memory is written again.
         churn = [str(n) * 40 for n in range(200)]

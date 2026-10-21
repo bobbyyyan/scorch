@@ -321,9 +321,9 @@ def execute_prebuilt_binary_kernel(
     # per matmul are not free next to a kernel that can finish in a couple of
     # microseconds, and every caller that does not pass time_dict was paying them.
     #
-    # The native checks refuse a repeated COO coordinate and an index past the 32-bit
-    # position bound as coded text; either leaves here as its structured error
-    # (exceptions.raise_if_native_coded).
+    # The native checks refuse a repeated COO coordinate, an index past the 32-bit
+    # position bound and operands that give one index two extents as coded text; each
+    # leaves here as its structured error (exceptions.raise_if_native_coded).
     try:
         if time_dict is None:
             if nthreads is not None:

@@ -1338,12 +1338,12 @@ inline std::string argument_name(const char* op, const char* argument) {
 // 64,001 row offsets and its nonzeros, and no kernel forms rows x columns for it. The bound
 // on a logical element count belongs to the kernels that address a dense array with `int`
 // offsets, and to no others.
-//
-// Every refusal under this bound ends with the code below. scorch.exceptions
-// .raise_if_native_coded turns a text that carries it into IndexCapacityError at every
-// Python call site of a kernel, so the code's spelling is a contract: change both or neither.
+// A refusal under this bound ends with the first code below, and a prebuilt kernel's refusal of
+// operands that give one index two extents with the second. scorch.exceptions.raise_if_native_coded
+// turns each into its error at every Python call site of a kernel: change both or neither.
 #define SCORCH_INDEX_CAPACITY_CODE " [index_position_exceeds_int32]"
-
+#define SCORCH_EXTENT_MISMATCH_CODE " [einsum_index_extent_mismatch]"
+[[noreturn]] inline void refuse_contraction_mismatch(const char*, int64_t, int64_t);
 constexpr int64_t kMaxIndexPosition = std::numeric_limits<int>::max();
 
 #if defined(__GNUC__) || defined(__clang__)
@@ -2273,11 +2273,11 @@ inline void validate_binary_inputs(
     const auto b = checked_dense_view(b_shape, b_mode_indices, b_values, dtype, 1,
                                       op, "B");
     check_legacy_output_shape(result_shape, 1, op);
-    TORCH_CHECK(a.shape[1] == b.shape[0], op,
-                ": contraction mismatch: A.shape[1]=", a.shape[1],
-                " but B.shape[0]=", b.shape[0]);
+    if (C10_UNLIKELY_OR_CONST(!(a.shape[1] == b.shape[0]))) {
+      refuse_contraction_mismatch(op, a.shape[1], b.shape[0]);
+    }
     TORCH_CHECK(result_shape[0] == a.shape[0], op,
-                ": result_shape must be [A.rows]");
+                ": result_shape must be [A.rows]" SCORCH_EXTENT_MISMATCH_CODE);
     return;
   }
 
@@ -2287,12 +2287,12 @@ inline void validate_binary_inputs(
     const auto a = checked_csr_view(a_shape, a_mode_indices, a_values, dtype, op, "A");
     const auto b = checked_dense_view(b_shape, b_mode_indices, b_values, dtype, 2,
                                       op, "B", /*int32_elements=*/false);
-    TORCH_CHECK(a.shape[1] == b.shape[0], op,
-                ": contraction mismatch: A.shape[1]=", a.shape[1],
-                " but B.shape[0]=", b.shape[0]);
+    if (C10_UNLIKELY_OR_CONST(!(a.shape[1] == b.shape[0]))) {
+      refuse_contraction_mismatch(op, a.shape[1], b.shape[0]);
+    }
     TORCH_CHECK(result_shape[0] == a.shape[0] &&
                     result_shape[1] == b.shape[1],
-                op, ": result_shape must equal [A.rows, B.cols]");
+                op, ": result_shape must equal [A.rows, B.cols]" SCORCH_EXTENT_MISMATCH_CODE);
     return;
   }
   // The logical size of the result bounds only the kernels that address a dense result
@@ -2302,12 +2302,12 @@ inline void validate_binary_inputs(
     const auto a = checked_csr_view(a_shape, a_mode_indices, a_values, dtype, op, "A");
     const auto b = checked_dense_view(b_shape, b_mode_indices, b_values, dtype, 2,
                                       op, "B");
-    TORCH_CHECK(a.shape[1] == b.shape[0], op,
-                ": contraction mismatch: A.shape[1]=", a.shape[1],
-                " but B.shape[0]=", b.shape[0]);
+    if (C10_UNLIKELY_OR_CONST(!(a.shape[1] == b.shape[0]))) {
+      refuse_contraction_mismatch(op, a.shape[1], b.shape[0]);
+    }
     TORCH_CHECK(result_shape[0] == a.shape[0] &&
                     result_shape[1] == b.shape[1],
-                op, ": result_shape must equal [A.rows, B.cols]");
+                op, ": result_shape must equal [A.rows, B.cols]" SCORCH_EXTENT_MISMATCH_CODE);
     return;
   }
   if (contract == BinaryContract::CsrCsrMatmul) {
@@ -2319,12 +2319,12 @@ inline void validate_binary_inputs(
         op);
     const auto a = checked_csr_view(a_shape, a_mode_indices, a_values, dtype, op, "A");
     const auto b = checked_csr_view(b_shape, b_mode_indices, b_values, dtype, op, "B");
-    TORCH_CHECK(a.shape[1] == b.shape[0], op,
-                ": contraction mismatch: A.shape[1]=", a.shape[1],
-                " but B.shape[0]=", b.shape[0]);
+    if (C10_UNLIKELY_OR_CONST(!(a.shape[1] == b.shape[0]))) {
+      refuse_contraction_mismatch(op, a.shape[1], b.shape[0]);
+    }
     TORCH_CHECK(result_shape[0] == a.shape[0] &&
                     result_shape[1] == b.shape[1],
-                op, ": result_shape must equal [A.rows, B.cols]");
+                op, ": result_shape must equal [A.rows, B.cols]" SCORCH_EXTENT_MISMATCH_CODE);
     return;
   }
   if (contract == BinaryContract::CooDenseMatmul) {
@@ -2333,12 +2333,12 @@ inline void validate_binary_inputs(
                                     op, "A");
     const auto b = checked_dense_view(b_shape, b_mode_indices, b_values, dtype, 2,
                                       op, "B");
-    TORCH_CHECK(a.shape[1] == b.shape[0], op,
-                ": contraction mismatch: A.shape[1]=", a.shape[1],
-                " but B.shape[0]=", b.shape[0]);
+    if (C10_UNLIKELY_OR_CONST(!(a.shape[1] == b.shape[0]))) {
+      refuse_contraction_mismatch(op, a.shape[1], b.shape[0]);
+    }
     TORCH_CHECK(result_shape[0] == a.shape[0] &&
                     result_shape[1] == b.shape[1],
-                op, ": result_shape must equal [A.rows, B.cols]");
+                op, ": result_shape must equal [A.rows, B.cols]" SCORCH_EXTENT_MISMATCH_CODE);
     return;
   }
   // CooCooMatmul. A COO result: coordinate and value vectors that grow by one entry at a
@@ -2351,11 +2351,11 @@ inline void validate_binary_inputs(
                                   op, "A");
   const auto b = checked_coo_view(b_shape, b_mode_indices, b_values, dtype, 2,
                                   op, "B");
-  TORCH_CHECK(a.shape[1] == b.shape[0], op,
-              ": contraction mismatch: A.shape[1]=", a.shape[1],
-              " but B.shape[0]=", b.shape[0]);
+  if (C10_UNLIKELY_OR_CONST(!(a.shape[1] == b.shape[0]))) {
+    refuse_contraction_mismatch(op, a.shape[1], b.shape[0]);
+  }
   TORCH_CHECK(result_shape[0] == a.shape[0] && result_shape[1] == b.shape[1],
-              op, ": result_shape must equal [A.rows, B.cols]");
+              op, ": result_shape must equal [A.rows, B.cols]" SCORCH_EXTENT_MISMATCH_CODE);
 }
 
 inline int validate_tile_size(int value, const char* op, const char* argument,
@@ -2408,13 +2408,13 @@ inline void validate_sddmm_inputs(
       {static_cast<int>(LevelKind::Coordinate), static_cast<int>(LevelKind::Coordinate)},
       op);
   TORCH_CHECK(result_shape[0] == s.shape[0] && result_shape[1] == s.shape[1],
-              op, ": result_shape must equal S.shape");
+              op, ": result_shape must equal S.shape" SCORCH_EXTENT_MISMATCH_CODE);
   TORCH_CHECK(a.shape[0] == s.shape[0], op,
-              ": A rows must equal S rows");
+              ": A rows must equal S rows" SCORCH_EXTENT_MISMATCH_CODE);
   TORCH_CHECK(b.shape[0] == s.shape[1], op,
-              ": B rows must equal S columns");
+              ": B rows must equal S columns" SCORCH_EXTENT_MISMATCH_CODE);
   TORCH_CHECK(a.shape[1] == b.shape[1], op,
-              ": A and B reduction dimensions must match");
+              ": A and B reduction dimensions must match" SCORCH_EXTENT_MISMATCH_CODE);
 }
 
 inline void validate_csr_segments(
@@ -2734,6 +2734,19 @@ inline void validate_jit_extra_tensor(const torch::Tensor& tensor,
               argument_name(op, argument),
               " element count exceeds the current native int32 bound",
               SCORCH_INDEX_CAPACITY_CODE);
+}
+
+// The refusal of a contraction whose two extents differ (validate_binary_inputs): out of line
+// and cold, as refuse_index_capacity, so that each check there is one compare and a branch and
+// its message is formed only here. It is defined after the last check in this file, and
+// declared in the blank line after the codes, so that no check moves: TORCH_CHECK passes
+// __LINE__, and every generated kernel's source holds this file.
+[[noreturn]] SCORCH_COLD_NOINLINE inline void refuse_contraction_mismatch(const char* op,
+                                                                         int64_t a_cols,
+                                                                         int64_t b_rows) {
+  TORCH_CHECK(false, op, ": contraction mismatch: A.shape[1]=", a_cols,
+              " but B.shape[0]=", b_rows, SCORCH_EXTENT_MISMATCH_CODE);
+  std::abort();  // not reached: TORCH_CHECK(false) throws
 }
 
 }  // namespace scorch_native
