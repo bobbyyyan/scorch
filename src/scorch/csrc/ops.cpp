@@ -166,21 +166,24 @@ void bind_binary_kernel(py::module_& m, const char* name, BinaryKernelFn fn,
                         scorch_native::BinaryContract contract,
                         torch::ScalarType dtype) {
   m.def(name,
-        [fn, name, contract, dtype](
+        [fn, label = std::string(name), contract, dtype](
             std::vector<int64_t> result_shape, std::vector<int64_t> A_shape,
             std::vector<std::vector<torch::Tensor>> A_mode_indices,
             torch::Tensor A_values, std::vector<int64_t> B_shape,
             std::vector<std::vector<torch::Tensor>> B_mode_indices,
             torch::Tensor B_values) {
+          // The kernel's name, owned by this function object: `name` may point into a
+          // temporary of the caller's (bind_typed_prebuilt_kernels builds its names).
+          const char* const op = label.c_str();
           scorch_native::validate_binary_inputs(
-              name, contract, dtype, result_shape, A_shape, A_mode_indices,
+              op, contract, dtype, result_shape, A_shape, A_mode_indices,
               A_values, B_shape, B_mode_indices, B_values);
           return fn(
-              scorch_native::narrow_legacy_shape(result_shape, name,
+              scorch_native::narrow_legacy_shape(result_shape, op,
                                                   "result_shape"),
-              scorch_native::narrow_legacy_shape(A_shape, name, "A_shape"),
+              scorch_native::narrow_legacy_shape(A_shape, op, "A_shape"),
               A_mode_indices, A_values,
-              scorch_native::narrow_legacy_shape(B_shape, name, "B_shape"),
+              scorch_native::narrow_legacy_shape(B_shape, op, "B_shape"),
               B_mode_indices, B_values);
         },
         doc, py::arg("result_shape"), py::arg("A_shape"),
@@ -194,23 +197,26 @@ void bind_binary_kernel_with_tile(py::module_& m, const char* name,
                                   scorch_native::BinaryContract contract,
                                   torch::ScalarType dtype) {
   m.def(name,
-        [fn, name, contract, dtype](
+        [fn, label = std::string(name), contract, dtype](
             std::vector<int64_t> result_shape, std::vector<int64_t> A_shape,
             std::vector<std::vector<torch::Tensor>> A_mode_indices,
             torch::Tensor A_values, std::vector<int64_t> B_shape,
             std::vector<std::vector<torch::Tensor>> B_mode_indices,
             torch::Tensor B_values, int tile_size) {
+          // The kernel's name, owned by this function object: `name` may point into a
+          // temporary of the caller's (bind_typed_prebuilt_kernels builds its names).
+          const char* const op = label.c_str();
           scorch_native::validate_binary_inputs(
-              name, contract, dtype, result_shape, A_shape, A_mode_indices,
+              op, contract, dtype, result_shape, A_shape, A_mode_indices,
               A_values, B_shape, B_mode_indices, B_values);
           tile_size = scorch_native::validate_tile_size(
-              tile_size, name, "tile_size", B_shape[1]);
+              tile_size, op, "tile_size", B_shape[1]);
           return fn(
-              scorch_native::narrow_legacy_shape(result_shape, name,
+              scorch_native::narrow_legacy_shape(result_shape, op,
                                                   "result_shape"),
-              scorch_native::narrow_legacy_shape(A_shape, name, "A_shape"),
+              scorch_native::narrow_legacy_shape(A_shape, op, "A_shape"),
               A_mode_indices, A_values,
-              scorch_native::narrow_legacy_shape(B_shape, name, "B_shape"),
+              scorch_native::narrow_legacy_shape(B_shape, op, "B_shape"),
               B_mode_indices, B_values, tile_size);
         },
         doc, py::arg("result_shape"), py::arg("A_shape"),
@@ -226,25 +232,28 @@ void bind_binary_kernel_with_two_tiles(py::module_& m, const char* name,
                                        scorch_native::BinaryContract contract,
                                        torch::ScalarType dtype) {
   m.def(name,
-        [fn, name, contract, dtype](
+        [fn, label = std::string(name), contract, dtype](
             std::vector<int64_t> result_shape, std::vector<int64_t> A_shape,
             std::vector<std::vector<torch::Tensor>> A_mode_indices,
             torch::Tensor A_values, std::vector<int64_t> B_shape,
             std::vector<std::vector<torch::Tensor>> B_mode_indices,
             torch::Tensor B_values, int i_tile_size, int k_tile_size) {
+          // The kernel's name, owned by this function object: `name` may point into a
+          // temporary of the caller's (bind_typed_prebuilt_kernels builds its names).
+          const char* const op = label.c_str();
           scorch_native::validate_binary_inputs(
-              name, contract, dtype, result_shape, A_shape, A_mode_indices,
+              op, contract, dtype, result_shape, A_shape, A_mode_indices,
               A_values, B_shape, B_mode_indices, B_values);
           i_tile_size = scorch_native::validate_tile_size(
-              i_tile_size, name, "i_tile_size", A_shape[0]);
+              i_tile_size, op, "i_tile_size", A_shape[0]);
           k_tile_size = scorch_native::validate_tile_size(
-              k_tile_size, name, "k_tile_size", B_shape[1]);
+              k_tile_size, op, "k_tile_size", B_shape[1]);
           return fn(
-              scorch_native::narrow_legacy_shape(result_shape, name,
+              scorch_native::narrow_legacy_shape(result_shape, op,
                                                   "result_shape"),
-              scorch_native::narrow_legacy_shape(A_shape, name, "A_shape"),
+              scorch_native::narrow_legacy_shape(A_shape, op, "A_shape"),
               A_mode_indices, A_values,
-              scorch_native::narrow_legacy_shape(B_shape, name, "B_shape"),
+              scorch_native::narrow_legacy_shape(B_shape, op, "B_shape"),
               B_mode_indices, B_values, i_tile_size, k_tile_size);
         },
         doc, py::arg("result_shape"), py::arg("A_shape"),
@@ -580,24 +589,27 @@ using FusedKernelFn = Tensor (*)(std::vector<int>, std::vector<int>,
 void bind_fused_kernel(py::module_& m, const char* name, FusedKernelFn fn,
                        const char* doc) {
   m.def(name,
-        [fn, name](std::vector<int64_t> result_shape,
+        [fn, label = std::string(name)](std::vector<int64_t> result_shape,
                    std::vector<int64_t> A_shape,
                    std::vector<std::vector<torch::Tensor>> A_mode_indices,
                    torch::Tensor A_values, std::vector<int64_t> B_shape,
                    std::vector<std::vector<torch::Tensor>> B_mode_indices,
                    torch::Tensor B_values, torch::Tensor bias) {
+          // The kernel's name, owned by this function object: `name` may point into a
+          // temporary of the caller's (bind_typed_prebuilt_kernels builds its names).
+          const char* const op = label.c_str();
           scorch_native::validate_binary_inputs(
-              name, scorch_native::BinaryContract::CsrDenseMatmul,
+              op, scorch_native::BinaryContract::CsrDenseMatmul,
               torch::kFloat32, result_shape, A_shape, A_mode_indices, A_values,
               B_shape, B_mode_indices, B_values);
           scorch_native::check_flat_values(bias, torch::kFloat32, B_shape[1],
-                                           name, "bias");
+                                           op, "bias");
           return fn(
-              scorch_native::narrow_legacy_shape(result_shape, name,
+              scorch_native::narrow_legacy_shape(result_shape, op,
                                                   "result_shape"),
-              scorch_native::narrow_legacy_shape(A_shape, name, "A_shape"),
+              scorch_native::narrow_legacy_shape(A_shape, op, "A_shape"),
               A_mode_indices, A_values,
-              scorch_native::narrow_legacy_shape(B_shape, name, "B_shape"),
+              scorch_native::narrow_legacy_shape(B_shape, op, "B_shape"),
               B_mode_indices, B_values, bias);
         },
         doc, py::arg("result_shape"), py::arg("A_shape"),
