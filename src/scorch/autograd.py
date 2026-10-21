@@ -936,6 +936,12 @@ def _covered(
     return left, op, values, dense
 
 
+def computes(a: Any, b: Any) -> bool:
+    """Whether this module computes ``a @ b`` (``_covered``): then the product is a dense
+    tensor in every grad mode, recorded (``matmul``) or not (``right_product``)."""
+    return _covered(a, b) is not None
+
+
 def _differentiable(a: Any, b: Any) -> Optional[torch.Tensor]:
     covered = _covered(a, b)
     if covered is None:

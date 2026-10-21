@@ -5,6 +5,7 @@ import re
 import string
 import sys
 import time
+import warnings
 from contextlib import contextmanager
 from dataclasses import dataclass, replace
 from typing import (
@@ -76,13 +77,16 @@ from .exceptions import (
     EinsumRepeatedIndexError,
     EinsumScalarResultError,
     IndexExtentMismatchError,
+    KeywordArgumentError,
     MatmulOperandRankError,
     ScheduleWithoutSparseOperandError,
     ScorchAssertionError,
+    ScorchRuntimeError,
     ScorchTypeError,
     ScorchValueError,
     ShapeCapacitySpecError,
     TensorTypeError,
+    defect_code,
     raise_if_native_coded,
     shape_capacity_error,
 )
@@ -1254,8 +1258,12 @@ def spmv(
         Requested output format. Defaults to ``"d"`` (a dense 1-D vector). Accepts
         anything :func:`scorch.utils.parse_format` understands.
     **kwargs
-        ``time_dict`` : dict, optional -- if given, ``time_dict["eval_time"]`` is
-        set to the kernel wall-clock time in seconds.
+        ``format``: ``output_format`` by another name; the two given together must
+        name one format (``format_keywords_conflict``).  ``time_dict`` : dict,
+        optional -- if given, ``time_dict["eval_time"]`` is set to the kernel
+        wall-clock time in seconds.  Also ``use_cache``, ``schedule`` (refused: the
+        SpMV path takes none yet), ``_compile_options`` and ``_compilation_context``.
+        Any other name raises ``KeywordArgumentError`` (``unknown_keyword_argument``).
 
     Returns
     -------
@@ -1279,6 +1287,12 @@ def spmv(
     >>> torch.allclose(y, A.to_torch() @ x, atol=1e-3, rtol=1e-3)
     True
     """
+    # The product entries' keyword rule (patch 0072); format= is output_format= by
+    # another name here.
+    if kwargs:
+        _entry_keywords(kwargs, _SPMV_KEYWORDS, "spmv")
+        if "format" in kwargs:
+            output_format = _format_alias("spmv", kwargs.pop("format"), output_format)
     return _spmv_owned(a, b, output_format, kwargs, _DeferredOptions(kwargs))
 
 
@@ -1777,6 +1791,416 @@ def _dense_layouts_product(a: STensor, b: STensor) -> torch.Tensor:
         raise
 
 
+# The keyword arguments each product entry takes (patch 0072).  Any other name is refused
+# with KeywordArgumentError (unknown_keyword_argument): every entry used to ignore it, so a
+# misspelt format=, an out= or a torch keyword returned a result computed without it.
+_PRODUCT_KEYWORDS = frozenset(
+    {
+        "format",
+        "output_format",
+        "use_cache",
+        "schedule",
+        "_schedule",
+        "time_dict",
+        "output_mode_order",
+        "_compile_options",
+        "_compilation_context",
+    }
+)
+_MATMUL_KEYWORDS = _PRODUCT_KEYWORDS | {"out"}
+# einsum takes no out=: torch.einsum has none, and nothing here implements one.
+_EINSUM_KEYWORDS = _PRODUCT_KEYWORDS | {
+    "_post_ops",
+    "_post_ops_tensors",
+    "_deferred_options",
+}
+# spmv names its result format output_format, a parameter; format= is its alias.  A vector
+# result has no other mode order, so output_mode_order is not one of them.
+_SPMV_KEYWORDS = (_PRODUCT_KEYWORDS - {"output_format", "output_mode_order"}) | {
+    "format"
+}
+
+# A keyword given this value is dropped at the entry, compared by identity: every reader
+# takes the same value when the keyword is absent.  So a call whose keywords all hold
+# their defaults is the plain call (autograd.py, plans, a dense einsum's route).
+_KEYWORD_DEFAULTS: Dict[str, Any] = {
+    "format": None,
+    "output_format": None,
+    "use_cache": True,
+    "schedule": None,
+    "_schedule": None,
+    "time_dict": None,
+    "output_mode_order": None,
+    "_compile_options": None,
+    "_compilation_context": None,
+    "out": None,
+    "_post_ops": None,
+    "_post_ops_tensors": None,
+    "_deferred_options": None,
+}
+_NO_DEFAULT = object()
+# What _matmul_keyword_call returns when matmul goes on with the call itself.
+_PLAIN_CALL = object()
+
+
+def _same_format(first: FormatInput, second: FormatInput) -> bool:
+    """Whether two format spellings name one format; a spelling that is no format raises
+    the error it raises wherever a format is read."""
+
+    return first is second or parse_format(first) == parse_format(second)
+
+
+def _format_alias(entry: str, value: Any, alias: Any) -> Any:
+    """The result format of a call given it both as ``format=`` (``value``) and by its
+    alias (``alias``): either one when the other is absent (``None``), refused with
+    ``format_keywords_conflict`` when they name different formats."""
+
+    if value is None:
+        return alias
+    if alias is not None and not _same_format(value, alias):
+        raise KeywordArgumentError(
+            f"{entry}() got format={value!r} and output_format={alias!r}, which name "
+            "different formats",
+            code="format_keywords_conflict",
+        )
+    return value
+
+
+def _entry_keywords(
+    kwargs: Dict[str, Any], accepted: FrozenSet[str], entry: str
+) -> None:
+    """Apply the product entries' keyword rule to ``kwargs``, in place (patch 0072).
+
+    A name ``entry`` does not take is refused, with Python's own message for it.  A
+    keyword holding its default is dropped (``_KEYWORD_DEFAULTS``).  ``output_format=``
+    is ``format=`` by another name: it is read as ``format``, and the two given together
+    must name the same format.  Called only with keywords: a call with none pays nothing.
+    """
+
+    for name in kwargs:
+        if name not in accepted:
+            raise KeywordArgumentError(
+                f"{entry}() got an unexpected keyword argument '{name}'",
+                code="unknown_keyword_argument",
+            )
+    for name in [
+        name
+        for name, value in kwargs.items()
+        if value is _KEYWORD_DEFAULTS.get(name, _NO_DEFAULT)
+    ]:
+        del kwargs[name]
+    if "output_format" in kwargs:
+        alias = kwargs.pop("output_format")
+        kwargs["format"] = _format_alias(entry, kwargs.get("format"), alias)
+
+
+def _checked_output_mode_order(order: Any, rank: int) -> List[int]:
+    """``order`` as a list, refused with einsum's codes unless it is a permutation of a
+    result of ``rank`` modes."""
+
+    if isinstance(order, (str, bytes)) or not isinstance(order, Sequence):
+        raise CompileSpecError(
+            "output_mode_order must be a sequence of integers",
+            code="output_mode_order_type_invalid",
+        )
+    if any(isinstance(mode, bool) or not isinstance(mode, int) for mode in order):
+        raise CompileSpecError(
+            "output_mode_order entries must be integers",
+            code="output_mode_order_type_invalid",
+        )
+    if len(order) != rank or sorted(order) != list(range(rank)):
+        raise CompileSpecError(
+            "output_mode_order must be a permutation of the result modes",
+            code="output_mode_order_not_permutation",
+        )
+    return list(order)
+
+
+def _matmul_result_rank(a: Any, b: Any) -> Optional[int]:
+    """The rank of ``a @ b`` by torch.matmul's rules, or ``None`` for a pair of ranks
+    matmul refuses further on, or an operand that is not a tensor (an fx Proxy among
+    them: asking its rank would record a node)."""
+
+    if not (
+        isinstance(a, (torch.Tensor, STensor))
+        and isinstance(b, (torch.Tensor, STensor))
+    ):
+        return None
+    expression = _MATMUL_EXPRESSIONS.get((a.dim(), b.dim()))
+    return None if expression is None else len(expression.split("->")[1])
+
+
+def _is_sparse_matrix(x: Any) -> bool:
+    if isinstance(x, STensor):
+        return x.dim() == 2 and not x.format.is_dense()
+    return (
+        isinstance(x, torch.Tensor)
+        and x.dim() == 2
+        and x.layout in (torch.sparse_csr, torch.sparse_coo)
+    )
+
+
+def _is_dense_operand(x: Any) -> bool:
+    if isinstance(x, STensor):
+        return x.format.is_dense()
+    return isinstance(x, torch.Tensor) and x.layout is torch.strided
+
+
+def _plain_dense_result_rank(a: Any, b: Any) -> Optional[int]:
+    """The rank of ``a @ b`` when the product's plain result is a dense tensor on every
+    route, else ``None``.  That holds for a sparse matrix times a dense matrix or vector
+    (einsum infers the dense last index from the dense operand, spmv's default is dense,
+    and the prebuilt kernels and autograd.py return dense), and for a dense operand times
+    a sparse matrix where autograd.py computes the product (``autograd.computes``).  Any
+    other dense x sparse product can have a sparse plain result (an integer x @ A is an
+    STensor: einsum infers "ds" from A's compressed level)."""
+
+    if _is_sparse_matrix(a) and _is_dense_operand(b) and b.dim() in (1, 2):
+        return int(b.dim())
+    if (
+        _is_dense_operand(a)
+        and a.dim() in (1, 2)
+        and _is_sparse_matrix(b)
+        and _autograd.computes(a, b)
+    ):
+        return int(a.dim())
+    return None
+
+
+def _names_plain_dense_result(a: Any, b: Any, requested: FormatInput) -> bool:
+    """Whether ``format=requested`` names what ``a @ b`` returns without it: a dense
+    layout of the result's rank, on a product whose plain result is a dense tensor on
+    every route (``_plain_dense_result_rank``)."""
+
+    rank = _plain_dense_result_rank(a, b)
+    if rank is None:
+        return False
+    tensor_format = parse_format(requested)
+    return tensor_format.is_dense() and tensor_format.get_order() == rank
+
+
+def _matmul_keyword_call(a: Any, b: Any, kwargs: Dict[str, Any]) -> Any:
+    """Apply ``matmul``'s keyword rule to ``kwargs``, in place (patch 0072).
+
+    The rule every product entry applies (``_entry_keywords``), and three more that make
+    a keyword which changes nothing about the result leave the call the plain call:
+    an identity ``output_mode_order`` is dropped (any other order is checked, by
+    einsum's codes, against the result's rank); a ``format=`` naming the plain result's
+    own dense layout is dropped (``_names_plain_dense_result``).  Any other order
+    changes the result's storage order and nothing else, so with no ``format=`` a
+    product whose plain result is dense (``_plain_dense_result_rank``) asks for a dense
+    result: the generated kernel the order goes to infers "ds" for x @ A from A's
+    compressed level, where the plain call returns a dense tensor.  ``out=`` is filled
+    here (``_matmul_into``), except for an fx Proxy operand, whose call is recorded as
+    it was made.  Returns the result of a call completed here, else ``_PLAIN_CALL``.
+    A separate function so ``matmul`` stays within the project's complexity bound.
+    """
+
+    _entry_keywords(kwargs, _MATMUL_KEYWORDS, "matmul")
+    if "output_mode_order" in kwargs:
+        rank = _matmul_result_rank(a, b)
+        if rank is not None:
+            order = _checked_output_mode_order(kwargs["output_mode_order"], rank)
+            if order == list(range(rank)):
+                del kwargs["output_mode_order"]
+            else:
+                kwargs["output_mode_order"] = order
+    requested = kwargs.get("format")
+    if "output_mode_order" in kwargs:
+        if requested is None:
+            dense_rank = _plain_dense_result_rank(a, b)
+            if dense_rank is not None:
+                kwargs["format"] = "d" * dense_rank
+    elif requested is not None and _names_plain_dense_result(a, b, requested):
+        del kwargs["format"]
+    if "out" in kwargs and not (isinstance(a, Proxy) or isinstance(b, Proxy)):
+        return _matmul_into(a, b, kwargs.pop("out"), kwargs)
+    return _PLAIN_CALL
+
+
+def _operand_requires_grad(x: Any) -> bool:
+    return isinstance(x, (torch.Tensor, STensor)) and bool(x.requires_grad)
+
+
+def _matmul_into(a: Any, b: Any, out: Any, kwargs: Dict[str, Any]) -> torch.Tensor:
+    """``matmul(a, b, out=out, **kwargs)`` by ``torch.matmul``'s contract for ``out=``.
+
+    Refused before anything is computed, each by code: an ``out`` that is not a tensor;
+    a call in grad mode with an operand or ``out`` that requires grad (torch refuses
+    automatic differentiation through ``out=``); a sparse result format, or a result
+    mode order (``out``'s own strides are the result's layout); an ``out`` of another
+    dtype than the operands' values, or on another device.  Two dense torch tensors with
+    nothing else asked are ``torch.matmul(a, b, out=out)`` itself, with torch's own
+    checks.  Every other product is computed by ``matmul(a, b, **kwargs)``, and ``out``
+    resized by torch's rule (``_resize_out``, which warns when a non-empty ``out`` has
+    another shape) and filled.  A product computed into a temporary cannot
+    alias an operand, so these routes accept an ``out`` that overlaps one.
+    """
+
+    if not isinstance(out, torch.Tensor) or out.layout is not torch.strided:
+        raise ScorchTypeError(
+            "matmul(): argument 'out' must be a dense torch.Tensor, not "
+            f"{type(out).__name__}",
+            code="out_argument_type_invalid",
+        )
+    if torch.is_grad_enabled() and (
+        out.requires_grad or _operand_requires_grad(a) or _operand_requires_grad(b)
+    ):
+        raise ScorchRuntimeError(
+            "matmul(): functions with out=... arguments don't support automatic "
+            "differentiation, but one of the arguments requires grad.",
+            code="out_argument_requires_grad",
+        )
+    requested = kwargs.get("format")
+    if "output_mode_order" in kwargs or (
+        requested is not None and not parse_format(requested).is_dense()
+    ):
+        raise KeywordArgumentError(
+            "matmul(): out= takes a dense result in out's own layout; a sparse format "
+            "or an output_mode_order cannot be given with it",
+            code="out_requires_dense_result",
+        )
+    dtype = getattr(a, "dtype", None)
+    if dtype is not None and out.dtype != dtype:
+        raise ScorchRuntimeError(
+            f"Expected out tensor to have dtype {dtype}, but got {out.dtype} instead",
+            code="out_dtype_mismatch",
+        )
+    if out.device.type != "cpu":
+        raise ScorchRuntimeError(
+            f"Expected out tensor to be on the cpu, but got {out.device} instead",
+            code="out_device_mismatch",
+        )
+    dense_tensors = (
+        type(a) is torch.Tensor
+        and type(b) is torch.Tensor
+        and a.layout is torch.strided
+        and b.layout is torch.strided
+    )
+    if dense_tensors and set(kwargs) <= {"time_dict"}:
+        start_time = time.time()
+        torch.matmul(a, b, out=out)
+        if "time_dict" in kwargs:
+            kwargs["time_dict"]["eval_time"] = time.time() - start_time
+        return out
+    result = matmul(a, b, **kwargs)
+    if not isinstance(result, torch.Tensor):
+        raise KeywordArgumentError(
+            "matmul(): out= takes a dense result, and this product's is "
+            f"{type(result).__name__} of format {getattr(result, 'format', None)}",
+            code="out_requires_dense_result",
+        )
+    _resize_out(out, result.shape)
+    out.copy_(result)
+    return out
+
+
+def _resize_out(out: torch.Tensor, shape: torch.Size) -> None:
+    """Resize ``out`` to ``shape`` by torch's rule for an ``out=`` argument
+    (``at::native::resize_output``): unchanged when the shape matches, else resized, with
+    torch's own deprecation warning when ``out`` had elements.  torch's operator for it,
+    ``torch._resize_output_``, has no CPU kernel."""
+
+    if out.shape == shape:
+        return
+    if out.numel() != 0:
+        warnings.warn(
+            f"An output with one or more elements was resized since it had shape "
+            f"{list(out.shape)}, which does not match the required output shape "
+            f"{list(shape)}. This behavior is deprecated, and in a future PyTorch "
+            "release outputs will not be resized unless they have zero elements. You "
+            "can explicitly reuse an out tensor t by resizing it, inplace, to zero "
+            "elements with t.resize_(0).",
+            UserWarning,
+            stacklevel=4,
+        )
+    out.resize_(shape)
+
+
+def _as_stensor(x: Union[torch.Tensor, STensor]) -> STensor:
+    return x if isinstance(x, STensor) else STensor.from_torch(x)
+
+
+def _in_storage_order(tensor: torch.Tensor, order: List[int]) -> torch.Tensor:
+    """``tensor`` with its elements stored in mode order ``order``, read back in logical
+    order: the strides of the dense result a generated kernel stores in that order
+    (``STensor.to_torch`` returns it permuted back the same way)."""
+
+    inverse = [0] * len(order)
+    for position, mode in enumerate(order):
+        inverse[mode] = position
+    return tensor.permute(*order).contiguous().permute(*inverse)
+
+
+def _dense_product(
+    a: Union[torch.Tensor, STensor],
+    b: Union[torch.Tensor, STensor],
+    kwargs: Dict[str, Any],
+    compilation_context: Optional[CompilationContext],
+) -> Union[torch.Tensor, STensor]:
+    """``matmul`` of two dense operands, torch tensors or dense STensors, called with
+    keywords: torch's product, with the keywords honoured as on every other route.
+
+    ``time_dict`` is filled; a sparse ``format`` converts the result; an
+    ``output_mode_order`` stores a dense result in that order (``_in_storage_order``).
+    A sparse result in another mode order is the generated kernel's, which stores it so.
+    A separate function so ``matmul`` stays within the project's complexity bound.
+    """
+
+    requested = kwargs.get("format")
+    output_format = None if requested is None else parse_format(requested)
+    sparse_result = output_format is not None and not output_format.is_dense()
+    order = kwargs.get("output_mode_order")
+    if sparse_result and order is not None:
+        return _dense_result_as_tensor(
+            _generated_matmul(_as_stensor(a), _as_stensor(b), dict(kwargs), None)
+        )
+    start_time = time.time()
+    if isinstance(a, STensor):
+        result_torch = _dense_layouts_product(a, cast(STensor, b))
+    else:
+        result_torch = torch.matmul(a, cast(torch.Tensor, b))
+    time_dict = kwargs.get("time_dict")
+    if time_dict is not None:
+        time_dict["eval_time"] = time.time() - start_time
+    if sparse_result:
+        options = _matmul_options(None, kwargs, compilation_context)
+        return STensor.from_torch(result_torch).to_sparse(
+            output_format, **_conversion_kwargs(options, compilation_context)
+        )
+    return result_torch if order is None else _in_storage_order(result_torch, order)
+
+
+def _dense_tensors_product(
+    a: torch.Tensor, b: torch.Tensor, kwargs: Dict[str, Any]
+) -> Union[torch.Tensor, STensor]:
+    """``matmul`` of two dense torch tensors called with keywords (``_dense_product``).
+
+    A schedule is refused, as for every all-dense product: the policy's own question, so
+    a schedule carried only inside ``_compile_options`` is refused too."""
+
+    if _matmul_compile_policy(kwargs)[1] is not None:
+        raise ScheduleWithoutSparseOperandError()
+    return _dense_product(a, b, kwargs, _matmul_compilation_context(kwargs))
+
+
+def _matmul_compilation_context(kwargs: Dict[str, Any]) -> Optional[CompilationContext]:
+    """The ``_compilation_context`` a ``matmul`` call was handed, refused by code unless
+    it is a ``CompilationContext``.  A separate function so ``matmul`` stays within the
+    project's complexity bound."""
+
+    compilation_context = kwargs.get("_compilation_context")
+    if (
+        compilation_context is not None
+        and type(compilation_context) is not CompilationContext
+    ):
+        raise ScorchTypeError(
+            "_compilation_context must be a CompilationContext instance",
+            code="compilation_context_type_invalid",
+        )
+    return compilation_context
+
+
 def _require_matrix_vector_operands(a: object, b: object) -> None:
     """Refuse an ``spmv`` whose operands are not a matrix and a vector of its width,
     with the codes ``einsum("ij,j->i", a, b)`` gives the same mistakes, before any CIN
@@ -1889,7 +2313,7 @@ def _generated_matmul(
     b: Union[torch.Tensor, STensor],
     einsum_kwargs: dict[str, Any],
     options: Optional[_DeferredOptions],
-) -> Union[STensor, TensorSpec]:
+) -> STensor:
     """The product ``matmul`` sends to the generated path, as an ``einsum``.
 
     The expression follows ``torch.matmul``'s rank rules (``_MATMUL_EXPRESSIONS``).  A
@@ -1901,7 +2325,11 @@ def _generated_matmul(
     (a relayout), and ``einsum`` then runs under it, so the call makes at most one
     snapshot.  Otherwise ``einsum`` makes its own holder from the same keyword
     arguments, which resolves the same schedule.  ``einsum_kwargs`` already carries any
-    context the caller handed in.  A separate function so ``matmul`` stays within the
+    context the caller handed in.  An ``output_mode_order`` the generated kernel refuses
+    by code is honoured by a relayout of the product in the default order
+    (``_in_default_order``).  The result is an ``STensor``: ``einsum`` returns a
+    ``TensorSpec`` only for ``compile_only=True``, which ``matmul`` does not take
+    (``_MATMUL_KEYWORDS``).  A separate function so ``matmul`` stays within the
     project's complexity bound.
     """
 
@@ -1910,7 +2338,53 @@ def _generated_matmul(
         raise MatmulOperandRankError((a.dim(), b.dim()))
     if options is not None:
         einsum_kwargs["_deferred_options"] = options
-    return einsum(expression, a, b, **einsum_kwargs)
+    if "output_mode_order" not in einsum_kwargs:
+        return cast(STensor, einsum(expression, a, b, **einsum_kwargs))
+    try:
+        return cast(STensor, einsum(expression, a, b, **einsum_kwargs))
+    except Exception as refusal:
+        code = defect_code(refusal)
+        if code is None:
+            raise
+        return _in_default_order(expression, a, b, einsum_kwargs, code)
+
+
+#: The ``matmul`` calls whose generated kernel refused the ``output_mode_order`` asked
+#: for, by the refusal's code: each was computed in the default order and relaid out
+#: (``_in_default_order``).  The tests read it to record the route a call took.  The
+#: scheduler choosing between the two routes itself is a compiler frontier item.
+_ORDER_RELAYOUTS: Dict[str, int] = {}
+
+
+def _in_default_order(
+    expression: str,
+    a: Union[torch.Tensor, STensor],
+    b: Union[torch.Tensor, STensor],
+    einsum_kwargs: dict[str, Any],
+    code: str,
+) -> STensor:
+    """The product ``einsum(expression, a, b, **einsum_kwargs)`` refused by code (``code``)
+    for its ``output_mode_order``: computed in the default order and relaid out to the
+    order asked for (``STensor.change_mode_order``), so the request is honoured and
+    nothing raises.  Before patch 0072 every route but the generated kernel's dropped the
+    order and returned the product, so such a call must not raise now.  The relayout
+    keeps the format's letters by storage position, as einsum's own relayout from the
+    order it computes in does.  An error of the product in the default order
+    propagates, its context the refusal.
+    """
+
+    order = einsum_kwargs["output_mode_order"]
+    kwargs = {k: v for k, v in einsum_kwargs.items() if k != "output_mode_order"}
+    result = cast(STensor, einsum(expression, a, b, **kwargs))
+    compilation_context = kwargs.get("_compilation_context")
+    options = _matmul_options(
+        kwargs.get("_deferred_options"), kwargs, compilation_context
+    )
+    result.change_mode_order(
+        list(order), **_conversion_kwargs(options, compilation_context)
+    )
+    _ORDER_RELAYOUTS[code] = _ORDER_RELAYOUTS.get(code, 0) + 1
+    return result
 
 
 def _matmul_options(
@@ -1972,13 +2446,25 @@ def matmul(
         immediately via ``torch.matmul``; two ``sparse_coo`` tensors are promoted
         to CSR; any other sparse input triggers ``STensor.from_torch``.
     **kwargs
+        The keywords below, on every route; any other name raises
+        ``KeywordArgumentError`` (``unknown_keyword_argument``).  A keyword given its
+        default value is the call without it.
         format : str or list or TensorFormat, optional
-            Requested output format. Read as
-            ``kwargs.get("format", kwargs.get("output_format", None))``. For the
-            dense-dense path only ``format`` is consulted. When omitted for a
-            compiled product the output format is inferred (see :func:`einsum`).
+            Requested output format. When omitted for a compiled product the output
+            format is inferred (see :func:`einsum`). A format naming the dense layout
+            the product returns anyway (a sparse matrix times a dense operand) is the
+            call without it, so it keeps its gradient and its plan.
         output_format : str or list or TensorFormat, optional
-            Alias for ``format`` (see above).
+            Alias for ``format``. Given together they must name one format
+            (``format_keywords_conflict``).
+        output_mode_order : sequence of int, optional
+            The result's storage order, a permutation of its modes. A dense result is
+            returned with its elements stored in that order; a sparse one is the
+            generated kernel's. The identity order is the call without it.
+        out : torch.Tensor, optional
+            Filled with a dense result by ``torch.matmul``'s rules for ``out=``
+            (resized as torch resizes it; refused in grad mode when an argument
+            requires grad, and for another dtype or a sparse result).
         use_cache : bool, default True
             When ``True``, allow the prebuilt-kernel fast path and the adaptive
             tiling selector. ``False`` forces the generic ``einsum`` path (used by
@@ -2045,9 +2531,10 @@ def matmul(
     # what a plan exists to skip. The exact-type tests keep it off every other
     # shape of call at the cost of two pointer comparisons: a torch.fx Proxy, an
     # STensor right-hand operand, a dense left-hand operand and a sparse-sparse
-    # product all fail them and fall through unchanged. Keyword arguments are
-    # excluded wholesale -- output_format, use_cache, schedule and time_dict all
-    # change what the call means or what it must report.
+    # product all fail them and fall through unchanged. The keyword arguments left
+    # once _matmul_keyword_call has dropped those that change nothing are excluded
+    # wholesale -- a sparse format, use_cache=False, a schedule, output_mode_order and
+    # time_dict all change what the call means or what it must report.
     # The same test decides whether a plan may serve this call and whether one may
     # be installed for it at the end of the prebuilt branch, so it is made once.
     # plan_a/plan_b are the caller's own objects: a plan is keyed on what the
@@ -2062,7 +2549,15 @@ def matmul(
     # slower than the tree before plans on the small cells of both hosts.
     # The caller's left operand: an STensor, or a torch sparse CSR tensor.
     plan_a: Optional[Union[STensor, torch.Tensor]]
-    probed = _c_probed(a, b, kwargs) if kwargs else _NOT_PROBED
+    probed = _NOT_PROBED
+    if kwargs:
+        # The C entry point's keyword first: a call it handed over has no other.  Then
+        # matmul's keyword rule (_matmul_keyword_call), which refuses a name matmul does
+        # not take and drops what does not change the call, so a call left with no
+        # keywords is the plain call from here on: autograd.py, plans, the same value.
+        probed = _c_probed(a, b, kwargs)
+        if kwargs and (done := _matmul_keyword_call(a, b, kwargs)) is not _PLAIN_CALL:
+            return done
     plan_a, plan_b, plan_key = probed
     # Tier 1 first: two dense torch tensors are torch's product. Testing for them before
     # anything else keeps every test below off the path of a dense model's products, all
@@ -2072,16 +2567,12 @@ def matmul(
         and isinstance(b, torch.Tensor)
         and not (a.is_sparse or a.is_sparse_csr or b.is_sparse or b.is_sparse_csr)
     ):
-        # Ask the same question the policy below asks, so a schedule carried only
-        # inside ``_compile_options`` is refused here too.  The perf line read
-        # ``kwargs`` directly because ``_compile_options`` did not exist on it; this
-        # block sits above where the policy is resolved, so reading only ``kwargs``
-        # would let that spelling through and silently return torch's product.
-        # With no keyword arguments the policy is the context's forced schedule alone,
-        # read here directly: every dense product a dense model makes comes this way.
-        if (
-            _matmul_compile_policy(kwargs)[1] if kwargs else get_forced_schedule()
-        ) is not None:
+        # Keywords are honoured as on every other route (_dense_product).  Without them
+        # the policy is the context's forced schedule alone, read here directly: every
+        # dense product a dense model makes comes this way.
+        if kwargs:
+            return _dense_tensors_product(a, b, kwargs)
+        if get_forced_schedule() is not None:
             raise ScheduleWithoutSparseOperandError()
         return torch.matmul(a, b)
     # ``scorch.compile`` traces user functions with torch.fx.  Keep the leaf
@@ -2178,15 +2669,7 @@ def matmul(
     effective_schedule = (
         _matmul_compile_policy(kwargs)[1] if kwargs else get_forced_schedule()
     )
-    compilation_context = kwargs.get("_compilation_context")
-    if (
-        compilation_context is not None
-        and type(compilation_context) is not CompilationContext
-    ):
-        raise ScorchTypeError(
-            "_compilation_context must be a CompilationContext instance",
-            code="compilation_context_type_invalid",
-        )
+    compilation_context = _matmul_compilation_context(kwargs) if kwargs else None
     # The call's options holder, made by the first step that needs options
     # (``_matmul_options``) and handed to every later one.
     options: Optional[_DeferredOptions] = None
@@ -2220,34 +2703,22 @@ def matmul(
     if a.format.is_dense() and b.format.is_dense():
         if effective_schedule is not None:
             raise ScheduleWithoutSparseOperandError()
-        start_time = time.time()
-        result_torch = _dense_layouts_product(a, b)
-        end_time = time.time()
-        eval_time = end_time - start_time
-        if "time_dict" in kwargs:
-            time_dict = kwargs["time_dict"]
-            time_dict["eval_time"] = eval_time
+        if kwargs:
+            return _dense_product(a, b, kwargs, compilation_context)
+        return _dense_layouts_product(a, b)
 
-        output_format_kw = kwargs.get("format", None)
-        if output_format_kw is None:
-            return result_torch
-
-        output_format = parse_format(output_format_kw)
-        if output_format.is_dense():
-            return result_torch
-
-        options = _matmul_options(options, kwargs, compilation_context)
-        return STensor.from_torch(result_torch).to_sparse(
-            output_format, **_conversion_kwargs(options, compilation_context)
-        )
-
-    # Never silently swallow a codegen schedule in a prebuilt dispatch.
-    use_cache = kwargs.get("use_cache", True) and effective_schedule is None
+    # Never silently swallow a codegen schedule in a prebuilt dispatch.  A result
+    # stored in another mode order (output_mode_order: only a non-identity order is
+    # left by now) is the generated kernel's: the prebuilt kernels store their own.
+    use_cache = (
+        kwargs.get("use_cache", True)
+        and effective_schedule is None
+        and "output_mode_order" not in kwargs
+    )
     time_dict = kwargs.get("time_dict", None)
-    requested_output_format = kwargs.get("format", kwargs.get("output_format", None))
+    # output_format= arrived as format= (_entry_keywords).
+    requested_output_format = kwargs.get("format")
     einsum_kwargs = dict(kwargs)
-    if "output_format" in einsum_kwargs and "format" not in einsum_kwargs:
-        einsum_kwargs["format"] = einsum_kwargs.pop("output_format")
 
     if a.dim() == 2 and b.dim() == 1:
         if effective_schedule is not None:
@@ -2283,9 +2754,7 @@ def matmul(
                 return _dense_result_as_tensor(result)
 
         spmv_kwargs = dict(kwargs)
-        if "format" in spmv_kwargs and "output_format" not in spmv_kwargs:
-            spmv_kwargs["output_format"] = spmv_kwargs.pop("format")
-        spmv_output_format = spmv_kwargs.pop("output_format", None)
+        spmv_output_format = spmv_kwargs.pop("format", None)
         # Under the call's holder, so the SpMV makes a snapshot only when its kernel is
         # not kept.  ``spmv_kwargs`` carries any context the caller handed in.
         # ``spmv`` itself still returns the STensor it built; ``matmul`` hands a dense
@@ -3532,29 +4001,9 @@ def _einsum_owned(
             )
     output_mode_order = kwargs.get("output_mode_order")
     if output_mode_order is not None:
-        if isinstance(output_mode_order, (str, bytes)) or not isinstance(
-            output_mode_order, Sequence
-        ):
-            raise CompileSpecError(
-                "output_mode_order must be a sequence of integers",
-                code="output_mode_order_type_invalid",
-            )
-        if any(
-            isinstance(mode, bool) or not isinstance(mode, int)
-            for mode in output_mode_order
-        ):
-            raise CompileSpecError(
-                "output_mode_order entries must be integers",
-                code="output_mode_order_type_invalid",
-            )
-        if len(output_mode_order) != len(result_index_strs) or sorted(
-            output_mode_order
-        ) != list(range(len(result_index_strs))):
-            raise CompileSpecError(
-                "output_mode_order must be a permutation of the result modes",
-                code="output_mode_order_not_permutation",
-            )
-        output_mode_order = list(output_mode_order)
+        output_mode_order = _checked_output_mode_order(
+            output_mode_order, len(result_index_strs)
+        )
     logical_index_sizes = _logical_index_sizes(input_index_strs, tensors)
     if not compile_only and any(isinstance(tensor, TensorSpec) for tensor in tensors):
         raise CompileSpecError(
@@ -4216,6 +4665,11 @@ def einsum(
 ) -> Union[STensor, TensorSpec]:
     """Compile and evaluate a validated numpy-style sparse/dense einsum."""
 
+    # The product entries' keyword rule first (patch 0072): a name einsum does not take
+    # is refused, and output_format= is read as format=.  A call with no keywords pays
+    # the test alone.
+    if kwargs:
+        _entry_keywords(kwargs, _EINSUM_KEYWORDS, "einsum")
     # ``_deferred_options``: the options holder of a call this one runs inside
     # (``matmul``), made from the same keyword arguments, so the two make at most one
     # snapshot between them.

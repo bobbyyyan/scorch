@@ -872,7 +872,9 @@ def test_an_uncovered_product_computes_and_raises_only_when_differentiated():
     d = dense_matrix()
     a = d.to_sparse_csr()
     w = rand(5, 3).requires_grad_()
-    out = scorch.matmul(a, w, use_cache=True)
+    # use_cache=False asks for the generated kernel, which has no derivative here.
+    # (use_cache=True is the default, and since patch 0072 the call without it.)
+    out = scorch.matmul(a, w, use_cache=False)
     torch.testing.assert_close(out, d @ w.detach())
     assert out.grad_fn is not None
     with pytest.raises(NotImplementedError, match="use_cache"):

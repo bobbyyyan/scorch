@@ -156,29 +156,39 @@ def test_disabled_installs_nothing():
     assert plans_of(a) == {}
 
 
-@pytest.mark.parametrize(
-    "kwargs",
-    [
-        {"format": "dd"},
-        {"output_format": "dd"},
-        {"time_dict": {}},
-    ],
-)
-def test_keyword_arguments_never_take_the_plan(kwargs):
-    """Keywords change what a call means or must report, so they bypass plans."""
+def test_a_keyword_that_must_report_bypasses_the_plan():
+    """time_dict asks for the kernel's time, which a plan does not measure, so a call
+    with it takes the ordinary path."""
     a, dense = random_csr(64, 64, 0.05)
     b = dense_rhs(64, 8)
     for _ in range(3):
         scorch.matmul(a, b)
     (plan,) = plans_of(a).values()
     before = plan.served
-    passed = dict(kwargs)
-    out = scorch.matmul(a, b, **passed)
-    assert plan.served == before, "a keyword call was served by the plan"
+    times: dict = {}
+    out = scorch.matmul(a, b, time_dict=times)
+    assert plan.served == before, "a time_dict call was served by the plan"
+    assert "eval_time" in times, "timing contract broken"
     reference = torch.matmul(dense.double(), b.double()).float()
     torch.testing.assert_close(as_tensor(out), reference, atol=1e-3, rtol=1e-3)
-    if "time_dict" in kwargs:
-        assert "eval_time" in passed["time_dict"], "timing contract broken"
+
+
+@pytest.mark.parametrize("kwargs", [{"format": "dd"}, {"output_format": "dd"}], ids=str)
+def test_a_format_naming_the_plain_result_takes_the_plan(kwargs):
+    """A CSR x dense product is a dense tensor, so format="dd" (or output_format="dd")
+    changes nothing about it: matmul drops the keyword (patch 0072), and the plan serves
+    the call, bitwise equal to the plain call."""
+    a, _ = random_csr(64, 64, 0.05)
+    b = dense_rhs(64, 8)
+    for _ in range(3):
+        scorch.matmul(a, b)
+    (plan,) = plans_of(a).values()
+    before = plan.served
+    out = scorch.matmul(a, b, **kwargs)
+    assert plan.served == before + 1, "the plan did not serve the call"
+    torch.testing.assert_close(
+        as_tensor(out), as_tensor(scorch.matmul(a, b)), atol=0, rtol=0
+    )
 
 
 def test_use_cache_false_is_not_served_by_a_plan(generated_kernels):

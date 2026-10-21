@@ -102,6 +102,20 @@ class TensorTypeError(ScorchError, TypeError):
     """A public tensor API received an object of the wrong type."""
 
 
+class KeywordArgumentError(ScorchTypeError):
+    """A product entry (``matmul``, ``einsum``, ``ops.spmv``) was given a keyword argument
+    it does not take, or two spellings of one argument that disagree.
+
+    A ``TypeError``, because Python and torch raise one for the same mistakes.  Each raise
+    passes its code:
+
+    * ``unknown_keyword_argument``: a name the entry does not take, with Python's own
+      message for it;
+    * ``format_keywords_conflict``: ``format=`` and its alias ``output_format=`` naming
+      different formats.
+    """
+
+
 class CompileSpecError(TensorValidationError):
     """A compile-only tensor specification is invalid."""
 
