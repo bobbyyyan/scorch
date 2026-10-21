@@ -20,10 +20,8 @@ import hashlib
 import itertools
 import os
 import re
-import resource
 import shutil
 import subprocess
-import sys
 from functools import lru_cache
 from pathlib import Path
 
@@ -52,6 +50,7 @@ from scorch.exceptions import (
 from scorch.format import MAX_INDEX_POSITION, LevelType, dense_prefix_unaddressable
 from scorch.stensor import _refuse_oversized_result_arrays
 from tests.test_scorch.level_array_support import emitted_einsum_cpp
+from tests.test_scorch.peak_rss import assert_peak_rise_below
 
 M = MAX_INDEX_POSITION
 CODE = "index_position_exceeds_int32"
@@ -1067,27 +1066,6 @@ def test_a_dense_block_result_is_bounded_where_each_block_opens(monkeypatch):
 # --------------------------------------------------------------------------------------
 
 
-def _peak_rss_gb():
-    """The process's peak resident set in GiB.  getrusage reports ``ru_maxrss`` in bytes
-    on macOS and in KiB on Linux (getrusage(2) on each)."""
-    peak = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
-    return peak / (2**30 if sys.platform == "darwin" else 2**20)
-
-
-@pytest.mark.parametrize(
-    "platform, ru_maxrss", [("darwin", 3 * 2**30), ("linux", 3 * 2**20)]
-)
-def test_peak_rss_reads_each_platforms_unit(monkeypatch, platform, ru_maxrss):
-    class _Usage:
-        pass
-
-    usage = _Usage()
-    usage.ru_maxrss = ru_maxrss
-    monkeypatch.setattr(sys, "platform", platform)
-    monkeypatch.setattr(resource, "getrusage", lambda who: usage)
-    assert _peak_rss_gb() == 3.0
-
-
 def _wide_row():
     return STensor.from_components(
         (1, M),
@@ -1097,27 +1075,44 @@ def _wide_row():
     )
 
 
+# What the moves below would allocate is 8 GB; each is measured in a process of its own
+# (peak_rss.py), since this process's peak may already stand above any rise they make.
+_MOVE_RISE_BOUND = 2**30
+
+
+def _moved_with_every_level_compressed(mark):
+    """Run in a fresh process by the test below."""
+    weight = torch.tensor([2.0], dtype=torch.float64)
+    row = _wide_row()
+    mark()
+    result = scorch.einsum("ik,i->i", row, weight, format="d")
+    assert result.to_torch().tolist() == [16.0]
+    result = scorch.einsum("ik,i->i", row, weight, format="s")
+    assert result.values.tolist() == [16.0]
+
+
 def test_einsum_converts_an_operand_it_cannot_move_into_a_dense_level():
     """``ik,i->i`` with A in "ds" of shape (1, 2**31 - 1) and two stored entries: moving A
     to its column order with its letters kept would allocate 2**31 position entries (8 GB)
     for a level no kernel can address.  It is moved with every level compressed, which
     holds it in two positions, and the product is computed."""
-    before = _peak_rss_gb()
-    weight = torch.tensor([2.0], dtype=torch.float64)
-    result = scorch.einsum("ik,i->i", _wide_row(), weight, format="d")
-    assert result.to_torch().tolist() == [16.0]
-    result = scorch.einsum("ik,i->i", _wide_row(), weight, format="s")
-    assert result.values.tolist() == [16.0]
-    assert _peak_rss_gb() - before < 1.0
+    assert_peak_rise_below(
+        _MOVE_RISE_BOUND, f"{__name__}:_moved_with_every_level_compressed"
+    )
+
+
+def _change_mode_order_refused(mark):
+    """Run in a fresh process by the test below."""
+    row = _wide_row()
+    mark()
+    with pytest.raises(IndexCapacityError) as caught:
+        row.change_mode_order([1, 0])
+    assert_capacity_error(caught.value)
+    assert "change_mode_order" in str(caught.value)
 
 
 def test_change_mode_order_refuses_an_unaddressable_layout_before_allocating():
-    before = _peak_rss_gb()
-    with pytest.raises(IndexCapacityError) as caught:
-        _wide_row().change_mode_order([1, 0])
-    assert_capacity_error(caught.value)
-    assert "change_mode_order" in str(caught.value)
-    assert _peak_rss_gb() - before < 1.0
+    assert_peak_rise_below(_MOVE_RISE_BOUND, f"{__name__}:_change_mode_order_refused")
     # A compressed first level over the columns holds the same tensor in two positions.
     moved = _wide_row().to_sparse("ss").change_mode_order([1, 0])
     assert moved.values.tolist() == [3.0, 5.0]

@@ -50,6 +50,7 @@ from scorch.compiler.loopir.pipeline import (
 )
 from scorch.compiler.loopir.verifier import verify_program
 from scorch.compiler.scheduler import Schedule, Scheduler
+from scorch.exceptions import defect_code
 from scorch.stensor import STensor
 
 
@@ -785,11 +786,21 @@ def test_unsupported_repeated_operand():
 
 
 def test_unsupported_repeated_access_index():
+    """CIN verification refuses the access first, with the new compiler's own code.
+
+    Both compilers normalize before they lower, and normalization's structural check
+    refuses an access that repeats an index variable (the shipped compiler read A[i, i]
+    at the first occurrence's position).  The new compiler's own refusal in its CIN
+    lowering stays behind it; the code a caller reads is the same either way.
+    """
+
     i = IndexVar("i")
     a = TensorVar("A", fmt="dd")
     y = TensorVar("y", fmt="d")
     assign = TensorAssign(y[i], a[i, i])
-    expect_code("unsupported_repeated_access_index", ForAll(i, assign))
+    with pytest.raises(VerificationError) as error:
+        lower_normalized_cin_to_loopir(normalize_cin(ForAll(i, assign)))
+    assert defect_code(error.value) == "unsupported_repeated_access_index"
 
 
 def test_unsupported_inplace_operand():

@@ -1616,6 +1616,8 @@ def _preflight_cin_structure_impl(  # noqa: C901
                 path + ("index_ids",),
             )
         else:
+            first_axis_of: Dict[int, int] = {}
+            repeated_axis: Optional[Tuple[int, int]] = None
             for axis, (index, index_id) in enumerate(zip(indices, index_ids)):
                 stored_index_id = (
                     _safe_exact_dict_value(index, "index_id")
@@ -1643,6 +1645,25 @@ def _preflight_cin_structure_impl(  # noqa: C901
                         "TensorAccess.index_ids references an undefined IndexId",
                         path + ("index_ids", f"[{axis}]"),
                     )
+                if reference_value is not None:
+                    if reference_value in first_axis_of and repeated_axis is None:
+                        repeated_axis = (first_axis_of[reference_value], axis)
+                    first_axis_of.setdefault(reference_value, axis)
+            if repeated_axis is not None:
+                # An access that names one index variable at two axes (A[i, i]) reads
+                # only where those coordinates are equal.  No lowering of the shipped
+                # compiler computes that: its value read resolves at the first
+                # occurrence's level (A_val[pA0] for A[i, i]), a silent wrong result.
+                # Refuse before any lowering, kernel build or kernel-cache lookup, with
+                # the new compiler's code for the same access.
+                first, second = repeated_axis
+                diagnose(
+                    "unsupported_repeated_access_index",
+                    f"TensorAccess names one index variable at axes {first} and "
+                    f"{second}; an access that repeats an index variable is not "
+                    "supported",
+                    path + ("index_ids", f"[{second}]"),
+                )
         tensor_symbol_id = _safe_exact_dict_value(tensor, "symbol_id")
         reference_symbol = exact_identity_value(tensor_id, SymbolId)
         stored_symbol = exact_identity_value(tensor_symbol_id, SymbolId)

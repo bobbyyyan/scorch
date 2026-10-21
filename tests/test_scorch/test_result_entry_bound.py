@@ -20,7 +20,6 @@ itself) or run (a warm call).  A level the two-pass assembly checks exactly (pat
 from __future__ import annotations
 
 import os
-import resource
 from pathlib import Path
 from typing import List
 
@@ -38,6 +37,7 @@ from scorch.exceptions import (
 from scorch.format import MAX_INDEX_POSITION, LevelType
 from scorch.result_bound import entry_bound, level_totals_in_source
 from scorch.stensor import STensor
+from tests.test_scorch.peak_rss import assert_peak_rise_below
 
 CODE = "index_position_exceeds_int32"
 D, S, COO = LevelType.DENSE, LevelType.COMPRESSED, LevelType.COORDINATE
@@ -57,8 +57,9 @@ def _kernel_sources() -> List[Path]:
     return sorted(Path(os.environ["TORCH_EXTENSIONS_DIR"]).rglob("main.cpp"))
 
 
-def _peak_rss_gb() -> float:
-    return resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 2**20
+# A refused call allocates nothing the result would need; it is measured in a process of
+# its own (peak_rss.py), since this one's peak may already stand above any rise it makes.
+_REFUSAL_RISE_BOUND = 2**29
 
 
 @pytest.fixture
@@ -260,18 +261,36 @@ def test_the_level_totals_are_read_from_the_source():
 # --------------------------------------------------------------------------------------
 
 
-@pytest.mark.parametrize("result_format", ["ds", "ss", "oo"])
-def test_an_outer_product_past_the_bound_is_refused_before_a_build(
-    result_format, fresh_caches, no_build
-):
+def _refuse_builds() -> None:
+    """In a measuring process (peak_rss.py): a build of a generated kernel fails the
+    call, as the ``no_build`` fixture makes it fail in this one."""
+
+    def refuse(*args, **kwargs):
+        raise AssertionError("a generated kernel was built")
+
+    ops._prepare_generated_kernel_build = refuse
+
+
+def _outer_product_refused(mark, result_format: str) -> None:
+    """Run in a fresh process by the test below: its caches start empty."""
+    _refuse_builds()
     x, y = _sparse_vector(N, N, seed=1), _sparse_vector(N, N, seed=2)
-    before, rss = _kernel_sources(), _peak_rss_gb()
+    before = _kernel_sources()
+    mark()
     with pytest.raises(IndexCapacityError) as caught:
         scorch.einsum("i,j->ij", x, y, format=result_format)
     assert_capacity_error(caught.value)
     assert "result level" in str(caught.value)
     assert _kernel_sources() == before
-    assert _peak_rss_gb() - rss < 0.5
+
+
+@pytest.mark.parametrize("result_format", ["ds", "ss", "oo"])
+def test_an_outer_product_past_the_bound_is_refused_before_a_build(result_format):
+    """Refused with the code, before a kernel is built, and with less than
+    ``_REFUSAL_RISE_BOUND`` of memory: the result would hold 2.5 * 10**9 entries."""
+    assert_peak_rise_below(
+        _REFUSAL_RISE_BOUND, f"{__name__}:_outer_product_refused", result_format
+    )
 
 
 def test_spgemm_into_ds_is_left_to_its_two_pass_total(fresh_caches):
@@ -293,30 +312,35 @@ def test_spgemm_into_ds_is_left_to_its_two_pass_total(fresh_caches):
     assert _kernel_sources() == before
 
 
-def test_a_warm_call_is_refused_when_only_the_stored_counts_grow(fresh_caches):
+def _warm_call_refused(mark) -> None:
+    """Run in a fresh process by the test below: its caches start empty."""
     small_x, small_y = _sparse_vector(N, 10, seed=5), _sparse_vector(N, 12, seed=6)
     result = scorch.einsum("i,j->ij", small_x, small_y, format="ds")
-    expected = torch.outer(
-        small_x.to_dense().values.reshape(-1), small_y.to_dense().values.reshape(-1)
-    )
     rows = torch.repeat_interleave(
         torch.arange(N), torch.diff(result.storage._mode_indices[1][0].long())
     )
     cols = result.storage._mode_indices[1][1].long()
     assert result.values.numel() == 120
-    assert torch.equal(result.values, expected[rows, cols])
-    entries, before, rss = (
-        len(ops._einsum_dispatch_cache),
-        _kernel_sources(),
-        _peak_rss_gb(),
-    )
+    # The outer product at the stored coordinates only: the whole of it is N * N
+    # float64, 20 GB.
+    x_dense = small_x.to_dense().values.reshape(-1)
+    y_dense = small_y.to_dense().values.reshape(-1)
+    assert torch.equal(result.values, x_dense[rows] * y_dense[cols])
+    assert int(torch.count_nonzero(x_dense)) * int(torch.count_nonzero(y_dense)) == 120
+    entries, before = len(ops._einsum_dispatch_cache), _kernel_sources()
     big_x, big_y = _sparse_vector(N, N, seed=7), _sparse_vector(N, N, seed=8)
+    mark()
     with pytest.raises(IndexCapacityError) as caught:
         scorch.einsum("i,j->ij", big_x, big_y, format="ds")
     assert_capacity_error(caught.value)
     assert len(ops._einsum_dispatch_cache) == entries
     assert _kernel_sources() == before
-    assert _peak_rss_gb() - rss < 0.5
+
+
+def test_a_warm_call_is_refused_when_only_the_stored_counts_grow():
+    """The same program warm, its operands now storing every coordinate: refused with
+    the code, with no new kernel and less than ``_REFUSAL_RISE_BOUND`` of memory."""
+    assert_peak_rise_below(_REFUSAL_RISE_BOUND, f"{__name__}:_warm_call_refused")
 
 
 # --------------------------------------------------------------------------------------

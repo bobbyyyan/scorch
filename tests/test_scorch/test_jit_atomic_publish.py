@@ -31,7 +31,13 @@ import scorch  # type: ignore[import-untyped]
 
 NAME = "kernel_atomic_publish_test"
 SOURCE = "int evaluate() { return 7; }"
+# The hang guard. A child's builds run one after another, and one build can take a
+# minute on a loaded host: the child that builds 10 kernels took 105 s on the M5 and
+# more than 600 s on a sapling node shared with four other jobs. So the guard limits
+# the time between kernels, not the child's whole run: a child that has neither exited
+# nor published a new kernel for TIMEOUT seconds is stuck.
 TIMEOUT = 600
+POLL = 5
 
 # A kernel that does not compile: a failed build's files and error (patch 0064b).
 BROKEN_NAME = "kernel_atomic_publish_broken"
@@ -125,7 +131,7 @@ def _environment(extensions: Path, **extra: str) -> dict:
 def _start(
     body: str, cwd: Path, environment: dict, prelude: str = PRELUDE
 ) -> subprocess.Popen:
-    return subprocess.Popen(
+    process = subprocess.Popen(
         [sys.executable, "-c", prelude + body],
         cwd=cwd,
         env=environment,
@@ -133,10 +139,46 @@ def _start(
         stderr=subprocess.PIPE,
         text=True,
     )
+    process.extensions = Path(environment["TORCH_EXTENSIONS_DIR"])  # type: ignore[attr-defined]
+    return process
+
+
+def _published(extensions: Path) -> int:
+    """Kernels on their final paths; a build still running writes below a staging
+    directory, which does not count."""
+
+    return sum(
+        1
+        for so in extensions.rglob("*.so")
+        if not any(part.startswith(".scorch-staging") for part in so.parts)
+    )
+
+
+def _communicate(process: subprocess.Popen) -> tuple:
+    """``process.communicate()``, failing when the child is stuck: TIMEOUT seconds
+    without exiting or publishing a new kernel.  Retrying ``communicate`` after its
+    timeout loses no output."""
+
+    extensions = process.extensions  # type: ignore[attr-defined]
+    seen, since = _published(extensions), time.monotonic()
+    while True:
+        try:
+            return process.communicate(timeout=POLL)
+        except subprocess.TimeoutExpired:
+            now = _published(extensions)
+            if now != seen:
+                seen, since = now, time.monotonic()
+            elif time.monotonic() - since > TIMEOUT:
+                process.kill()
+                _, err = process.communicate()
+                pytest.fail(
+                    f"no exit and no new kernel for {TIMEOUT} s "
+                    f"({now} published): {err[-3000:]}"
+                )
 
 
 def _result(process: subprocess.Popen) -> dict:
-    out, err = process.communicate(timeout=TIMEOUT)
+    out, err = _communicate(process)
     assert process.returncode == 0, err[-3000:]
     return json.loads(out.strip().splitlines()[-1])
 
