@@ -3998,8 +3998,10 @@ def _refuse_einsum_result_past_bound(
 ) -> Optional[EntryBound]:
     """An einsum result's bound (patch 0056) with the levels its kernel checks itself,
     after refusing the call when a level assembled one entry at a time may pass the
-    position bound.  ``None`` (a shape that cannot pass) is returned as it is.  A
-    ``compile_only`` call has no stored counts and is not refused.
+    position bound -- read from the shapes and stored counts, and where those pass it,
+    from the operands' coordinates (result_bound, J).  ``None`` (a shape that cannot
+    pass) is returned as it is.  A ``compile_only`` call has no stored counts and is not
+    refused.
 
     A separate function so that ``_einsum_owned`` keeps within its complexity.
     """
@@ -4008,7 +4010,7 @@ def _refuse_einsum_result_past_bound(
         return None
     bound = bound.with_checked(checked)
     if not compile_only:
-        bound.refuse_past_limit(_stored_counts(tensors))
+        bound.refuse_past_limit(_stored_counts(tensors), tensors)
     return bound
 
 
@@ -4312,9 +4314,11 @@ def _einsum_owned(
                 compilation.cancel_frontend()
             # The result bound (patch 0056): None unless the result's shape can pass
             # the 32-bit position bound at a level assembled one entry at a time, so a
-            # call whose shape cannot pays this test and no call.  Before any move.
+            # call whose shape cannot pays this test and no call.  Before any move.  The
+            # operands' coordinates are read only where the counts pass the bound, and
+            # once per index structure (result_bound._cached_join).
             if _cached[8] is not None:
-                _cached[8].refuse_past_limit(_stored_counts(tensors))
+                _cached[8].refuse_past_limit(_stored_counts(tensors), tensors)
             _module = _cached[0]
             _output_fmt = _cached[1]
             _temp_mo = _cached[2]
@@ -4601,13 +4605,15 @@ def _einsum_owned(
     )
     # Patch 0056: the result's levels bounded from the shapes and stored counts, for a
     # result whose shape can pass the position bound at a sparse level (else None).  The
-    # expression is one product of every operand, each carrying its own indices.
+    # expression is one product of every operand, each carrying its own indices; their
+    # order per operand lets the bound read the coordinates where the counts pass it.
     result_bound = entry_bound(
         "einsum",
         [result_index_strs[logical_mode] for logical_mode in result_mode_order],
         physical_result_shape,
         output_format.level_types,
         [[(k, letters) for k, letters in enumerate(input_index_strs)]],
+        operand_names=input_index_strs,
     )
 
     # Create the result TensorVar

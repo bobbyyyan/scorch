@@ -12,7 +12,7 @@ import math
 # route isinstance through __subclasscheck__ at 153 ns against 73 ns for the
 # abc. `from __future__ import annotations` above means the annotations that
 # also use these names are never evaluated at runtime.
-from collections.abc import Mapping, Sequence
+from collections.abc import Container, Iterator, Mapping, Sequence
 from typing import Any, List, Optional, Tuple
 
 import torch
@@ -20,6 +20,7 @@ import torch
 from .exceptions import (
     COALESCE_ADVICE,
     RepeatedCoordinateError,
+    ScorchAssertionError,
     TensorDeviceError,
     TensorIndexError,
     TensorLayoutError,
@@ -975,6 +976,218 @@ def _sorted_distinct(
     return key[starts], order, entry, int(entry[-1].item()) + 1
 
 
+def level_positions(
+    level_types: Sequence[LevelType],
+    mode_indices: IndexModes,
+    extents: Sequence[int],
+    level: int,
+) -> int:
+    """How many positions storage level ``level`` holds; level ``-1`` is the root, one.
+
+    A dense level holds its parent's positions times its extent; a compressed,
+    coordinate or singleton level one per coordinate it stores."""
+
+    count = 1
+    for kind, arrays, extent in zip(level_types[: level + 1], mode_indices, extents):
+        count = count * int(extent) if kind == LevelType.DENSE else arrays[-1].numel()
+    return count
+
+
+def _records_its_parent(level_types: Sequence[LevelType], level: int) -> bool:
+    """Whether the index arrays say which position of the level above each position of
+    storage level ``level`` belongs to.
+
+    A dense level's parent follows from the position (position = parent * extent +
+    coordinate) and a compressed level's from its ``pos`` array; a singleton level stores
+    one coordinate per position of its parent, so a position's parent is the same
+    position.  A coordinate level stores one coordinate per stored value: in the leading
+    run of coordinate levels (COO) every level does, so the parent there is the same
+    position too (level 0's is the root), but below a dense, compressed or singleton
+    level nothing records which parent a coordinate belongs to.  This is the one rule
+    for every walk over a storage's levels (:func:`_walk_up`, :func:`positions_beneath`).
+    It does not lean on ``validate_runtime_contract`` refusing singleton levels today: a
+    coordinate level below a singleton one is refused here for what its arrays hold.
+    """
+
+    if level_types[level] != LevelType.COORDINATE:
+        return True
+    return all(kind == LevelType.COORDINATE for kind in level_types[:level])
+
+
+def _parents_recorded(level_types: Sequence[LevelType], level: int, top: int) -> bool:
+    """Whether a walk from storage level ``level`` up to level ``top`` finds every parent
+    it needs: those of levels ``top + 1 .. level``."""
+
+    return all(
+        _records_its_parent(level_types, current)
+        for current in range(top + 1, level + 1)
+    )
+
+
+def _walk_up(
+    level_types: Sequence[LevelType],
+    mode_indices: IndexModes,
+    extents: Sequence[int],
+    level: int,
+    top: int,
+    wanted: Optional[Container[int]] = None,
+    positions: Optional[torch.Tensor] = None,
+) -> Iterator[Tuple[int, torch.Tensor]]:
+    """The coordinates of positions of storage level ``level`` at each level from
+    ``level`` up to ``top``, deepest first: yields ``(current, coordinates)`` for each
+    ``current`` in ``wanted`` (every level when ``None``), ``coordinates`` int64 with one
+    entry per walked position.  The positions walked are ``positions`` (int64 indices
+    into level ``level``), or every position of the level in order when ``None``; then a
+    yielded tensor may be the storage's own array, which the caller must not write.
+
+    The one walk up a storage's levels: :func:`_walked_coordinates` (each stored value's
+    full coordinate, for ``stored_coordinates`` and ``_canonical_index``) and
+    :func:`level_keys` (``result_bound``'s keys) read it.  A dense level's coordinate and parent follow from the
+    position arithmetically; a compressed level's coordinate is ``crd[position]`` and its
+    parent the segment of ``pos`` holding the position; a singleton or coordinate level's
+    coordinate is ``crd[position]`` and its parent the same position one level up.  The
+    caller checks :func:`_parents_recorded` first: a walk that needs a parent no array
+    records raises ScorchAssertionError (``storage_parent_unrecorded``).
+    """
+
+    position = positions  # None: every position of ``current``, in order
+    for current in range(level, top - 1, -1):
+        kind = level_types[current]
+        if kind == LevelType.DENSE:
+            extent = int(extents[current])
+            if position is None:
+                position = torch.arange(
+                    level_positions(level_types, mode_indices, extents, current),
+                    dtype=torch.int64,
+                )
+            if wanted is None or current in wanted:
+                yield current, position % extent
+            if current == top:
+                return
+            position = torch.div(position, extent, rounding_mode="floor")
+            continue
+        if wanted is None or current in wanted:
+            coordinates = mode_indices[current][-1]
+            here = coordinates if position is None else coordinates[position]
+            yield current, here.to(torch.int64)
+        if current == top:
+            return
+        if kind == LevelType.COMPRESSED:
+            pos = mode_indices[current][0]
+            lengths = (pos[1:] - pos[:-1]).to(torch.int64)
+            above = level_positions(level_types, mode_indices, extents, current - 1)
+            owner = torch.repeat_interleave(
+                torch.arange(above, dtype=torch.int64), lengths
+            )
+            position = owner if position is None else owner[position]
+        elif not _records_its_parent(level_types, current):
+            raise ScorchAssertionError(
+                f"storage level {current} is a coordinate level below a "
+                f"{level_types[current - 1].name.lower()} level: no index array records "
+                "the parent of its positions, and the caller did not check "
+                "(_parents_recorded)",
+                code="storage_parent_unrecorded",
+            )
+
+
+def level_keys(
+    level_types: Sequence[LevelType],
+    mode_indices: IndexModes,
+    extents: Sequence[int],
+    strides: Mapping[int, int],
+    level: int,
+) -> Optional[torch.Tensor]:
+    """For every position of storage level ``level``, as int64: the sum over the levels
+    in ``strides`` (each at most ``level``) of the position's coordinate at that level
+    times the level's stride, read by :func:`_walk_up` from ``level`` to the highest
+    level named.  ``None`` when that walk needs a parent no array records (a coordinate
+    level below a dense, compressed or singleton one, :func:`_records_its_parent`).
+
+    The caller keeps the sum inside int64 (a layout's element count fits one,
+    layout._normalize_shape).  ``result_bound`` reads the operands' keys of an einsum
+    term this way.
+    """
+
+    count = level_positions(level_types, mode_indices, extents, level)
+    key = torch.zeros(count, dtype=torch.int64)
+    if not strides:
+        return key
+    top = min(strides)
+    if not _parents_recorded(level_types, level, top):
+        return None
+    for current, coordinates in _walk_up(
+        level_types, mode_indices, extents, level, top, wanted=strides
+    ):
+        key += coordinates * strides[current]
+    return key
+
+
+def positions_beneath(
+    level_types: Sequence[LevelType],
+    mode_indices: IndexModes,
+    extents: Sequence[int],
+    level: int,
+    depth: int,
+) -> Optional[torch.Tensor]:
+    """For every position of storage level ``level`` (``-1``: the root), as int64: how
+    many positions of level ``depth`` (at least ``level``) lie beneath it.  ``None`` when
+    a level between them has a parent no array records (a coordinate level below a
+    dense, compressed or singleton one, :func:`_records_its_parent`).
+
+    The positions beneath one position form a range at every level below it, carried
+    down level by level: a dense level multiplies both ends by its extent, a compressed
+    level maps them through ``pos``, a coordinate or singleton level keeps them (one
+    position per parent position), and a coordinate or singleton level 0 holds every
+    one of its positions beneath the root."""
+
+    start = torch.arange(
+        level_positions(level_types, mode_indices, extents, level), dtype=torch.int64
+    )
+    end = start + 1
+    for current in range(level + 1, depth + 1):
+        kind = level_types[current]
+        if kind == LevelType.DENSE:
+            start = start * int(extents[current])
+            end = end * int(extents[current])
+        elif kind == LevelType.COMPRESSED:
+            positions = mode_indices[current][0].to(torch.int64)
+            start, end = positions[start], positions[end]
+        elif current == 0:
+            # Beneath the root's one position: start is [0] and end [1] here.
+            end = end * mode_indices[0][-1].numel()
+        elif not _records_its_parent(level_types, current):
+            return None
+    return end - start
+
+
+def structure_of(
+    storage: "SparseStorage",
+) -> Tuple[Tuple[LevelType, ...], IndexModes, Tuple[int, ...], Tuple[int, ...]]:
+    """A storage's level kinds, index arrays, extents and permutation, in storage order
+    (level ``l`` holds logical mode ``permutation[l]``).  The arrays are the storage's
+    own, not copies: for analyses that only read them (``result_bound``)."""
+
+    layout = storage._layout
+    return (
+        tuple(layout.format.level_types),
+        storage._mode_indices,
+        tuple(int(extent) for extent in layout.physical_shape),
+        tuple(layout.permutation),
+    )
+
+
+def structure_stamp(storage: "SparseStorage") -> Tuple[Tuple[int, int, int], ...]:
+    """``(data_ptr, version, numel)`` of each index array of ``storage``: equal stamps on
+    the same live storage mean the same structure, for the reasons, and with the blind
+    spots, :func:`_validation_stamp` gives for the same triple."""
+
+    return tuple(
+        (array.data_ptr(), tensor_version(array), array.numel())
+        for arrays in storage._mode_indices
+        for array in arrays
+    )
+
+
 def _canonical_coo_index(
     mode_indices: IndexModes,
     extents: Sequence[int],
@@ -1008,51 +1221,27 @@ def _walked_coordinates(
     (physical order), entry ``p`` of each the coordinate of the value at position
     ``p``; the caller has checked the hierarchy (``stored_coordinates``).
 
-    Walks up from each value's own position.  A dense level's coordinate and parent
-    follow from the position arithmetically; a compressed level's come from its
-    arrays; a singleton level, and a coordinate level below coordinate levels, hold
-    one coordinate per position of the level above, so a position's parent is the
-    position itself; the top coordinate level's parent is the root.  ``count`` is the
-    number of stored values.
+    Walks up from each value's own position (:func:`_walk_up`, the walk every reader of
+    a storage's levels shares): a dense level's coordinate and parent follow from the
+    position arithmetically; a compressed level's come from its arrays; a singleton
+    level, and a coordinate level below coordinate levels, hold one coordinate per
+    position of the level above, so a position's parent is the position itself.  The
+    positions walked are ``0 .. count - 1`` (``count`` stored values), so every tensor
+    returned is a new one, never an index array of the storage.
     """
 
-    def arange(n: int) -> torch.Tensor:
-        return torch.arange(n, dtype=torch.int64)
-
-    # Per level: None for a dense level (arithmetic), the parent of each position for a
-    # compressed level, and "same" for a level whose positions are its parent's.
-    parents_of: List[Any] = []
-    parent_count = 1
-    for level, (level_type, arrays, extent) in enumerate(
-        zip(level_types, mode_indices, extents)
+    coordinate_at: List[torch.Tensor] = [torch.zeros(0, dtype=torch.int64)] * len(
+        level_types
+    )
+    for level, coordinates in _walk_up(
+        level_types,
+        mode_indices,
+        extents,
+        len(level_types) - 1,
+        0,
+        positions=torch.arange(count, dtype=torch.int64),
     ):
-        if level_type == LevelType.DENSE:
-            parents_of.append(None)
-            parent_count *= extent
-        elif level_type == LevelType.COMPRESSED:
-            positions, coordinates = arrays
-            lengths = (positions[1:] - positions[:-1]).to(torch.int64)
-            parents_of.append(torch.repeat_interleave(arange(parent_count), lengths))
-            parent_count = coordinates.numel()
-        elif level_type == LevelType.COORDINATE and level == 0:
-            parents_of.append(torch.zeros(arrays[0].numel(), dtype=torch.int64))
-            parent_count = arrays[0].numel()
-        else:
-            parents_of.append("same")
-            parent_count = arrays[0].numel()
-    coordinate_at: List[torch.Tensor] = [arange(0)] * len(level_types)
-    position = arange(count)
-    for level in reversed(range(len(level_types))):
-        extent = extents[level]
-        parents = parents_of[level]
-        if parents is None:
-            coordinate_at[level] = position % extent
-            position = torch.div(position, extent, rounding_mode="floor")
-            continue
-        arrays = mode_indices[level]
-        coordinate_at[level] = arrays[-1][position].to(torch.int64)
-        if not isinstance(parents, str):
-            position = parents[position]
+        coordinate_at[level] = coordinates
     return coordinate_at
 
 
@@ -1073,10 +1262,7 @@ def stored_coordinates(
 
     level_types = layout.format.level_types
     extents = layout.physical_shape
-    leading = 0
-    while leading < len(level_types) and level_types[leading] == LevelType.COORDINATE:
-        leading += 1
-    if any(level == LevelType.COORDINATE for level in level_types[leading:]):
+    if not _parents_recorded(level_types, len(level_types) - 1, 0):
         raise TensorStorageError(
             f"the stored coordinates of format {layout.format} are not computed: a "
             "coordinate level below a dense, compressed or singleton level does not "
@@ -1085,7 +1271,7 @@ def stored_coordinates(
         )
     if count == 0:
         return [torch.zeros(0, dtype=torch.int64) for _ in level_types]
-    if leading == len(level_types):
+    if all(level == LevelType.COORDINATE for level in level_types):
         return [arrays[0].to(torch.int64) for arrays in mode_indices]
     return _walked_coordinates(level_types, mode_indices, extents, count)
 

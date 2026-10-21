@@ -51,6 +51,7 @@ from functools import reduce
 from dataclasses import dataclass, replace
 from itertools import combinations
 from typing import (
+    Any,
     Callable,
     Dict,
     List,
@@ -69,7 +70,17 @@ from ...exceptions import (
     shape_capacity_error,
 )
 from .. import llir
-from ..cin import ForAll, IndexStmt, TensorAccess, TensorAssign, Workspace
+from ..cin import (
+    BinaryOp,
+    CINVisitorAccept,
+    ForAll,
+    IndexStmt,
+    Operation,
+    TensorAccess,
+    TensorAssign,
+    Where,
+    Workspace,
+)
 from ..cin_analysis import (
     _trusted_normalized_cin,
     normalize_cin,
@@ -1493,6 +1504,10 @@ def execute_cin_via_loopir(
     _require_converted_or_stored_as_declared(
         normalized, runtime_args, kernel.conversions
     )
+    # The shipped dispatch's result bound, after lowering (which says which levels the
+    # kernel checks itself) and before the build: the same calls refused, with the same
+    # code, before anything is allocated.
+    _refuse_result_past_bound(normalized, kernel, result_shape, runtime_args)
     header_cpp_code = options.build.preamble_source
     prepared_build = _prepare_generated_kernel_build(
         header_cpp_code,
@@ -1551,6 +1566,116 @@ def execute_cin_via_loopir(
         mode_order=result_mode_order,
     )
     return result, kernel
+
+
+_LEVEL_TYPES = {
+    LoopIRLevelKind.DENSE: LevelType.DENSE,
+    LoopIRLevelKind.COMPRESSED: LevelType.COMPRESSED,
+    LoopIRLevelKind.COORDINATE: LevelType.COORDINATE,
+}
+
+
+def _sum_of_products(
+    normalized: IndexStmt,
+) -> Optional[Tuple[TensorAccess, List[List[TensorAccess]]]]:
+    """The access the program's one assignment writes and its right-hand side as a sum
+    of products of input accesses, or ``None`` when the program is not that: more or
+    fewer than one assignment, a workspace, or an operation other than ``+``, ``-`` and
+    ``*`` over tensor accesses.
+
+    A product's stored coordinates lie in the join of its factors' stored entries, and a
+    sum's in the union of its terms', which is what the result bound reads from them.
+    """
+
+    assignments: List[TensorAssign] = []
+    wheres: List[Where] = []
+
+    class _Collector(CINVisitorAccept):
+        def visit_TensorAssign(self, node: TensorAssign) -> None:
+            assignments.append(node)
+
+        def visit_Where(self, node: Where) -> None:
+            wheres.append(node)
+
+    _Collector().visit(normalized)
+    if len(assignments) != 1 or wheres:
+        return None
+
+    def expand(expression: object) -> Optional[List[List[TensorAccess]]]:
+        if isinstance(expression, TensorAccess):
+            if isinstance(expression.get_tensor(), Workspace):
+                return None
+            return [[expression]]
+        if not isinstance(expression, BinaryOp):
+            return None
+        left, right = expand(expression.left), expand(expression.right)
+        if left is None or right is None:
+            return None
+        if expression.op is Operation.MUL:
+            return [a + b for a in left for b in right]
+        if expression.op in (Operation.ADD, Operation.SUB):
+            return left + right
+        return None
+
+    terms = expand(assignments[0].get_rhs())
+    return None if terms is None else (assignments[0].get_lhs(), terms)
+
+
+def _refuse_result_past_bound(
+    normalized: IndexStmt,
+    kernel: LoopIRCompiledKernel,
+    result_shape: Sequence[int],
+    runtime_args: Sequence[Any],
+) -> None:
+    """Refuse, as the shipped einsum dispatch does (scorch/result_bound.py), a result
+    level the kernel assembles one entry at a time and does not check itself whose bound
+    -- from the shapes and stored counts, then from the operands' coordinates -- passes
+    the 32-bit position bound.  A program that is not a sum of products of its inputs
+    is left to its kernel, as it was before this check."""
+
+    from ...result_bound import entry_bound, level_totals_in_source
+
+    found = _sum_of_products(normalized)
+    if found is None:
+        return
+    result_access, terms = found
+    accesses = normalized.get_rhs_tensor_accesses()
+    position = {id(access): k for k, access in enumerate(accesses)}
+    if any(id(factor) not in position for term in terms for factor in term):
+        return
+    result_decl = next(
+        decl
+        for decl in kernel.lowering.program.tensors
+        if decl.symbol == kernel.lowering.result_symbol
+    )
+    order = kernel.result_mode_order or tuple(range(len(result_decl.levels)))
+    result_names = [var.name for var in result_access.get_index_vars()]
+    bound = entry_bound(
+        "execute",
+        [result_names[mode] for mode in order],
+        [int(result_shape[mode]) for mode in order],
+        [_LEVEL_TYPES[level.kind] for level in result_decl.levels],
+        [
+            [
+                (
+                    position[id(factor)],
+                    [var.name for var in factor.get_index_vars()],
+                )
+                for factor in term
+            ]
+            for term in terms
+        ],
+        operand_names=[
+            [var.name for var in access.get_index_vars()] for access in accesses
+        ],
+    )
+    if bound is None:
+        return
+    bound = bound.with_checked(level_totals_in_source(kernel.cpp_source))
+    bound.refuse_past_limit(
+        [snapshot.values.numel() for snapshot in runtime_args],
+        [getattr(snapshot, "tensor", None) for snapshot in runtime_args],
+    )
 
 
 def _run_conversions(

@@ -295,9 +295,11 @@ def test_an_outer_product_past_the_bound_is_refused_before_a_build(result_format
 
 def test_spgemm_into_ds_is_left_to_its_two_pass_total(fresh_caches):
     """A's rows all store column 0 and B's row 0 is empty, so the product stores
-    nothing, while the bound (nnz(A) * nnz(B) and the cells) passes the limit.  Into
-    ``ds`` the kernel checks level 1's total itself and the result is computed; into
-    ``ss`` level 1 is assembled one entry at a time and the call is refused."""
+    nothing, while the bound from the counts (nnz(A) * nnz(B) and the cells) passes the
+    limit.  Into ``ds`` the kernel checks level 1's total itself and the result is
+    computed.  Into ``ss`` level 1 is assembled one entry at a time: the bound reads the
+    operands' coordinates, whose join on j is empty, and the result is computed too.
+    With B's row 0 full the join holds N * N tuples and that call is refused."""
     a = _rows_csr(N, 4, lambda row: [0], seed=3)
     b = _rows_csr(4, N, lambda row: [] if row == 0 else list(range(N)), seed=4)
     result = scorch.einsum("ij,jk->ik", a, b, format="ds")
@@ -305,10 +307,13 @@ def test_spgemm_into_ds_is_left_to_its_two_pass_total(fresh_caches):
     assert any(
         "scorch_check_level_total(" in path.read_text() for path in _kernel_sources()
     )
+    assert scorch.einsum("ij,jk->ik", a, b, format="ss").values.numel() == 0
+    full = _rows_csr(4, N, lambda row: list(range(N)), seed=4)
     before = _kernel_sources()
     with pytest.raises(IndexCapacityError) as caught:
-        scorch.einsum("ij,jk->ik", a, b, format="ss")
+        scorch.einsum("ij,jk->ik", a, full, format="ss")
     assert_capacity_error(caught.value)
+    assert f"{N * N} tuples in the join" in str(caught.value)
     assert _kernel_sources() == before
 
 
