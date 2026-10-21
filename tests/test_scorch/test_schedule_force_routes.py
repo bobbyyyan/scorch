@@ -277,6 +277,143 @@ def test_matrix_vector_refuses_with_its_code(call):
         ops.matmul(a, v)
 
 
+# ---- A forced schedule's recorded product is a tensor of its own ----------------------------
+#
+# torch takes a custom Function's output that is a view made inside the Function for a view it
+# cannot replay: an in-place operation on it in grad mode raises, and so does reading its
+# grad_fn once it was written in place under no_grad (test_autograd_matmul.py, the note above
+# its WRITES). Under a forced schedule a recorded product's forward is ops.matmul's generated
+# product on the primals, in the caller's shape, which autograd._scheduled_out gives the
+# strides the Function's own product has and makes a tensor of its own (series step 10), so
+# each side and layout is checked here as that file checks the unforced products:
+# the schedule's kernel made it, the caller's tensor is the Function's output, not a view and
+# sharing storage with no input, both writes are allowed, and the product and both gradients
+# through them are torch.matmul's for the same call on float64 copies, A in the same CSR
+# layout. A torch sparse operand gets torch.matmul's gradient, dense strided and not masked
+# to its pattern (test_torch_sparse_gradients.py), so A's is compared layout and values with
+# torch's. A matrix times a vector refuses every schedule before anything is recorded
+# (test_matrix_vector_refuses_with_its_code).
+
+# v @ A is einsum's "j,jk->k" (ops.py, the expressions for a vector operand), whose two
+# indices S cannot order; SVO is its own order, (j, k), with no tile. Two tiled schedules
+# are refusals below. SV strip-mines the reduction index j, which the scheduler refuses
+# whatever the accumulator (reduction_tiling_accumulator_unsupported; sapling 85435). SVP
+# cuts k, A's compressed level, into sparse panels, as test_schedule_api's tile-j-panel
+# cuts A's compressed level in SpMM; a panel tile needs the level's dense parent row loop
+# as Schedule.parallel_loop, here the reduction index j, and SVP names none
+# (panel_parallel_loop_invalid; sapling 85441).
+SVO = scorch.Schedule(loop_order=("j", "k"), tag="order-j-k")
+SVP = scorch.Schedule(
+    loop_order=("j", "k"),
+    tiles=(scorch.TileSpec("k", 4, kind="panel", accum="direct"),),
+    tag="panel-k-4",
+)
+SV = scorch.Schedule(
+    loop_order=("j", "k"),
+    tiles=(scorch.TileSpec("j", 4, placement="outermost", accum="direct"),),
+    tag="tile-j-4",
+)
+
+# path: (the sparse operand's side, the dense operand's layout, the schedule, the node)
+FORCED_RECORDED = {
+    "A @ b": ("left", "matrix", S, "_TorchSparseMMBackward"),
+    "A @ b.t()": ("left", "transposed", S, "_TorchSparseMMBackward"),
+    "x @ A": ("right", "matrix", S, "_TorchSparseXABackward"),
+    "x.t() @ A": ("right", "transposed", S, "_TorchSparseXABackward"),
+    "v @ A": ("right", "vector", SVO, "_TorchSparseMMTBackward"),
+}
+WRITES = ["relu_ in grad mode", "add_ under no_grad"]
+
+
+def _write(write, *tensors):
+    """The same in-place write on each tensor: relu_ recorded, as nn.ReLU(inplace=True)
+    does, or add_ under no_grad, as an optimizer step does, after which reading grad_fn
+    is what torch refuses for a view made inside a Function."""
+    for t in tensors:
+        if write == "relu_ in grad mode":
+            t.relu_()
+        else:
+            with torch.no_grad():
+                t.add_(1.0)
+            if t.requires_grad:
+                assert t.grad_fn is not None
+
+
+def _near(got, want, tol):
+    got, want = got.detach().double(), want.detach()
+    assert got.shape == want.shape, (got.shape, want.shape)
+    assert (got - want).abs().max().item() <= tol * max(1.0, want.abs().max().item())
+
+
+@pytest.mark.parametrize("dtype", [torch.float32, torch.float64])
+@pytest.mark.parametrize("write", WRITES)
+@pytest.mark.parametrize("path", list(FORCED_RECORDED))
+def test_a_forced_recorded_product_is_a_tensor_of_its_own(
+    generated, path, write, dtype
+):
+    side, layout, schedule, node = FORCED_RECORDED[path]
+    left = side == "left"
+    shape = {
+        "matrix": (N, K) if left else (K, N),
+        "transposed": (K, N) if left else (N, K),
+        "vector": (N,),
+    }[layout]
+    # entries of both signs, for relu_ to change
+    raw = torch.from_numpy(np.random.default_rng(1).uniform(-1, 1, shape)).to(dtype)
+    raw.requires_grad_(True)
+    a = torch.from_numpy(dense_a()).to(dtype).to_sparse_csr().requires_grad_(True)
+    dense = raw.t() if layout == "transposed" else raw
+    with scorch.schedule_force(schedule):
+        out = ops.matmul(a, dense) if left else ops.matmul(dense, a)
+    assert generated == [schedule], generated
+    assert node in out.grad_fn.name(), out.grad_fn.name()
+    assert out._base is None
+    held = out.untyped_storage().data_ptr()
+    inputs = (raw, a.values(), a.crow_indices(), a.col_indices())
+    assert all(held != t.untyped_storage().data_ptr() for t in inputs)
+
+    a64 = torch.from_numpy(dense_a()).to_sparse_csr().requires_grad_(True)
+    raw64 = raw.detach().double().requires_grad_(True)
+    dense64 = raw64.t() if layout == "transposed" else raw64
+    ref = torch.matmul(a64, dense64) if left else torch.matmul(dense64, a64)
+    _write(write, out, ref)
+    g = torch.from_numpy(np.random.default_rng(5).uniform(-1, 1, tuple(ref.shape)))
+    (out * g.to(dtype)).sum().backward()
+    (ref * g).sum().backward()
+
+    tol = 1e-12 if dtype == torch.float64 else 1e-5
+    _near(out, ref, tol)
+    _near(raw.grad, raw64.grad, tol)
+    assert a64.grad.layout is torch.strided, a64.grad.layout  # torch.matmul's
+    assert a.grad.layout is a64.grad.layout, a.grad.layout
+    _near(a.grad, a64.grad, tol)
+
+
+@pytest.mark.parametrize(
+    "schedule, code",
+    [
+        (S, "schedule_loop_order_incomplete"),
+        (SV, "reduction_tiling_accumulator_unsupported"),
+        (SVP, "panel_parallel_loop_invalid"),
+    ],
+    ids=["S", "SV", "SVP"],
+)
+def test_a_forced_recorded_vector_times_matrix_refuses_a_schedule_it_cannot_run(
+    schedule, code
+):
+    """v @ A recorded under a schedule its generated kernel cannot take: S orders three
+    indices and v @ A has two; SV strip-mines its reduction index; SVP's panel tile
+    names no parallel loop. The Function's forced forward is ops.matmul's, which refuses
+    with the scheduler's code, and nothing is recorded."""
+    a = torch_csr().requires_grad_(True)
+    v = torch.from_numpy(np.random.default_rng(2).uniform(-1, 1, N))
+    v.requires_grad_(True)
+    with scorch.schedule_force(schedule), pytest.raises(Exception) as caught:
+        ops.matmul(v, a)
+    assert defect_code(caught.value) == code, caught.value
+    assert a.grad is None and v.grad is None
+
+
 def test_call_without_forced_schedule():
     def inner():
         return get_forced_schedule()
