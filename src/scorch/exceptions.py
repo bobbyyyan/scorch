@@ -256,6 +256,42 @@ class ScheduleWithoutSparseOperandError(UnsupportedScheduleError):
         super().__init__(message)
 
 
+class DerivativeUnsupportedError(ScorchNotImplementedError):
+    """A gradient was asked of a result whose operation has no derivative.
+
+    torch's convention for such an operation: the forward pass computes, so inference
+    with parameters that require grad keeps working, and the result's ``grad_fn``
+    raises when a gradient is asked of it, naming what was to be differentiated.  Never
+    raised itself: each refusal raises the subclass of its operation, whose ``code``
+    names it.  A ``ScorchNotImplementedError``, which is what these refusals raised
+    before they had a class of their own, so an ``except`` clause written for it or for
+    ``NotImplementedError`` still catches them.
+    """
+
+    code: str = ""
+
+
+class MatmulDerivativeError(DerivativeUnsupportedError):
+    """``scorch.matmul``'s result has no derivative for its operands and keywords."""
+
+    code = "matmul_derivative_unsupported"
+
+
+class EinsumDerivativeError(DerivativeUnsupportedError):
+    """``scorch.einsum``'s result has no derivative: the call is in a form the
+    derivative does not read, it carries fused post-operations, or the compiler refused
+    the einsum that computes an operand's gradient."""
+
+    code = "einsum_derivative_unsupported"
+
+
+class SparseLinearDerivativeError(DerivativeUnsupportedError):
+    """``scorch.sparse_linear_fm``'s result has no derivative for its weight's mode
+    order."""
+
+    code = "sparse_linear_derivative_unsupported"
+
+
 class RepeatedCoordinateError(TensorIndexError):
     """A COO tensor stores one coordinate tuple at two positions.
 

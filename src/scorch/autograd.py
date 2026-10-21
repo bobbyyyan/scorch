@@ -22,8 +22,11 @@ Which inputs carry gradients:
 - a torch sparse CSR or COO tensor that requires grad: its gradient arrives through
   ``values()``, so ``A.grad`` is a sparse tensor with A's structure, as
   ``torch.sparse.mm`` gives (``torch.matmul`` raises on such an input);
-- an STensor: never. Its values are stored detached and its ``requires_grad`` is inert
-  (see STensor), so only its dense partner gets a gradient;
+- an STensor whose ``requires_grad`` is set: its gradient arrives through the tensor
+  autograd tracks for its values (``stensor_grad.AUTOGRAD_VALUES``: the same memory as
+  the detached values every kernel reads), so ``A.grad`` is an STensor over A's index
+  arrays (drop-in note, section 0.2). An STensor whose ``requires_grad`` is unset is a
+  constant, and only its dense partner gets a gradient;
 - a dense torch tensor: as under torch.
 
 The products run on scorch's ordinary path. ``A @ B`` runs on the caller's own operand,
@@ -35,9 +38,10 @@ STensor gets plans of its own like any other operand.
 
 A product this module does not cover (a sparse x sparse product, a batched one, keyword
 arguments, an unsupported dtype or device) is computed without autograd and given a
-``grad_fn`` that raises when a gradient is actually asked of it. That is torch's own
-convention for an operation with no derivative, and it keeps a forward pass that never
-calls ``backward`` -- inference with parameters that require grad, say -- working.
+``grad_fn`` that raises when a gradient is actually asked of it -- on the result itself,
+or, for an STensor result, on the tensor autograd tracks for its values. That is torch's
+own convention for an operation with no derivative, and it keeps a forward pass that
+never calls ``backward`` -- inference with parameters that require grad, say -- working.
 """
 
 from __future__ import annotations
@@ -45,7 +49,7 @@ from __future__ import annotations
 import functools
 import threading
 import weakref
-from typing import Any, Callable, Dict, Optional, Tuple, cast
+from typing import Any, Callable, Dict, Optional, Tuple, Type, cast
 
 import torch
 import torch.autograd.forward_ad as _fwad
@@ -58,14 +62,19 @@ from .compiler.scheduler import (
     call_without_forced_schedule,
 )
 from .exceptions import (
+    DerivativeUnsupportedError,
+    EinsumDerivativeError,
+    MatmulDerivativeError,
     ScorchAssertionError,
-    ScorchNotImplementedError,
+    SparseLinearDerivativeError,
     TensorIndexError,
 )
 from .format import LevelType
-from .layout import TensorLayout
+from .layout import TensorLayout, TensorSpec
 from .plan import GRAD_ATTR, torch_object_state
+from . import einsum_grad
 from .stensor import STensor
+from .stensor_grad import AUTOGRAD_VALUES, attach
 from .storage import _canonical_index, _first_unsorted_parent, tensor_version
 
 _Stamp = Tuple[int, int, int, int]
@@ -387,6 +396,13 @@ class _Structure:
         one place they are held, so it is refreshed rather than compared.
         """
         b = _plain(b)
+        # Detached when autograd tracks them (the tensor it tracks for an STensor's
+        # values, stensor_grad): they reach native code below, which never reads that
+        # tensor, and a backward that runs this records nothing through it. Detached too
+        # under forward-mode AD, where values may carry a tangent; values with neither
+        # are used as they are, with no call.
+        if values.requires_grad or _fwad._current_level >= 0:
+            values = values.detach()
         with self._lock:
             held = self._carriers.get(values.dtype)
             if held is None:
@@ -1085,15 +1101,49 @@ def _fw_tangent(x: Any) -> bool:
         return False
 
 
+def _asks_gradient(x: Any) -> bool:
+    """Whether ``x`` asks for a gradient: a torch tensor that requires grad, or an STensor
+    whose ``requires_grad`` is set. (The STensor's metadata flag, which is set exactly
+    when it carries ``AUTOGRAD_VALUES``: the C entry point reads the same flag.)"""
+    if isinstance(x, torch.Tensor):
+        return x.requires_grad
+    return type(x) is STensor and x._metadata.requires_grad
+
+
+def _tracked(x: Any) -> Optional[torch.Tensor]:
+    """The tensor autograd tracks for an STensor's values, or None (stensor_grad)."""
+    return x.__dict__.get(AUTOGRAD_VALUES) if type(x) is STensor else None
+
+
 def wanted(a: Any, b: Any) -> bool:
-    """Whether ``a @ b`` must be recorded for autograd: grad mode is on and a torch
-    input requires grad, or forward-mode AD has given a torch input a tangent."""
+    """Whether ``a @ b`` must be recorded for autograd: grad mode is on and an input asks
+    for a gradient (``_asks_gradient``), or forward-mode AD has given a torch input a
+    tangent."""
+    # _asks_gradient written out, the torch tensors' flags read first: every product
+    # makes this test, and a training step whose dense operand requires grad decides it
+    # there, with no call.
     if torch.is_grad_enabled() and (
         (isinstance(a, torch.Tensor) and a.requires_grad)
         or (isinstance(b, torch.Tensor) and b.requires_grad)
+        or (type(a) is STensor and a._metadata.requires_grad)
+        or (type(b) is STensor and b._metadata.requires_grad)
     ):
         return True
     return _fwad._current_level >= 0 and (_fw_tangent(a) or _fw_tangent(b))
+
+
+def wanted_by_any(operands: Tuple[Any, ...]) -> bool:
+    """``wanted`` for any number of operands, as ``einsum`` has."""
+    if torch.is_grad_enabled() and any(_asks_gradient(x) for x in operands):
+        return True
+    return _fwad._current_level >= 0 and any(_fw_tangent(x) for x in operands)
+
+
+def wanted_for(x: torch.Tensor) -> bool:
+    """``wanted`` for the one torch tensor of a unary operation (``fast_transpose``)."""
+    if x.requires_grad and torch.is_grad_enabled():
+        return True
+    return _fwad._current_level >= 0 and _fw_tangent(x)
 
 
 def serve(a: Any, b: Any, ordinary: Callable[..., Any], kwargs: Dict[str, Any]) -> Any:
@@ -1185,6 +1235,15 @@ def _differentiable(
         and _SCHEDULE_FORCE.get() is not None
     ):
         forced = (_scheduled_product(a, b, ordinary),)
+    # An STensor's values enter as the tensor autograd tracks for them, when it has one:
+    # the same memory as the detached values the operand reads (_Operand._owns holds), so
+    # the product is the one computed without autograd, and the gradient of the values
+    # reaches the STensor's leaf through whatever recorded them (stensor_grad). The
+    # metadata flag is set exactly when it has one, so an STensor whose values autograd
+    # does not track, and every torch operand, is passed by with no call.
+    owner = op.owner
+    if type(owner) is STensor and owner._metadata.requires_grad:
+        values = owner.__dict__.get(AUTOGRAD_VALUES, values)
     if left:
         return _SparseMM.apply(op, values, dense, *forced)
     # v @ A = A^T @ v
@@ -1225,31 +1284,202 @@ def right_product(a: Any, b: Any) -> Optional[torch.Tensor]:
     return _x_at_a(op.mm_t(values, xt, right=True), _transposed_layout(xt))
 
 
+# --------------------------------------------------------------------------- #
+# The fused feature-major Linear layer (ops.sparse_linear_fm)
+# --------------------------------------------------------------------------- #
+
+
+def _activation_slope(act: int, y: torch.Tensor) -> Optional[torch.Tensor]:
+    """``act'(z)`` at the layer's output ``y = act(z)``, read from ``y``: None for the
+    identity, ``y > 0`` for relu (0 at 0, as torch's relu backward has it), and
+    ``y (1 - y)`` for sigmoid."""
+    if act == 1:
+        return (y > 0).to(y.dtype)
+    if act == 2:
+        return y * (1 - y)
+    return None
+
+
+class _SparseLinearFM(torch.autograd.Function):
+    """``act(A(values) @ x + bias[:, None])``, computed by the fused kernel.
+
+    Its derivative is the product's (``_mm_backward``) applied to ``dz``, the output's
+    gradient times the activation's slope, and ``dz`` summed over the batch for the
+    bias. The slope is read from the output, so the layer saves nothing beyond what it
+    returns and the product saves. Under grad mode (a backward building its own graph)
+    each piece is recorded -- the product's by its own Functions, the slope and the sum
+    by torch -- so the layer is closed under differentiation as the product is.
+    """
+
+    @staticmethod
+    def forward(
+        ctx: Any,
+        op: _Operand,
+        values: torch.Tensor,
+        x: torch.Tensor,
+        bias: torch.Tensor,
+        act: int,
+        kernel: Callable[[torch.Tensor, torch.Tensor, torch.Tensor], torch.Tensor],
+    ) -> torch.Tensor:
+        # Never a view, and the tensor saved is the one returned: see the note above
+        # _in_layout.
+        y = kernel(
+            values.detach(), _plain(x.detach()).reshape(-1), bias.detach()
+        ).detach()
+        ctx.op = op
+        ctx.act = act
+        ctx.x_transposed = _transposed_layout(x)
+        need = ctx.needs_input_grad
+        ctx.save_for_backward(
+            values if need[2] else None,
+            x if need[1] else None,
+            y if act != 0 else None,
+        )
+        ctx.save_for_forward(values, x, y)
+        return y
+
+    @staticmethod
+    def backward(ctx: Any, g: torch.Tensor):
+        values, x, y = ctx.saved_tensors
+        slope = None if y is None else _activation_slope(ctx.act, y)
+        dz = g if slope is None else g * slope
+        need = ctx.needs_input_grad
+        gv, gx = _mm_backward(ctx.op, values, x, dz, need[1], need[2], ctx.x_transposed)
+        gb = dz.sum(1) if need[3] else None
+        return None, gv, gx, gb, None, None
+
+    @staticmethod
+    def jvp(
+        ctx: Any,
+        _op: Any,
+        dv: Optional[torch.Tensor],
+        dx: Optional[torch.Tensor],
+        db: Optional[torch.Tensor],
+        _act: Any,
+        _kernel: Any,
+    ):
+        values, x, y = ctx.saved_tensors
+        op = ctx.op
+        dz = _add(
+            op.mm(dv, x) if dv is not None else None,
+            op.mm(values, dx) if dx is not None else None,
+        )
+        if db is not None:
+            dz = db[:, None].expand_as(y) if dz is None else dz + db[:, None]
+        assert dz is not None  # forward AD asks for this only with some tangent
+        slope = _activation_slope(ctx.act, y)
+        return (dz if slope is None else dz * slope).contiguous()
+
+
+_LINEAR_FM_DIFFERENTIABLE = (
+    "its derivative is recorded for a CSR weight (an STensor stored dense-compressed "
+    "in mode order [0, 1], or a torch tensor, which sparse_linear_fm converts to one)"
+)
+
+
+def linear_fm(
+    weight: STensor,
+    x: torch.Tensor,
+    bias: torch.Tensor,
+    act: int,
+    kernel: Callable[[torch.Tensor, torch.Tensor, torch.Tensor], torch.Tensor],
+) -> torch.Tensor:
+    """``ops.sparse_linear_fm`` recorded for autograd: ``kernel(values, x, bias)`` -- the
+    layer's own fused call -- as :class:`_SparseLinearFM`, with ``weight``'s values
+    entering as the tensor autograd tracks for them when it has one.
+
+    The kernel reads the weight's index arrays as a CSR matrix in storage order. For a
+    weight that ``_stensor_operand`` reads as one -- CSR in mode order [0, 1], the
+    operand ``direct`` products run on -- the product's derivative is that matrix's.
+    Any other weight is computed by the same call without autograd and given a node
+    that raises ``sparse_linear_derivative_unsupported`` when a gradient is asked of
+    it, so the layer returns the same values in every grad mode."""
+    held = _stensor_operand(weight)
+    if held is not None and held[0].direct:
+        op, values = held
+        # As _differentiable reads it.
+        if weight._metadata.requires_grad:
+            values = weight.__dict__.get(AUTOGRAD_VALUES, values)
+        return cast(
+            torch.Tensor, _SparseLinearFM.apply(op, values, x, bias, act, kernel)
+        )
+    with torch.no_grad():
+        result = kernel(
+            weight._raw_values, _plain(x.detach()).reshape(-1), bias.detach()
+        )
+    return cast(
+        torch.Tensor,
+        not_differentiable(
+            result,
+            f"scorch.sparse_linear_fm has no derivative for {_describe(weight)} in "
+            f"mode order {list(weight.mode_order)}: " + _LINEAR_FM_DIFFERENTIABLE,
+            "sparse_linear_derivative_unsupported",
+            (weight, x, bias),
+        ),
+    )
+
+
+# The refusal a result with no derivative raises, by the code of its operation: a table
+# of the classes, so that every class ``_NotDifferentiable`` can raise is named here.
+_DERIVATIVE_REFUSALS: Dict[str, Type[DerivativeUnsupportedError]] = {
+    MatmulDerivativeError.code: MatmulDerivativeError,
+    EinsumDerivativeError.code: EinsumDerivativeError,
+    SparseLinearDerivativeError.code: SparseLinearDerivativeError,
+}
+
+
 class _NotDifferentiable(torch.autograd.Function):
     """Carries a result computed without autograd; raises if a gradient is asked of it."""
 
     @staticmethod
     def forward(
-        ctx: Any, result: torch.Tensor, what: str, *inputs: torch.Tensor
+        ctx: Any, result: torch.Tensor, refusal: Tuple[str, str], *inputs: torch.Tensor
     ) -> torch.Tensor:
-        ctx.what = what
+        ctx.refusal = refusal
         return result.detach()  # not ``result`` itself: see the note above _x_at_a
 
     @staticmethod
     def backward(ctx: Any, *grads: torch.Tensor):
-        raise ScorchNotImplementedError(
-            f"scorch.matmul has no derivative for {ctx.what}; differentiable products "
-            "are a 2-D sparse operand (torch CSR or COO, or a CSR, CSC, DCSR or sorted "
-            "COO STensor) times a dense float32/float64 CPU matrix or vector, either way "
-            "round, with no keyword arguments",
-            code="matmul_derivative_unsupported",
-        )
+        message, code = ctx.refusal
+        error = _DERIVATIVE_REFUSALS[code]
+        raise error(message)
 
     @staticmethod
     def jvp(ctx: Any, *tangents: Any):
-        raise NotImplementedError(
-            f"scorch.matmul has no forward derivative for {ctx.what}"
-        )
+        message, code = ctx.refusal
+        error = _DERIVATIVE_REFUSALS[code]
+        raise error(f"(forward mode) {message}")
+
+
+def not_differentiable(
+    result: Any, message: str, code: str, operands: Tuple[Any, ...]
+) -> Any:
+    """``result``, computed without autograd, with a ``grad_fn`` that raises ``message``
+    when a gradient is asked of it, as the class ``_DERIVATIVE_REFUSALS`` gives ``code``
+    -- torch's convention for an operation with no derivative, so a forward pass that
+    never calls ``backward`` keeps working.  Its inputs are the torch operands and the
+    tensors autograd tracks for the STensor operands' values, so the result requires
+    grad whenever any operand does.
+
+    An STensor result gets the node on the tensor autograd tracks for its values (a view
+    of its stored values, as the ``_NotDifferentiable`` output of an input is), and with
+    it ``requires_grad``; one no input asks a gradient of gets neither."""
+    inputs = [x for x in operands if isinstance(x, torch.Tensor)]
+    inputs += [t for t in map(_tracked, operands) if t is not None]
+    if type(result) is not STensor:
+        return _NotDifferentiable.apply(result, (message, code), *inputs)
+    tracked = _NotDifferentiable.apply(result._storage._value, (message, code), *inputs)
+    if tracked.requires_grad:
+        attach(result, tracked)
+    return result
+
+
+_MATMUL_DIFFERENTIABLE = (
+    "differentiable products are those of 1-D and 2-D operands with no keyword "
+    "arguments: a sparse operand times a dense float32/float64 CPU matrix or vector "
+    "either way round by scorch's SpMM, and every other such product as the einsum it "
+    "is (scorch.einsum's derivative)"
+)
 
 
 def _describe(x: Any) -> str:
@@ -1260,20 +1490,67 @@ def _describe(x: Any) -> str:
     return type(x).__name__
 
 
+# The einsum each product of 1-D and 2-D operands is (torch.matmul's semantics), whose
+# derivative einsum_grad records for a product the Functions above do not cover.
+_PRODUCT_EXPRESSIONS: Dict[Tuple[Optional[int], Optional[int]], str] = {
+    (2, 2): "ij,jk->ik",
+    (2, 1): "ij,j->i",
+    (1, 2): "j,jk->k",
+    (1, 1): "j,j->",
+}
+
+
+def _rank(x: Any) -> Optional[int]:
+    if type(x) is STensor or isinstance(x, torch.Tensor):
+        return int(x.dim())
+    return None
+
+
 def _not_differentiable(
     a: Any, b: Any, ordinary: Callable[..., Any], kwargs: Dict[str, Any]
 ) -> Any:
-    inputs = [x for x in (a, b) if isinstance(x, torch.Tensor)]
     # Computed from the primals, outside autograd: the ordinary path records nothing, and
     # with forward-mode AD active it would otherwise be asked again.
-    with torch.no_grad():
-        result = ordinary(
-            *(x.detach() if isinstance(x, torch.Tensor) else x for x in (a, b)),
-            **kwargs,
-        )
-    if type(result) is not torch.Tensor:
-        return result  # an STensor result has no autograd at all (see STensor)
+    detached = tuple(x.detach() if isinstance(x, torch.Tensor) else x for x in (a, b))
     what = f"{_describe(a)} @ {_describe(b)}" + (
         f" with {', '.join(sorted(kwargs))}" if kwargs else ""
     )
-    return _NotDifferentiable.apply(result, what, *inputs)
+    expression = _PRODUCT_EXPRESSIONS.get((_rank(a), _rank(b)))
+    if expression is not None:
+        # A product of 1-D and 2-D operands is an einsum: its derivative is the
+        # einsum's (einsum_grad), recorded on the result the ordinary path returns for
+        # the same call, keyword arguments included (``format=`` names the result's
+        # layout, which the derivative reads), so the product has one type and one value
+        # in every grad mode.
+        def compute(_expression: str, *_operands: Any, **_kwargs: Any) -> Any:
+            return ordinary(*detached, **kwargs)
+
+        def refuse(result: Any, why: str) -> Any:
+            return _refused_product(result, what + f" ({why})", a, b)
+
+        return einsum_grad.recorded(expression, (a, b), kwargs, compute, refuse)
+    with torch.no_grad():
+        result = ordinary(*detached, **kwargs)
+    return _refused_product(result, what, a, b)
+
+
+def _refused_product(result: Any, what: str, a: Any, b: Any) -> Any:
+    """``result`` with the node that raises ``matmul_derivative_unsupported``."""
+
+    if type(result) is TensorSpec:
+        # A compile-only call: no values were computed, so there is no gradient to drop.
+        return result
+    if type(result) not in (torch.Tensor, STensor):
+        # Every product scorch.matmul computes is one of the two; anything else cannot
+        # carry the node, so the gradient asked for is refused rather than dropped.
+        raise MatmulDerivativeError(
+            f"scorch.matmul cannot record a gradient for {what}: its result is an "
+            f"{type(result).__name__}, which carries no autograd; "
+            + _MATMUL_DIFFERENTIABLE
+        )
+    return not_differentiable(
+        result,
+        f"scorch.matmul has no derivative for {what}; " + _MATMUL_DIFFERENTIABLE,
+        "matmul_derivative_unsupported",
+        (a, b),
+    )

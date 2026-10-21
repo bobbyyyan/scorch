@@ -25,6 +25,7 @@ from typing import (
 
 import scorch_ops as _scorch_ops
 import torch
+import torch.autograd.forward_ad as _fwad
 from torch.fx import Proxy
 
 from .compiler import compile_options as _compile_options_module
@@ -87,6 +88,7 @@ from .exceptions import (
     ScorchTypeError,
     ScorchValueError,
     ShapeCapacitySpecError,
+    TensorFormatError,
     TensorTypeError,
     defect_code,
     raise_if_native_coded,
@@ -137,6 +139,7 @@ from .stensor import (
 # own line so the suppression covers this name only.
 from .stensor import _finalize_generated_mode_indices  # noqa: F401 - re-export
 from . import autograd as _autograd
+from . import einsum_grad as _einsum_grad
 from .result_bound import EntryBound, entry_bound, level_totals_in_source
 from .utils import (
     _PreparedJITBuild,
@@ -1457,7 +1460,8 @@ def _spmv_owned(
     for tensor in [a, b]:
         args.append(tensor.shape)  # type: ignore
         args.append(tensor._native_mode_indices())  # type: ignore
-        args.append(tensor.values)  # type: ignore
+        # The detached values: native code never reads autograd's tensor (stensor_grad).
+        args.append(tensor._raw_values)  # type: ignore
 
     start_time = time.time()
     try:
@@ -3052,6 +3056,10 @@ def fast_transpose(x: torch.Tensor) -> torch.Tensor:
     Uses ``torch.get_num_threads()`` when ``SCORCH_MATCH_HOST_THREADS`` is on, else
     ``-1``. Backs the input transpose inside :func:`sparse_linear`.
 
+    A call through which a gradient is wanted (``x`` requires grad in grad mode, or has
+    a forward-mode tangent) is recorded as ``_FastTranspose``, whose derivative is the
+    same transpose, so ``sparse_linear``'s input gets its gradient.
+
     Examples
     --------
     >>> import torch
@@ -3066,8 +3074,34 @@ def fast_transpose(x: torch.Tensor) -> torch.Tensor:
     fn = getattr(_native, "scorch_transpose_2d_float", None)
     if fn is None or x.dim() != 2 or x.dtype != torch.float32:
         return x.T.contiguous()
+    # autograd.wanted_for written out, the flag first and forward-mode AD after: a call
+    # through which no gradient is wanted makes no call into autograd.py.
+    if (x.requires_grad and torch.is_grad_enabled()) or (
+        _fwad._current_level >= 0 and _autograd.wanted_for(x)
+    ):
+        return _FastTranspose.apply(x)
     nthreads = torch.get_num_threads() if _MATCH_HOST_THREADS else -1
     return fn(x.contiguous(), nthreads)
+
+
+class _FastTranspose(torch.autograd.Function):
+    """``fast_transpose(x)`` recorded for autograd. The derivative of a transpose is the
+    transpose of the incoming gradient, computed by ``fast_transpose`` again, which
+    records itself under grad mode, so a second derivative is recorded the same way."""
+
+    @staticmethod
+    def forward(ctx: Any, x: torch.Tensor) -> torch.Tensor:  # type: ignore[override]
+        # Never a view (the fallback's contiguous() returns one when x.T is contiguous
+        # already): see the note above autograd._in_layout.
+        return fast_transpose(x.detach()).detach()
+
+    @staticmethod
+    def backward(ctx: Any, g: torch.Tensor) -> torch.Tensor:  # type: ignore[override]
+        return fast_transpose(g)
+
+    @staticmethod
+    def jvp(ctx: Any, dx: torch.Tensor) -> torch.Tensor:  # type: ignore[override]
+        return fast_transpose(dx)
 
 
 def sparse_softmax_csr(
@@ -3331,14 +3365,20 @@ def sparse_linear_fm(
     fn = getattr(_native, "spmm_csr_linear_fused_float", None)
     if (
         fn is None
-        or weight.values.dtype != torch.float32
+        or weight._raw_values.dtype != torch.float32
         or x_vals.dtype != torch.float32
     ):
         # Fallback (kernel unavailable / unsupported dtype): dense reference in
-        # feature-major layout so the op still produces the right result.
+        # feature-major layout so the op still produces the right result.  Torch
+        # operations throughout, so torch records its gradient: ``to_torch`` and
+        # ``values`` read the tensor autograd tracks for an STensor's values.
         w_dense = weight.to_torch()
         x_dense = x_vals.reshape(in_dim, batch)
-        y = torch.matmul(w_dense, x_dense) + bias_t.view(-1, 1)
+        y = torch.matmul(w_dense, x_dense)
+        if bias is not None:
+            # In the product's dtype: ``bias_t`` is the float32 copy the kernel takes,
+            # which rounds a float64 bias.
+            y = y + bias.to(y.dtype).view(-1, 1)
         if act == 1:
             return torch.relu(y)
         if act == 2:
@@ -3351,14 +3391,56 @@ def sparse_linear_fm(
         nthreads = torch.get_num_threads()
         atparallel = _ATPARALLEL_PIPELINE
 
+    # autograd.wanted_by_any written out, as _einsum_compiler_path has it: a call through
+    # which no gradient is wanted makes no call into autograd.py.
+    grad_wanted = False
+    if torch.is_grad_enabled():
+        for operand in (x_fm, weight, bias):
+            if (isinstance(operand, torch.Tensor) and operand.requires_grad) or (
+                type(operand) is STensor and operand._metadata.requires_grad
+            ):
+                grad_wanted = True
+                break
+    if not grad_wanted and _fwad._current_level >= 0:
+        grad_wanted = _autograd.wanted_by_any((x_fm, weight, bias))
+    if grad_wanted:
+
+        def kernel(
+            values: torch.Tensor, x: torch.Tensor, bias_values: torch.Tensor
+        ) -> torch.Tensor:
+            # The call below, on the values, activation and bias autograd hands it.
+            result_cpp = fn(
+                result_shape,
+                list(weight.shape),
+                weight._native_mode_indices(),
+                values,
+                [in_dim, batch],
+                _EMPTY_MODE_INDICES,
+                x,
+                bias_values,
+                act,
+                256,
+                nthreads,
+                atparallel,
+            )
+            # The [out, batch] product as the kernel allocated it, as below.
+            return result_cpp.storage.value
+
+        # Recorded by autograd.linear_fm on the same kernel, so the layer returns the
+        # same values whether or not a gradient is wanted through it.
+        return _autograd.linear_fm(
+            weight, x_vals.reshape(in_dim, batch), bias_t, act, kernel
+        )
+
     result_cpp = fn(
         result_shape,
         list(weight.shape),
         weight._native_mode_indices(),
-        weight.values,
+        # The detached values: native code never reads autograd's tensor.
+        weight._raw_values,
         [in_dim, batch],
         _EMPTY_MODE_INDICES,
-        x_vals,
+        x_vals if isinstance(x_fm, torch.Tensor) else x_fm._raw_values,
         bias_t,
         act,
         256,
@@ -3933,7 +4015,93 @@ def _refuse_einsum_result_past_bound(
 def _stored_counts(tensors: Sequence[Any]) -> List[int]:
     """Each operand's stored entries, the counts a result bound reads (patch 0056)."""
 
-    return [tensor.values.numel() for tensor in tensors]
+    return [tensor._raw_values.numel() for tensor in tensors]
+
+
+def _validated_einsum_request(
+    expression: Any, tensors: Sequence[Any], kwargs: Mapping[str, Any]
+) -> Tuple[
+    List[str],
+    str,
+    Any,
+    Any,
+    Optional[TensorFormat],
+    Optional[List[int]],
+    dict,
+]:
+    """The checks every einsum request passes before anything is computed.
+
+    ``tensors`` are STensors or TensorSpecs (torch operands already converted).  Returns
+    ``(input_groups, result_expression, input_index_strs, result_index_strs,
+    requested_output_format, output_mode_order, logical_index_sizes)``.  Shared by the
+    compiler path (``_einsum_owned``) and the all-dense path (``_dense_einsum``), so a
+    mistake is refused with the same code whichever path the operands take.
+    """
+
+    if not isinstance(expression, str) or expression.count("->") != 1:
+        raise CompileSpecError(
+            "einsum expression must contain an explicit '->'",
+            code="einsum_implicit_output_unsupported",
+        )
+    input_expression, result_expression = expression.split("->")
+    input_groups = input_expression.split(",")
+    if len(input_groups) != len(tensors):
+        raise CompileSpecError(
+            f"einsum expression expects {len(input_groups)} operands, got {len(tensors)}",
+            code="einsum_operand_count_mismatch",
+        )
+    if any(tensor is None for tensor in tensors):
+        raise TensorTypeError(
+            "einsum operands cannot be None", code="einsum_operand_type_invalid"
+        )
+    invalid = [
+        type(tensor).__name__
+        for tensor in tensors
+        if not isinstance(tensor, (STensor, TensorSpec))
+    ]
+    if invalid:
+        raise TensorTypeError(
+            "einsum operands must be torch.Tensor, STensor, or TensorSpec; got "
+            + ", ".join(invalid),
+            code="einsum_operand_type_invalid",
+        )
+    input_index_strs, result_index_strs = _validated_labels(
+        expression, input_groups, result_expression
+    )
+    requested_output_format = _require_output_format_rank(
+        kwargs.get("format"), len(result_index_strs), "einsum"
+    )
+    if requested_output_format is not None:
+        if any(
+            level_type == LevelType.SINGLETON
+            for level_type in requested_output_format.get_level_types()
+        ):
+            raise CompileSpecError(
+                "singleton output levels are not supported by the compiler",
+                code="singleton_level_unsupported",
+            )
+    for operand, (labels, tensor) in enumerate(zip(input_index_strs, tensors)):
+        if len(labels) != tensor.dim():
+            raise CompileSpecError(
+                f"einsum operand {operand} has {len(labels)} labels but tensor "
+                f"rank {tensor.dim()}",
+                code="einsum_operand_rank_mismatch",
+            )
+    output_mode_order = kwargs.get("output_mode_order")
+    if output_mode_order is not None:
+        output_mode_order = _checked_output_mode_order(
+            output_mode_order, len(result_index_strs)
+        )
+    logical_index_sizes = _logical_index_sizes(input_index_strs, tensors)
+    return (
+        input_groups,
+        result_expression,
+        input_index_strs,
+        result_index_strs,
+        requested_output_format,
+        output_mode_order,
+        logical_index_sizes,
+    )
 
 
 def _einsum_owned(
@@ -4057,61 +4225,15 @@ def _einsum_owned(
     tensors = tuple(
         STensor.from_torch(t) if isinstance(t, torch.Tensor) else t for t in tensors
     )
-    if not isinstance(expression, str) or expression.count("->") != 1:
-        raise CompileSpecError(
-            "einsum expression must contain an explicit '->'",
-            code="einsum_implicit_output_unsupported",
-        )
-    input_expression, result_expression = expression.split("->")
-    input_groups = input_expression.split(",")
-    if len(input_groups) != len(tensors):
-        raise CompileSpecError(
-            f"einsum expression expects {len(input_groups)} operands, got {len(tensors)}",
-            code="einsum_operand_count_mismatch",
-        )
-    if any(tensor is None for tensor in tensors):
-        raise TensorTypeError(
-            "einsum operands cannot be None", code="einsum_operand_type_invalid"
-        )
-    invalid = [
-        type(tensor).__name__
-        for tensor in tensors
-        if not isinstance(tensor, (STensor, TensorSpec))
-    ]
-    if invalid:
-        raise TensorTypeError(
-            "einsum operands must be torch.Tensor, STensor, or TensorSpec; got "
-            + ", ".join(invalid),
-            code="einsum_operand_type_invalid",
-        )
-    input_index_strs, result_index_strs = _validated_labels(
-        expression, input_groups, result_expression
-    )
-    requested_output_format = _require_output_format_rank(
-        kwargs.get("format"), len(result_index_strs), "einsum"
-    )
-    if requested_output_format is not None:
-        if any(
-            level_type == LevelType.SINGLETON
-            for level_type in requested_output_format.get_level_types()
-        ):
-            raise CompileSpecError(
-                "singleton output levels are not supported by the compiler",
-                code="singleton_level_unsupported",
-            )
-    for operand, (labels, tensor) in enumerate(zip(input_index_strs, tensors)):
-        if len(labels) != tensor.dim():
-            raise CompileSpecError(
-                f"einsum operand {operand} has {len(labels)} labels but tensor "
-                f"rank {tensor.dim()}",
-                code="einsum_operand_rank_mismatch",
-            )
-    output_mode_order = kwargs.get("output_mode_order")
-    if output_mode_order is not None:
-        output_mode_order = _checked_output_mode_order(
-            output_mode_order, len(result_index_strs)
-        )
-    logical_index_sizes = _logical_index_sizes(input_index_strs, tensors)
+    (
+        input_groups,
+        result_expression,
+        input_index_strs,
+        result_index_strs,
+        requested_output_format,
+        output_mode_order,
+        logical_index_sizes,
+    ) = _validated_einsum_request(expression, tensors, kwargs)
     if not compile_only and any(isinstance(tensor, TensorSpec) for tensor in tensors):
         raise CompileSpecError(
             "TensorSpec has no runtime payload; pass compile_only=True or use STensor",
@@ -4126,7 +4248,7 @@ def _einsum_owned(
         and not compile_only
         and expression == "ij,ik,jk->ij"
         and len(tensors) == 3
-        and tensors[0].values.dtype == torch.float32
+        and cast(STensor, tensors[0])._raw_values.dtype == torch.float32
         and str(tensors[0].format) == "o,o"
         and str(tensors[1].format) == "d,d"
         and str(tensors[2].format) == "d,d"
@@ -4146,13 +4268,13 @@ def _einsum_owned(
                 result_shape,
                 S.shape,
                 S._native_mode_indices(),
-                S.values,
+                cast(STensor, S)._raw_values,
                 A.shape,
                 A._native_mode_indices(),
-                A.values,
+                cast(STensor, A)._raw_values,
                 B.shape,
                 B._native_mode_indices(),
-                B.values,
+                cast(STensor, B)._raw_values,
             )
             return _wrap_generated_result(
                 shape=result_shape,
@@ -4246,7 +4368,7 @@ def _einsum_owned(
             for _t in tensors:
                 _args.append(_t.shape)
                 _args.append(_t._native_mode_indices())
-                _args.append(_t.values)
+                _args.append(cast(STensor, _t)._raw_values)
 
             # ``_evaluate_native`` without its call.  A try block costs nothing until
             # it raises (CPython 3.11 and later).
@@ -4726,7 +4848,7 @@ def _einsum_owned(
     for tensor in tensors:
         args.append(tensor.shape)  # type: ignore
         args.append(tensor._native_mode_indices())  # type: ignore
-        args.append(tensor.values)  # type: ignore
+        args.append(tensor._raw_values)  # type: ignore
 
     # Append extra tensors for PostOps (bias, scale, etc.)
     if _post_ops_tensors:
@@ -4764,12 +4886,174 @@ def _einsum_owned(
     return result
 
 
+def _einsum_operands(expression: Any, tensors: Tuple[Any, ...]) -> Tuple[Any, ...]:
+    """The operands of an einsum call, in each form ``torch.einsum`` accepts.
+
+    ``einsum("ij,jk->ik", a, b)``; the operands as one list,
+    ``einsum("ij,jk->ik", [a, b])``; and the sublist form
+    ``einsum(a, [0, 1], b, [1, 2], [0, 2])``, whose operands are the arguments in even
+    positions before the optional output sublist.
+    """
+
+    if isinstance(expression, str):
+        if len(tensors) == 1 and isinstance(tensors[0], (list, tuple)):
+            return tuple(tensors[0])
+        return tensors
+    arguments = (expression,) + tensors
+    return arguments[0 : 2 * (len(arguments) // 2) : 2]
+
+
+def _torch_argument(argument: Any) -> Any:
+    """An einsum argument as ``torch.einsum`` takes it: a dense STensor as its tensor,
+    a list of operands element by element, anything else (a sublist, a torch tensor)
+    as it is."""
+
+    if type(argument) is STensor:
+        return argument.to_torch(in_place=False)
+    if isinstance(argument, list):
+        return [_torch_argument(item) for item in argument]
+    return argument
+
+
+def _requests_schedule(kwargs: Dict[str, Any]) -> bool:
+    """Whether a call requests a compiler schedule, in any of its four forms.
+
+    ``schedule=``, ``_schedule=``, a ``_compile_options`` snapshot whose
+    ``requested_schedule`` is set, and the context's ``schedule_force(...)``.  It is the
+    question the compiler path asks (``_matmul_compile_policy``, ``_DeferredOptions``):
+    a snapshot that was handed in decides by itself, otherwise the keywords decide and
+    then the forced schedule.  With no keyword arguments only the context variable is
+    read.  A request is explicit and torch cannot honor it, so an all-dense call that
+    makes one keeps the compiler path (scorch-merge, 2026-10-14).
+    """
+
+    return (
+        _matmul_compile_policy(kwargs)[1] if kwargs else get_forced_schedule()
+    ) is not None
+
+
+def _requests_sparse_result(kwargs: Dict[str, Any]) -> bool:
+    """Whether a call names a result ``format`` with a level that is not dense.
+
+    ``output_format=`` has been read as ``format=`` by then (``_entry_keywords``).  A
+    sparse result is scorch's computation even when every operand is dense (Bobby,
+    2026-10-14: "for sparse stuff it should always be scorch").  Such a call keeps the
+    compiler path, the route einsum ships for it: the shipped route is kept until the
+    measurement in drop-in note 5.1 decides between it and torch's product followed by
+    a conversion.  The two give the same values; their stored entries can differ,
+    which is allowed when the values are the same.  A ``format`` that does not parse is
+    the compiler path's to refuse, so it counts as not dense.
+    """
+
+    requested = kwargs.get("format")
+    if requested is None:
+        return False
+    try:
+        return not parse_format(requested).is_dense()
+    except (TensorFormatError, TensorTypeError):
+        return True
+
+
+def _dense_einsum(
+    expression: Any, tensors: Tuple[Any, ...], kwargs: Dict[str, Any]
+) -> Union[torch.Tensor, STensor]:
+    """An einsum whose operands and result are all dense, computed by ``torch.einsum``.
+
+    Under ``import scorch as torch`` a dense model's every ``torch.einsum`` arrives here,
+    so this is torch's own call: torch records its gradient and it compiles nothing.
+    With no keyword the arguments reach ``torch.einsum`` exactly as given, in every form
+    it accepts, and torch raises its own error for a mistake.  A keyword einsum does not
+    take (``out``) was refused at the entry, with ``unknown_keyword_argument``
+    (``_entry_keywords``).  A dense STensor operand reaches it through ``to_torch``,
+    which reads the tensor autograd tracks for its values when it has one
+    (``stensor_grad``), so its gradient is recorded by torch too.
+
+    The result's type follows the call (scorch-merge, 2026-10-14 18:4x): torch tensors
+    in and no result keyword give torch's tensor, as ``torch.einsum`` returns it; an
+    STensor operand, or a ``format`` (``output_format``) or ``output_mode_order``, give a
+    dense STensor over torch's tensor (``_dense_as_stensor``), as the compiler path
+    returns for the same call.
+
+    A call naming a scorch keyword is checked by ``_validated_einsum_request`` first, so a
+    mistake gets the code the compiler path gives it; ``time_dict`` gets ``eval_time``.
+    Two kinds of call never arrive here: one that requests a schedule
+    (``_requests_schedule``) and one whose ``format`` has a sparse level
+    (``_requests_sparse_result``).  The compiler builds both.
+    """
+
+    arguments = tuple(_torch_argument(argument) for argument in (expression,) + tensors)
+    stensor_result = (
+        "format" in kwargs
+        or "output_mode_order" in kwargs
+        or any(
+            type(operand) is STensor
+            for operand in _einsum_operands(expression, tensors)
+        )
+    )
+    if not kwargs:
+        result = torch.einsum(*arguments)
+        return _dense_as_stensor(result) if stensor_result else result
+    # Read for their descriptors only, so under no_grad: a converted operand that
+    # requires grad would otherwise record a copy of its values nothing reads.
+    with torch.no_grad():
+        stensors = tuple(
+            STensor.from_torch(item) if isinstance(item, torch.Tensor) else item
+            for item in _einsum_operands(expression, tensors)
+        )
+    (
+        _input_groups,
+        _result_expression,
+        _input_index_strs,
+        _result_index_strs,
+        _requested_output_format,
+        output_mode_order,
+        _logical_index_sizes,
+    ) = _validated_einsum_request(expression, stensors, kwargs)
+    start_time = time.time()
+    result = torch.einsum(*arguments)
+    if "time_dict" in kwargs:
+        kwargs["time_dict"]["eval_time"] = time.time() - start_time
+    if not stensor_result:
+        return result
+    return _dense_as_stensor(result, output_mode_order)
+
+
+def _dense_as_stensor(
+    result: torch.Tensor, output_mode_order: Optional[List[int]] = None
+) -> STensor:
+    """A dense torch result as a dense STensor over the same memory.
+
+    ``STensor.from_torch`` stores a dense tensor's values as its row-major flattening in
+    the STensor's mode order, a view when the tensor is laid out in that order, and gives
+    them the tensor's history when it requires grad (``stensor_grad.link_dense_copy``),
+    so the STensor differentiates as torch's tensor does.  A requested
+    ``output_mode_order`` is the mode order, and a tensor laid out otherwise is copied
+    into it.  With none requested the level order is scorch's choice (the format fixes
+    each mode's level kind, not their order), so the mode order is the one torch's tensor
+    is laid out in: a permutation of its axes that makes it contiguous, when there is one.
+    ``torch.einsum`` can return such a permuted view (``"ij,jk->ki"``), and then nothing
+    is copied either.  A tensor that is no permutation of a contiguous one (none comes
+    from ``torch.einsum`` today) is copied into the identity order.
+    """
+
+    identity = list(range(result.dim()))
+    order = identity if output_mode_order is None else output_mode_order
+    if output_mode_order is None and result.dim() > 1 and not result.is_contiguous():
+        # The axes by decreasing stride; ties (a size-1 axis can have any stride) keep
+        # the logical order.
+        strides = result.stride()
+        by_stride = sorted(identity, key=lambda axis: (-strides[axis], axis))
+        if result.permute(*by_stride).is_contiguous():
+            order = by_stride
+    return STensor.from_torch(result, mode_order=None if order == identity else order)
+
+
 def einsum(
-    expression: str,
+    expression: Any,
     *tensors: Optional[Union[torch.Tensor, STensor, TensorSpec]],
     compile_only: Optional[bool] = False,
     **kwargs: Any,
-) -> Union[STensor, TensorSpec]:
+) -> Union[torch.Tensor, STensor, TensorSpec]:
     """Compile and evaluate a validated numpy-style sparse/dense einsum."""
 
     # The product entries' keyword rule first (patch 0072): a name einsum does not take
@@ -4777,6 +5061,99 @@ def einsum(
     # the test alone.
     if kwargs:
         _entry_keywords(kwargs, _EINSUM_KEYWORDS, "einsum")
+    # Operands and a result that are all dense are torch's computation (drop-in
+    # note, section 0.1, step 1): ``_dense_einsum``.  Tested before anything else
+    # is built, so a dense model pays one pass over its operands.  A sparse result
+    # format (``_requests_sparse_result``), a compile-only request, a schedule
+    # request (``_requests_schedule``), and the internal calls that carry another
+    # call's options (``_deferred_options``, from ``matmul``) or fused
+    # post-operations (``_post_ops``, ``_post_ops_tensors``), keep the compiler path,
+    # ``_einsum_compiler_path``.  This is the one decision between the two routes:
+    # neither hands a call to the other.
+    if (
+        not compile_only
+        and "_deferred_options" not in kwargs
+        and "_post_ops" not in kwargs
+        and "_post_ops_tensors" not in kwargs
+    ):
+        operands = _einsum_operands(expression, tensors)
+        if (
+            operands
+            and all(_is_dense_operand(operand) for operand in operands)
+            and not _requests_sparse_result(kwargs)
+            and not _requests_schedule(kwargs)
+        ):
+            return _dense_einsum(expression, tensors, kwargs)
+    return _einsum_compiler_path(
+        expression, *tensors, compile_only=compile_only, **kwargs
+    )
+
+
+def _einsum_via_compiler(
+    expression: Any,
+    *tensors: Optional[Union[torch.Tensor, STensor, TensorSpec]],
+    compile_only: Optional[bool] = False,
+    **kwargs: Any,
+) -> Union[torch.Tensor, STensor, TensorSpec]:
+    """``einsum`` computed by scorch's compiler, whatever the operands are.
+
+    ``einsum`` sends an all-dense call with no schedule request to ``torch.einsum``
+    and everything else to the compiler.  A caller that needs scorch's own kernel for
+    an all-dense program, such as a harness comparing compilers or a test of dense
+    code generation under the automatic schedule, calls this instead.  It checks a
+    call's arguments as ``einsum`` does, then runs the same compiler path
+    (``_einsum_compiler_path``), so the two entries build the same kernel for the same
+    call.
+    """
+
+    return _einsum_compiler_path(
+        expression, *tensors, compile_only=compile_only, **kwargs
+    )
+
+
+def _einsum_compiler_path(
+    expression: Any,
+    *tensors: Optional[Union[torch.Tensor, STensor, TensorSpec]],
+    compile_only: Optional[bool] = False,
+    **kwargs: Any,
+) -> Union[torch.Tensor, STensor, TensorSpec]:
+    """The compiler's einsum, after the entry's argument checks (``einsum``,
+    ``_einsum_via_compiler``): the options holder, the compilation owner and
+    ``_einsum_owned``.
+
+    A call through which a gradient is wanted (``autograd.wanted_by_any``: grad mode and
+    an operand that asks for one, or a forward-mode tangent) is computed without autograd
+    and its result recorded with a node that raises ``einsum_derivative_unsupported``
+    when a gradient is asked of it (``_einsum_without_derivative``), so a forward pass
+    that never calls ``backward`` runs and a gradient is never dropped.  ``matmul``'s own
+    calls (``_deferred_options``) are exempt: ``autograd.serve`` has decided their
+    gradient, and computes what it does not cover under ``torch.no_grad`` on detached
+    operands.
+    """
+
+    if not compile_only and "_deferred_options" not in kwargs:
+        # autograd.wanted_by_any written out, grad mode and the operands' flags first and
+        # forward-mode AD after, so a call through which no gradient is wanted makes no
+        # call into autograd.py. The operands are _einsum_operands', read in place.
+        grad_wanted = False
+        if torch.is_grad_enabled():
+            if isinstance(expression, str):
+                operands = tensors
+                if len(tensors) == 1 and isinstance(tensors[0], (list, tuple)):
+                    operands = tensors[0]
+            else:
+                arguments = (expression,) + tensors
+                operands = arguments[0 : 2 * (len(arguments) // 2) : 2]
+            for operand in operands:
+                if (isinstance(operand, torch.Tensor) and operand.requires_grad) or (
+                    type(operand) is STensor and operand._metadata.requires_grad
+                ):
+                    grad_wanted = True
+                    break
+        if not grad_wanted and _fwad._current_level >= 0:
+            grad_wanted = _autograd.wanted_by_any(_einsum_operands(expression, tensors))
+        if grad_wanted:
+            return _einsum_recorded(expression, tensors, kwargs)
     # ``_deferred_options``: the options holder of a call this one runs inside
     # (``matmul``), made from the same keyword arguments, so the two make at most one
     # snapshot between them.
@@ -4801,6 +5178,36 @@ def einsum(
     except Exception:
         compilation.fail_frontend_if_active()
         raise
+
+
+def _einsum_recorded(
+    expression: Any, tensors: Tuple[Any, ...], kwargs: Dict[str, Any]
+) -> Union[torch.Tensor, STensor]:
+    """The compiler's einsum of a call through which a gradient is wanted, computed on
+    detached operands under ``torch.no_grad`` and recorded by ``einsum_grad``: its
+    result's values as a function of every operand's.  A call that module does not
+    differentiate gets a node that raises ``einsum_derivative_unsupported`` when a
+    gradient is asked of it instead (``autograd.not_differentiable``), whose inputs are
+    every operand that requires grad, so the result requires grad exactly when torch's
+    would and a forward pass that never calls ``backward`` runs."""
+
+    operands = _einsum_operands(expression, tensors)
+
+    def refuse(result: Any, why: str) -> Any:
+        shown = expression if isinstance(expression, str) else "<sublist form>"
+        described = ", ".join(_autograd._describe(operand) for operand in operands)
+        return _autograd.not_differentiable(
+            result,
+            f"scorch.einsum has no derivative for {shown!r} with {described}: {why}. "
+            "An einsum whose operands and result are all dense is differentiated by "
+            "torch.einsum",
+            "einsum_derivative_unsupported",
+            operands,
+        )
+
+    return _einsum_grad.recorded(
+        expression, tensors, kwargs, _einsum_compiler_path, refuse
+    )
 
 
 einsum.__doc__ = _einsum_owned.__doc__
@@ -4912,7 +5319,9 @@ def _snapshot_runtime_tensors(
             tensor_format = STensor.format.__get__(arg, STensor)
             mode_order = STensor.mode_order.__get__(arg, STensor)
             has_index = STensor.has_index.__get__(arg, STensor)
-            values = STensor.values.__get__(arg, STensor)
+            # The detached values: the snapshot reaches native code, which never
+            # reads autograd's tensor (stensor_grad).
+            values = STensor._raw_values.__get__(arg, STensor)
             native_mode_indices = STensor._native_mode_indices(arg)
         except CompileSpecError:
             raise

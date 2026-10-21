@@ -944,7 +944,11 @@ def test_matmul_dd_dd_dd():
     a_scorch = STensor.from_torch(tensor_a_torch, "A").to_dense()
     b_scorch = STensor.from_torch(tensor_b_torch, "B").to_dense()
 
-    scorch_result = einsum("ik,kj->ij", a_scorch, b_scorch, format="dd")
+    # The compiler's dd x dd -> dd kernel, through the compiler's own entry: the public
+    # einsum hands an all-dense call to torch.einsum (drop-in note, 0.1 step 1).
+    scorch_result = scorch_ops._einsum_via_compiler(
+        "ik,kj->ij", a_scorch, b_scorch, format="dd"
+    )
 
     result_torch = torch.matmul(tensor_a_torch, tensor_b_torch)
     scorch_result_torch = scorch_result.to_torch()
@@ -1924,10 +1928,13 @@ def test_einsum_dense_root_reduction():
     dense and sparse workspace APIs over one undeclared symbol and failed
     to compile.  The scheduler now elides that insertion exactly as the
     empty-Schedule replay contract does.
+
+    The compiler is reached through its own entry: the public einsum hands an all-dense
+    call to torch.einsum (drop-in note, 0.1 step 1).
     """
 
     torch.manual_seed(2612)
     dense = torch.randn(5, 7)
     dense_stensor = STensor.from_torch(dense, "A").to_dense()
-    result = einsum("jk->k", dense_stensor)
+    result = scorch_ops._einsum_via_compiler("jk->k", dense_stensor)
     assert torch.allclose(result.values, dense.sum(dim=0), atol=1e-3, rtol=1e-3)

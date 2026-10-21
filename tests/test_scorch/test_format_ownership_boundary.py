@@ -42,6 +42,7 @@ from scorch.format import (
 )
 from scorch.exceptions import (
     CompileSpecError,
+    ScorchRuntimeError,
     TensorDeviceError,
     TensorFormatError,
     TensorIndexError,
@@ -1075,8 +1076,30 @@ def test_a_copy_has_its_own_metadata_and_shares_only_values():
 
     with pytest.raises(AttributeError):
         object.__setattr__(duplicate.format, "_level_formats", _OO)
-    duplicate.requires_grad = False
+    # Values that require grad are copied as torch's clone copies them: the copy is
+    # recorded, so it is not a leaf, and a non-leaf's flag cannot be cleared.
+    assert duplicate.grad_fn is not None and not duplicate.is_leaf
+    with pytest.raises(ScorchRuntimeError) as raised:
+        duplicate.requires_grad = False
+    assert raised.value.code == "stensor_requires_grad_non_leaf"
+    # A leaf's copy is a leaf with a flag of its own: setting it leaves the original's.
+    plain = csr("B")
+    plain_copy = plain.copy()
+    plain_copy.requires_grad = True
+    assert plain.requires_grad is False
     assert tensor.requires_grad is True
+
+    # The same three facts of torch's clone, the rule the copy follows.
+    reference = torch.eye(3).requires_grad_()
+    reference_copy = reference.clone()
+    assert reference_copy.grad_fn is not None and not reference_copy.is_leaf
+    with pytest.raises(RuntimeError, match="leaf variables"):
+        reference_copy.requires_grad = False
+    plain_reference = torch.eye(3)
+    plain_reference_copy = plain_reference.clone()
+    plain_reference_copy.requires_grad = True
+    assert plain_reference.requires_grad is False
+    assert reference.requires_grad is True
     assert list(tensor.format.get_level_types()) == [
         LevelType.DENSE,
         LevelType.COMPRESSED,

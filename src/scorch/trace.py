@@ -265,7 +265,7 @@ def _prebuilt_inputs(
         return None
     if a.storage.index.mode_order != [0, 1]:
         return None
-    if a.values.device.type != "cpu" or not a.values.is_contiguous():
+    if a._raw_values.device.type != "cpu" or not a._raw_values.is_contiguous():
         return None
 
     if type(b) is torch.Tensor:
@@ -283,12 +283,14 @@ def _prebuilt_inputs(
             b.dim() != 2
             or str(b.format) != "d,d"
             or b.storage.index.mode_order != [0, 1]
-            or b.values.device.type != "cpu"
-            or not b.values.is_contiguous()
+            or b._raw_values.device.type != "cpu"
+            or not b._raw_values.is_contiguous()
         ):
             return None
-        b_dtype = b.values.dtype
-        b_requires_grad = b.values.requires_grad
+        b_dtype = b._raw_values.dtype
+        # The flag, set exactly when the STensor's values carry autograd's history
+        # (stensor_grad): what autograd.wanted and the C entry point read.
+        b_requires_grad = b._metadata.requires_grad
     else:
         return None
 
@@ -302,13 +304,17 @@ def _prebuilt_inputs(
         return None
     if a.shape[1] != b.shape[0] or bias.shape[0] != b.shape[1]:
         return None
-    if not (a.values.dtype == b_dtype == bias.dtype == torch.float32):
+    if not (a._raw_values.dtype == b_dtype == bias.dtype == torch.float32):
         return None
+    # The fused kernel records no gradient, so a call through which one is wanted keeps
+    # the eager path, which records it (autograd.py).
     if torch.is_grad_enabled() and (
-        a.values.requires_grad or b_requires_grad or bias.requires_grad
+        a._metadata.requires_grad or b_requires_grad or bias.requires_grad
     ):
         return None
 
+    # ``values``, not ``_raw_values``: the tensor autograd tracks for an STensor's values
+    # where it has one, which is the tensor a forward-mode tangent would be on.
     b_values = b.values if isinstance(b, STensor) else b
     if any(
         tensor.is_neg() or tensor.is_conj() for tensor in (a.values, b_values, bias)
@@ -387,10 +393,11 @@ def _fused_kernel_args(
         result_shape,
         list(a.shape),
         a._native_mode_indices(),
-        a.values,
+        # The detached values: native code never reads autograd's tensor.
+        a._raw_values,
         list(b.shape),
         b._native_mode_indices(),
-        b.values,
+        b._raw_values,
         bias,
     )
 
@@ -461,7 +468,7 @@ def _try_prebuilt_fused(spec: FusionSpec, args: tuple) -> Optional[Callable]:
     a, b, _ = prepared
     post_op_kinds = tuple(op.kind for op in spec.post_ops.ops)
     resolved = resolve_prebuilt_fused(
-        str(a.format), str(b.format), post_op_kinds, a.values.dtype
+        str(a.format), str(b.format), post_op_kinds, a._raw_values.dtype
     )
     if resolved is None:
         return None

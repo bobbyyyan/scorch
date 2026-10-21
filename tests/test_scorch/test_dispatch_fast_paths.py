@@ -295,12 +295,21 @@ def test_a_malformed_expression_still_reports_the_operand_problem_first():
 
     Both of these expressions have an illegal label. Neither error is the one a caller
     sees, because the operand count and the None check come first -- and they still do.
+
+    ``B`` is sparse, so the call is scorch's: an all-dense call naming no scorch keyword
+    is torch.einsum's own, and gets torch's error for the label (drop-in note, 0.1
+    step 1), which the last check pins.
     """
-    B = torch.rand(4, 4)
+    B = STensor.from_torch((torch.rand(4, 4) < 0.5).float().to_sparse_csr())
     with pytest.raises(CompileSpecError, match="expects 2 operands"):
         scorch.einsum("i&,kj->ij", B)
     with pytest.raises(TensorTypeError, match="operands cannot be None"):
         scorch.einsum("i&,kj->ij", None, B)
+    dense = torch.rand(4, 4)
+    with pytest.raises(RuntimeError, match="invalid subscript"):
+        torch.einsum("i&,kj->ij", dense, dense)
+    with pytest.raises(RuntimeError, match="invalid subscript"):
+        scorch.einsum("i&,kj->ij", dense, dense)
 
 
 def test_logical_index_sizes_survive_relayout():

@@ -194,7 +194,7 @@ def _resolve_prebuilt_matmul_uncached(
     b: "STensor",
     output_format: Optional[Union[TensorFormat, str, List[str]]] = None,
 ) -> Optional[ResolvedPrebuiltKernel]:
-    if a.values.dtype != b.values.dtype:
+    if a._raw_values.dtype != b._raw_values.dtype:
         return None
 
     requested_format = (
@@ -214,7 +214,7 @@ def _resolve_prebuilt_matmul_uncached(
             parse_format(spec.output_format)
         ):
             continue
-        symbols = spec.symbol_by_dtype.get(a.values.dtype)
+        symbols = spec.symbol_by_dtype.get(a._raw_values.dtype)
         if symbols is None:
             continue
         fn, symbol_name = _resolve_symbol(symbols)

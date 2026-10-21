@@ -21,6 +21,12 @@ float32 to 1e-5, integers exactly) on both automatic arms; the shipped compiler 
 first call and on the call einsum's dispatch cache serves.  The new compiler runs on the
 program einsum lowers, copied after einsum's operand moves, with the operands einsum
 passes to its kernel.
+
+``scorch.einsum`` hands a call whose operands and result are all dense to
+``torch.einsum`` (drop-in note, section 0.1, step 1), so the programs here whose operands
+are all dense reach the shipped compiler through its own entry,
+``ops._einsum_via_compiler`` (``shipped_einsum``); every other program goes through the
+public einsum, as before.
 """
 
 import copy
@@ -160,6 +166,15 @@ def options(regblock):
     return CompileOptions.from_environment().with_regblock_enabled(regblock)
 
 
+def shipped_einsum(expr, *operands, **kwargs):
+    """The shipped compiler on ``expr``: the public einsum, or, for operands that are all
+    dense, which the public einsum hands to ``torch.einsum``, the compiler's entry."""
+
+    if all(ops._is_dense_operand(operand) for operand in operands):
+        return ops._einsum_via_compiler(expr, *operands, **kwargs)
+    return scorch.einsum(expr, *operands, **kwargs)
+
+
 @pytest.fixture
 def empty_caches(monkeypatch):
     monkeypatch.setattr(ops, "_kernel_cache", {})
@@ -177,9 +192,9 @@ def test_shipped_einsum_computes_the_program(
 ):
     dense, built = operands_of(expr, formats, dtype)
 
-    first = scorch.einsum(expr, *built, _compile_options=options(regblock))
+    first = shipped_einsum(expr, *built, _compile_options=options(regblock))
     entries = len(ops._einsum_dispatch_cache)
-    second = scorch.einsum(expr, *built, _compile_options=options(regblock))
+    second = shipped_einsum(expr, *built, _compile_options=options(regblock))
 
     check(first, expr, dense, dtype)
     # The second call is served by the dispatch cache the first one filled.
@@ -217,11 +232,17 @@ def test_a_scalar_result_has_its_own_cache_entry(empty_caches):
 
 @pytest.mark.parametrize("dtype", [torch.float32, torch.float64, torch.int64])
 def test_a_dense_torch_operand_is_summed(empty_caches, dtype):
+    """By the compiler through its entry, and by ``torch.einsum`` through the public one,
+    which hands it an all-dense call unchanged."""
+
     square = torch.arange(1, 10, dtype=dtype).reshape(3, 3)
 
-    result = scorch.einsum("ij->", square)
+    compiled = ops._einsum_via_compiler("ij->", square)
+    public = scorch.einsum("ij->", square)
 
-    check(result, "ij->", [square], dtype)
+    check(compiled, "ij->", [square], dtype)
+    assert type(public) is torch.Tensor
+    assert torch.equal(public, torch.einsum("ij->", square))
 
 
 def test_the_kernel_writes_position_zero_once_per_stored_entry(monkeypatch):
@@ -256,7 +277,7 @@ def captured_program(monkeypatch, expr, built, compile_options):
         ops, "_select_and_bind_einsum_operand_mode_orders", remember_program
     )
     monkeypatch.setattr(ops, "_finish_einsum_operand_moves", remember_moves)
-    scorch.einsum(expr, *built, _compile_options=compile_options)
+    shipped_einsum(expr, *built, _compile_options=compile_options)
     return captured["program"], captured["operands"]
 
 
@@ -306,7 +327,7 @@ def test_a_large_sum_is_exact_on_both_compilers(
 ):
     dense, built = operands_of(expr, formats, dtype, LARGE_EXTENT)
     program, moved = captured_program(monkeypatch, expr, built, options(regblock))
-    shipped = scorch.einsum(expr, *built, _compile_options=options(regblock))
+    shipped = shipped_einsum(expr, *built, _compile_options=options(regblock))
     loopir_options = replace(options(regblock), requested_schedule=Schedule())
     new, _ = execute_cin_via_loopir(
         program, result_shape_of(program), *moved, compile_options=loopir_options

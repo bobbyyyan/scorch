@@ -122,7 +122,9 @@ def operands_for(shapes, formats, dtype=torch.float64):
 
 def _id(case):
     expression, shapes, formats, result, _, _ = case
-    return f"{expression} {','.join(formats)}->[{result}] {'x'.join(map(str, shapes[0]))}"
+    return (
+        f"{expression} {','.join(formats)}->[{result}] {'x'.join(map(str, shapes[0]))}"
+    )
 
 
 @pytest.mark.parametrize("blocking", [False, True], ids=["baseline", "regblock"])
@@ -152,7 +154,11 @@ def test_operand_term_that_repeats_an_index_is_refused(monkeypatch, case, blocki
 def test_torch_operands_are_refused_the_same_way(monkeypatch, dtype):
     """A dense ``torch.Tensor`` is wrapped before the labels are checked.  The trace
     ``"ii->"`` is refused for its repeated index like the diagonal: its empty result term
-    is a rank-0 result, which einsum computes (``test_einsum_scalar_result.py``)."""
+    is a rank-0 result, which einsum computes (``test_einsum_scalar_result.py``).
+
+    Every call names a scorch keyword, so its labels are checked as the compiler checks
+    them, whichever path computes it; ``ops._einsum_via_compiler`` is the compiler's own
+    entry.  The same calls without a scorch keyword are torch's own (next test)."""
 
     square = torch.arange(16, dtype=dtype).reshape(4, 4)
     nothing_past_the_label_check(monkeypatch)
@@ -162,11 +168,32 @@ def test_torch_operands_are_refused_the_same_way(monkeypatch, dtype):
         with pytest.raises(EinsumRepeatedIndexError):
             scorch.einsum("ij,jj->i", square, square, format="d")
         with pytest.raises(EinsumRepeatedIndexError) as trace:
-            scorch.einsum("ii->", square)
+            ops._einsum_via_compiler("ii->", square)
     assert (raised.value.operand, raised.value.index) == (0, "i")
     assert (trace.value.operand, trace.value.index) == (0, "i")
     # What the refused call asked for, so the reference of the feature is on record.
     assert torch.equal(torch.einsum("ii->i", square), torch.diagonal(square))
+
+
+@pytest.mark.parametrize("dtype", [torch.float32, torch.float64, torch.int64])
+def test_an_all_dense_call_without_a_scorch_keyword_is_torchs(monkeypatch, dtype):
+    """``scorch.einsum`` hands a call whose operands and result are all dense, naming no
+    scorch keyword, to ``torch.einsum`` unchanged (drop-in note, section 0.1, step 1), so
+    the diagonal and the trace that the compiler refuses are computed, by torch, and
+    nothing of the compiler runs."""
+
+    square = torch.arange(16, dtype=dtype).reshape(4, 4)
+    moves = nothing_past_the_label_check(monkeypatch)
+    with time_limit(SECONDS):
+        for expression, operands in (
+            ("ii->i", (square,)),
+            ("ii->", (square,)),
+            ("ij,jj->i", (square, square)),
+        ):
+            result = scorch.einsum(expression, *operands)
+            assert type(result) is torch.Tensor
+            assert torch.equal(result, torch.einsum(expression, *operands))
+    assert moves == []
 
 
 def test_compile_only_specification_is_refused_the_same_way(monkeypatch):

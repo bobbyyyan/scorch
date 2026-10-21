@@ -604,14 +604,16 @@ def decided(a, n: int, level: Optional[str] = None, baseline_tag: str = "v2"):
 
 
 def _tilej_args(a, b, result_shape, Jc, nthreads):
+    # The detached values (_raw_values): native code never reads the tensor autograd
+    # tracks for an STensor's values (stensor_grad).
     return [
         result_shape,
         a.shape,
         a._native_mode_indices(),
-        a.values,
+        a._raw_values,
         b.shape,
         b._native_mode_indices(),
-        b.values,
+        b._raw_values,
         Jc,
         nthreads,
     ]
@@ -622,10 +624,10 @@ def _tileijk_args(a, b, result_shape, Nc, Jc, nthreads):
         result_shape,
         a.shape,
         a._native_mode_indices(),
-        a.values,
+        a._raw_values,
         b.shape,
         b._native_mode_indices(),
-        b.values,
+        b._raw_values,
         Nc,
         Jc,
         nthreads,

@@ -1376,7 +1376,8 @@ def call_without_forced_schedule(
     derivative computes -- a backward's ``A^T @ G``, an SDDMM, a forward-mode tangent --
     are other expressions, so they run under the default schedule even when
     ``backward()`` is called inside ``schedule_force``. Every such product goes through
-    this one function (autograd._matmul). One list read in a process that has never
+    this function: autograd._matmul's, and einsum_grad._einsum's for the einsum's
+    derivative. One list read in a process that has never
     forced a schedule (FORCE_SEEN_CELL), one context-variable read in one that has, and a
     set and a reset where one is forced.
     """

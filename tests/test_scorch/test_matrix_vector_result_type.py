@@ -206,25 +206,39 @@ def test_the_internal_entry_still_returns_the_stensor_it_built():
     assert_matches(result, expected, torch.float64)
 
 
-def test_a_gradient_asked_of_a_product_autograd_does_not_cover_raises(generated):
-    """torch's convention for an operation with no derivative, which the product of two
-    matrices already follows (test_autograd_matmul.py): the forward pass works and the
-    backward pass raises, naming what it was asked to differentiate.  A keyword argument
-    takes the product out of what autograd.py covers.  The generated kernel's dense
-    result used to leave as an STensor, which carries no autograd at all, so asking for
-    the gradient failed without saying which product had none."""
+@pytest.mark.parametrize("dtype", [torch.float32, torch.float64])
+def test_the_generated_kernel_s_product_has_the_einsums_derivative(generated, dtype):
+    """The generated kernel's product is differentiable.  A keyword argument takes the
+    product out of what autograd.py's product Functions cover, and the product is
+    recorded with the einsum's derivative instead, for both operands, as the product of
+    two matrices is (test_autograd_matmul.py).  Before step 3 its backward raised
+    matmul_derivative_unsupported, and before that the dense result left as an STensor,
+    which carried no autograd at all."""
 
-    a, x, expected = _operands(SHAPES["small"])
+    a, x, expected = _operands(SHAPES["small"], dtype)
+    matrix = a.to_sparse_csr().requires_grad_()
     weights = x.clone().requires_grad_()
 
-    out = scorch.matmul(a.to_sparse_csr(), weights, use_cache=False)
+    out = scorch.matmul(matrix, weights, use_cache=False)
 
     assert len(generated) == 1
     assert type(out) is torch.Tensor
-    assert_matches(out.detach(), expected, torch.float64)
-    assert out.grad_fn is not None
-    with pytest.raises(NotImplementedError, match="use_cache"):
-        out.sum().backward()
+    assert_matches(out.detach(), expected, dtype)
+    upstream = torch.rand(out.shape, generator=torch.Generator().manual_seed(5))
+    upstream = upstream.to(torch.float64)
+    (out * upstream.to(dtype)).sum().backward()
+
+    # The float64 reference, on the operands as stored in dtype.
+    a64, x64 = a.to(torch.float64), x.to(torch.float64)
+    tolerance = 1e-12 if dtype == torch.float64 else 1e-5
+    close = dict(rtol=tolerance, atol=tolerance)
+    torch.testing.assert_close(weights.grad.double(), a64.t() @ upstream, **close)
+    assert matrix.grad.layout is torch.sparse_csr
+    torch.testing.assert_close(
+        matrix.grad.to_dense().double(),
+        torch.outer(upstream, x64) * (a64 != 0),
+        **close,
+    )
 
 
 @pytest.mark.parametrize("size", ["small", "large"])

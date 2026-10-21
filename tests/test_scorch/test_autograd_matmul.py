@@ -20,6 +20,7 @@ import scorch_ops
 from scorch import STensor
 from scorch.exceptions import TensorIndexError
 from scorch import autograd as grad_mod
+from scorch import einsum_grad as einsum_grad_mod
 from scorch import plan as plan_mod
 from scorch.plan import plans_of
 
@@ -1047,42 +1048,57 @@ def test_the_sddmm_functions_output_takes_in_place_writes(write, dtype):
 # --------------------------------------------------------------------------- #
 
 
-def test_an_uncovered_product_computes_and_raises_only_when_differentiated():
-    """torch's convention for an operation with no derivative: the forward pass works
-    (inference with parameters that require grad keeps working) and the backward pass
-    raises, naming what it was asked to differentiate."""
-    d = dense_matrix()
-    a = d.to_sparse_csr()
-    w = rand(5, 3).requires_grad_()
-    # use_cache=False asks for the generated kernel, which has no derivative here.
-    # (use_cache=True is the default, and since patch 0072 the call without it.)
+@pytest.mark.parametrize("dtype", [torch.float32, torch.float64])
+def test_the_generated_kernels_product_has_the_einsums_derivative(dtype):
+    """The generated kernel's product is differentiable.  use_cache=False asks for the
+    generated kernel, which the SpMM Functions above do not cover; the product is the
+    einsum ij,jk->ik and is recorded with that einsum's derivative (einsum_grad), for
+    both operands.  Before step 3 its backward raised matmul_derivative_unsupported.
+    (use_cache=True is the default, and since patch 0072 the call without it.)"""
+    d = dense_matrix(dtype=dtype)
+    a = d.to_sparse_csr().requires_grad_()
+    w = rand(5, 3, dtype=dtype).requires_grad_()
     out = scorch.matmul(a, w, use_cache=False)
-    torch.testing.assert_close(out, d @ w.detach())
+    torch.testing.assert_close(out, d @ w.detach(), **tolerance(dtype))
     assert out.grad_fn is not None
-    with pytest.raises(NotImplementedError, match="use_cache"):
-        out.sum().backward()
+    upstream = rand(7, 3, dtype=dtype, seed=2)
+    (out * upstream).sum().backward()
+
+    # The float64 reference, on the values rounded to the key's dtype.
+    d64, w64, g64 = d.double(), w.detach().double(), upstream.double()
+    torch.testing.assert_close(w.grad.double(), d64.t() @ g64, **tolerance(dtype))
+    assert a.grad.layout is torch.sparse_csr
+    torch.testing.assert_close(
+        a.grad.to_dense().double(), (g64 @ w64.t()) * (d64 != 0), **tolerance(dtype)
+    )
 
 
+@pytest.mark.parametrize("dtype", [torch.float32, torch.float64])
 @pytest.mark.parametrize("write", WRITES)
-def test_an_uncovered_products_output_takes_in_place_writes(write):
-    """The result of a product with no derivative is not a view either (see the section
-    above): it takes either write, and the backward still raises the coded refusal, with
-    or without a graph asked of it."""
-    d = dense_matrix()
-    a = d.to_sparse_csr()
-    w = (rand(5, 3) - 0.5).requires_grad_()
+def test_the_generated_kernels_product_takes_in_place_writes(write, dtype):
+    """The generated kernel's product, recorded with the einsum's derivative, is not a
+    view either (see the section above): it takes either write, and both operands'
+    gradients are dense float64 torch's for the same write.  Before step 3 this product
+    had no derivative, and the test was that its refusal survives the write."""
+    d = dense_matrix(dtype=dtype)
+    a = d.to_sparse_csr().requires_grad_()
+    w = (rand(5, 3, dtype=dtype) - 0.5).requires_grad_()
     out = scorch.matmul(a, w, use_cache=False)
-    assert out.grad_fn.name() == "_NotDifferentiableBackward"
-    ref = d @ w.detach()
+    assert out.grad_fn is not None
+    a64 = d.double().requires_grad_()
+    w64 = w.detach().double().requires_grad_()
+    ref = a64 @ w64
     _write(write, out, ref)
-    torch.testing.assert_close(out.detach(), ref)
-    for create_graph in (False, True):
-        with pytest.raises(NotImplementedError, match="use_cache") as raised:
-            # retain_graph: the first backward frees relu_'s saved result before it raises
-            torch.autograd.grad(
-                out.sum(), (w,), retain_graph=True, create_graph=create_graph
-            )
-        assert raised.value.code == "matmul_derivative_unsupported"
+    g = rand(7, 3, seed=2)
+    (out * g.to(dtype)).sum().backward()
+    (ref * g).sum().backward()
+
+    tol = tolerance(dtype)
+    torch.testing.assert_close(out.detach().double(), ref.detach(), **tol)
+    torch.testing.assert_close(w.grad.double(), w64.grad, **tol)
+    assert a.grad.layout is torch.sparse_csr
+    mask = a64.detach() != 0
+    torch.testing.assert_close(a.grad.to_dense().double(), a64.grad * mask, **tol)
 
 
 # What each of autograd.py's Functions returns, seen at the Function itself: never a view
@@ -1093,15 +1109,23 @@ def test_an_uncovered_products_output_takes_in_place_writes(write):
 # tensors of their own (see the note above autograd._x_at_a), so this is what stands behind
 # not making one.
 
-SPIED = ("_SparseMM", "_SparseMMT", "_SparseXA", "_SparseSDDMM", "_NotDifferentiable")
+# (module, Function): autograd.py's, and einsum_grad's for a product they do not cover
+SPIED = (
+    (grad_mod, "_SparseMM"),
+    (grad_mod, "_SparseMMT"),
+    (grad_mod, "_SparseXA"),
+    (grad_mod, "_SparseSDDMM"),
+    (grad_mod, "_NotDifferentiable"),
+    (einsum_grad_mod, "_EinsumValues"),
+)
 
 
 @contextlib.contextmanager
 def _function_outputs():
     """Every (Function name, output, tensor inputs) the Functions in SPIED return meanwhile."""
     seen = []
-    saved = {name: getattr(grad_mod, name).apply for name in SPIED}
-    own = {name: getattr(grad_mod, name).__dict__.get("apply") for name in SPIED}
+    saved = {name: getattr(mod, name).apply for mod, name in SPIED}
+    own = {name: getattr(mod, name).__dict__.get("apply") for mod, name in SPIED}
 
     def spy(name):
         def apply(*args):
@@ -1111,16 +1135,16 @@ def _function_outputs():
 
         return staticmethod(apply)
 
-    for name in SPIED:
-        setattr(getattr(grad_mod, name), "apply", spy(name))
+    for mod, name in SPIED:
+        setattr(getattr(mod, name), "apply", spy(name))
     try:
         yield seen
     finally:
-        for name in SPIED:
+        for mod, name in SPIED:
             if own[name] is None:  # torch.autograd.Function's apply again
-                delattr(getattr(grad_mod, name), "apply")
+                delattr(getattr(mod, name), "apply")
             else:
-                setattr(getattr(grad_mod, name), "apply", own[name])
+                setattr(getattr(mod, name), "apply", own[name])
 
 
 def _owned(seen, names):
@@ -1285,20 +1309,58 @@ def test_the_prebuilt_route_s_result_is_its_own_buffer(recorded, monkeypatch):
         torch.testing.assert_close(g, d.t() @ torch.ones(7, 3, dtype=d.dtype))
 
 
+def test_a_result_einsums_derivative_cannot_read_is_refused_by_name():
+    """A product recorded as its einsum whose result the einsum's derivative cannot read
+    (a torch sparse tensor) carries matmul_derivative_unsupported, and the message names
+    the product, why it has no derivative, and which products have one
+    (autograd._MATMUL_DIFFERENTIABLE).  No product scorch.matmul computes here returns
+    such a result, so autograd.matmul is given an ``ordinary`` that does: the torch CSR
+    product a torch CSR times torch CSR call returns once torch CSR results are kept."""
+    d = dense_matrix(5, 5)
+    a = d.to_sparse_csr().requires_grad_()
+    b = d.t().contiguous().to_sparse_csr()
+
+    def ordinary(x, y):
+        return (x.detach().to_dense() @ y.to_dense()).to_sparse_csr()
+
+    out = grad_mod.matmul(a, b, ordinary, {})
+    assert type(out) is torch.Tensor and out.layout is torch.sparse_csr
+    torch.testing.assert_close(out.detach().to_dense(), d @ d.t())
+    assert out.grad_fn is not None
+    with pytest.raises(NotImplementedError) as refused:
+        out.to_dense().sum().backward()
+    assert refused.value.code == "matmul_derivative_unsupported"
+    what = "a 2-D torch.sparse_csr torch.float64 tensor"
+    message = str(refused.value)
+    assert message.startswith(
+        f"scorch.matmul has no derivative for {what} @ {what} (the call is not in the "
+        "form the derivative reads); differentiable products are "
+    ), message
+    assert message.endswith("as the einsum it is (scorch.einsum's derivative)"), message
+    assert "float32/float64 CPU" in message and "scorch's SpMM" in message, message
+    assert message.endswith("; " + grad_mod._MATMUL_DIFFERENTIABLE), message
+
+
 def test_the_uncovered_products_function_returns_no_input():
-    """_NotDifferentiable returns ``result.detach()``: a new tensor, which costs less than
-    returning ``result`` itself (torch then makes a view of it).  The caller's leaf keeps
-    its version and stays a leaf."""
+    """A product the SpMM Functions do not cover is recorded by einsum_grad's _EinsumValues
+    (a generated kernel's product, here), and a result with no derivative by
+    _NotDifferentiable (not_differentiable).  Each returns ``.detach()`` of the result it
+    is given: a new tensor, which costs less than returning the result itself (torch then
+    makes a view of it).  The caller's leaf keeps its version and stays a leaf."""
     d = dense_matrix()
     a = d.to_sparse_csr()
     w = (rand(5, 3) - 0.5).requires_grad_()
     version = w._version
     with _function_outputs() as seen:
         out = scorch.matmul(a, w, use_cache=False)
-    _owned(seen, ["_NotDifferentiable"])
+        refused = grad_mod.not_differentiable(
+            d @ w.detach(), "no derivative", "matmul_derivative_unsupported", (w,)
+        )
+    _owned(seen, ["_EinsumValues", "_NotDifferentiable"])
     assert w._version == version and w.grad_fn is None and w.is_leaf
-    out.relu_()
-    torch.testing.assert_close(out.detach(), (d @ w.detach()).relu())
+    for y in (out, refused):
+        y.relu_()
+        torch.testing.assert_close(y.detach(), (d @ w.detach()).relu())
 
 
 def test_sparse_times_sparse_is_unchanged():

@@ -1802,3 +1802,12 @@ def test_spmv_and_dense_matmul_default_numerics_are_unchanged():
         format="dd",
     )
     assert torch.allclose(dense_result.to_torch(), left @ right, atol=1e-3, rtol=1e-3)
+    # STensor operands and a format give an STensor, whichever code computes it; its
+    # values against the float64 product, at float32's precision (the operands' dtype).
+    assert type(dense_result) is STensor
+    torch.testing.assert_close(
+        dense_result.to_torch().double(),
+        left.double() @ right.double(),
+        rtol=1e-6,
+        atol=1e-6,
+    )

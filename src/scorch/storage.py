@@ -998,6 +998,98 @@ def _canonical_coo_index(
     return tuple(rebuilt), unique_count, destination
 
 
+def _walked_coordinates(
+    level_types: Sequence[LevelType],
+    mode_indices: IndexModes,
+    extents: Sequence[int],
+    count: int,
+) -> List[torch.Tensor]:
+    """Each stored value's coordinate at every level, as one int64 tensor per level
+    (physical order), entry ``p`` of each the coordinate of the value at position
+    ``p``; the caller has checked the hierarchy (``stored_coordinates``).
+
+    Walks up from each value's own position.  A dense level's coordinate and parent
+    follow from the position arithmetically; a compressed level's come from its
+    arrays; a singleton level, and a coordinate level below coordinate levels, hold
+    one coordinate per position of the level above, so a position's parent is the
+    position itself; the top coordinate level's parent is the root.  ``count`` is the
+    number of stored values.
+    """
+
+    def arange(n: int) -> torch.Tensor:
+        return torch.arange(n, dtype=torch.int64)
+
+    # Per level: None for a dense level (arithmetic), the parent of each position for a
+    # compressed level, and "same" for a level whose positions are its parent's.
+    parents_of: List[Any] = []
+    parent_count = 1
+    for level, (level_type, arrays, extent) in enumerate(
+        zip(level_types, mode_indices, extents)
+    ):
+        if level_type == LevelType.DENSE:
+            parents_of.append(None)
+            parent_count *= extent
+        elif level_type == LevelType.COMPRESSED:
+            positions, coordinates = arrays
+            lengths = (positions[1:] - positions[:-1]).to(torch.int64)
+            parents_of.append(torch.repeat_interleave(arange(parent_count), lengths))
+            parent_count = coordinates.numel()
+        elif level_type == LevelType.COORDINATE and level == 0:
+            parents_of.append(torch.zeros(arrays[0].numel(), dtype=torch.int64))
+            parent_count = arrays[0].numel()
+        else:
+            parents_of.append("same")
+            parent_count = arrays[0].numel()
+    coordinate_at: List[torch.Tensor] = [arange(0)] * len(level_types)
+    position = arange(count)
+    for level in reversed(range(len(level_types))):
+        extent = extents[level]
+        parents = parents_of[level]
+        if parents is None:
+            coordinate_at[level] = position % extent
+            position = torch.div(position, extent, rounding_mode="floor")
+            continue
+        arrays = mode_indices[level]
+        coordinate_at[level] = arrays[-1][position].to(torch.int64)
+        if not isinstance(parents, str):
+            position = parents[position]
+    return coordinate_at
+
+
+def stored_coordinates(
+    layout: TensorLayout, mode_indices: IndexModes, count: int
+) -> List[torch.Tensor]:
+    """The coordinate of every stored value, one int64 tensor per physical level.
+
+    Entry ``p`` of the tensor for level ``k`` is the coordinate, along the physical
+    mode of level ``k``, of the value at storage position ``p``.  Read from the index
+    arrays without writing them, for every hierarchy whose arrays say which parent each
+    entry belongs to: any sequence of dense, compressed and singleton levels, below a
+    leading run of coordinate (COO) levels.  A coordinate level below a dense,
+    compressed or singleton one holds one coordinate per stored value and nothing that
+    places it under a parent, so that hierarchy is refused with a code, never guessed
+    at.  ``count`` is the number of stored values.
+    """
+
+    level_types = layout.format.level_types
+    extents = layout.physical_shape
+    leading = 0
+    while leading < len(level_types) and level_types[leading] == LevelType.COORDINATE:
+        leading += 1
+    if any(level == LevelType.COORDINATE for level in level_types[leading:]):
+        raise TensorStorageError(
+            f"the stored coordinates of format {layout.format} are not computed: a "
+            "coordinate level below a dense, compressed or singleton level does not "
+            "say which parent each of its entries belongs to",
+            code="stored_coordinates_format_unsupported",
+        )
+    if count == 0:
+        return [torch.zeros(0, dtype=torch.int64) for _ in level_types]
+    if leading == len(level_types):
+        return [arrays[0].to(torch.int64) for arrays in mode_indices]
+    return _walked_coordinates(level_types, mode_indices, extents, count)
+
+
 def _canonical_index(
     layout: TensorLayout, mode_indices: IndexModes, value_count: int
 ) -> Tuple[IndexModes, int, Optional[torch.Tensor]]:
@@ -1052,31 +1144,7 @@ def _canonical_index(
                 parent_count = 0
         return tuple(empty), parent_count, None
 
-    # Each stored value's coordinate at every level, walking up from the value's own
-    # position. A dense level's coordinate and parent follow from the position
-    # arithmetically; a compressed level's come from its arrays.
-    parents_of: List[Optional[torch.Tensor]] = []
-    parent_count = 1
-    for level_type, arrays, extent in zip(level_types, mode_indices, extents):
-        if level_type == LevelType.DENSE:
-            parents_of.append(None)
-            parent_count *= extent
-        else:
-            positions, coordinates = arrays
-            lengths = (positions[1:] - positions[:-1]).to(torch.int64)
-            parents_of.append(torch.repeat_interleave(arange(parent_count), lengths))
-            parent_count = coordinates.numel()
-    coordinate_at: List[torch.Tensor] = [arange(0)] * len(level_types)
-    position = arange(count)
-    for level in reversed(range(len(level_types))):
-        extent = extents[level]
-        parents = parents_of[level]
-        if parents is None:
-            coordinate_at[level] = position % extent
-            position = torch.div(position, extent, rounding_mode="floor")
-        else:
-            coordinate_at[level] = mode_indices[level][1][position].to(torch.int64)
-            position = parents[position]
+    coordinate_at = _walked_coordinates(level_types, mode_indices, extents, count)
 
     # Sort on the row-major linear index. It cannot overflow: a layout's element count
     # is checked to fit in a signed int64 (layout._normalize_shape).

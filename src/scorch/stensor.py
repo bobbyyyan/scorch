@@ -27,6 +27,7 @@ from .exceptions import (
     IndexCapacityError,
     ScorchAssertionError,
     ScorchNotImplementedError,
+    ScorchRuntimeError,
     ScorchTypeError,
     TensorFormatError,
     TensorIndexError,
@@ -74,6 +75,11 @@ from .storage import (
     _validate_index_storage,
 )
 from . import result_bound
+
+# Autograd for the stored values (drop-in note, section 0.2). It imports storage, layout
+# and exceptions only, so there is no cycle.
+from . import stensor_grad as _grad
+from .stensor_grad import AUTOGRAD_VALUES as _AUTOGRAD_VALUES
 from .result_bound import EntryBound, entry_bound
 from .utils import (
     parse_format,
@@ -650,11 +656,11 @@ def _flat_contiguous_values(tensor: torch.Tensor) -> torch.Tensor:
     Never with autograd history.  The result is stored as an STensor's values and a copy
     is remembered in ``_OPERAND_COPY_CACHE``; a copy made from ``tensor`` itself in grad
     mode would carry the caller's graph into the cache and keep it alive as long as the
-    entry lives.  An STensor's ``requires_grad`` is stored but inert, and its values do
-    not carry the graph of the tensor they came from.  ``detach`` shares storage and the
-    version counter, so the hit test below sees the same writes; the key and the weak
-    reference stay on ``tensor``'s own base, because a detached alias has no ``_base``
-    and is a new object on every call.
+    entry lives.  History is the caller's to attach (``_dense_from_torch`` does, through
+    ``stensor_grad.link_dense_copy``).  ``detach`` shares storage and the version counter,
+    so the hit test below sees the same writes; the key and the weak reference stay on
+    ``tensor``'s own base, because a detached alias has no ``_base`` and is a new object
+    on every call.
     """
     values = tensor.detach() if tensor.requires_grad else tensor
     if values.is_conj() or values.is_neg():
@@ -698,6 +704,23 @@ def _flat_contiguous_values(tensor: torch.Tensor) -> torch.Tensor:
     return copy
 
 
+def _linked(
+    result: "STensor",
+    given: torch.Tensor,
+    mode_indices: Sequence[Sequence[torch.Tensor]],
+) -> "STensor":
+    """``result``, built from the values ``given`` and the index arrays ``mode_indices``,
+    with the history of its values when ``given`` requires grad in grad mode: torch's
+    own sparse constructors are differentiable in their values, and an STensor built
+    from them must not lose the gradient (drop-in note, section 0.2)."""
+
+    if given.requires_grad and torch.is_grad_enabled():
+        _grad.link_constructed(
+            result, given, _grad.given_structure(result, mode_indices, given.numel())
+        )
+    return result
+
+
 def _dense_from_torch(
     tensor: torch.Tensor,
     name: Optional[str],
@@ -708,8 +731,22 @@ def _dense_from_torch(
 
     The caller has already checked that ``tensor`` is a strided CPU tensor and applied
     any permutation, so the value below is contiguous, flat, 1-D and free of lazy view
-    bits by construction -- which is why the assembly skips re-checking those.
+    bits by construction -- which is why the assembly skips re-checking those.  A
+    ``tensor`` that requires grad in grad mode gives the result the history of its
+    values, after the parts are cached, so the cache holds only unflagged metadata.
     """
+    built = _dense_from_torch_parts(tensor, name, mode_order, rank)
+    if tensor.requires_grad and torch.is_grad_enabled():
+        _grad.link_dense_copy(built, tensor)
+    return built
+
+
+def _dense_from_torch_parts(
+    tensor: torch.Tensor,
+    name: Optional[str],
+    mode_order: List[int],
+    rank: int,
+) -> "STensor":
     key = (tuple(tensor.shape), tensor.dtype, tensor.device, name, tuple(mode_order))
     parts = _DENSE_PARTS_CACHE.get(key)
     value = _flat_contiguous_values(tensor)
@@ -1240,6 +1277,10 @@ class STensor:
             requires_grad,
         )
         self._set_state(metadata, runtime_storage, fresh_storage=fresh_storage)
+        if value is not None and index is not None:
+            _linked(self, value, index.mode_indices)
+        if requires_grad and _AUTOGRAD_VALUES not in self.__dict__:
+            _grad.make_leaf(self)
 
     @classmethod
     def _from_validated(
@@ -1249,6 +1290,51 @@ class STensor:
         tensor = object.__new__(cls)
         tensor._set_state(metadata, storage)
         return tensor
+
+    def _over_structure(self, values: torch.Tensor) -> "STensor":
+        """An STensor over this tensor's layout and index arrays -- shared, as they
+        are, with no audit or walk: they passed both when this tensor was built --
+        whose stored values are ``values``, one per stored entry, in storage order.
+
+        ``values`` that require grad are attached as the tensor autograd tracks for the
+        new tensor's values (``stensor_grad``), so the result carries their history;
+        ones that are not contiguous are copied first, which that history records.
+        It is how a gradient (``grad``, the derivative of the compiler's einsum) and a
+        structure's pattern of ones are built over a structure that exists already.
+        """
+
+        storage = self._storage
+        layout = storage.layout
+        if values.dim() != 1 or values.numel() != storage._value.numel():
+            raise TensorValidationError(
+                f"values for a structure of {storage._value.numel()} stored entries "
+                f"must be one-dimensional with that many, got shape "
+                f"{tuple(values.shape)}",
+                code="structure_values_shape_invalid",
+            )
+        values = values.contiguous()
+        built = SparseStorage(
+            layout,
+            values,
+            _trusted_index=True,
+            _audited_index=(
+                layout.format,
+                storage._mode_indices,
+                layout.permutation,
+                layout.index_dtype,
+            ),
+        )
+        metadata = TensorMetadata._from_owned_layout(
+            self._metadata.name,
+            built._value.dtype,
+            built._value.device,
+            layout,
+            False,
+        )
+        result = STensor._from_validated(metadata, built)
+        if values.requires_grad:
+            _grad.attach(result, values)
+        return result
 
     @classmethod
     def _from_parts(
@@ -1310,6 +1396,8 @@ class STensor:
         )
         tensor = object.__new__(cls)
         tensor._set_state(metadata, storage, fresh_storage=True)
+        if requires_grad:
+            _grad.make_leaf(tensor)
         return tensor
 
     def _set_state(
@@ -1394,7 +1482,36 @@ class STensor:
         # autograd.py's structure for this operand: memoized work like a plan, and it
         # holds a lock, which cannot be pickled.
         state.pop(_PLAN_GRAD_ATTR, None)
+        # Autograd's history is not state either. The metadata keeps the flag, and
+        # ``__setstate__`` gives a tensor that requires grad a new leaf: what torch.save
+        # and pickle give a tensor that requires grad (drop-in note, 0.2).
+        state.pop(_AUTOGRAD_VALUES, None)
+        state.pop(_grad.AUTOGRAD_ROOT, None)
         return state
+
+    def __setstate__(self, state: dict) -> None:
+        self.__dict__.update(state)
+        if self._metadata.requires_grad:
+            _grad.make_leaf(self)
+
+    def __deepcopy__(self, memo: dict) -> "STensor":
+        """A deep copy, as ``copy.deepcopy`` makes one of a torch tensor: a leaf that
+        requires grad is copied as a new leaf, and an STensor whose values are the
+        output of a recorded operation is refused, as torch refuses one."""
+
+        if not _grad.is_leaf(self):
+            raise ScorchRuntimeError(
+                "Only STensors created explicitly by the user (graph leaves) support "
+                "the deepcopy protocol, as for torch tensors",
+                code="stensor_deepcopy_non_leaf",
+            )
+        # Annotated, so that ``copied.__setstate__`` resolves to STensor's (or a
+        # subclass's) for the refusal-code inventory rather than to every package
+        # class's ``__setstate__``.
+        copied: STensor = object.__new__(type(self))
+        memo[id(self)] = copied
+        copied.__setstate__(deepcopy(self.__getstate__(), memo))
+        return copied
 
     def insert(self, indices, values):
         """Insert values into the tensor.
@@ -1417,7 +1534,7 @@ class STensor:
 
     def _nnz(self):
         """Get the number of non-zero elements in the tensor."""
-        return self.values.numel()
+        return self._raw_values.numel()
 
     @property
     def has_index(self) -> bool:
@@ -1467,10 +1584,36 @@ class STensor:
         torch.Tensor
             A 1-D tensor holding every stored value in physical order — the
             entire numeric payload. For a dense tensor this is the row-major
-            flattening; for CSR/COO it is the ``nnz`` nonzeros. Equivalent to
-            ``self.storage.value``.
+            flattening; for CSR/COO it is the ``nnz`` nonzeros. When the values
+            require grad it is the tensor autograd tracks for them, as torch's
+            ``values()`` is, so a computation on it is differentiated; otherwise
+            it is ``self.storage.value``, which has no history.
         """
+        values = self.__dict__.get(_AUTOGRAD_VALUES)
+        if values is not None:
+            return values
         return self.storage.value
+
+    @values.setter
+    def values(self, value: torch.Tensor) -> None:
+        """Only for ``A.values -= x`` and the like: Python runs an augmented
+        assignment to an attribute as an in-place operation on the tensor ``values``
+        returned, followed by assigning that same tensor back. Assigning it is
+        therefore a no-op; assigning any other tensor is refused, since the values
+        are written in place."""
+
+        current = self.__dict__.get(_AUTOGRAD_VALUES)
+        if value is not current and (
+            current is not None
+            or not isinstance(value, torch.Tensor)
+            or value.data_ptr() != self._storage._value.data_ptr()
+            or value.shape != self._storage._value.shape
+        ):
+            raise ScorchTypeError(
+                "an STensor's values cannot be replaced; write them in place "
+                "(A.values.copy_(new), A.values -= x)",
+                code="stensor_values_assignment",
+            )
 
     @property
     def _raw_values(self) -> torch.Tensor:
@@ -1575,14 +1718,40 @@ class STensor:
 
     @property
     def requires_grad(self) -> bool:
+        """Whether autograd records operations on the stored values.
+
+        True exactly when the STensor carries ``_autograd_values``, the tensor autograd
+        tracks for its values (drop-in note, section 0.2): a leaf the user asked for,
+        or the output of a recorded operation.
+        """
         return self._metadata.requires_grad
 
     @requires_grad.setter
     def requires_grad(self, value: bool) -> None:
+        """Torch's rules: True makes the values a leaf (nothing changes if they already
+        require grad); False is allowed on a leaf only."""
+
         if type(value) is not bool:
             raise TensorTypeError(
                 "requires_grad must be a bool", code="requires_grad_type_invalid"
             )
+        if value:
+            if _AUTOGRAD_VALUES not in self.__dict__:
+                _grad.make_leaf(self)
+            return
+        if not _grad.is_leaf(self):
+            raise ScorchRuntimeError(
+                "you can only change requires_grad flags of leaf variables, as for "
+                "torch tensors; use detach() for values without history",
+                code="stensor_requires_grad_non_leaf",
+            )
+        _grad.drop(self)
+
+    def _write_requires_grad(self, value: bool) -> None:
+        """The one writer of the metadata flag, kept equal to whether the STensor has
+        ``_autograd_values``; whatever reads the flag (the plan installer, the C entry's
+        gradient test, ``autograd.wanted``) reads the metadata."""
+
         self._metadata = TensorMetadata._from_owned_layout(
             name=self._metadata.name,
             dtype=self._metadata.dtype,
@@ -1590,6 +1759,60 @@ class STensor:
             layout=self._storage.layout,
             requires_grad=value,
         )
+
+    def requires_grad_(self, requires_grad: bool = True) -> "STensor":
+        """Set :attr:`requires_grad` and return the tensor, as torch's method does."""
+        self.requires_grad = requires_grad
+        return self
+
+    def detach(self) -> "STensor":
+        """The same index arrays and values memory, with no history, as torch's
+        ``detach``: a write through either is seen by the other."""
+
+        metadata = self._metadata
+        if metadata.requires_grad:
+            metadata = TensorMetadata._from_owned_layout(
+                name=metadata.name,
+                dtype=metadata.dtype,
+                device=metadata.device,
+                layout=self._storage.layout,
+                requires_grad=False,
+            )
+        return STensor._from_validated(metadata, self._storage)
+
+    @property
+    def is_leaf(self) -> bool:
+        """True for values that do not require grad and for a leaf the user made, as
+        torch's attribute; an in-place conversion keeps a leaf a leaf."""
+        return _grad.is_leaf(self)
+
+    @property
+    def grad_fn(self) -> Any:
+        """The node that recorded the values, or None for a leaf or no history."""
+        if _grad.is_leaf(self):
+            return None
+        values = self.__dict__.get(_AUTOGRAD_VALUES)
+        return None if values is None else values.grad_fn
+
+    @property
+    def grad(self) -> Optional["STensor"]:
+        """The gradient of a leaf: an STensor over this tensor's index arrays whose
+        values are the gradient of each stored value, or None (as a torch sparse
+        leaf's gradient has the leaf's layout)."""
+
+        gradient = _grad.grad_of(self)
+        if gradient is None:
+            return None
+        return self._over_structure(gradient)
+
+    @grad.setter
+    def grad(self, value: Optional[Union["STensor", torch.Tensor]]) -> None:
+        """``A.grad = None`` clears a leaf's gradient; an STensor over this tensor's
+        structure, or a 1-D tensor of its stored values, sets it."""
+
+        if isinstance(value, STensor):
+            value = value.values
+        _grad.set_grad(self, value)
 
     @property
     def shape(self) -> Tuple[int, ...]:
@@ -1725,6 +1948,8 @@ class STensor:
                 "STensor addition requires another STensor",
                 code="add_operand_type_invalid",
             )
+        if _AUTOGRAD_VALUES in self.__dict__ or _AUTOGRAD_VALUES in other.__dict__:
+            return _grad.summed(self, other, STensor.__add__, ())
         if self.logical_shape != other.logical_shape:
             raise TensorLayoutError(
                 f"addition requires equal logical shapes, got "
@@ -1875,7 +2100,12 @@ class STensor:
             An independent copy.
 
         :meth:`clone` is an alias for this operation.
+
+        Values that require grad are copied as torch's ``clone`` copies them: in grad
+        mode the copy's values are recorded as a function of these.
         """
+        if _AUTOGRAD_VALUES in self.__dict__:
+            return _grad.converted(self, STensor.copy, (), {}, identity=True)
         storage = self.storage.copy()
         metadata = TensorMetadata._from_owned_layout(
             name=self.metadata.name,
@@ -1905,6 +2135,8 @@ class STensor:
             ``self`` when every coordinate is stored once and in order, else a new
             tensor whose storage shares nothing with this one.
         """
+        if _AUTOGRAD_VALUES in self.__dict__:
+            return _grad.converted(self, STensor.coalesce, (), {})
         storage = self._storage
         layout = storage.layout
         if not _validate_index_storage(
@@ -1951,7 +2183,7 @@ class STensor:
             raise TensorTypeError(
                 "shape must be a sequence of integers", code="shape_type_invalid"
             )
-        return cls._from_parts(
+        built = cls._from_parts(
             name,
             tuple(shape),
             tensor_format,
@@ -1961,6 +2193,9 @@ class STensor:
             index_dtype=index_dtype,
             requires_grad=requires_grad,
         )
+        if isinstance(values, torch.Tensor):
+            _linked(built, values, mode_indices)
+        return built
 
     @staticmethod
     def from_csr(
@@ -2038,14 +2273,16 @@ class STensor:
                 "CSR format is only valid for rank-2 tensors", code="csr_rank_invalid"
             )
 
-        return STensor._from_parts(
+        mode_indices = [[], [crow_indices, col_indices]]
+        built = STensor._from_parts(
             name,
             tuple(shape),
             "ds",
-            [[], [crow_indices, col_indices]],
+            mode_indices,
             values,
             adopt=True,  # shared with `csr_matrix`, as torch shares them
         )
+        return _linked(built, values, mode_indices)
 
     @staticmethod
     def from_coo(
@@ -2242,7 +2479,7 @@ class STensor:
                 "COO components were not initialized", code="coo_components_missing"
             )
         mode_indices = [[indices[mode]] for mode in range(len(shape))]
-        return STensor._from_parts(
+        built = STensor._from_parts(
             name,
             tuple(shape),
             "o" * len(shape),
@@ -2250,6 +2487,7 @@ class STensor:
             values,
             adopt=True,  # the coalesced tensor's own, as torch shares them
         )
+        return _linked(built, values, mode_indices)
 
     @staticmethod
     def from_torch(
@@ -2372,30 +2610,33 @@ class STensor:
                 for i in range(tensor.dim()):
                     mode_indices.append([tensor_indices[i]])
 
-                return STensor._from_parts(
+                coo_values = tensor.values().resolve_conj().resolve_neg()
+                built = STensor._from_parts(
                     name,
                     tuple(tensor.shape),
                     "o" * rank,
                     mode_indices,
-                    tensor.values().resolve_conj().resolve_neg(),
+                    coo_values,
                     mode_order=mode_order,
                     adopt=True,  # shared with `tensor`, as torch shares them
                 )
+                return _linked(built, coo_values, mode_indices)
 
             elif tensor.layout == torch.sparse_csr:
                 crow_indices, col_indices = _torch_index_members(tensor)
-                values = tensor.values()
+                csr_values = tensor.values().resolve_conj().resolve_neg()
                 shape = tensor.size()
-
-                return STensor._from_parts(
+                csr_indices = [[], [crow_indices, col_indices]]
+                built = STensor._from_parts(
                     name,
                     shape,
                     "ds",
-                    [[], [crow_indices, col_indices]],
-                    values.resolve_conj().resolve_neg(),
+                    csr_indices,
+                    csr_values,
                     mode_order=mode_order,
                     adopt=True,  # shared with `tensor`, as torch shares them
                 )
+                return _linked(built, csr_values, csr_indices)
             raise TensorStorageError(
                 f"unsupported sparse layout {tensor.layout}",
                 code="torch_layout_unsupported",
@@ -2434,9 +2675,12 @@ class STensor:
         """
         # Get a dense Scorch tensor
         dense_tensor = self.to_dense(in_place=in_place)
-        # Convert the dense Scorch tensor to a torch.Tensor
-        # torch_tensor = dense_tensor.storage.value.clone().detach()
-        torch_tensor = dense_tensor.storage.value
+        # Convert the dense Scorch tensor to a torch.Tensor: its values' history when they
+        # require grad (to_dense recorded it), so the dtype cast, reshape and permute
+        # below are recorded by torch too (drop-in note, 0.2).
+        torch_tensor = dense_tensor.__dict__.get(_AUTOGRAD_VALUES)
+        if torch_tensor is None:
+            torch_tensor = dense_tensor.storage.value
         if torch_tensor.dtype != self.dtype:
             torch_tensor = torch_tensor.type(self.dtype)
         # Reshape the torch.Tensor to the original shape
@@ -2499,6 +2743,17 @@ class STensor:
         to_torch : Materialize to a dense ``torch.Tensor``.
         """
 
+        if _AUTOGRAD_VALUES in self.__dict__:
+            return _grad.converted(
+                self,
+                STensor.to_dense,
+                (fmt, in_place),
+                {
+                    "_compile_options": _compile_options,
+                    "_compilation_context": _compilation_context,
+                    "_deferred_options": _deferred_options,
+                },
+            )
         # If self is already dense at every level, return self
         if self.format.is_dense():
             if in_place:
@@ -2688,6 +2943,17 @@ class STensor:
         --------
         to_dense : The inverse (densify).
         """
+        if _AUTOGRAD_VALUES in self.__dict__:
+            return _grad.converted(
+                self,
+                STensor.to_sparse,
+                (fmt,),
+                {
+                    "_compile_options": _compile_options,
+                    "_compilation_context": _compilation_context,
+                    "_deferred_options": _deferred_options,
+                },
+            )
         if len(self.shape) == 1:
             parsed_rank_one_format = None if fmt is None else parse_format(fmt)
             rank_one_format: Optional[TensorFormat]
@@ -2738,7 +3004,7 @@ class STensor:
             # corrupt the tensor.  Densify out of place under the caller's
             # exact options and context, exactly like the rank>=2 route.
             source_values = (
-                self.values
+                self._raw_values
                 if self.format.is_dense()
                 else self.to_dense(
                     in_place=False,
@@ -3119,6 +3385,19 @@ class STensor:
         rank, and ``_keep_every_stored_entry`` copies every stored entry
         whatever its value.
         """
+        if _AUTOGRAD_VALUES in self.__dict__:
+            return _grad.converted(
+                self,
+                STensor.change_mode_order,
+                (mode_order,),
+                {
+                    "_compile_options": _compile_options,
+                    "_compilation_context": _compilation_context,
+                    "_target_format": _target_format,
+                    "_keep_every_stored_entry": _keep_every_stored_entry,
+                    "_deferred_options": _deferred_options,
+                },
+            )
         dim = len(self.shape)
         if not isinstance(mode_order, (list, tuple)):
             raise TensorTypeError(
@@ -3237,7 +3516,7 @@ class STensor:
             values: Optional[torch.Tensor] = None
 
             if fmt_str == "d,d":
-                dense = self.values.reshape(self.shape).permute(*perm_old_to_new)
+                dense = self._raw_values.reshape(self.shape).permute(*perm_old_to_new)
                 values = dense.contiguous().reshape(-1)
                 mode_indices = [[], []]
             elif fmt_str == "o,o":
@@ -3250,10 +3529,10 @@ class STensor:
                 coalesced_row, coalesced_col, coalesced_values = _coalesce_2d_coo(
                     new_row,
                     new_col,
-                    self.values,
+                    self._raw_values,
                     result_shape[1],
                 )
-                if coalesced_values.numel() != self.values.numel():
+                if coalesced_values.numel() != self._raw_values.numel():
                     # Transposing distinct coordinates keeps them distinct, so only an
                     # in-place write to the index arrays after construction gets here.
                     # Refused, as the kernels' index check refuses it, not summed.
@@ -3283,7 +3562,7 @@ class STensor:
                 coalesced_row, coalesced_col, coalesced_values = _coalesce_2d_coo(
                     new_row,
                     new_col,
-                    self.values,
+                    self._raw_values,
                     result_shape[1],
                 )
                 transposed_crow = torch.zeros(

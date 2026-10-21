@@ -217,6 +217,43 @@ def test_recorded_forward_honours_the_schedule_and_backward_does_not(generated, 
     close(other.grad, want_o.numpy())
 
 
+def test_the_einsums_derivative_runs_under_the_default_schedule(
+    generated, monkeypatch
+):
+    """A product autograd.py's Functions do not cover (use_cache=False asks for the
+    generated kernel) is recorded with the einsum's derivative (einsum_grad), which
+    computes its gradients with scorch.einsum.  Those are other expressions than the
+    forward the schedule names, so, like autograd.py's own products, they run under the
+    default schedule with backward() called inside the context; the forward is the
+    schedule's kernel."""
+    seen = []
+    real = ops.einsum
+
+    def spy(*args, **kwargs):
+        seen.append(get_forced_schedule())
+        return real(*args, **kwargs)
+
+    monkeypatch.setattr(ops, "einsum", spy)
+    a_ref = torch_csr().requires_grad_(True)
+    o_ref = rhs(N, K).requires_grad_(True)
+    want_out = ops.matmul(a_ref, o_ref, use_cache=False)
+    want_out.sum().backward()
+    a = torch_csr().requires_grad_(True)
+    other = rhs(N, K).requires_grad_(True)
+    del generated[:], seen[:]
+    with scorch.schedule_force(S):
+        out = ops.matmul(a, other, use_cache=False)
+        forward_calls, before = list(generated), len(seen)
+        out.sum().backward()
+    assert forward_calls == [S]
+    assert all(s is None for s in generated[len(forward_calls):])
+    assert len(seen) > before, "the derivative computed nothing with scorch.einsum"
+    assert all(s is None for s in seen[before:])
+    close(out, want_out.detach().numpy())
+    close(a.grad.to_dense(), a_ref.grad.to_dense().numpy())
+    close(other.grad, o_ref.grad.numpy())
+
+
 @pytest.mark.parametrize(
     "call",
     ["torch_first", "torch_cached", "stensor_direct", "recorded"],
