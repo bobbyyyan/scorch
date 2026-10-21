@@ -3920,12 +3920,6 @@ def sparse_linear_fm(
     out_dim = int(weight.shape[0])
     result_shape = [out_dim, batch]
 
-    if bias is None:
-        bias_t = torch.zeros(out_dim, dtype=torch.float32)
-    else:
-        bias_t = bias if bias.dtype == torch.float32 else bias.to(torch.float32)
-        bias_t = bias_t.contiguous()
-
     fn = getattr(_native, "spmm_csr_linear_fused_float", None)
     if (
         fn is None
@@ -3940,14 +3934,27 @@ def sparse_linear_fm(
         x_dense = x_vals.reshape(in_dim, batch)
         y = torch.matmul(w_dense, x_dense)
         if bias is not None:
-            # In the product's dtype: ``bias_t`` is the float32 copy the kernel takes,
-            # which rounds a float64 bias.
-            y = y + bias.to(y.dtype).view(-1, 1)
+            # In the product's dtype, so the result keeps the operands' dtype (float64;
+            # float16 and bfloat16 weights are refused earlier), as F.linear's does.
+            # .to() only on a dtype change: a same-dtype .to() returns the bias itself
+            # but still goes through the dispatcher on every call.
+            if bias.dtype != y.dtype:
+                bias = bias.to(y.dtype)
+            y = y + bias.view(-1, 1)
         if act == 1:
             return torch.relu(y)
         if act == 2:
             return torch.sigmoid(y)
         return y
+
+    # The kernel's float32 bias, made only on the kernel's path: before step 13 the
+    # fallback above added this copy, so every float64 call carried a float32-rounded
+    # bias (L16: 3e6-5e6 times the float64 error bound on the M5).
+    if bias is None:
+        bias_t = torch.zeros(out_dim, dtype=torch.float32)
+    else:
+        bias_t = bias if bias.dtype == torch.float32 else bias.to(torch.float32)
+        bias_t = bias_t.contiguous()
 
     nthreads = -1
     atparallel = False
