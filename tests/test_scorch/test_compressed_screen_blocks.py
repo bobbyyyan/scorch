@@ -8,6 +8,12 @@ its first span boundary by binary search and walks the boundaries block by block
 can go wrong -- a boundary counted twice or not at all, a range that starts on a run of empty
 spans, a descent on the last element of a block or a range -- shows up as a verdict that differs
 from the reference at one of these positions.
+
+The flat loop counts a block's non-increases as its length less its increases, one packed
+compare on AVX2 rather than two (patch 0077); a coordinate equal to its predecessor is the case
+that separates the two counts, so it is placed inside spans (a defect) and across a boundary
+(legal) at every edge, and a population of random levels with random defects is compared with
+the reference as well.
 """
 
 import numpy as np
@@ -120,12 +126,29 @@ def inject(kind, pos, crd, p, rng):
         else:
             crd[q - 1], crd[q] = LIMIT - 1, 0
         return pos, crd
-    if kind == "repeat_inside":  # a coordinate equal to the one before it, inside a span
+    if (
+        kind == "repeat_inside"
+    ):  # a coordinate equal to the one before it, inside a span
         q = inside(p, set(pos[1:-1].tolist()), nnz)
         if q is None:
             return None
         crd[q] = crd[q - 1]
         return pos, crd
+    if (
+        kind == "repeat_at_boundary"
+    ):  # legal: a span may start at the last value before it
+        starts = set(pos[:-1].tolist())
+        for q in sorted(boundaries(pos, nnz).tolist(), key=lambda x: abs(x - p)):
+            # Raise the earlier span's last value to the later span's first, or lower the
+            # later span's first to the earlier span's last, whichever keeps both spans
+            # strictly increasing.
+            if q - 1 in starts or crd[q - 2] < crd[q]:
+                crd[q - 1] = crd[q]
+                return pos, crd
+            if q + 1 == nnz or q + 1 in starts or crd[q + 1] > crd[q - 1]:
+                crd[q] = crd[q - 1]
+                return pos, crd
+        return None
     if kind == "descent_at_boundary":  # legal
         b = boundaries(pos, nnz)
         if not b.size:
@@ -165,7 +188,15 @@ def threads():
 @pytest.mark.parametrize("nthreads", [1, 2, 3, 5])
 @pytest.mark.parametrize(
     "kind",
-    ["clean", "descent_inside", "repeat_inside", "descent_at_boundary", "above_limit", "negative"],
+    [
+        "clean",
+        "descent_inside",
+        "repeat_inside",
+        "repeat_at_boundary",
+        "descent_at_boundary",
+        "above_limit",
+        "negative",
+    ],
 )
 @pytest.mark.parametrize("empty_fraction", [0.0, 0.4])
 def test_coordinate_defects_at_block_and_range_edges(
@@ -192,7 +223,7 @@ def test_coordinate_defects_at_block_and_range_edges(
                 kind in ("descent_inside", "repeat_inside") and require_sorted
             ):
                 assert want, (kind, p)  # the injection made a defect
-            if kind in ("clean", "descent_at_boundary"):
+            if kind in ("clean", "descent_at_boundary", "repeat_at_boundary"):
                 assert not want, (kind, p)  # and these made none
             for grain in (1, 1 << 40):
                 got = screen(cp, cc, require_sorted, grain, dtype)
@@ -250,3 +281,51 @@ def test_a_range_that_starts_on_a_run_of_empty_spans(threads, dtype, nthreads):
         bad[c + 2] = 0
         assert reference(pos, bad, LIMIT, True)
         assert screen(pos, bad, True, 1, dtype) is True, c
+
+
+@pytest.mark.parametrize("dtype", [torch.int32, torch.int64])
+@pytest.mark.parametrize("nthreads", [1, 3])
+def test_random_levels_match_the_reference(threads, dtype, nthreads):
+    """Random levels (spans of every length, empty spans, sizes around a block and a worker
+    range) with up to three random defects or legal boundary values each, at random positions
+    and at block edges: the verdict is the reference's, sorted or not, for both grains.
+    """
+    torch.set_num_threads(nthreads)
+    itemsize = torch.empty(0, dtype=dtype).element_size()
+    block = BLOCK_BYTES // itemsize
+    rng = np.random.default_rng([2077, nthreads, itemsize])
+    kinds = [
+        "descent_inside",
+        "repeat_inside",
+        "repeat_at_boundary",
+        "descent_at_boundary",
+        "above_limit",
+        "negative",
+    ]
+    verdicts = {True: 0, False: 0}
+    for case in range(160):
+        nnz = int(
+            rng.choice([1, 2, 7, block - 1, block, block + 1, 2 * block + 3, 3000])
+        )
+        pos, crd = structure(rng, nnz, float(rng.choice([0.0, 0.2, 0.6])))
+        for _ in range(int(rng.integers(0, 4))):
+            at = [b * block + d for b in range(1, nnz // block + 1) for d in (-1, 0, 1)]
+            p = (
+                int(rng.choice(at))
+                if at and rng.random() < 0.5
+                else int(rng.integers(0, nnz))
+            )
+            p = min(max(p, 1 if nnz > 1 else 0), nnz - 1)
+            changed = inject(str(rng.choice(kinds)), pos, crd, p, rng)
+            if changed is not None:
+                pos, crd = changed
+        for require_sorted in (True, False):
+            want = reference(pos, crd, LIMIT, require_sorted)
+            verdicts[want] += 1
+            for grain in (1, 1 << 40):
+                assert screen(pos, crd, require_sorted, grain, dtype) == want, (
+                    case,
+                    require_sorted,
+                    grain,
+                )
+    assert verdicts[True] >= 40 and verdicts[False] >= 40, verdicts

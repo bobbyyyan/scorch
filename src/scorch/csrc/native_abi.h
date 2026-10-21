@@ -308,8 +308,17 @@ inline bool abi_screen_compressed_typed(
   // 2^31 coordinates. Together they let the flat loop vectorize at the full lane count. Two
   // signed tests ORed into an int that is read as a condition after the loop kept it scalar
   // ("value that could not be identified as reduction is used outside the loop"). M5, one
-  // thread, 8.4M coordinates: int32 1382 -> 467 us, int64 1375 -> 942 us. The ordering test is
-  // `crd[p - 1] >= crd[p]`, the strict contract above.
+  // thread, 8.4M coordinates: int32 1382 -> 467 us, int64 1375 -> 942 us.
+  //
+  // The ordering count is the strict contract above, a block's non-increases (crd[p - 1] >=
+  // crd[p]), taken as the block's length less its increases (crd[p - 1] < crd[p]): the same
+  // number, since one of the two holds at every p. Counted directly, the non-increase is a
+  // `>=`, which AVX2 has no packed compare for: vpcmpgtd and one more instruction per vector
+  // (clang 21 -march=broadwell: 10 instructions to the loop's 9 for int32, 11 to 10 for int64;
+  // +692 instructions per first call in GCC's build on sapling's Broadwell, attr3 83817). The
+  // increase is one vpcmpgtd. AVX-512's
+  // vpcmpd and NEON's cmge take either predicate in one instruction, so on Zen 4 and the M5
+  // the two loops are the same length.
   using U = std::make_unsigned_t<T>;
   const U ulim = (U)lim;
   constexpr int64_t kBlock = 16384 / (int64_t)sizeof(T);
@@ -327,14 +336,16 @@ inline bool abi_screen_compressed_typed(
         U unordered = 0;
         for (int64_t b0 = begin; b0 < end; b0 += kBlock) {
           const int64_t b1 = std::min(b0 + kBlock, end);
-          U nonincr = 0;
+          U incr = 0;
           // Reads crd[p - 1], which is in range because the scan starts at 1.
           for (int64_t p = b0; p < b1; ++p) {
             const T c = crd[p];
             out_of_range += ((U)c >= ulim);
-            nonincr += (crd[p - 1] >= c);
+            incr += (crd[p - 1] < c);
             if constexpr (kCopy) crd_out[p] = (N)c;
           }
+          // The block's non-increases. b1 - b0 <= kBlock, so the count fits U.
+          U nonincr = (U)(b1 - b0) - incr;
           // The block's boundaries pos[r .. r_end) are the p in [b0, b1), so 1 <= p < nnz.
           // Found by binary search, which makes the walk a counted loop the compiler can
           // vectorize where spans hold one element and every position is a boundary. Parents
