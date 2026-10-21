@@ -12,6 +12,7 @@ from pathlib import Path
 import shutil
 import subprocess
 import threading
+import types
 from typing import Any, cast
 
 import pytest
@@ -1310,7 +1311,9 @@ def test_build_boundary_snapshots_caller_owned_sequences_once(
         lambda name, verbose: str(tmp_path),
     )
     monkeypatch.setattr(utils, "_build_and_load_extension", fake_build)
-    utils._so_cache.clear()
+    # An empty cache of this test's own, so _load_kernel builds, and the stand-in it
+    # caches leaves with the test: the process's cache holds loaded modules only.
+    monkeypatch.setattr(utils, "_so_cache", {})
 
     utils._load_kernel(
         "compile_options_detached_build_inputs",
@@ -1327,6 +1330,36 @@ def test_build_boundary_snapshots_caller_owned_sequences_once(
     assert request.functions == ("evaluate",)
     assert request.extra_cflags == options.build.extra_cflags
     assert request.extra_ldflags == options.build.extra_ldflags
+
+
+# The tests above that replace the build with one returning object(), each called with
+# its own monkeypatch.
+FAKE_BUILD_TESTS = {
+    "public einsum": lambda patch, tmp_path: (
+        test_public_einsum_snapshots_once_and_routes_one_identity_to_all_stages(patch)
+    ),
+    "build boundary": lambda patch, tmp_path: (
+        test_build_boundary_snapshots_caller_owned_sequences_once(patch, tmp_path)
+    ),
+}
+
+
+@pytest.mark.parametrize("name", sorted(FAKE_BUILD_TESTS))
+def test_a_fake_build_leaves_the_kernel_cache_as_it_found_it(
+    name: str, tmp_path: Path
+) -> None:
+    """A test that fakes the build must not leave its stand-in in utils._so_cache, nor
+    drop what the process had loaded: a later test in the same process reads the cache
+    and expects loaded modules there (test_stensor_autograd's native_boundary wraps
+    each one)."""
+    loaded = types.ModuleType("loaded_before_the_test")
+    cache: dict[Any, Any] = {("loaded_before_the_test", ()): loaded}
+    with pytest.MonkeyPatch.context() as outer:
+        outer.setattr(utils, "_so_cache", cache)
+        with pytest.MonkeyPatch.context() as patch:
+            FAKE_BUILD_TESTS[name](patch, tmp_path)
+        assert utils._so_cache is cache
+        assert list(cache.items()) == [(("loaded_before_the_test", ()), loaded)]
 
 
 def test_darwin_direct_extension_flags_compile_without_ambient_target_state(
