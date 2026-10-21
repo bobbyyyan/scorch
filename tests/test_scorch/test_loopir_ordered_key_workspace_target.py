@@ -3057,7 +3057,7 @@ def test_the_signature_reference_is_the_abis_own_authority():
 
     abi = TorchCppKernelABI(
         result_shape=(4, 5),
-        result_rank=2,
+        result_level_types=(LevelType.DENSE, LevelType.COMPRESSED),
         input_tensors=(
             KernelTensorABI(
                 name="A",

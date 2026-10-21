@@ -89,6 +89,13 @@ from .verifier import verify_program
 # it is a scheduling decision and enters the canonical form for the same reason;
 # ``null`` records that no structure was chosen and every existing layer keeps
 # choosing what it chooses today.
+#
+# ``entries_of`` (the input whose stored entries a sparse result stores) enters
+# the canonical form only when an input is named, so it needs no new version:
+# every program that names none keeps its v13 bytes.
+#
+# ``vector_loops`` (the loops a schedule keeps marked for vector instructions)
+# enters it on the same terms: only when recorded.
 CANONICAL_SCHEMA = "scorch.loopir.canonical.v13"
 
 
@@ -626,7 +633,7 @@ def canonical_program_dump(program: LoopProgram) -> str:
         program.dimensions, key=lambda decl: ids.dimension(decl.dimension)
     )
     tensor_decls = sorted(program.tensors, key=lambda decl: ids.symbol(decl.symbol))
-    payload = {
+    payload: Dict[str, object] = {
         "schema": CANONICAL_SCHEMA,
         "dimensions": [
             {"dimension": ids.dimension(decl.dimension)} for decl in dimension_decls
@@ -645,6 +652,22 @@ def canonical_program_dump(program: LoopProgram) -> str:
             None if program.accumulator is None else program.accumulator.value
         ),
     }
+    if program.entries_of is not None:
+        # Present only when an input is named, so every program that names none
+        # keeps its canonical bytes (and the schema its version).
+        payload["entries_of"] = ids.symbol(program.entries_of)
+    if program.vector_loops is not None:
+        # Present only when recorded, for the same reason: every program that
+        # records no vector decision keeps its canonical bytes.  The marks are a
+        # set (the verifier refuses one recorded twice), so they are sorted by
+        # their canonical form and the recorded order does not reach the bytes.
+        payload["vector_loops"] = [
+            {"index": ids.index(mark.index), "part": mark.part.value}
+            for mark in sorted(
+                program.vector_loops,
+                key=lambda mark: (ids.index(mark.index), mark.part.value),
+            )
+        ]
     return json.dumps(
         payload,
         sort_keys=True,
@@ -946,6 +969,8 @@ def print_program(program: LoopProgram) -> str:
     outputs = ", ".join(f"t{ids.symbol(symbol)}" for symbol in program.outputs)
     lines.append(f"  inputs({inputs})")
     lines.append(f"  outputs({outputs})")
+    if program.entries_of is not None:
+        lines.append(f"  entries_of(t{ids.symbol(program.entries_of)})")
     if program.parallel is not None:
         selection = program.parallel
         nnz = selection.work.nnz
@@ -959,6 +984,15 @@ def print_program(program: LoopProgram) -> str:
             f" work(d{ids.dimension(selection.work.rows)}, {nnz_text})"
             f" intent={selection.intent.value}"
         )
+    if program.vector_loops is not None:
+        marks = ", ".join(
+            f"x{ids.index(mark.index)}:{mark.part.value}"
+            for mark in sorted(
+                program.vector_loops,
+                key=lambda mark: (ids.index(mark.index), mark.part.value),
+            )
+        )
+        lines.append(f"  vector_loops({marks})")
     lines.append("  body {")
     _render_stmt(program.body, ids, {}, 2, lines)
     lines.append("  }")

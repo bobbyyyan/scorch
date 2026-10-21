@@ -113,6 +113,8 @@ def emitted_addition_cpp(monkeypatch, left, right, shape, dtype=torch.float64):
         captured.append(prepared.request.cpp_sources[-1])
         raise _Emitted
 
+    # A kernel an earlier test kept for this sum would serve it without reaching the stop.
+    monkeypatch.setattr(stensor, "_GENERATED_KERNELS", {})
     monkeypatch.setattr(stensor, "_load_validated_prepared_kernel", stop_before_native)
     a, b = pair(left, right, shape, dtype, 3)
     with pytest.raises(_Emitted):

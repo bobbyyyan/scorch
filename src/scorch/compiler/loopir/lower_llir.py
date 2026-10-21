@@ -102,6 +102,7 @@ from ..llir_traversal import (
     SUPPORTED_LLIR_NODE_TYPES,
     SUPPORTED_LLIR_STATEMENT_NODE_TYPES,
 )
+from ..iter_lattice import mark_simd_on_reduction_loops, select_vector_marks
 from ..loop_plan import MAX_AFFINE_TILE_WIDTH
 from ..merged_coordinate import merged_coordinate_name
 from ..parallel_marking_pass import (
@@ -134,6 +135,9 @@ from ..torch_cpp_abi import (
     KernelTensorABI,
     ResultTensorAssembler,
     TorchCppKernelABI,
+    dense_block_check,
+    dense_blocks,
+    level_total_check,
 )
 from ...utils import dtype_to_c_datatype
 from ..sparse_accumulator import (
@@ -147,6 +151,7 @@ from ..sparse_accumulator import (
 from ..sparse_assembly import (
     DEFAULT_SERIAL_STRATEGY,
     INVALID_SCHEDULE_ASSEMBLY,
+    SINGLE_PASS_STRATEGIES,
     SPARSE_ASSEMBLY_STRATEGIES,
     TWO_PASS_STRATEGIES,
     UNSUPPORTED_ASSEMBLY_HOST,
@@ -225,13 +230,20 @@ from .nodes import (
     TileId,
     TileInnerFor,
     TileOuterFor,
+    VectorLoop,
+    VectorLoopPart,
     WorkspaceId,
     WorkspaceDecl,
     WorkspaceRead,
     WorkspaceReduce,
     WorkspaceRegion,
 )
-from .verifier import LoopIRVerificationError, verify_program
+from .verifier import (
+    LoopIRVerificationError,
+    _vector_target_matches,
+    _walk_declared_schema,
+    verify_program,
+)
 
 if TYPE_CHECKING:
     # Imported for annotations only, matching how the two-phase pass's context is
@@ -318,6 +330,7 @@ _LOOPIR_GRAPH_NODE_TYPES = (
     TiledReduce,
     TileInnerFor,
     TileOuterFor,
+    VectorLoop,
     WorkspaceDecl,
     WorkspaceRead,
     WorkspaceReduce,
@@ -335,6 +348,7 @@ _LOOPIR_GRAPH_ENUM_TYPES = (
     ReduceOp,
     RelayoutScope,
     ScalarType,
+    VectorLoopPart,
 )
 _LOOPIR_IDENTITY_TYPES = (
     SymbolId,
@@ -4366,7 +4380,8 @@ class _TargetLowering:
 
     def _input_metadata(self, symbol: SymbolId) -> llir.TensorAccessMetadata:
         decl = self.decls[symbol]
-        per_tensor = self.level_drivers[symbol]
+        # A rank-0 tensor has no level for a loop to drive: its access names no index.
+        per_tensor = self.level_drivers[symbol] if decl.levels else {}
         logical_indices: List[Optional[IndexId]] = [None] * len(decl.levels)
         for level, level_decl in enumerate(decl.levels):
             logical_indices[level_decl.mode] = cast(IndexId, per_tensor[level])
@@ -4395,6 +4410,21 @@ class _TargetLowering:
                 ),
                 role=llir.TensorAccessRole.RESULT_WRITE,
             ),
+        )
+
+    def _result_value_position(self, levels: int) -> llir.Expr:
+        """Where the result value is written, below ``levels`` resolved levels.
+
+        ``p{R}{levels - 1}``, the position the last resolved level computed.  A rank-0
+        result has no level and holds one value, at position 0: the root of its
+        (empty) level tree.
+        """
+
+        if not levels:
+            return llir.Literal(value=0, data_type=llir.DataType.INT64)
+        return llir.Var(
+            name=f"p{self.result_decl.name}{levels - 1}",
+            type=llir.DataType.INT64,
         )
 
     def _result_storage(
@@ -4713,13 +4743,24 @@ class _TargetLowering:
             return lowered
         if type(expr) is Load:
             decl = self.decls[expr.tensor]
+            torch_dtype = _SCALAR_TO_TORCH[decl.dtype]
+            if not expr.indices:
+                # A rank-0 tensor holds one value, at position 0: the root of
+                # its (empty) level tree.
+                return llir.ArrayAccess(
+                    array=llir.Var(
+                        name=f"{decl.name}_val",
+                        type=_value_pointer_type(torch_dtype),
+                    ),
+                    index=llir.Literal(value=0, data_type=llir.DataType.INT64),
+                    tensor_access=self._input_metadata(expr.tensor),
+                )
             if len(expr.indices) == 1:
                 bound = self._index_of(expr.indices[0], "load index")
                 position = self.loops[self.loop_positions[bound]]
                 physical_index = self._loop_var_name(position)
             else:
                 physical_index = f"p{decl.name}{len(expr.indices) - 1}"
-            torch_dtype = _SCALAR_TO_TORCH[decl.dtype]
             return llir.ArrayAccess(
                 array=llir.Var(
                     name=f"{decl.name}_val",
@@ -4826,10 +4867,7 @@ class _TargetLowering:
                 name=f"{self.result_decl.name}_values",
                 type=llir.DataType.NO_TYPE,
             ),
-            index=llir.Var(
-                name=f"p{self.result_decl.name}{len(leaf_indices) - 1}",
-                type=llir.DataType.INT64,
-            ),
+            index=self._result_value_position(len(leaf_indices)),
             tensor_access=self._result_metadata(),
         )
         if self._tiled_leaf is not None:
@@ -5112,10 +5150,7 @@ class _TargetLowering:
                 name=f"{result_name}_values",
                 type=llir.DataType.NO_TYPE,
             ),
-            index=llir.Var(
-                name=f"p{result_name}{leaf_level}",
-                type=llir.DataType.INT64,
-            ),
+            index=self._result_value_position(leaf_level + 1),
             tensor_access=self._result_metadata(),
         )
         stmts: List[llir.Stmt] = [
@@ -6832,10 +6867,25 @@ class _TargetLowering:
             appends[-1],
         ]
 
+    def _levels_bounded_in_kernel(self) -> Tuple[int, ...]:
+        """The result levels whose dense blocks this target's body checks where
+        they open (``torch_cpp_abi.dense_block_check``), so that the entry check
+        leaves them to the body.  None, here: a target that emits the checks
+        declares its blocks by overriding this.  A method of the class and not a
+        record filled during emission, because the target's state is sealed
+        after construction; the lowering checks the declaration against the
+        finished function (``TorchCppKernelABI.require_bounded_levels_checked``)."""
+
+        return ()
+
     def kernel_abi(self) -> TorchCppKernelABI:
+        """The kernel's ABI.  Its result check declares the dense blocks the
+        body bounds (:meth:`_levels_bounded_in_kernel`)."""
+
         return TorchCppKernelABI(
+            result_levels_bounded_in_kernel=self._levels_bounded_in_kernel(),
             result_shape=self.shapes[self.result_symbol],
-            result_rank=len(self.result_decl.levels),
+            result_level_types=self._result_level_types(),
             input_tensors=tuple(
                 KernelTensorABI(
                     name=self.decls[symbol].name,
@@ -6984,6 +7034,28 @@ class _TargetLowering:
         """
 
         return self.supported_assemblies()
+
+    def stored_entry_source(self) -> Optional[SymbolId]:
+        """The input whose stored entries this lowering stores as the result's.
+
+        ``None``: the result stores the entries its statements write.  A program
+        that names an input (``LoopProgram.entries_of``) is lowered only by a
+        family that answers with that input (:func:`_select_lowering`).
+        """
+
+        return None
+
+    def assembly_split_extent(self) -> Optional[int]:
+        """How many parts a parallel assembly of this program is split into, at most.
+
+        The automatic rule (:func:`.assembly_rule.automatic_assembly`) prefers a
+        parallel strategy only from a count that can reach two workers.  A
+        parallel assembly splits the result's first level, so the count is that
+        level's extent, ``None`` for a scalar result.  A family that splits
+        something else answers for what it splits.
+        """
+
+        return next(iter(self.shapes[self.result_symbol]), None)
 
     def owns_two_phase_output(self) -> bool:
         """Whether the shared compressed-Where pass owns this result's assembly.
@@ -12928,6 +13000,9 @@ class _ParallelSparseWorkspaceLowering(_TargetLowering):
                     index=rows_int,
                 ),
             ),
+            # The shared pass holds the total to the 32-bit position bound before
+            # anything is allocated (compressed_where_openmp_pass._level_total_checks).
+            level_total_check(total, 1, compressed_below=False),
             *assembler.emit_first_compressed_position_allocation(
                 llir.Var(name=rows_text, type=llir.DataType.INT),
                 llir.Var(name="_offset1", type=llir.DataType.STD_VECTOR_INT),
@@ -16280,9 +16355,15 @@ class _MultiCompressedAssemblyLowering(_OrderedKeyRegionEmission):
         self._target_owner_snapshot = self._validated_target_owner_signature()
         self.level_drivers = self._compute_level_drivers()
         self._validate_access_orders()
+        self._driver_entry = self._driver_entry_input()
         self._reserve_merge_names()
         self._reserve_reduction_accumulator_name()
         self._reserve_region_names()
+        if self._driver_entry is not None:
+            self._reserve_generated_name(
+                _KNOWN_ENTRY_COUNT,
+                f"entry count of output tensor {self.result_decl.name!r}",
+            )
         self._seal_target_state(seal_token)
 
     def _validate_assembly_layouts(self) -> None:
@@ -17256,6 +17337,10 @@ class _MultiCompressedAssemblyLowering(_OrderedKeyRegionEmission):
                             ),
                         ),
                         llir.Increment(var=int64(f"p{result_name}{level}")),
+                        # A dense block below opens with the new coordinate.
+                        *self._dense_block_open_statements(
+                            level, self._drained_position(level)
+                        ),
                     ],
                     result_storage=self._result_storage(
                         (RESULT_CRD, level, STORAGE_READ)
@@ -17466,9 +17551,81 @@ class _MultiCompressedAssemblyLowering(_OrderedKeyRegionEmission):
         a zero-extent dense level, and coordinate intersections alike, and it
         never inspects a value: a stored zero, or contributions cancelling
         exactly, keep the key.
+
+        A program that names the input whose entries the result stores
+        (``LoopProgram.entries_of``, realized by :meth:`_driver_entry_input`)
+        stores every entry the result loops visit, so its append is not guarded.
         """
 
-        return self._reduction_depth > 0
+        return self._reduction_depth > 0 and self._driver_entry is None
+
+    def _driver_entry_input(self) -> Optional[SymbolId]:
+        """The input whose stored entries are this COO result's entries, if one is.
+
+        ``LoopProgram.entries_of`` names it.  Loop ``l`` binds result level ``l``
+        (the chain checks it), and each such loop is a dense loop or walks one
+        stored stream.  The result loops must walk the named input's levels in
+        order, loop ``l`` its level ``l`` -- a stream loop over its cursor, or a
+        dense loop over a dense level -- with a reduction sub-nest below them;
+        they then visit its stored entries once each, in its storage order, and
+        the result stores one entry for each, unguarded.  The entry at the
+        input's leaf position ``p`` is the result's entry ``p``: the JIT entry
+        check requires every compressed level to start at position 0 and end at
+        its coordinate count, a dense level's positions are ``0 .. count - 1``
+        by construction, and a COO input stores each coordinate once.  So the
+        result is allocated at that input's entry count and each entry is
+        written at that position, as the shipped compiler writes it (scalar
+        accumulation).
+
+        A program whose loops this family cannot make store those entries fails
+        closed with ``unsupported_entries_of``: the append form would store only
+        the entries the reduction reaches.
+        """
+
+        source = self.program.entries_of
+        if source is None:
+            return None
+        levels = len(self.result_decl.levels)
+        if (
+            not self._coordinate_result
+            or self._region_form
+            or self._dense_blocks
+            or not self._reduction_depth
+            or len(self.loops) < levels
+            or len(self.decls[source].levels) != levels
+            or not all(
+                self._walks_input_level(self.loops[level], source, level)
+                for level in range(levels)
+            )
+            or any(
+                type(node) in _TILE_STATEMENTS
+                for node in _walk_declared_schema(self.program.body)
+            )
+        ):
+            _fail(
+                UNSUPPORTED_ENTRIES_OF,
+                f"output {self.result_decl.name!r} stores the entries of input "
+                f"{self.decls[source].name!r}, which needs a coordinate result "
+                "whose loops walk that input's levels in order above a reduction "
+                "sub-nest, with no tile in the nest",
+            )
+        return source
+
+    def stored_entry_source(self) -> Optional[SymbolId]:
+        return self._driver_entry
+
+    def _walks_input_level(self, loop: _Loop, symbol: SymbolId, level: int) -> bool:
+        """Whether ``loop`` visits every stored coordinate of ``symbol``'s ``level``
+        once per stored parent, and nothing else."""
+
+        if self._level_dimension(symbol, level) != loop.dimension:
+            return False
+        if loop.kind is _SPARSE:
+            cursor = loop.cursors[0]
+            return cursor.tensor == symbol and cursor.level == level
+        if loop.kind is _DENSE:
+            return self.decls[symbol].levels[level].kind is LevelKind.DENSE
+        return False
 
     def _structural_guard_name(self) -> str:
         return f"{self.result_decl.name}_nonempty"
@@ -17549,6 +17706,21 @@ class _MultiCompressedAssemblyLowering(_OrderedKeyRegionEmission):
                     then_body=appends,
                 )
             ]
+        # The shared child dispatch owns the reduction sub-nest: its loops
+        # assemble nothing, so they need this family's assembly overrides no
+        # more than the generic target's loops do.  The sub-nest is a sum kept
+        # in a register, so a schedule may keep a vector mark on its loops
+        # (the shared rule decides which are safe).  With no vector decision
+        # recorded the sub-nest carries no mark, as this family has always
+        # emitted it.  Nor does it when each inner iteration also writes the
+        # flag that records whether the sum ran (``guarded``): the loop
+        # then carries two scalars, and the mark (no reduction clause) is
+        # shown safe only for the one sum the shipped compiler's marked loops
+        # carry.  A schedule naming such a loop is refused
+        # (``unsupported_vector_loop``).
+        reduction = _TargetLowering._loop_children(self, position)
+        if self.program.vector_loops is not None and not guarded:
+            mark_simd_on_reduction_loops(reduction)
         return [
             llir.Comment("Initialize the reduction accumulator"),
             llir.VarInit(
@@ -17560,10 +17732,7 @@ class _MultiCompressedAssemblyLowering(_OrderedKeyRegionEmission):
             ),
             *guard_init,
             llir.BlankLine(),
-            # The shared child dispatch owns the reduction sub-nest: its loops
-            # assemble nothing, so they need this family's assembly overrides
-            # no more than the generic target's loops do.
-            *_TargetLowering._loop_children(self, position),
+            *reduction,
             llir.BlankLine(),
             *appends,
         ]
@@ -17838,7 +18007,11 @@ class _MultiCompressedAssemblyLowering(_OrderedKeyRegionEmission):
                     *_stored_prefix_close_statements(self, position),
                 ]
             return child_stmts
-        return [*child_stmts, *self._compressed_level_close_statements(position)]
+        return [
+            *self._dense_block_open_statements(position),
+            *child_stmts,
+            *self._compressed_level_close_statements(position),
+        ]
 
     def _assembly_coordinates(self, levels: int) -> List[llir.Expr]:
         """The coordinates the assembly loops bind for result levels ``0 ..
@@ -17850,6 +18023,53 @@ class _MultiCompressedAssemblyLowering(_OrderedKeyRegionEmission):
                 type=llir.DataType.INT64,
             )
             for level in range(levels)
+        ]
+
+    def _levels_bounded_in_kernel(self) -> Tuple[int, ...]:
+        """Every level of every dense block of the result: each block is checked
+        where it opens (:meth:`_dense_block_open_statements`).  A coordinate
+        result has no dense block below a compressed level."""
+
+        if self._coordinate_result:
+            return ()
+        return tuple(
+            level
+            for first, last in dense_blocks(self._result_level_types())
+            for level in range(first, last + 1)
+        )
+
+    def _dense_block_open_statements(
+        self, position: int, parent_position: Optional[llir.Expr] = None
+    ) -> List[llir.Stmt]:
+        """What a compressed level's body starts with when a dense block is below.
+
+        The check that the block the coordinate opens ends within the position
+        bound (``torch_cpp_abi.dense_block_check``), before the child forms and
+        narrows the block's positions; the block's commit
+        (:meth:`_dense_block_commit_statements`) ends the same body.
+        ``parent_position`` is the coordinate's position where it is not the
+        pending one (a drained level's, which is already appended).
+        """
+
+        levels = self.result_decl.levels
+        if (
+            self._coordinate_result
+            or position + 1 >= len(levels)
+            or levels[position].kind is not LevelKind.COMPRESSED
+            or levels[position + 1].kind is not LevelKind.DENSE
+        ):
+            return []
+        level_types = self._result_level_types()
+        if all(first != position + 1 for first, _ in dense_blocks(level_types)):
+            return []
+        return [
+            dense_block_check(
+                None,
+                self.result_decl.name,
+                level_types,
+                position + 1,
+                parent_position,
+            )
         ]
 
     def _compressed_level_close_statements(self, position: int) -> List[llir.Stmt]:
@@ -18356,6 +18576,7 @@ class _MultiCompressedAssemblyLowering(_OrderedKeyRegionEmission):
             return [*resolves, *child]
         return [
             *resolves,
+            *self._dense_block_open_statements(position),
             *child,
             *self._compressed_level_close_statements(position),
         ]
@@ -18603,6 +18824,7 @@ class _MultiCompressedAssemblyLowering(_OrderedKeyRegionEmission):
                 ]
             return children
         return [
+            *self._dense_block_open_statements(position),
             *self._child_stream_statements(position),
             *self._compressed_level_close_statements(position),
         ]
@@ -18975,20 +19197,321 @@ class _CoordinateResultOrderedKeyLowering(_OrderedKeySparseWorkspaceLowering):
     _coordinate_result = True
 
 
+#: The local holding a COO result's entry count when it is known before the
+#: loops run: the shipped compiler's spelling of the same count.
+_KNOWN_ENTRY_COUNT = "_known_nnz"
+
+#: A program names the input whose entries its result stores
+#: (``LoopProgram.entries_of``) and the lowering cannot build that structure.
+UNSUPPORTED_ENTRIES_OF = "unsupported_entries_of"
+
+#: The tile statements a program storing one input's entries may not hold: no
+#: lowering is shown to store those entries with a tile in the nest, and plan
+#: legality refuses the plan that would place one.
+_TILE_STATEMENTS = (TileOuterFor, TileInnerFor, PanelOuterFor, TiledReduce)
+
+
 class _CoordinateResultAssemblyLowering(_MultiCompressedAssemblyLowering):
     """The ordered-append family assembling a coordinate (COO) result.
 
     Built on the result's all-compressed twin; see
     ``_TargetLowering._coordinate_result``.
+
+    When one input's stored entries are the result's entries
+    (:meth:`_driver_entry_input`), the result's arrays are allocated at that
+    input's entry count before the loops run and each entry is written at that
+    input's leaf position, as the shipped compiler writes it, instead of being
+    appended to growing vectors.  The values are the same; nothing is copied
+    out of a vector afterwards.
     """
 
     _coordinate_result = True
 
     def supported_assemblies(self) -> Tuple[str, ...]:
-        """The serial single pass: a coordinate result has no position array to
-        fill from per-segment counts."""
+        """The serial single pass, and the parallel one for a program that names
+        the input whose entries the result stores.
 
+        A coordinate result has no position array to fill from per-segment
+        counts, so neither two-pass strategy applies.  The parallel single pass
+        needs every entry's position known before the loops run, which only a
+        program recording ``entries_of`` has; it is emitted where the result
+        loops fold into one loop over that input's entries
+        (:meth:`_walks_driver_entries`).
+        """
+
+        if self._driver_entry is None:
+            return (DEFAULT_SERIAL_STRATEGY,)
+        return SINGLE_PASS_STRATEGIES
+
+    def emittable_assemblies(self) -> Tuple[str, ...]:
+        """The serial single pass, and the parallel one over a COO driver."""
+
+        if self._walks_driver_entries():
+            return SINGLE_PASS_STRATEGIES
         return (DEFAULT_SERIAL_STRATEGY,)
+
+    def assembly_split_extent(self) -> Optional[int]:
+        """The driver's entry count, bounded by the product of the result's extents.
+
+        The parallel single pass splits the driving input's stored entries, not
+        the result's first level.  Their number is known only when the kernel
+        runs; it is at most the number of the result's cells, and below
+        :data:`.assembly_rule.PARALLEL_FROM_EXTENT` entries the runtime thread cap
+        (``scorch_nthreads``) gives the loop one worker.
+        """
+
+        if not self._walks_driver_entries():
+            return super().assembly_split_extent()
+        cells = 1
+        for extent in self.shapes[self.result_symbol]:
+            cells *= extent
+        return cells
+
+    def _walks_driver_entries(self) -> bool:
+        """Whether the result loops can walk the driver as one loop over its entries.
+
+        The driving input (:meth:`_driver_entry_input`, which the program names
+        as ``entries_of``) is a COO tensor of two levels or more, and the result
+        loops walk its levels in order.  Each driver entry is one result
+        entry written at the entry's own position, and nothing in its body
+        depends on the entries before it, so the loops over runs of equal
+        coordinates fold into one counted loop over the entries, whose
+        iterations are independent.  This is the shipped compiler's loop for
+        these results, run in parallel.
+
+        A rank-1 COO driver is already walked entry by entry, and a CSR or
+        dense driver's levels are counted loops of their own; the shipped
+        compiler runs both serially, and so does this family.
+        """
+
+        if self._driver_entry is None:
+            return False
+        # The result loops walk the driver's levels in order
+        # (``_driver_entry_input`` refuses the program otherwise), so a COO
+        # driver's loops are single-cursor loops over its levels.
+        levels = self.decls[self._driver_entry].levels
+        return len(levels) >= 2 and all(
+            level.kind is LevelKind.COORDINATE for level in levels
+        )
+
+    def _parallel_over_driver_entries(self) -> bool:
+        """Whether this program records the parallel single pass.
+
+        Fails closed for a recorded strategy :meth:`emittable_assemblies`
+        leaves out.
+        """
+
+        strategy = self.assembly_strategy()
+        if strategy not in self.emittable_assemblies():
+            _fail(
+                UNSUPPORTED_ASSEMBLY_STRATEGY,
+                f"assembly strategy {strategy!r} needs a COO result written at "
+                "the positions of one COO input's stored entries, a tensor of "
+                "two levels or more whose levels the result loops walk in order",
+            )
+        return strategy == AssemblyStrategy.SINGLE_PASS_CHUNK_PARALLEL.value
+
+    def _driver_entry_var(self) -> llir.Var:
+        """``p{D}{L-1}``: the driver's leaf position, which numbers its entries."""
+
+        driver = self.decls[cast(SymbolId, self._driver_entry)]
+        return llir.Var(
+            name=f"p{driver.name}{len(driver.levels) - 1}", type=llir.DataType.INT
+        )
+
+    def raw_loop_statements(self) -> List[llir.Stmt]:
+        if not self._parallel_over_driver_entries():
+            return super().raw_loop_statements()
+        _TargetLowering._require_value_expression_unchanged(self)
+        return self._driver_entry_loop()
+
+    def _driver_entry_loop(self) -> List[llir.Stmt]:
+        """One parallel loop over the driver's entries, as the shipped compiler emits it.
+
+        ``for (int64_t pD{L-1} = 0; pD{L-1} < pD0_end; pD{L-1}++)`` reads every
+        level's coordinate at the entry (:meth:`_lower_sparse` on the levels
+        below the first), resolves the dense positions each coordinate
+        addresses, and runs the reduction and the entry's writes.  The loop is
+        marked by the shared marking pass, which keeps a loop serial whose
+        iterations carry a scalar, and is given the shared thread policy.
+        """
+
+        loop = self.loops[0]
+        cursor = loop.cursors[0]
+        driver = self.decls[cursor.tensor]
+        entry = self._driver_entry_var()
+        end = llir.Var(
+            name=f"{self._cursor_position_name(cursor)}_end", type=llir.DataType.INT
+        )
+        body: List[llir.Stmt] = [
+            llir.Comment("Resolve coordinates"),
+            llir.VarInit(
+                var=llir.Var(name=self._loop_var_name(loop), type=llir.DataType.INT64),
+                value=llir.ArrayAccess(
+                    array=self._cursor_crd_array(cursor), index=entry
+                ),
+            ),
+            llir.BlankLine(),
+            *self._entry_level_resolves(0),
+        ]
+        entry_loop = llir.ForLoop(
+            init=llir.VarInit(
+                var=llir.Var(name=entry.name, type=llir.DataType.INT64),
+                value=llir.Literal(0),
+            ),
+            cond=llir.BinOp(op="<", left=entry, right=end),
+            update=llir.Increment(var=entry),
+            body=body,
+        )
+        entry_loop.scorch_index_var = self._loop_var_name(loop)
+        self._record_emitted_loop(0, entry_loop)
+        if not mark_first_for_loop_parallel(
+            [entry_loop], EMPTY_PARALLEL_WORKSPACE_CLUSTER
+        ):
+            _fail(
+                UNSUPPORTED_ASSEMBLY_STRATEGY,
+                "the loop over the driving input's entries carries a value "
+                "between iterations, so it cannot run in parallel",
+            )
+        return [
+            llir.Comment("Initialize iterators"),
+            llir.VarInit(
+                var=end,
+                value=llir.FunctionCall(
+                    name=f"{driver.name}0_crd_tensor.size", args=[llir.Literal(0)]
+                ),
+            ),
+            llir.BlankLine(),
+            entry_loop,
+        ]
+
+    def _entry_level_resolves(self, position: int) -> List[llir.Stmt]:
+        """The dense positions one driver level's coordinate addresses, then the
+        statements below that level."""
+
+        loop = self.loops[position]
+        stmts: List[llir.Stmt] = []
+        input_resolves = self._input_resolves_at(loop)
+        result_resolves = self._result_resolves_at(loop)
+        if input_resolves:
+            stmts.append(llir.Comment("Resolve dense coordinates"))
+            stmts.extend(input_resolves)
+        if result_resolves:
+            stmts.append(llir.Comment("Resolve index into dense level of values array"))
+            stmts.extend(result_resolves)
+        stmts.extend(self._loop_children(position))
+        return stmts
+
+    def _lower_sparse(self, position: int) -> List[llir.Stmt]:
+        """A driver level below the first, in the loop over the driver's entries:
+        its coordinate read at the entry, with no loop of its own."""
+
+        if (
+            position == 0
+            or position >= len(self.result_decl.levels)
+            or not self._parallel_over_driver_entries()
+        ):
+            return super()._lower_sparse(position)
+        loop = self.loops[position]
+        return [
+            llir.Comment("Resolve coordinates"),
+            llir.VarInit(
+                var=llir.Var(name=self._loop_var_name(loop), type=llir.DataType.INT),
+                value=llir.ArrayAccess(
+                    array=self._cursor_crd_array(loop.cursors[0]),
+                    index=self._driver_entry_var(),
+                ),
+            ),
+            llir.BlankLine(),
+            *self._entry_level_resolves(position),
+        ]
+
+    def result_size_inits(self) -> List[llir.Stmt]:
+        statements = super().result_size_inits()
+        if self._driver_entry is None:
+            return statements
+        driver = self.decls[self._driver_entry].name
+        return [
+            *statements,
+            llir.VarInit(
+                var=llir.Var(name=_KNOWN_ENTRY_COUNT, type=llir.DataType.INT64),
+                value=llir.MemberCall(
+                    base=llir.Var(
+                        name=f"{driver}_values", type=llir.DataType.TORCH_TENSOR
+                    ),
+                    member="size",
+                    args=(llir.Literal(value=0, data_type=llir.DataType.INT64),),
+                ),
+            ),
+        ]
+
+    def result_assembler(self) -> ResultTensorAssembler:
+        if self._driver_entry is None:
+            return super().result_assembler()
+        # Torch-owned arrays of the known entry count, written by position: the
+        # shared assembler's known-count spelling, which the shipped compiler
+        # uses for the same results.
+        return ResultTensorAssembler(
+            name=self.result_decl.name,
+            level_types=self._result_level_types(),
+            dtype=_SCALAR_TO_TORCH[self.result_decl.dtype],
+            known_nnz_var=_KNOWN_ENTRY_COUNT,
+            result_id=SymbolId(self.result_symbol.value),
+        )
+
+    def _coordinate_entry_appends(
+        self, appends: List[llir.Stmt], upper: Sequence[llir.Expr]
+    ) -> List[llir.Stmt]:
+        """One entry of the COO result: appended, or written at its position.
+
+        The base class checks the twin's leaf append and turns it into one
+        append per level.  With a driving input the entry is instead written at
+        that input's leaf position: the value, then the coordinate of every
+        level, outermost first, as the shipped compiler writes them.
+        """
+
+        entry = super()._coordinate_entry_appends(appends, upper)
+        if self._driver_entry is None:
+            return entry
+        result_name = self.result_decl.name
+        levels = len(self.result_decl.levels)
+        driver = self.decls[self._driver_entry].name
+        position = llir.Var(name=f"p{driver}{levels - 1}", type=llir.DataType.INT)
+        value = cast(llir.FunctionCallStmt, appends[0]).args[0]
+        leaf_coordinate = cast(llir.FunctionCallStmt, appends[-2]).args[0]
+        writes: List[llir.Stmt] = [
+            llir.Assign(
+                var=llir.ArrayAccess(
+                    array=llir.Var(
+                        name=f"{result_name}_values", type=llir.DataType.NO_TYPE
+                    ),
+                    index=position,
+                    tensor_access=self._result_metadata(),
+                ),
+                value=value,
+                result_storage=self._result_storage(
+                    (RESULT_VALUES, None, STORAGE_WRITE)
+                ),
+            ),
+            *(statement for statement in appends[1:-2]),
+        ]
+        for level, coordinate in enumerate([*upper, leaf_coordinate]):
+            writes.append(
+                llir.Assign(
+                    var=llir.ArrayAccess(
+                        array=llir.Var(
+                            name=f"{result_name}{level}_crd",
+                            type=llir.DataType.NO_TYPE,
+                        ),
+                        index=position,
+                    ),
+                    value=coordinate,
+                    result_storage=self._result_storage(
+                        (RESULT_CRD, level, STORAGE_WRITE)
+                    ),
+                )
+            )
+        return writes
 
 
 _RELAYOUT_LOST = "relayout_completion_lost"
@@ -21656,7 +22179,14 @@ def _compressed_result_twin(program: LoopProgram) -> LoopProgram:
             for decl in program.tensors
         ),
     )
-    verify_program(twin)
+    # The recorded assembly strategy belongs to the coordinate receiver and was
+    # verified against it with the program (``_owned_input_shapes``).  The
+    # parallel single pass is legal for a COO result that stores one input's
+    # entries (``entries_of``) and for no all-compressed receiver without a
+    # dense level zero, so a twin of such a program is verified without the
+    # strategy and keeps it: the coordinate-result families read it from the
+    # twin.  Every other twin is verified as it is.
+    verify_program(twin if program.entries_of is None else replace(twin, assembly=None))
     return twin
 
 
@@ -21711,7 +22241,9 @@ def _require_no_coordinate_operand_positions(
 
 
 def _require_coordinate_result_assembly(
-    lowering: "_TargetLowering", statements: List[llir.Stmt]
+    lowering: "_TargetLowering",
+    statements: List[llir.Stmt],
+    stored_entry_source: Optional[SymbolId] = None,
 ) -> None:
     """Fail closed unless every appended entry of a coordinate result is whole.
 
@@ -21729,6 +22261,18 @@ def _require_coordinate_result_assembly(
     levels = len(lowering.result_decl.levels)
     forbidden = tuple(f"{result_name}{level}_pos" for level in range(levels + 1))
     value_append = f"{result_name}_values.emplace_back"
+    value_array = f"{result_name}_values"
+    # Only a program that names the input whose entries the result stores
+    # (``entries_of``, passed here as ``stored_entry_source``) writes an entry
+    # at a known position; every other one is checked on its appends alone.
+    written_arrays = (
+        {
+            value_array,
+            *(f"{result_name}{level}_crd" for level in range(levels)),
+        }
+        if stored_entry_source is not None
+        else set()
+    )
     coordinate_appends = tuple(
         (
             f"{result_name}{level}_crd.emplace_back",
@@ -21747,6 +22291,7 @@ def _require_coordinate_result_assembly(
             )
             self.positions: List[str] = []
             self.partial: List[int] = []
+            self.scattered: List[List[str]] = []
             self.entries = 0
 
         def enter_node(self, node: llir.Node, path: Tuple[str, ...]) -> None:
@@ -21764,11 +22309,36 @@ def _require_coordinate_result_assembly(
                 for statement in statements
                 if type(statement) is llir.FunctionCallStmt
             ]
-            values = calls.count(value_append)
+            # An entry written at a known position (the result allocated at a
+            # driving input's entry count) writes the values array and every
+            # level's coordinate array at that one position.
+            writes = [
+                (
+                    cast(llir.Var, statement.var.array).name,
+                    statement.var.index,
+                )
+                for statement in statements
+                if type(statement) is llir.Assign
+                and type(statement.var) is llir.ArrayAccess
+                and type(statement.var.array) is llir.Var
+                and cast(llir.Var, statement.var.array).name in written_arrays
+            ]
+            written = [name for name, _ in writes]
+            values = calls.count(value_append) + written.count(value_array)
             self.entries += values
             for level, spellings in enumerate(coordinate_appends):
-                if sum(calls.count(spelling) for spelling in spellings) != values:
+                stored = sum(calls.count(spelling) for spelling in spellings)
+                stored += written.count(f"{result_name}{level}_crd")
+                if stored != values:
                     self.partial.append(level)
+            positions = {
+                index.name if type(index) is llir.Var else repr(index)
+                for _, index in writes
+            }
+            if len(positions) > 1 or any(
+                type(index) is not llir.Var for _, index in writes
+            ):
+                self.scattered.append(sorted(positions))
 
     assembly = _Assembly()
     assembly.walk(cast(Any, statements))
@@ -21784,6 +22354,12 @@ def _require_coordinate_result_assembly(
             "unsupported_sparse_output",
             f"the assembly of coordinate result {result_name!r} appends a "
             f"value without a coordinate on level {assembly.partial[0]}",
+        )
+    if assembly.scattered:
+        _fail(
+            "unsupported_sparse_output",
+            f"the assembly of coordinate result {result_name!r} writes one "
+            f"entry's arrays at different positions {assembly.scattered[0]}",
         )
     if not assembly.entries:
         _fail(
@@ -22023,6 +22599,17 @@ def _select_lowering(
         )
     else:
         lowering = _TargetLowering(program, owned_input_shapes, result_shape)
+    if (
+        program.entries_of is not None
+        and lowering.stored_entry_source() != program.entries_of
+    ):
+        # Every other family stores the entries its statements write, which
+        # are fewer: storing them would quietly change the result's structure.
+        _fail(
+            UNSUPPORTED_ENTRIES_OF,
+            f"{type(lowering).__name__} stores the entries its statements write, "
+            "not every stored entry of the input the program names",
+        )
     return lowering, coordinate_result
 
 
@@ -22048,9 +22635,12 @@ class AssemblyChoices:
     ``host`` names the target family that lowers the program.  ``emittable`` is
     every strategy a plan can record for it and get a kernel, in the order
     :data:`SPARSE_ASSEMBLY_STRATEGIES` lists them; a recorded strategy outside
-    it is refused.  ``split_extent`` is the extent of the result's first level,
-    the one a parallel assembly is split over, as the target reads it (``None``
-    for a scalar result).  ``sparse_result`` says whether the result has a level
+    it is refused.  ``split_extent`` is the most parts a parallel assembly of
+    it is split into, as the target reads it
+    (:meth:`_TargetLowering.assembly_split_extent`): the extent of the result's
+    first level, or, for a loop over one input's stored entries, the product of
+    the result's extents (``None`` for a scalar result).  ``sparse_result`` says
+    whether the result has a level
     that is not dense: only then does the program assemble anything a strategy
     describes.  Nothing here weighs that extent, a density or a thread count:
     which emittable strategy to use is the scheduler's decision.
@@ -22088,7 +22678,7 @@ def assembly_choices(
     return AssemblyChoices(
         host=type(lowering).__name__,
         emittable=lowering.emittable_assemblies(),
-        split_extent=next(iter(lowering.shapes[lowering.result_symbol]), None),
+        split_extent=lowering.assembly_split_extent(),
         sparse_result=assembles_sparse_result(program),
     )
 
@@ -22133,6 +22723,67 @@ def with_recorded_assembly(
     return recorded, choices
 
 
+#: A schedule keeps a vector mark on a loop the target does not mark
+#: (``LoopProgram.vector_loops``).
+UNSUPPORTED_VECTOR_LOOP = "unsupported_vector_loop"
+
+_VECTOR_LOOP_SUFFIX = {
+    VectorLoopPart.LOGICAL: "",
+    VectorLoopPart.OUTER: "_out",
+    VectorLoopPart.INNER: "_in",
+}
+
+
+def _vector_loop_identity_names(program: LoopProgram) -> Optional[Tuple[str, ...]]:
+    """The loop identity names a program's recorded vector marks name.
+
+    ``None`` when the program records no vector decision.  The target names
+    each loop it emits (``llir.ForLoop.scorch_index_var``) by its dimension's
+    display name, with ``_out`` for the origin loop of a split or panel and
+    ``_in`` for a split's point loop: the spelling the shipped compiler's
+    schedule lowering reads (``scheduler._render_loop_ref``), so one request
+    names the same loops in both compilers.
+    """
+
+    marks = program.vector_loops
+    if marks is None:
+        return None
+    dimension_names = {decl.dimension: decl.name for decl in program.dimensions}
+    tensors = {decl.symbol: decl for decl in program.tensors}
+    statements = [
+        node for node in _walk_declared_schema(program.body) if isinstance(node, Stmt)
+    ]
+    names: List[str] = []
+    for mark in marks:
+        node = next(
+            (
+                statement
+                for statement in statements
+                if _vector_target_matches(statement, mark.index, mark.part)
+            ),
+            None,
+        )
+        if node is None:
+            _fail(
+                UNSUPPORTED_VECTOR_LOOP,
+                "a vector mark names a loop the program does not bind",
+            )
+        if type(node) is SparseFor or type(node) is MergedSparseFor:
+            cursor = (
+                cast(SparseFor, node).cursor
+                if type(node) is SparseFor
+                else cast(MergedSparseFor, node).cursors[0]
+            )
+            decl = tensors[cursor.tensor]
+            dimension = decl.dimensions[decl.levels[cursor.level].mode]
+        else:
+            # DenseFor, TileOuterFor, TileInnerFor and PanelOuterFor each name
+            # the dimension they iterate.
+            dimension = cast(DenseFor, node).dimension
+        names.append(dimension_names[dimension] + _VECTOR_LOOP_SUFFIX[mark.part])
+    return tuple(names)
+
+
 def _lower_loopir_to_llir_owned(
     program: LoopProgram,
     *,
@@ -22153,10 +22804,26 @@ def _lower_loopir_to_llir_owned(
         program, owned_input_shapes, result_shape
     )
     raw_statements = lowering.raw_loop_statements()
+    unmarkable = select_vector_marks(
+        raw_statements, _vector_loop_identity_names(program)
+    )
+    if unmarkable:
+        _fail(
+            UNSUPPORTED_VECTOR_LOOP,
+            f"the schedule keeps {', '.join(map(repr, unmarkable))} marked for "
+            "vector instructions, and this kernel does not mark them: a mark is "
+            "placed only on a loop of a sum kept in a register, not parallel or "
+            "unrolled, with no early exit and no loop over a compressed level's "
+            "positions in its body",
+        )
     kernel_abi = lowering.kernel_abi()
     assembler = lowering.result_assembler()
     if coordinate_result:
-        _require_coordinate_result_assembly(lowering, raw_statements)
+        _require_coordinate_result_assembly(
+            lowering,
+            raw_statements,
+            stored_entry_source=lowering.stored_entry_source(),
+        )
     _require_no_coordinate_operand_positions(lowering, raw_statements)
 
     validation_stmts = kernel_abi.emit_validation()
@@ -22306,6 +22973,9 @@ def _lower_loopir_to_llir_owned(
         ordered_key_completion_reference,
     )
     _require_reads_in_scope(returned)
+    # The result check's dense blocks and the body's block checks, after every
+    # pass and completion stage.
+    kernel_abi.require_bounded_levels_checked(returned)
     return returned
 
 

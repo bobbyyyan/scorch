@@ -1224,7 +1224,7 @@ def test_a_dense_outer_loop_numbers_two_pass_cells_by_its_loop_variable():
     ).cpp_source
 
     assert "std::vector<int> _count1((size_t)A0_size, 0);" in source
-    assert "std::vector<int> _count2((size_t)A0_size, 0);" in source
+    assert "std::vector<int64_t> _count2((size_t)A0_size, 0);" in source
     assert "_count1[i] = _cnt1;" in source
     assert "_count2[i] = _cnt2;" in source
     assert "int64_t _base1 = _offset1[i];" in source

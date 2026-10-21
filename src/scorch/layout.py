@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import FrozenInstanceError, dataclass, replace
+from dataclasses import dataclass, replace
 import json
 import math
 
@@ -19,11 +19,16 @@ import torch
 from .exceptions import (
     CompileSpecError,
     OperandDtypeMismatchError,
+    ScorchFrozenInstanceError,
+    ShapeCapacityLayoutError,
+    ShapeCapacitySpecError,
     TensorDeviceError,
     TensorLayoutError,
     TensorTypeError,
     TensorValidationError,
     UnsupportedDtypePromotionError,
+    defect_code,
+    shape_capacity_error,
 )
 from .format import (
     FormatInput,
@@ -55,12 +60,15 @@ SUPPORTED_VALUE_DTYPES = (
 def validate_runtime_contract(tensor_format: TensorFormat, dtype: torch.dtype) -> None:
     """Reject layouts and value dtypes that Scorch cannot execute safely."""
     if dtype not in SUPPORTED_VALUE_DTYPES:
-        raise TensorValidationError(f"Scorch tensor dtype {dtype} is not supported")
+        raise TensorValidationError(
+            f"Scorch tensor dtype {dtype} is not supported", code="dtype_unsupported"
+        )
     # A membership test, not a generator over the levels: this runs for every tensor's
     # metadata, and level_types holds the exact LevelType members.
     if LevelType.SINGLETON in tensor_format.level_types:
         raise TensorLayoutError(
-            "singleton levels are not supported by the Scorch runtime"
+            "singleton levels are not supported by the Scorch runtime",
+            code="singleton_level_unsupported",
         )
 
 
@@ -104,27 +112,48 @@ def require_same_value_dtype(*dtypes: torch.dtype, operation: str) -> torch.dtyp
 
 def _normalize_shape(shape: ShapeLike, field: str) -> Tuple[int, ...]:
     if isinstance(shape, (str, bytes)) or not isinstance(shape, Sequence):
-        raise TensorTypeError(f"{field} must be a sequence of integers")
-    normalized = []
-    product = 1
+        raise TensorTypeError(
+            f"{field} must be a sequence of integers", code="shape_type_invalid"
+        )
+    normalized: list[int] = []
     for mode, extent in enumerate(shape):
         extent_type = type(extent)
         if extent_type is bool or not issubclass(extent_type, int):
             raise TensorTypeError(
-                f"{field}[{mode}] must be an integer, got {type(extent).__name__}"
+                f"{field}[{mode}] must be an integer, got {type(extent).__name__}",
+                code="shape_type_invalid",
             )
         # Do not retain or execute arithmetic supplied by an ``int``
         # subclass after this boundary.  Calling the base descriptor directly
         # both bypasses an overridden ``__int__`` and produces an exact int.
         extent = int.__int__(extent)
         if extent < 0:
-            raise TensorLayoutError(f"{field}[{mode}] must be nonnegative")
+            raise TensorLayoutError(
+                f"{field}[{mode}] must be nonnegative", code="shape_extent_negative"
+            )
         if extent > _MAX_INT64:
-            raise TensorLayoutError(f"{field}[{mode}] exceeds signed int64")
-        if extent and product > _MAX_INT64 // extent:
-            raise TensorLayoutError(f"{field} element count exceeds signed int64")
-        product *= extent
+            raise shape_capacity_error(
+                ShapeCapacityLayoutError,
+                f"{field}[{mode}] exceeds signed int64",
+                field,
+                normalized,
+                mode,
+                extent,
+            )
         normalized.append(extent)
+    # The count of every extent, multiplied exactly: a zero extent holds no element
+    # whatever the extents before it multiply to.
+    if 0 not in normalized:
+        count = math.prod(normalized)
+        if count > _MAX_INT64:
+            raise shape_capacity_error(
+                ShapeCapacityLayoutError,
+                f"{field} element count exceeds signed int64",
+                field,
+                normalized,
+                None,
+                count,
+            )
     return tuple(normalized)
 
 
@@ -134,18 +163,26 @@ def _normalize_permutation(
     if permutation is None:
         return tuple(range(rank))
     if isinstance(permutation, (str, bytes)) or not isinstance(permutation, Sequence):
-        raise TensorTypeError("layout permutation must be a sequence of integers")
+        raise TensorTypeError(
+            "layout permutation must be a sequence of integers",
+            code="mode_order_type_invalid",
+        )
     supplied = tuple(permutation)
     if any(type(mode) is bool or not issubclass(type(mode), int) for mode in supplied):
-        raise TensorTypeError("layout permutation entries must be integers")
+        raise TensorTypeError(
+            "layout permutation entries must be integers",
+            code="mode_order_type_invalid",
+        )
     result = tuple(int.__int__(mode) for mode in supplied)
     if len(result) != rank:
         raise TensorLayoutError(
-            f"layout permutation has rank {len(result)}, expected {rank}"
+            f"layout permutation has rank {len(result)}, expected {rank}",
+            code="mode_order_not_permutation",
         )
     if sorted(result) != list(range(rank)):
         raise TensorLayoutError(
-            f"layout permutation must contain each mode in range({rank}) once"
+            f"layout permutation must contain each mode in range({rank}) once",
+            code="mode_order_not_permutation",
         )
     return result
 
@@ -162,7 +199,10 @@ def _parse_dtype(value: Union[str, torch.dtype], field: str) -> torch.dtype:
         parsed = getattr(torch, name, None)
         if type(parsed) is torch.dtype:
             return parsed
-    raise TensorTypeError(f"{field} must be a torch.dtype, got {type(value).__name__}")
+    raise TensorTypeError(
+        f"{field} must be a torch.dtype, got {type(value).__name__}",
+        code="dtype_type_invalid",
+    )
 
 
 # Shared TensorLayout instances, keyed by the arguments that produced them. A layout
@@ -229,26 +269,33 @@ class TensorLayout(_TensorLayoutFields):
         index_dtype = _parse_dtype(index_dtype, "index_dtype")
         if len(physical_shape) != rank:
             raise TensorLayoutError(
-                "logical_shape and physical_shape must have the same rank"
+                "logical_shape and physical_shape must have the same rank",
+                code="physical_shape_mismatch",
             )
         if tensor_format.get_order() != rank:
             raise TensorLayoutError(
-                f"format rank {tensor_format.get_order()} does not match shape rank {rank}"
+                f"format rank {tensor_format.get_order()} does not match shape rank {rank}",
+                code="format_rank_mismatch",
             )
         expected_physical = tuple(logical_shape[mode] for mode in permutation)
         if physical_shape != expected_physical:
             raise TensorLayoutError(
                 "physical_shape must equal logical_shape reordered by permutation: "
-                f"expected {expected_physical}, got {physical_shape}"
+                f"expected {expected_physical}, got {physical_shape}",
+                code="physical_shape_mismatch",
             )
         if index_dtype not in _INDEX_DTYPES:
             raise TensorLayoutError(
-                "index_dtype must be torch.int32 or torch.int64, " f"got {index_dtype}"
+                "index_dtype must be torch.int32 or torch.int64, " f"got {index_dtype}",
+                code="index_dtype_invalid",
             )
         if not _seal(
             self, logical_shape, physical_shape, tensor_format, permutation, index_dtype
         ):
-            raise FrozenInstanceError("cannot assign to field 'logical_shape'")
+            raise ScorchFrozenInstanceError(
+                "cannot assign to field 'logical_shape'",
+                code="value_object_already_sealed",
+            )
 
     def __reduce__(self):
         # An exact layout loads through from_physical_shape (the logical shape follows
@@ -412,23 +459,31 @@ def owned_layout(layout: object) -> TensorLayout:
     # The constructor sets every field at once, so one unset field means all are.
     if layout_type is TensorLayout:
         if _field_unset(layout, _LAYOUT_DESCRIPTORS[0][1]):
-            raise TensorLayoutError("layout has malformed stored state")
+            raise TensorLayoutError(
+                "layout has malformed stored state", code="value_object_state_corrupt"
+            )
         return cast(TensorLayout, layout)
     try:
         is_layout = issubclass(layout_type, TensorLayout)
     except TypeError:
         is_layout = False
     if not is_layout:
-        raise TensorTypeError("layout must be a TensorLayout")
+        raise TensorTypeError(
+            "layout must be a TensorLayout", code="layout_type_invalid"
+        )
     if _field_unset(layout, _LAYOUT_DESCRIPTORS[0][1]):
-        raise TensorLayoutError("layout has malformed stored state")
+        raise TensorLayoutError(
+            "layout has malformed stored state", code="value_object_state_corrupt"
+        )
     fields = [descriptor.__get__(layout) for _, descriptor in _LAYOUT_DESCRIPTORS]
     try:
         return TensorLayout(*fields)
     except (TensorTypeError, TensorLayoutError):
         raise
     except Exception as error:
-        raise TensorLayoutError("layout has malformed stored state") from error
+        raise TensorLayoutError(
+            "layout has malformed stored state", code="value_object_state_corrupt"
+        ) from error
 
 
 _METADATA_FIELDS = ("name", "dtype", "device", "layout", "requires_grad")
@@ -448,11 +503,15 @@ def _metadata_fields(
 ) -> Tuple[Any, ...]:
     """Validate metadata's arguments; return its fields in declaration order."""
     if not issubclass(type(name), str):
-        raise TensorLayoutError("tensor name must be a non-empty string")
+        raise TensorLayoutError(
+            "tensor name must be a non-empty string", code="tensor_name_invalid"
+        )
     # Bypass a subclass override and retain an exact immutable ``str``.
     name = str.strip(name)
     if not name:
-        raise TensorLayoutError("tensor name must be a non-empty string")
+        raise TensorLayoutError(
+            "tensor name must be a non-empty string", code="tensor_name_invalid"
+        )
     dtype = _parse_dtype(dtype, "dtype")
     try:
         if type(device) is torch.device:
@@ -463,17 +522,25 @@ def _metadata_fields(
             raise TypeError
     except Exception as error:
         raise TensorDeviceError(
-            f"invalid tensor device of type {type(device).__name__}"
+            f"invalid tensor device of type {type(device).__name__}",
+            code="device_type_invalid",
         ) from error
     if device.type != "cpu":
-        raise TensorDeviceError(f"Scorch runtime tensors must be on CPU, got {device}")
+        raise TensorDeviceError(
+            f"Scorch runtime tensors must be on CPU, got {device}",
+            code="device_not_cpu_unsupported",
+        )
     if own_layout:
         layout = owned_layout(layout)
     elif type(layout) is not TensorLayout:
-        raise TensorTypeError("owned metadata layout must be a TensorLayout")
+        raise TensorTypeError(
+            "owned metadata layout must be a TensorLayout", code="layout_type_invalid"
+        )
     validate_runtime_contract(layout.format, dtype)
     if type(requires_grad) is not bool:
-        raise TensorTypeError("requires_grad must be a bool")
+        raise TensorTypeError(
+            "requires_grad must be a bool", code="requires_grad_type_invalid"
+        )
     return (name, dtype, device, layout, requires_grad)
 
 
@@ -503,7 +570,9 @@ class TensorMetadata(_TensorMetadataFields):
             name, dtype, device, layout, requires_grad, own_layout=True
         )
         if not _seal(self, *fields):
-            raise FrozenInstanceError("cannot assign to field 'name'")
+            raise ScorchFrozenInstanceError(
+                "cannot assign to field 'name'", code="value_object_already_sealed"
+            )
 
     @classmethod
     def _from_owned_layout(
@@ -613,6 +682,9 @@ class TensorSpec:
             metadata = TensorMetadata(
                 name, parsed_dtype, torch.device(device), layout, False
             )
+        except ShapeCapacityLayoutError as error:
+            # The clause below would keep the text and drop the code.
+            raise error.retyped(ShapeCapacitySpecError) from error
         except (
             TensorLayoutError,
             TensorDeviceError,
@@ -621,7 +693,9 @@ class TensorSpec:
             TypeError,
             RuntimeError,
         ) as error:
-            raise CompileSpecError(str(error)) from error
+            raise CompileSpecError(
+                str(error), code=defect_code(error) or "tensor_spec_invalid"
+            ) from error
         object.__setattr__(self, "metadata", metadata)
 
     @property

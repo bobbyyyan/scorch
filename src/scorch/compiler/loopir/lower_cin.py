@@ -57,6 +57,7 @@ from .. import cin as cin_nodes
 from ..cin import (
     BinaryOp as CINBinaryOp,
     ForAll,
+    IndexExpr,
     IndexStmt,
     IndexVar,
     Operation,
@@ -68,6 +69,7 @@ from ..cin import (
 )
 from ..cin_analysis import verify_cin, verify_cin_structure
 from ..loop_plan import LoopPlan, verify_loop_plan
+from ..sparse_assembly import AccessLayout, entry_source
 from .build import LoopIRBuilder
 from .iterdomain import (
     DomainKind,
@@ -168,6 +170,28 @@ class LoopIRLoweringResult:
     result_symbol: SymbolId
 
 
+_WHERE_REFUSAL = "Where/workspace programs are outside the dense LoopIR families"
+
+
+def refuse_where_program(cin: IndexStmt) -> None:
+    """Refuse a program whose ForAll nest reaches a Where, as the lowering refuses it.
+
+    The lowering takes a ForAll nest whose leaf is one TensorAssign
+    (``_collect_loop_nest``), so every Where program ends at this refusal.  A route that
+    runs another stage before the lowering calls this first, so a Where program meets
+    the lowering's own coded refusal rather than that stage's account of a statement it
+    does not handle: the scheduler's automatic plan orders the ForAll chain above a
+    Where and none of the loops below it, and its plan verification then refuses the
+    plan without a code.
+    """
+
+    current: IndexStmt = cin
+    while isinstance(current, ForAll):
+        current = current.stmt
+    if isinstance(current, Where):
+        _fail("unsupported_statement", _WHERE_REFUSAL)
+
+
 def _collect_loop_nest(cin: IndexStmt) -> Tuple[List[IndexVar], TensorAssign]:
     loop_vars: List[IndexVar] = []
     current: IndexStmt = cin
@@ -181,10 +205,7 @@ def _collect_loop_nest(cin: IndexStmt) -> Tuple[List[IndexVar], TensorAssign]:
         loop_vars.append(current.index_var)
         current = current.stmt
     if isinstance(current, Where):
-        _fail(
-            "unsupported_statement",
-            "Where/workspace programs are outside the dense LoopIR families",
-        )
+        _fail("unsupported_statement", _WHERE_REFUSAL)
     if not isinstance(current, TensorAssign):
         _fail(
             "unsupported_statement",
@@ -252,16 +273,6 @@ def _check_tensor(
             f"tensor {tensor.name!r} declares no format",
         )
     level_types = tuple(tensor_format.get_level_types())
-    if not level_types:
-        # A rank-0 format is a format (``TensorVar(fmt="")``), and a scalar is a
-        # valid tensor outside the migrated families.  Refused here so that it
-        # is reported as that, and not by the LoopIR verifier as a malformed
-        # ``TensorDecl`` this lowering built.
-        _fail(
-            "unsupported_format",
-            f"tensor {tensor.name!r} is rank 0; a scalar tensor stays outside "
-            "the migrated DENSE/COMPRESSED families",
-        )
     if any(level_type not in _LEVEL_TYPE_TO_KIND for level_type in level_types):
         _fail(
             "unsupported_format",
@@ -323,6 +334,21 @@ def tensor_name_of(accesses: List[TensorAccess], symbol: SymbolId) -> str:
     )
 
 
+def _display_name(
+    lhs: TensorAccess, rhs_accesses: List[TensorAccess], symbol: SymbolId
+) -> str:
+    """The display name of ``symbol`` in this statement, or its identity."""
+
+    return next(
+        (
+            access.tensor.name
+            for access in (lhs, *rhs_accesses)
+            if access.tensor.symbol_id == symbol
+        ),
+        repr(symbol),
+    )
+
+
 def _level_types_to_lower_on(
     level_types: Dict[SymbolId, Tuple[LevelType, ...]], result_symbol: SymbolId
 ) -> Dict[SymbolId, Tuple[LevelType, ...]]:
@@ -344,6 +370,71 @@ def _level_types_to_lower_on(
     lowered = dict(level_types)
     lowered[result_symbol] = (LevelType.COMPRESSED,) * len(declared)
     return lowered
+
+
+def _entry_source(
+    lhs: TensorAccess,
+    rhs: IndexExpr,
+    result_symbol: SymbolId,
+    declared_result_levels: Tuple[LevelType, ...],
+    level_types: Dict[SymbolId, Tuple[LevelType, ...]],
+    storage_modes: Dict[SymbolId, Tuple[int, ...]],
+    loop_index_ids: Tuple[IndexId, ...],
+) -> Optional[SymbolId]:
+    """The input whose stored entries a reduction into a COO result stores.
+
+    The rule is :func:`~scorch.compiler.sparse_assembly.entry_source`, which plan
+    legality applies to the same facts: one input has exactly the result's
+    indices, every other factor of the product is dense along them, the input is
+    stored in the result's logical and storage order, and the loops over the
+    result's indices are the outermost ones with the reduction below.  Those
+    loops then walk that input's stored entries, one result entry each.
+
+    A plan that names that input (``LoopPlan.entries_of``) is recorded on the
+    program as ``LoopProgram.entries_of``, and this rule is checked against
+    it: the result then stores every one of its entries, including one whose
+    inner sum ran zero times (its value is zero), as the shipped compiler
+    stores it under scalar accumulation.  With no decision the result stores
+    only the entries some term reached, which gives the same values and costs
+    a flag per inner iteration, a branch per entry, and an output whose size is
+    not known before the loops run, so it cannot be allocated once or written
+    in parallel.  Which of the two is faster is measured, so it is a schedule
+    decision.  A field and not a statement: the loop nest stays one chain of
+    loops over one leaf, which every scheduling pass needs, and the reference
+    interpreter, every target and every schedule store the same entries.
+    """
+
+    factors: List[TensorAccess] = []
+
+    def collect(expr: object) -> bool:
+        if isinstance(expr, TensorAccess):
+            factors.append(expr)
+            return True
+        if isinstance(expr, CINBinaryOp) and expr.op is Operation.MUL:
+            return collect(expr.left) and collect(expr.right)
+        return False
+
+    def layout(access: TensorAccess, levels: Tuple[LevelType, ...]) -> AccessLayout:
+        symbol = access.tensor.symbol_id
+        logical = tuple(access.index_ids)
+        return AccessLayout(
+            tensor=symbol,
+            logical=logical,
+            storage=tuple(logical[mode] for mode in storage_modes[symbol]),
+            levels=levels,
+        )
+
+    product = collect(rhs) and not any(access.is_workspace() for access in factors)
+    source = entry_source(
+        layout(lhs, declared_result_levels),
+        (
+            [layout(access, level_types[access.tensor.symbol_id]) for access in factors]
+            if product
+            else None
+        ),
+        loop_index_ids,
+    )
+    return cast(Optional[SymbolId], source)
 
 
 def input_symbols_of(rhs_accesses: List[TensorAccess]) -> List[SymbolId]:
@@ -395,6 +486,7 @@ def lower_normalized_cin_to_loopir(
     cin: IndexStmt,
     *,
     planned_loop_order: Optional[Tuple[IndexId, ...]] = None,
+    planned_entries_of: Optional[SymbolId] = None,
 ) -> LoopIRLoweringResult:
     """Lower one normalized dense-family CIN program to verified LoopIR.
 
@@ -412,6 +504,12 @@ def lower_normalized_cin_to_loopir(
     reorder pass leaves them, so a program the written nest already lowered
     keeps its declarations.  The target lowering re-enforces the same
     boundary against the program it actually emits.
+
+    ``planned_entries_of`` is the plan's ``entries_of``: the input whose
+    stored entries a COO result stores.  The program records it only when the
+    plan names it, and a program whose loops do not walk that input's entries
+    above a reduction is refused (``unsupported_entries_of``); with no
+    decision the result stores the entries its statements write.
 
     This boundary owns the implicit-reduction normalization: a public
     ``TensorAssign.op is None`` statement whose reduction loops are all
@@ -614,6 +712,13 @@ def lower_normalized_cin_to_loopir(
             scalar_types,
             level_types,
             storage_modes,
+            planned_entries_of,
+        )
+    if planned_entries_of is not None:
+        _fail(
+            "unsupported_entries_of",
+            "the plan names an input whose stored entries the result stores, "
+            "and every tensor of this program is dense",
         )
 
     builder = LoopIRBuilder()
@@ -1490,11 +1595,14 @@ def _lower_sparse_family(
     scalar_types: Dict[SymbolId, ScalarType],
     level_types: Dict[SymbolId, Tuple[LevelType, ...]],
     storage_modes: Dict[SymbolId, Tuple[int, ...]],
+    planned_entries_of: Optional[SymbolId] = None,
 ) -> LoopIRLoweringResult:
     """Materialize the sparse level families from the pure domain analysis.
 
     ``loop_vars`` is the order the loops are nested in; ``dimension_vars``
     the written order, in which dimensions are declared.
+    ``planned_entries_of`` is the plan's ``entries_of``, recorded on the
+    program only when the plan names it.
     """
 
     loop_index_ids = tuple(index_var.index_id for index_var in loop_vars)
@@ -1798,6 +1906,30 @@ def _lower_sparse_family(
     else:
         leaf = builder.store(result_symbol, store_indices, value)
 
+    # A plan that names the input whose stored entries a COO result stores
+    # makes the result store every one of them, whatever its inner sum visits
+    # (``_entry_source``).  Plan legality proved the same rule on the same
+    # nest; it is checked again on the facts this front end lowers.
+    if planned_entries_of is not None and (
+        reduction_form is not _SparseOutputReduction.BOUND_PREFIX_ACCUMULATION
+        or _entry_source(
+            lhs,
+            assign.rhs,
+            result_symbol,
+            declared_result_levels,
+            level_types,
+            storage_modes,
+            loop_index_ids,
+        )
+        != planned_entries_of
+    ):
+        _fail(
+            "unsupported_entries_of",
+            "the plan stores the entries of tensor "
+            f"{_display_name(lhs, rhs_accesses, planned_entries_of)!r}, and "
+            "this program's loops do not accumulate one result entry per "
+            "stored entry of it above a reduction",
+        )
     body = builder.block((leaf,))
     for index_var in reversed(loop_vars):
         domain = domains[index_var.index_id]
@@ -1870,6 +2002,7 @@ def _lower_sparse_family(
         tuple(input_symbols),
         (result_symbol,),
         body,
+        entries_of=planned_entries_of,
     )
     verify_program(program)
 

@@ -58,6 +58,7 @@ from scorch.compiler.sparse_prefetch_pass import (
 from scorch.compiler.torch_cpp_abi import (  # type: ignore[import-untyped]
     ResultTensorAssembler,
 )
+from tests.test_scorch.openmp_shared_writes import shared_scalar_writes
 
 
 def _var(name: str, data_type: llir.DataType = llir.DataType.NO_TYPE) -> llir.Var:
@@ -1437,9 +1438,10 @@ def test_production_routes_the_detached_list_at_the_original_optimization_seam(
     assert coordinate_read.tensor_access is None
     assert second_coordinate_read.tensor_access is None
     assert second_lowerer.llir_pass_run_records == lowerer.llir_pass_run_records
-    assert len(cpp) == 2505
+    # The result check names the level kinds, {0, 0}, where it named the rank (0038).
+    assert len(cpp) == 2510
     assert hashlib.sha256(cpp.encode()).hexdigest() == (
-        "36a8599c59f06b2cb060e27af26b7c9196716be88f666282d83b1ec2dc9d6151"
+        "058ed102cbd95a123af90dde7d6d10362b7dabc2262236b3880c13dea6b27714"
     )
     assert "int pA1_end = A1_pos[pA0 + 1];" in cpp
     assert "pA1 < pA1_end; pA1++" in cpp
@@ -1584,10 +1586,16 @@ def test_production_all_coo_sddmm_activates_single_iteration_and_factor_hoist() 
     )
     assert lowerer.compile_options is not second_lowerer.compile_options
     assert second_lowerer.llir_pass_run_records == lowerer.llir_pass_run_records
-    assert len(cpp) == 3521
+    # The result check names the level kinds, {2, 2}, where it named the rank (0038).
+    # The loop over the mask runs in parallel.  Before patch 0047 it wrote the result
+    # at a shared counter (pSampled1++) inside that loop, a data race; it now writes at
+    # the mask entry's own position (pMask0).  This is the text whose loop
+    # test_loop_invariant_factor_hoist_validity.py pins for the coordinate mask.
+    assert len(cpp) == 3500
     assert hashlib.sha256(cpp.encode()).hexdigest() == (
-        "53d6faaee132a5d82515235b529d7d88d16cbeefe388eba5cfae9ace5528d667"
+        "82cdc300ad6acc1ded85dc583dd1d8e0b8dc8bcec1aa41ff677e3ac28a2a0179"
     )
+    assert shared_scalar_writes(cpp) == []
     assert "pMask1_end" not in cpp
     assert "pMask1 = pMask0" not in cpp
     assert "pMask1 <" not in cpp

@@ -7,6 +7,7 @@ variables, context-local overrides, platform probes, or mutable build-flag lists
 
 from __future__ import annotations
 
+import functools
 import glob
 import hashlib
 import math
@@ -17,6 +18,7 @@ import shutil
 import sys
 import subprocess
 import sysconfig
+import weakref
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass, field, replace
 from enum import Enum
@@ -30,6 +32,7 @@ from .llir_pass_manager import (
     LLIRPassOptions,
     PRODUCTION_LLIR_PASS_OPTIONS,
 )
+from ..exceptions import ScorchTypeError
 
 if TYPE_CHECKING:
     from .scheduler import Schedule
@@ -244,12 +247,26 @@ def canonical_cache_digest(value: object) -> str:
             for child in item:
                 visit(child)
         else:
-            raise TypeError(
-                "cache identity supports only None, exact scalars, and tuples"
+            raise ScorchTypeError(
+                "cache identity supports only None, exact scalars, and tuples",
+                code="internal_argument_type_invalid",
             )
 
     visit(value)
     return digest.hexdigest()
+
+
+@functools.lru_cache(maxsize=8)
+def _preamble_digest(preamble_source: str) -> str:
+    """SHA-256 of one kernel preamble text, computed once per distinct text.
+
+    ``KernelBuildOptions.cache_key`` is read on every public call and the preamble
+    is several hundred kilobytes, so hashing it there cost more than a small kernel
+    takes to run.  The digest is keyed by the text itself, so it can never describe
+    a different text.
+    """
+
+    return hashlib.sha256(preamble_source.encode()).hexdigest()
 
 
 def _require_nonempty_string(value: object, field_name: str) -> str:
@@ -760,7 +777,13 @@ class KernelBuildOptions:
 
     @property
     def cache_key(self) -> tuple[object, ...]:
-        preamble_digest = hashlib.sha256(self.preamble_source.encode()).hexdigest()
+        # A forged non-``str`` preamble keeps the uncached spelling, so it fails
+        # exactly as it did before the digest was kept.
+        preamble_digest = (
+            _preamble_digest(self.preamble_source)
+            if type(self.preamble_source) is str
+            else hashlib.sha256(self.preamble_source.encode()).hexdigest()
+        )
         darwin_toolchain_key = (
             None if self.darwin_toolchain is None else self.darwin_toolchain.cache_key
         )
@@ -881,7 +904,75 @@ class CompileOptions:
         verify_cin_override: object = _USE_CONTEXT,
         llir_pass_options: LLIRPassOptions = PRODUCTION_LLIR_PASS_OPTIONS,
     ) -> "CompileOptions":
-        """Parse process and context state exactly once at the public boundary."""
+        """Parse process and context state exactly once at the public boundary.
+
+        The parse (``_parse_environment``) is a function of what it reads: the
+        environment variables it names, the three context overrides it consults when an
+        argument says so, its arguments, and what the build snapshot is keyed by
+        (``_snapshot_kernel_build_options``).  Every public call takes a snapshot, and
+        the parse validates each value and builds the nested policy objects: 120 us of a
+        390 us warm ``einsum`` call on sapling, whose kernel ran about 146 us (job
+        82239).  So the parsed snapshot is kept under a key of exactly those inputs
+        (``_environment_options_key``) and every call receives its own copy of it, as
+        the build snapshot does.  A change in any input parses again; an input that the
+        parse would refuse is not keyed at all, so the parse raises as it always did.
+        ``clear_build_snapshot_cache()`` forgets these snapshots as well.
+        """
+
+        key, held_objects = _environment_options_key(
+            cls,
+            environ,
+            requested_schedule,
+            forced_schedule,
+            regblock_override,
+            verify_cin_override,
+            llir_pass_options,
+        )
+        if key is None:
+            return cls._parse_environment(
+                environ,
+                requested_schedule=requested_schedule,
+                forced_schedule=forced_schedule,
+                regblock_override=regblock_override,
+                verify_cin_override=verify_cin_override,
+                llir_pass_options=llir_pass_options,
+            )
+        held = _environment_options_cache.get(key)
+        if held is not None and _same_objects(held[1], held_objects):
+            return _own_copy_of_options(held[0])
+        # The parse reads the values the key holds, not the mapping again: each variable
+        # is read once, and the kept snapshot is the parse of its own key.
+        _, values, *_, build_inputs = key
+        kept = cls._parse_environment(
+            _environment_copy(environ, values),
+            requested_schedule=requested_schedule,
+            forced_schedule=forced_schedule,
+            regblock_override=regblock_override,
+            verify_cin_override=verify_cin_override,
+            llir_pass_options=llir_pass_options,
+        )
+        if _build_snapshot_inputs() != build_inputs:
+            # The working directory or a header file changed while it parsed, so the
+            # snapshot may belong to neither reading.  Use it, do not keep it.
+            return kept
+        _keep_cache_keys(kept)
+        if len(_environment_options_cache) >= _BUILD_SNAPSHOT_CACHE_LIMIT:
+            _environment_options_cache.clear()
+        _environment_options_cache[key] = (kept, held_objects)
+        return _own_copy_of_options(kept)
+
+    @classmethod
+    def _parse_environment(
+        cls,
+        environ: Optional[Mapping[str, str]] = None,
+        *,
+        requested_schedule: Optional["Schedule"] = None,
+        forced_schedule: object = _USE_CONTEXT,
+        regblock_override: object = _USE_CONTEXT,
+        verify_cin_override: object = _USE_CONTEXT,
+        llir_pass_options: LLIRPassOptions = PRODUCTION_LLIR_PASS_OPTIONS,
+    ) -> "CompileOptions":
+        """The parse behind ``from_environment``, with nothing kept."""
 
         if environ is not None and not isinstance(environ, Mapping):
             _raise_options_error(
@@ -1081,10 +1172,18 @@ class CompileOptions:
 
     @property
     def cache_fingerprint(self) -> str:
+        kept = _kept_cache_keys.get(id(self))
+        if kept is not None and kept[0]() is self:
+            return kept[2]
         return canonical_cache_digest(self.cache_key)
 
     @property
     def cache_key(self) -> tuple[object, ...]:
+        # A snapshot kept by `from_environment` has its key, computed once when it was
+        # kept (`_keep_cache_keys`), and its copies inherit it.
+        kept = _kept_cache_keys.get(id(self))
+        if kept is not None and kept[0]() is self:
+            return kept[1]
         return (
             self.semantic_cache_key,
             self.verification.cache_key,
@@ -1270,7 +1369,528 @@ def _snapshot_darwin_toolchain(
     )
 
 
+# Resolved build snapshots, keyed by everything their resolution reads that is cheap to
+# read again (see ``_snapshot_kernel_build_options``).  One entry in ordinary use; the
+# limit bounds a process that keeps changing its compiler environment.
+_BUILD_SNAPSHOT_CACHE_LIMIT = 16
+_build_snapshot_cache: dict[tuple[object, ...], KernelBuildOptions] = {}
+
+
+def clear_build_snapshot_cache() -> None:
+    """Forget the resolved build snapshots, so the next public call probes the host.
+
+    The parsed option snapshots that hold them (``CompileOptions.from_environment``)
+    are forgotten with them, so the next public call parses again as well.  So are the
+    cache keys of the parses that succeeded (``parsed_options_key``), so a call that
+    skipped the parse makes it again.
+
+    Needed only after a change the cache key cannot see: a compiler or compiler
+    wrapper installed, removed or replaced in a directory already on ``PATH``, or a
+    change to the files in Torch's library directory, inside one process.
+    """
+
+    _build_snapshot_cache.clear()
+    _environment_options_cache.clear()
+    _parsed_options_keys.clear()
+
+
+def _own_copy_of_build_options(kept: KernelBuildOptions) -> KernelBuildOptions:
+    """Return a new instance equal to ``kept`` without validating its fields again.
+
+    The fields are immutable values that were validated when ``kept`` was built.
+    Every public call runs this, so it copies the instance dictionary directly
+    instead of going through the ``copy`` protocol.
+    """
+
+    own = object.__new__(KernelBuildOptions)
+    own.__dict__.update(kept.__dict__)
+    toolchain = kept.darwin_toolchain
+    if toolchain is not None:
+        own_toolchain = object.__new__(DarwinToolchainOptions)
+        own_toolchain.__dict__.update(toolchain.__dict__)
+        own.__dict__["darwin_toolchain"] = own_toolchain
+    return own
+
+
+# Kept results of ``CompileOptions.from_environment``: its key
+# (``_environment_options_key``) -> (the snapshot, the objects whose identity is in the
+# key).  One entry in ordinary use; bounded like the build snapshots, which these
+# contain.
+_environment_options_cache: dict[
+    tuple[object, ...], tuple["CompileOptions", tuple[object, ...]]
+] = {}
+
+# Every variable ``CompileOptions._parse_environment`` reads from its mapping, in its
+# order.
+_ENVIRONMENT_OPTION_KEYS = (
+    "SCORCH_REGBLOCK",
+    "SCORCH_REGBLOCK_MAX_N",
+    "SCORCH_REGBLOCK_T",
+    "SCORCH_VERIFY_CIN",
+    "SCORCH_REGBLOCK_DUAL",
+    "SCORCH_JIT_TUNE_HOOKS",
+    "CXX",
+    "PATH",
+    "SDKROOT",
+    "DEVELOPER_DIR",
+    "MACOSX_DEPLOYMENT_TARGET",
+    *_UNSUPPORTED_COMPILER_ENVIRONMENT,
+    "TORCH_DONT_CHECK_COMPILER_ABI",
+    "TORCH_NO_COMPILER_WRAPPER",
+)
+
+# (scheduler, cin_analysis, utils, torch), imported at the first public call.  The
+# modules, not their functions, so that a function replaced on its module is the one
+# called.  ``environment_reuse_key`` reads the two context variables on the first two
+# itself rather than through their reader functions.
+_late_modules_memo: Optional[tuple[object, ...]] = None
+
+
+def _late_modules() -> tuple:
+    global _late_modules_memo
+    if _late_modules_memo is None:
+        import torch
+
+        from .. import utils
+        from . import cin_analysis, scheduler
+
+        _late_modules_memo = (scheduler, cin_analysis, utils, torch)
+    return _late_modules_memo
+
+
+# (os.environ's key encoder, ``_ENVIRONMENT_OPTION_KEYS`` encoded by it).
+_encoded_option_keys_memo: Optional[tuple[object, tuple[object, ...]]] = None
+
+
+def _environment_values(source: Mapping[str, str]) -> Optional[tuple[object, ...]]:
+    """The value of every variable the parse reads from ``source``, or None.
+
+    Equal values give equal results.  None when a value is not a string: the parse
+    refuses that mapping, and the caller then lets the parse raise.
+
+    ``os.environ.get`` decodes the value and, for a variable that is not set, raises
+    and catches ``KeyError`` inside ``Mapping.get``.  Reading the 22 variables that
+    way cost 19.4 us on sapling (job 82687), most of them unset.  ``os.environ`` keeps
+    its variables encoded in a dict (``os._Environ._data``), and its encoding is one to
+    one, so for ``os.environ`` the encoded values are read from that dict instead.  They
+    are tagged, so they never compare equal to decoded ones.  Any other mapping is read
+    through ``get``, as the parse reads it.
+    """
+
+    global _encoded_option_keys_memo
+    if type(source) is os._Environ:
+        data = getattr(source, "_data", None)
+        encode = getattr(source, "encodekey", None)
+        if type(data) is dict and encode is not None:
+            memo = _encoded_option_keys_memo
+            if memo is None or memo[0] is not encode:
+                memo = (encode, tuple(map(encode, _ENVIRONMENT_OPTION_KEYS)))
+                _encoded_option_keys_memo = memo
+            return ("encoded", tuple(map(data.get, memo[1])))
+    try:
+        values = tuple(map(source.get, _ENVIRONMENT_OPTION_KEYS))
+    except Exception:
+        return None
+    for value in values:
+        if value is not None and type(value) is not str:
+            return None
+    return ("decoded", values)
+
+
+def _environment_copy(
+    environ: Optional[Mapping[str, str]], values: object
+) -> dict[str, str]:
+    """The variables ``values`` holds (``_environment_values``) as a mapping to parse.
+
+    The parse reads exactly ``_ENVIRONMENT_OPTION_KEYS``, so it reads the same values
+    from this copy as from the mapping they were read from.  Values read from
+    ``os.environ``'s store are decoded as ``os.environ`` decodes them.
+    """
+
+    tag, read = cast(tuple[str, tuple[Optional[str], ...]], values)
+    if tag == "encoded":
+        source = os.environ if environ is None else environ
+        decode = source.decodevalue  # type: ignore[attr-defined]
+        read = tuple(None if value is None else decode(value) for value in read)
+    return {
+        key: value
+        for key, value in zip(_ENVIRONMENT_OPTION_KEYS, read)
+        if value is not None
+    }
+
+
+def environment_reuse_key() -> Optional[tuple[object, ...]]:
+    """What a call must match to run a kernel built under an earlier call's options.
+
+    ``CompileOptions.from_environment`` reads three kinds of input:
+    - environment variables;
+    - the scheduler's and the verifier's context overrides;
+    - the host: the working directory, the interpreter, Torch, the files on ``PATH``
+      and the preamble's header files.
+    The first two decide which kernel a call selects and whether its options are
+    refused.  The host decides only how a new kernel is built: a kernel that is built
+    and loaded runs the same whatever the host holds now.  So a call whose operation
+    and these values equal an earlier call's may run that call's kernel without making
+    options, and this key holds exactly these values.  The next build makes its
+    options in full, so it sees any change to the host.
+
+    Making the options on such a call cost 85 us of a 329 us warm ``einsum`` on sapling
+    (job 82682), even with the parse kept (``from_environment``), because the parse's
+    key reads the host too.  This key took about 2 us there (job 82687's parts).
+
+    None when a value is one the parse would refuse to read.  The caller then makes
+    its options in full and lets the parse raise.
+
+    Every public call that reaches a generated kernel reads this key, so on its usual
+    path it calls no other Python function: once ``_environment_values`` has encoded
+    the variable names, ``os.environ``'s store is read here as that function reads it,
+    and the two overrides are read from their context variables
+    (``scheduler._REGBLOCK_FORCE``, ``cin_analysis._VERIFY_CIN_CONTEXT``), with the
+    checks their readers (``get_forced_regblock``, ``get_full_cin_verification``)
+    make.  A value a reader would refuse gives None here, as the reader's TypeError
+    did.  The four helper calls this replaces were four of the frames a warm call made
+    beyond 864745d's.
+    """
+
+    source = os.environ
+    memo = _encoded_option_keys_memo
+    data = getattr(source, "_data", None)
+    if (
+        memo is not None
+        and type(source) is os._Environ
+        and type(data) is dict
+        and getattr(source, "encodekey", None) is memo[0]
+    ):
+        read = tuple(map(data.get, memo[1]))
+        values: Optional[tuple[object, ...]] = ("encoded", read)
+    else:
+        values = _environment_values(source)
+        if values is None:
+            return None
+    modules = _late_modules_memo
+    if modules is None:
+        modules = _late_modules()
+    regblock = modules[0]._REGBLOCK_FORCE.get()  # type: ignore[attr-defined]
+    verify = modules[1]._VERIFY_CIN_CONTEXT.get()  # type: ignore[attr-defined]
+    if regblock is not None and type(regblock) is not bool:
+        return None
+    if type(verify) is not bool:
+        return None
+    return (values, regblock, verify)
+
+
+# The cache fingerprint of the snapshot each successful parse made, by the reuse key
+# (``environment_reuse_key``) it was begun under and the cache key of the schedule it
+# resolved.  Bounded as the snapshot caches are, and forgotten with them.
+_parsed_options_keys: dict[tuple[object, ...], str] = {}
+
+
+def parsed_options_key(
+    key: tuple[object, ...], schedule_key: Optional[str]
+) -> Optional[str]:
+    """The cache fingerprint of the snapshot a parse under ``key`` made here, or None.
+
+    ``schedule_key`` is the cache key of the schedule the parse resolved, or None.  A
+    parse under such a key would succeed again and make a snapshot with this
+    fingerprint: its other inputs are the host's, which this process treats as fixed
+    until ``clear_build_snapshot_cache()``.  A call may then name its options by this
+    fingerprint and skip the parse until it needs the snapshot itself.  The fingerprint
+    is kept rather than the cache key so that the call's dispatch key hashes one string,
+    whose hash Python keeps, and not a nested tuple (``ops._DeferredOptions``).
+    """
+
+    return _parsed_options_keys.get((key, schedule_key))
+
+
+def note_environment_parsed(key: tuple[object, ...], options: "CompileOptions") -> None:
+    """Record the cache fingerprint of ``options``, made by a parse begun under ``key``.
+
+    Nothing is recorded when the key changed while the parse ran: the parse may then
+    have read either value.
+    """
+
+    if environment_reuse_key() != key:
+        return
+    if len(_parsed_options_keys) >= _BUILD_SNAPSHOT_CACHE_LIMIT:
+        _parsed_options_keys.clear()
+    schedule = options.requested_schedule
+    schedule_key = schedule.cache_key if schedule is not None else None
+    _parsed_options_keys[(key, schedule_key)] = options.cache_fingerprint
+
+
+def _build_snapshot_inputs() -> Optional[tuple[object, ...]]:
+    """The parts of the build snapshot's key that are not environment variables.
+
+    The values ``_snapshot_kernel_build_options`` puts in its key besides its arguments,
+    read the same way.  None when the preamble's files have no identity: that function
+    then resolves on every call, so the parse is not kept either.
+    """
+
+    _, _, utils, torch = _late_modules()
+    preamble_identity = utils.jit_preamble_file_identity()
+    if preamble_identity is None:
+        return None
+    try:
+        working_directory: Optional[str] = os.getcwd()
+    except OSError:
+        working_directory = None
+    return (
+        working_directory,
+        platform.system(),
+        platform.machine(),
+        sys.executable,
+        str(torch.__version__),
+        torch.__file__,
+        preamble_identity,
+    )
+
+
+def _environment_options_key(
+    cls: type,
+    environ: Optional[Mapping[str, str]],
+    requested_schedule: object,
+    forced_schedule: object,
+    regblock_override: object,
+    verify_cin_override: object,
+    llir_pass_options: object,
+) -> Tuple[Optional[tuple[object, ...]], tuple[object, ...]]:
+    """What ``_parse_environment`` reads, as a key, and the objects named by identity.
+
+    The key holds the value of every variable the parse reads, each context override it
+    consults (only when its argument says to, as the parse does), the identity of each
+    object argument, and the rest of the build snapshot's key
+    (``_build_snapshot_inputs``).  The second value holds the objects whose identity is
+    in the key, so that a hit can check the key's ids still name them.  An input the
+    parse would refuse (a mapping that is not one, a value that is not an exact string,
+    an override of the wrong type, a context reader that raises) gives no key, and the
+    parse then raises as it did, in its own order.
+    """
+
+    if environ is None:
+        source: Mapping[str, str] = os.environ
+    elif isinstance(environ, Mapping):
+        source = environ
+    else:
+        return None, ()
+    values = _environment_values(source)
+    if values is None:
+        return None, ()
+    scheduler, cin_analysis, _, _ = _late_modules()
+    schedule_object: object = None
+    try:
+        if regblock_override is _USE_CONTEXT:
+            forced_regblock = scheduler.get_forced_regblock()
+            if forced_regblock is not None and type(forced_regblock) is not bool:
+                return None, ()
+            regblock: tuple[object, ...] = ("context", forced_regblock)
+        elif regblock_override is None or type(regblock_override) is bool:
+            regblock = ("given", regblock_override)
+        else:
+            return None, ()
+        if requested_schedule is not None:
+            schedule: tuple[object, ...] = (
+                ("requested",)
+                if forced_schedule is _USE_CONTEXT
+                else ("given", id(forced_schedule))
+            )
+            if forced_schedule is not _USE_CONTEXT:
+                schedule_object = forced_schedule
+        elif forced_schedule is _USE_CONTEXT:
+            schedule_object = scheduler.get_forced_schedule()
+            schedule = ("context", id(schedule_object))
+        else:
+            schedule_object = forced_schedule
+            schedule = ("given", id(forced_schedule))
+        if verify_cin_override is _USE_CONTEXT:
+            context_verify = cin_analysis.get_full_cin_verification()
+            if type(context_verify) is not bool:
+                return None, ()
+            verify: tuple[object, ...] = ("context", context_verify)
+        elif type(verify_cin_override) is bool:
+            verify = ("given", verify_cin_override)
+        else:
+            return None, ()
+        build_inputs = _build_snapshot_inputs()
+    except Exception:
+        return None, ()
+    if build_inputs is None:
+        return None, ()
+    key = (
+        cls,
+        values,
+        regblock,
+        schedule,
+        verify,
+        id(requested_schedule),
+        id(llir_pass_options),
+        build_inputs,
+    )
+    return key, (requested_schedule, schedule_object, llir_pass_options)
+
+
+def _same_objects(held: tuple[object, ...], now: tuple[object, ...]) -> bool:
+    """Whether the key's ids still name the objects the kept entry was made from."""
+
+    return len(held) == len(now) and all(a is b for a, b in zip(held, now))
+
+
+# The cache key and fingerprint of each snapshot ``from_environment`` kept, and of each
+# copy it handed out, by the instance's id.  Held beside the instances, not in their
+# dictionaries: a snapshot's instance dictionary holds exactly its fields, which the
+# new compiler's request identity requires (``plan_identity.require_exact_carrier``).
+# An entry goes when its instance is collected.
+_kept_cache_keys: dict[
+    int, tuple["weakref.ref[CompileOptions]", tuple[object, ...], str]
+] = {}
+
+
+def _note_kept_keys(
+    options: "CompileOptions", key: tuple[object, ...], fingerprint: str
+) -> None:
+    ident = id(options)
+
+    def forget(ref: "weakref.ref[CompileOptions]") -> None:
+        entry = _kept_cache_keys.get(ident)
+        if entry is not None and entry[0] is ref:
+            del _kept_cache_keys[ident]
+
+    _kept_cache_keys[ident] = (weakref.ref(options, forget), key, fingerprint)
+
+
+def _keep_cache_keys(options: "CompileOptions") -> None:
+    """Record the snapshot's cache key and fingerprint, for it and its copies.
+
+    Called once, on a snapshot about to be kept.  Its fields are frozen and nothing
+    replaces them afterwards, so the key computed now stays its key.
+    """
+
+    key = options.cache_key
+    _note_kept_keys(options, key, canonical_cache_digest(key))
+
+
+def _own_copy_of_options(kept: "CompileOptions") -> "CompileOptions":
+    """Return a new snapshot equal to ``kept`` without parsing or validating again.
+
+    As ``_own_copy_of_build_options``: every field was validated when ``kept`` was built
+    and is an immutable value.  The scheduler policy (with its cost model), the
+    verification policy and the build snapshot are copied as well, so no two callers
+    share an instance the snapshot owns.  The schedule and the pass options stay the
+    objects the caller passed, as the parse leaves them.
+    """
+
+    own = object.__new__(type(kept))
+    state = own.__dict__
+    state.update(kept.__dict__)
+    scheduler = object.__new__(SchedulerPolicy)
+    scheduler.__dict__.update(kept.scheduler.__dict__)
+    cost_model = object.__new__(SchedulerCostModel)
+    cost_model.__dict__.update(kept.scheduler.cost_model.__dict__)
+    scheduler.__dict__["cost_model"] = cost_model
+    state["scheduler"] = scheduler
+    verification = object.__new__(VerificationPolicy)
+    verification.__dict__.update(kept.verification.__dict__)
+    state["verification"] = verification
+    state["build"] = _own_copy_of_build_options(kept.build)
+    entry = _kept_cache_keys.get(id(kept))
+    if entry is not None and entry[0]() is kept:
+        _note_kept_keys(own, entry[1], entry[2])
+    return own
+
+
 def _snapshot_kernel_build_options(
+    *,
+    jit_tune_hooks: bool,
+    cxx_compiler: str,
+    cxx_compiler_from_environment: bool,
+    compiler_wrapper_policy: CompilerWrapperPolicy,
+    executable_search_path: str,
+    sdk_root_raw: Optional[str],
+    developer_dir_raw: Optional[str],
+    deployment_target_raw: Optional[str],
+) -> KernelBuildOptions:
+    """Return the build snapshot for these inputs, probing the host only when needed.
+
+    Resolving a snapshot reads the preamble's header files, lists Torch's library
+    directory and searches ``PATH`` three times.  That took milliseconds on every
+    public call, where a small cached kernel runs in a fraction of one.  A resolved
+    snapshot is therefore kept for the process under a key that holds everything the
+    resolution reads that is cheap to read again: the arguments (they carry every
+    environment variable involved), the working directory (a relative ``CXX`` and
+    relative ``PATH`` entries resolve against it), the platform, the interpreter,
+    Torch's version and location, and the identity of the preamble's files (path,
+    size, modification time, inode).  A change in any of them resolves again.
+
+    Not read again while the key is unchanged: which files the ``PATH`` directories
+    and Torch's library directory contain, and Python's include directory.  A
+    compiler or compiler wrapper that appears, disappears or is replaced under an
+    unchanged ``PATH`` is seen by the next process, or after
+    ``clear_build_snapshot_cache()``.  Until then a kernel that is already built
+    still runs, and a new build uses the compiler path the snapshot holds.  The build
+    child still compares the snapshot with its own host before it compiles
+    (``utils._verify_snapshotted_build_runtime``) and refuses the build if the
+    wrapper lookup, Torch or Python differ.  The Darwin toolchain above is resolved
+    once per process in the same way.
+
+    Every call returns its own copy of the kept snapshot.  No two callers share an
+    instance, so what one caller does to its object cannot reach the next caller.
+    """
+
+    import torch
+
+    from ..utils import jit_preamble_file_identity
+
+    def resolve() -> KernelBuildOptions:
+        return _resolve_kernel_build_options(
+            jit_tune_hooks=jit_tune_hooks,
+            cxx_compiler=cxx_compiler,
+            cxx_compiler_from_environment=cxx_compiler_from_environment,
+            compiler_wrapper_policy=compiler_wrapper_policy,
+            executable_search_path=executable_search_path,
+            sdk_root_raw=sdk_root_raw,
+            developer_dir_raw=developer_dir_raw,
+            deployment_target_raw=deployment_target_raw,
+        )
+
+    preamble_identity = jit_preamble_file_identity()
+    if preamble_identity is None:
+        # The package is not stored as plain files, so nothing short of reading the
+        # preamble says whether it changed: resolve every time, as before.
+        return resolve()
+    try:
+        working_directory: Optional[str] = os.getcwd()
+    except OSError:
+        working_directory = None
+    key = (
+        jit_tune_hooks,
+        cxx_compiler,
+        cxx_compiler_from_environment,
+        compiler_wrapper_policy,
+        executable_search_path,
+        sdk_root_raw,
+        developer_dir_raw,
+        deployment_target_raw,
+        working_directory,
+        platform.system(),
+        platform.machine(),
+        sys.executable,
+        str(torch.__version__),
+        torch.__file__,
+        preamble_identity,
+    )
+    kept = _build_snapshot_cache.get(key)
+    if kept is None:
+        kept = resolve()
+        if jit_preamble_file_identity() != preamble_identity:
+            # A preamble file changed while the snapshot was being resolved, so its
+            # text may be newer than the identity in the key.  Use it, do not keep it.
+            return kept
+        if len(_build_snapshot_cache) >= _BUILD_SNAPSHOT_CACHE_LIMIT:
+            _build_snapshot_cache.clear()
+        _build_snapshot_cache[key] = kept
+    return _own_copy_of_build_options(kept)
+
+
+def _resolve_kernel_build_options(
     *,
     jit_tune_hooks: bool,
     cxx_compiler: str,

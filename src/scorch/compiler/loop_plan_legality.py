@@ -9,7 +9,7 @@ lifetime facts are local values; none are attached to CIN or enter cache identit
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import List, Optional, Tuple
+from typing import Hashable, List, Optional, Tuple, cast
 
 from .cin import Operation
 from .cin_analysis import (
@@ -35,8 +35,13 @@ from .loop_plan import (
 from ..format import LevelType
 from .sparse_assembly import (
     DEFAULT_SERIAL_STRATEGY,
+    AccessLayout,
+    entry_positioned_receiver,
+    entry_source,
     partitionable_receiver_levels,
+    receiver_requirement,
 )
+from ..exceptions import ScorchAssertionError, ScorchTypeError
 
 
 @dataclass(frozen=True)
@@ -661,7 +666,10 @@ def _verify_tiling_capabilities(
                 ("auto_policy",),
             )
         origin_policy = plan.auto_policy
-        assert origin_policy is not None
+        if origin_policy is None:
+            raise ScorchAssertionError(
+                "origin_policy is not None", code="loop_plan_legality_state_missing"
+            )
         for position, tile in enumerate(affine_tiles):
             if tile.accumulation != "direct" or tile.parallel:
                 _invalid(
@@ -842,7 +850,10 @@ def _placement_depth(
     if placement.kind == PlacementKind.OUTERMOST:
         depth = 0
     elif placement.kind == PlacementKind.CHILD_OF:
-        assert placement.parent is not None
+        if placement.parent is None:
+            raise ScorchAssertionError(
+                "placement.parent is not None", code="loop_plan_legality_state_missing"
+            )
         if placement.parent not in state.prefix:
             _invalid(
                 "placement_parent_scope",
@@ -852,7 +863,10 @@ def _placement_depth(
             )
         depth = state.prefix.index(placement.parent) + 1
     else:
-        assert placement.depth is not None
+        if placement.depth is None:
+            raise ScorchAssertionError(
+                "placement.depth is not None", code="loop_plan_legality_state_missing"
+            )
         depth = placement.depth
         if depth > len(state.prefix):
             _invalid(
@@ -913,6 +927,32 @@ def _effective_parallel_loop(plan: LoopPlan) -> Optional[LoopRef]:
             index_id=parallel_tile.loop.index_id,
         )
     return LoopRef(parallel_tile.loop.index_id, LoopPart.OUTER)
+
+
+def _verify_vector_loops(plan: LoopPlan, parallel: Optional[LoopRef]) -> None:
+    """Refuse a vector mark the plan alone shows the shared rule never places.
+
+    The shared rule (``iter_lattice.mark_simd_on_reduction_loops``) never marks
+    a parallel loop, so a ``vector_loops`` entry naming the plan's parallel loop
+    (its ``parallel_loop``, or the outer part of a tile marked parallel) is
+    refused here, before either compiler lowers, with the code target lowering
+    gives every other unmarkable loop.  The conditions that need the loop's body
+    (a sum kept in a register, no early exit, no position loop below) are known
+    only at lowering and stay there; so does a parallel loop the automatic arm
+    selects after the plan.
+    """
+
+    if plan.vector_loops is None or parallel is None:
+        return
+    if parallel in plan.vector_loops:
+        position = plan.vector_loops.index(parallel)
+        _unsupported(
+            "unsupported_vector_loop",
+            "the plan keeps its own parallel loop marked for vector instructions; "
+            "the shared rule never marks a parallel loop",
+            ("plan", "vector_loops", str(position)),
+            index_id=parallel.index_id,
+        )
 
 
 def _scope_contains(analysis: CINAnalysis, owner: NodeId, scope: NodeId) -> bool:
@@ -1067,7 +1107,10 @@ def _verify_panel(
         )
     if panel.placement.kind == PlacementKind.CHILD_OF:
         parent = panel.placement.parent
-        assert parent is not None
+        if parent is None:
+            raise ScorchAssertionError(
+                "parent is not None", code="loop_plan_legality_state_missing"
+            )
         parent_tile = next(
             (
                 tile
@@ -1121,7 +1164,10 @@ def _verify_panel(
     parent_id = sparse_layout.storage_index_ids[sparse_level - 1]
     if panel.placement.kind == PlacementKind.CHILD_OF:
         placement_parent = panel.placement.parent
-        assert placement_parent is not None
+        if placement_parent is None:
+            raise ScorchAssertionError(
+                "placement_parent is not None", code="loop_plan_legality_state_missing"
+            )
         if placement_parent.index_id == parent_id:
             _invalid(
                 "panel_parallel_scope",
@@ -1223,7 +1269,10 @@ def _verify_result_tile(
         return
     tile = heap_tiles[0]
     result_tile = plan.result_tile
-    assert result_tile is not None
+    if result_tile is None:
+        raise ScorchAssertionError(
+            "result_tile is not None", code="loop_plan_legality_state_missing"
+        )
     if tile.placement.kind != PlacementKind.OUTERMOST or tile.parallel:
         _invalid(
             "heap_tile_lifetime",
@@ -1256,7 +1305,10 @@ def _verify_result_tile(
             "heap accumulation requires an explicit parallel result prefix",
             ("parallel_loop",),
         )
-    assert parallel is not None
+    if parallel is None:
+        raise ScorchAssertionError(
+            "parallel is not None", code="loop_plan_legality_state_missing"
+        )
     if parallel.index_id == tile.loop.index_id:
         _invalid(
             "heap_parallel_tile",
@@ -1532,7 +1584,9 @@ def _verify_relayout_shape(  # noqa: C901
         )
 
 
-def _verify_assembly(facts: LoopPlanLegalityFacts, plan: LoopPlan) -> None:
+def _verify_assembly(
+    facts: LoopPlanLegalityFacts, plan: LoopPlan, state: _PlacementState
+) -> None:
     """Prove one recorded sparse-assembly strategy legal for this receiver.
 
     The authoritative refusal, with a structured code, for every plan reaching
@@ -1547,9 +1601,21 @@ def _verify_assembly(facts: LoopPlanLegalityFacts, plan: LoopPlan) -> None:
     Two obligations.  Every strategy except the always-legal serial one needs the
     shared receiver contract -- a dense level zero with every level below it
     compressed -- because that correspondence is what lets the assembly be split
-    by outer cell at all.  And a recorded strategy owns the result's assembly, so
-    it cannot compose with a panel, a relayout, a result tile or an explicit
-    parallel loop, each of which owns part of the same assembly.
+    by outer cell at all.  The parallel single pass also admits a COO result
+    that stores one input's entries, which the plan records as ``entries_of``
+    (proved by :func:`_verify_entries_of`, which runs first), when that input
+    is a COO tensor of two levels or more: every entry's position is then
+    known before the loops run, and the loops over the result's indices fold
+    into one loop over the input's entries.  A CSR or dense input's levels
+    are counted loops of their own, which no lowering splits this way.  Any
+    tile beside it is refused as well, since no lowering is shown to run the
+    entry walk with a tile in its nest.  Today no tile of a sparse result
+    reaches this check (``_verify_tiling_capabilities`` and ``_verify_panel``
+    refuse it first); the refusal keeps the strategy's own rule from resting
+    on those.  And a
+    recorded strategy owns the result's assembly, so it cannot compose with a
+    panel, a relayout, a result tile or an explicit parallel loop, each of which
+    owns part of the same assembly.
 
     Extents, densities and thread counts are deliberately absent: whether a legal
     strategy pays is cost, and cost is not legality.
@@ -1559,15 +1625,37 @@ def _verify_assembly(facts: LoopPlanLegalityFacts, plan: LoopPlan) -> None:
     if strategy is None or strategy == DEFAULT_SERIAL_STRATEGY:
         return
     result = _unique_result(facts, ("plan", "assembly"))
-    if not partitionable_receiver_levels(result.level_types):
+    if not partitionable_receiver_levels(result.level_types) and not (
+        strategy == "single_pass_chunk_parallel"
+        and entry_positioned_receiver(result.level_types, plan.entries_of is not None)
+        and _is_multi_level_coo(_input_level_types(facts, plan.entries_of))
+    ):
         _unsupported(
             "unsupported_schedule_assembly",
-            f"assembly strategy {strategy!r} requires a result whose level zero "
-            "is dense with every level below it compressed",
+            f"assembly strategy {strategy!r} requires {receiver_requirement(strategy)}",
             ("plan", "assembly"),
             symbol_id=result.tensor_id,
         )
         return
+    if (
+        strategy == "single_pass_chunk_parallel"
+        and not partitionable_receiver_levels(result.level_types)
+        and plan.tiles
+    ):
+        # The COO receiver: its parallel single pass walks the input's entries
+        # as one loop, and no lowering is shown to run that walk with any tile
+        # in the nest (the explicit surface refuses affine tiles of a sparse
+        # result and of a reduction, and the automatic plan places none here).
+        # A tile below the result's loops reads legal under ``entry_source``, so
+        # it is refused by name rather than admitted untested.
+        _unsupported(
+            "unsupported_schedule_assembly",
+            f"assembly strategy {strategy!r} on a COO result that stores one "
+            "input's entries walks those entries in one loop; a tile in its nest "
+            "is not supported",
+            ("plan", "tiles"),
+            symbol_id=result.tensor_id,
+        )
     if (
         plan.panel_bounds
         or plan.relayout is not None
@@ -1582,6 +1670,128 @@ def _verify_assembly(facts: LoopPlanLegalityFacts, plan: LoopPlan) -> None:
             "result tile, or explicit parallel loop",
             ("plan", "assembly"),
         )
+
+
+def _access_layout(info: AccessLayoutInfo) -> AccessLayout:
+    return AccessLayout(
+        tensor=info.tensor_id,
+        logical=tuple(info.logical_index_ids),
+        storage=tuple(info.storage_index_ids),
+        levels=tuple(info.level_types),
+    )
+
+
+def _planned_nest(plan: LoopPlan, state: _PlacementState) -> Tuple[Hashable, ...]:
+    """The plan's loops outermost first, in the form :func:`entry_source` reads.
+
+    An unsplit loop is its ``IndexId``; each part of an affine-tiled loop is its
+    ``LoopRef``, which equals no ``IndexId``, so a split loop is never read as one
+    of the result's loops.  ``state.prefix`` is the placed common prefix, the
+    whole nest unless a workspace region starts below it; the plan's loops it
+    does not hold follow it in plan order.
+    """
+
+    placed: List[Hashable] = [
+        loop.index_id if loop.part is LoopPart.LOGICAL else loop
+        for loop in state.prefix
+    ]
+    held = {loop.index_id for loop in state.prefix}
+    placed.extend(index_id for index_id in plan.loop_order if index_id not in held)
+    return tuple(placed)
+
+
+def _input_level_types(
+    facts: LoopPlanLegalityFacts, symbol: Optional[SymbolId]
+) -> Tuple[LevelType, ...]:
+    """The level types of input ``symbol``, ``()`` when it is no read input."""
+
+    for access in facts.read_accesses:
+        if access.tensor_id == symbol and not access.is_workspace:
+            return tuple(access.level_types)
+    return ()
+
+
+def _is_multi_level_coo(levels: Tuple[LevelType, ...]) -> bool:
+    return len(levels) >= 2 and all(level is LevelType.COORDINATE for level in levels)
+
+
+def _verify_entries_of(
+    facts: LoopPlanLegalityFacts, plan: LoopPlan, state: _PlacementState
+) -> None:
+    """Prove a recorded ``entries_of`` names the input whose entries the result
+    stores under this plan's nest.
+
+    The rule is :func:`~scorch.compiler.sparse_assembly.entry_source`, read on
+    :func:`_planned_nest`: a COO result; one input with exactly the result's
+    indices, in the result's logical and storage order, every other factor
+    dense along them; and the loops over the result's indices the outermost
+    ones, unsplit and in storage order, with a reduction loop below them.  The
+    loops then walk that input's stored entries, one result entry each, and
+    that input is the only one ``entries_of`` may name
+    (``unsupported_entries_of`` otherwise; naming the result itself is
+    ``invalid_entries_of``).  A tile in the nest is refused too: no lowering is
+    shown to store those entries with one, and today none reaches a COO
+    result's plan.  The front end records the same input on the program and
+    the target refuses a program whose loops it cannot make store them (an
+    accumulation workspace among them), so a kernel stores only what this
+    proved.
+    """
+
+    source = plan.entries_of
+    if source is None:
+        return
+    path = ("plan", "entries_of")
+    result = _unique_result(facts, path)
+    if source == result.tensor_id:
+        _invalid(
+            "invalid_entries_of",
+            "entries_of names the result; it must name an input whose stored "
+            "entries the result stores",
+            path,
+            symbol_id=source,
+        )
+    if plan.tiles:
+        _unsupported(
+            "unsupported_entries_of",
+            "entries_of with a tile in the nest is not supported",
+            ("plan", "tiles"),
+            symbol_id=source,
+        )
+    if _entry_source_of(facts, result, plan, state) != source:
+        _unsupported(
+            "unsupported_entries_of",
+            "the loops over the result's indices do not walk this input's stored "
+            "entries one result entry each (the result must be COO; the input "
+            "must have exactly the result's indices in the result's logical and "
+            "storage order, every other factor dense along them; and those loops "
+            "must be the outermost, unsplit and in storage order, with a loop "
+            "below them)",
+            path,
+            symbol_id=source,
+        )
+
+
+def _entry_source_of(
+    facts: LoopPlanLegalityFacts,
+    result: AccessLayoutInfo,
+    plan: LoopPlan,
+    state: _PlacementState,
+) -> Optional[SymbolId]:
+    """The input whose stored entries the result stores under this plan's nest,
+    if one is (:func:`~scorch.compiler.sparse_assembly.entry_source`, read on
+    :func:`_planned_nest`)."""
+
+    assignment = _assignment_for_lhs(facts, result.access_id, ("plan", "entries_of"))
+    layouts = facts.analysis.access_layouts
+    factor_ids = assignment.multiplicative_access_ids
+    factors = (
+        None
+        if factor_ids is None
+        or any(layouts[access_id].is_workspace for access_id in factor_ids)
+        else [_access_layout(layouts[access_id]) for access_id in factor_ids]
+    )
+    nest = _planned_nest(plan, state)
+    return cast(Optional[SymbolId], entry_source(_access_layout(result), factors, nest))
 
 
 def _verify_accumulator(facts: LoopPlanLegalityFacts, plan: LoopPlan) -> None:
@@ -1634,7 +1844,10 @@ def verify_loop_plan_semantics(
     """
 
     if type(dense_results_any_order) is not bool:
-        raise TypeError("dense_results_any_order must be an exact bool")
+        raise ScorchTypeError(
+            "dense_results_any_order must be an exact bool",
+            code="internal_argument_type_invalid",
+        )
     facts = _build_facts(analysis, plan)
     _verify_schedulable_scope(facts, plan)
     _verify_storage_order(facts, dense_results_any_order)
@@ -1642,8 +1855,10 @@ def verify_loop_plan_semantics(
     _verify_workspace_replay_shape(facts, plan, workspace_inserted)
     state = _apply_affine_placements(facts, plan, workspace_inserted)
     parallel = _verify_parallel_legality(facts, plan, workspace_inserted)
+    _verify_vector_loops(plan, parallel)
     _verify_panel(facts, plan, state, parallel)
     _verify_result_tile(facts, plan, state, parallel)
     _verify_relayout(facts, plan, parallel)
-    _verify_assembly(facts, plan)
+    _verify_entries_of(facts, plan, state)
+    _verify_assembly(facts, plan, state)
     _verify_accumulator(facts, plan)

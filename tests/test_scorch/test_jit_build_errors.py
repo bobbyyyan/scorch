@@ -6,6 +6,11 @@ whose message named only the child's command line: the compiler log went to the
 terminal, not into the exception, and code that caught torch's ``RuntimeError``
 missed it.  The child now reports the exception that stopped it, and the parent
 re-raises its type and message.  None of these tests runs a compiler.
+
+The parent raises the Scorch variant of the reported built-in (``ScorchRuntimeError``
+for a ``RuntimeError``), which is still that built-in, with the code the child reported
+(:func:`scorch.exceptions.defect_code` of its error), or ``jit_build_failed`` when the
+child reported none.
 """
 
 from __future__ import annotations
@@ -22,6 +27,7 @@ import scorch.utils as utils  # type: ignore[import-untyped]
 from scorch.compiler.compile_options import (  # type: ignore[import-untyped]
     CompileOptions,
 )
+from scorch.exceptions import ScorchError, ScorchRuntimeError
 
 
 def _request(tmp_path: Path, **build_changes: object) -> utils._JITBuildRequest:
@@ -44,8 +50,8 @@ def _completed(returncode: int, stderr: bytes) -> subprocess.CompletedProcess[by
     return subprocess.CompletedProcess(["child"], returncode, None, stderr)
 
 
-def _report(error_type: str, message: str) -> bytes:
-    payload = json.dumps({"type": error_type, "message": message})
+def _report(error_type: str, message: str, code: object = None) -> bytes:
+    payload = json.dumps({"type": error_type, "message": message, "code": code})
     return (utils._JIT_BUILD_ERROR_MARKER + payload).encode()
 
 
@@ -56,29 +62,37 @@ def test_a_reported_build_error_is_raised_with_its_type_and_message(capsys):
     )
     with pytest.raises(RuntimeError) as raised:
         utils._raise_for_jit_build_child("k", completed)
-    assert type(raised.value) is RuntimeError
+    assert type(raised.value) is ScorchRuntimeError
+    assert raised.value.code == "jit_build_failed"
     assert str(raised.value) == message
     assert capsys.readouterr().err == "a warning the child printed\n"
 
 
 @pytest.mark.parametrize("error_type", sorted(utils._JIT_BUILD_CHILD_ERRORS))
 def test_every_forwarded_type_is_raised_as_itself(error_type):
+    report = _report(error_type, "m", "a_reported_code")
     with pytest.raises(utils._JIT_BUILD_CHILD_ERRORS[error_type]) as raised:
-        utils._raise_for_jit_build_child("k", _completed(1, _report(error_type, "m")))
-    assert type(raised.value).__name__ == error_type
+        utils._raise_for_jit_build_child("k", _completed(1, report))
+    # The Scorch variant of the reported type, which is still the reported built-in.
+    variant = type(raised.value)
+    assert issubclass(variant, ScorchError)
+    assert error_type in (variant.__name__, variant.__name__[len("Scorch") :])
+    assert raised.value.code == "a_reported_code"
     assert str(raised.value) == "m"
 
 
 def test_an_unlisted_type_becomes_a_runtime_error_with_the_same_message():
     with pytest.raises(RuntimeError, match="^m$") as raised:
         utils._raise_for_jit_build_child("k", _completed(1, _report("KeyError", "m")))
-    assert type(raised.value) is RuntimeError
+    assert type(raised.value) is ScorchRuntimeError
+    assert raised.value.code == "jit_build_failed"
 
 
 def test_a_child_that_dies_without_a_report_still_raises_with_its_stderr(capsys):
     with pytest.raises(RuntimeError, match="status -9") as raised:
         utils._raise_for_jit_build_child("k", _completed(-9, b"Killed\n"))
     assert "Killed" in str(raised.value)
+    assert raised.value.code == "jit_build_failed"
     assert capsys.readouterr().err == "Killed\n"
 
 
@@ -93,7 +107,8 @@ def test_the_real_child_reports_a_runtime_snapshot_mismatch(tmp_path):
     request = _request(tmp_path, torch_version="0.0.0+not-this-torch")
     with pytest.raises(RuntimeError) as raised:
         utils._build_and_load_extension(request)
-    assert type(raised.value) is RuntimeError
+    assert type(raised.value) is ScorchRuntimeError
+    assert raised.value.code == "jit_build_runtime_mismatch"
     assert str(raised.value) == (
         "JIT build runtime differs from CompileOptions snapshot: torch_version"
     )
@@ -124,6 +139,7 @@ def test_the_child_reports_through_the_marker(tmp_path):
     )
     assert marker
     assert json.loads(payload) == {
-        "type": "RuntimeError",
+        "type": "ScorchRuntimeError",
         "message": "JIT build runtime differs from CompileOptions snapshot: torch_version",
+        "code": "jit_build_runtime_mismatch",
     }

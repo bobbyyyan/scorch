@@ -77,14 +77,39 @@ def emitted(formats, result_format):
 
 
 def while_loops_over_an_undeclared_index(source):
-    """Index variables a ``while`` loop counts and the line before does not declare."""
+    """Index variables a ``while`` loop counts and its block does not declare before it.
+
+    The declaration need not be the line just before the loop: a statement such as the
+    dense-block check of a dense result level may sit between them.
+    """
 
     return [
         match.group(1)
-        for previous, line in zip(source, source[1:])
+        for at, line in enumerate(source)
         for match in [_WHILE_OVER_INDEX.match(line)]
-        if match and previous != f"int64_t {match.group(1)} = 0;"
+        if match and not _declared_before(source, at, match.group(1))
     ]
+
+
+def _declared_before(source, at, name):
+    """Whether ``int64_t name = 0;`` comes before line ``at`` in the block holding it.
+
+    Walks back over the lines and their braces from the right, so a block that closes
+    before the loop is skipped whole and the walk stops where the loop's block opens.
+    """
+
+    depth = 0
+    for line in reversed(source[:at]):
+        if depth == 0 and line == f"int64_t {name} = 0;":
+            return True
+        for char in reversed(line):
+            if char == "}":
+                depth += 1
+            elif char == "{":
+                depth -= 1
+                if depth < 0:
+                    return False
+    return False
 
 
 def layouts(rank):
@@ -95,6 +120,28 @@ def test_the_check_finds_a_while_loop_over_an_undeclared_index():
     source = ["int pB1_end = B1_pos[pB0 + 1];", "while (j < D1_size) {", "j++;", "}"]
     assert while_loops_over_an_undeclared_index(source) == ["j"]
     assert while_loops_over_an_undeclared_index(["int64_t j = 0;"] + source[1:]) == []
+
+
+def test_the_check_accepts_a_statement_between_the_declaration_and_the_loop():
+    source = [
+        "int64_t j = 0;",
+        "scorch_check_dense_block(pC0, C1_size, false, 1, 1);",
+        "while (j < A1_size) {",
+        "j++;",
+        "}",
+    ]
+    assert while_loops_over_an_undeclared_index(source) == []
+
+
+def test_the_check_finds_a_declaration_in_a_block_that_closed_before_the_loop():
+    loop = ["while (j < D1_size) {", "j++;", "}"]
+    sibling = ["if (pB1 < pB1_end) {", "int64_t j = 0;", "}"]
+    assert while_loops_over_an_undeclared_index(sibling + loop) == ["j"]
+    outer = "for (int64_t i = 0; i < A0_size; i++) {"
+    earlier_loop = [outer, "int64_t j = 0;", "}"]
+    assert while_loops_over_an_undeclared_index(earlier_loop + [outer] + loop) == ["j"]
+    branch = ["if (a) {", "int64_t j = 0;", "} else {"]
+    assert while_loops_over_an_undeclared_index(branch + loop + ["}"]) == ["j"]
 
 
 def test_the_merge_under_a_dense_extent_declares_its_counter():

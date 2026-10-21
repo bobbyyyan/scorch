@@ -63,9 +63,11 @@ def _result_value_access(
 
 
 def _phase_index(level: int) -> llir.Add:
+    # A deeper level's fill cursor is int64_t (patch 0038c): its count in one cell
+    # is bounded by a product of extents, not by one extent.
     return llir.Add(
         _var(f"_base{level}", llir.DataType.INT64),
-        _var(f"_pos{level}", llir.DataType.INT),
+        _var(f"_pos{level}", llir.DataType.INT if level == 1 else llir.DataType.INT64),
     )
 
 
@@ -521,14 +523,14 @@ def test_count_rewrite_matches_legacy_multiple_level_boundary() -> None:
         llir.IfThenElse(
             cond=llir.BinOp(
                 ">",
-                _var("_cnt2", llir.DataType.INT),
-                _var("_prev2", llir.DataType.INT),
+                _var("_cnt2", llir.DataType.INT64),
+                _var("_prev2", llir.DataType.INT64),
             ),
             then_body=[
                 llir.Increment(_var("_cnt1", llir.DataType.INT)),
                 llir.Assign(
-                    _var("_prev2", llir.DataType.INT),
-                    _var("_cnt2", llir.DataType.INT),
+                    _var("_prev2", llir.DataType.INT64),
+                    _var("_cnt2", llir.DataType.INT64),
                 ),
             ],
         ),
@@ -558,8 +560,8 @@ def test_fill_rewrite_matches_legacy_multiple_level_boundary() -> None:
         llir.IfThenElse(
             cond=llir.BinOp(
                 ">",
-                _var("_pos2", llir.DataType.INT),
-                _var("_prev2", llir.DataType.INT),
+                _var("_pos2", llir.DataType.INT64),
+                _var("_prev2", llir.DataType.INT64),
             ),
             then_body=[
                 _fill_store(
@@ -576,8 +578,8 @@ def test_fill_rewrite_matches_legacy_multiple_level_boundary() -> None:
                     llir.DataType.PTR_INT,
                 ),
                 llir.Assign(
-                    _var("_prev2", llir.DataType.INT),
-                    _var("_pos2", llir.DataType.INT),
+                    _var("_prev2", llir.DataType.INT64),
+                    _var("_pos2", llir.DataType.INT64),
                 ),
             ],
         ),

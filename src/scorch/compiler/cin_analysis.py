@@ -9,10 +9,11 @@ stored on CIN nodes.
 from __future__ import annotations
 
 import json
+import math
 from collections.abc import Iterable, Iterator, Mapping
 from contextlib import contextmanager
 from contextvars import ContextVar
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from enum import Enum
 from typing import Dict, Generic, List, Optional, Tuple, TypeVar, Union, cast
 
@@ -42,6 +43,7 @@ from .diagnostics import VerificationError
 from .identity import AccessId, IndexId, NodeId, SymbolId
 from .compile_options import CompileOptions
 from .compilation_context import CompilerStageId, CompilationContext
+from ..exceptions import ScorchAssertionError, ScorchKeyError, ScorchTypeError
 
 K = TypeVar("K")
 V = TypeVar("V")
@@ -65,7 +67,8 @@ class FrozenMap(Mapping[K, V], Generic[K, V]):
         for candidate, value in self._items:
             if candidate == key:
                 return value
-        raise KeyError(key)
+        # A pass asked the analysis about a node, symbol or access it does not hold.
+        raise ScorchKeyError(key, code="cin_analysis_key_unknown")
 
     def __iter__(self) -> Iterator[K]:
         return (key for key, _ in self._items)
@@ -198,6 +201,21 @@ _MAX_RUNTIME_EXTENT = (1 << 63) - 1
 _MISSING_CIN_FIELD = object()
 
 
+def _is_cin_shape(shape: object) -> bool:
+    """An exact tuple of at most 64 nonnegative int64 extents whose count fits int64.
+
+    A zero extent holds no element, so a shape with one has count 0 whatever its other
+    extents multiply to.  The extents are exact ints before anything compares them.
+    """
+
+    if type(shape) is not tuple or len(shape) > _MAX_CIN_TENSOR_RANK:
+        return False
+    for extent in shape:
+        if type(extent) is not int or extent < 0 or extent > _MAX_RUNTIME_EXTENT:
+            return False
+    return 0 in shape or math.prod(shape) <= _MAX_RUNTIME_EXTENT
+
+
 def _is_supported_cin_node_type(node_type: type) -> bool:
     """Use identity comparisons without hashing/equality on a hostile type."""
 
@@ -291,7 +309,10 @@ def _preflight_cin_structure_impl(  # noqa: C901
     """
 
     if type(allow_legacy_schedule_aliases) is not bool:
-        raise TypeError("legacy schedule alias policy must be an exact bool")
+        raise ScorchTypeError(
+            "legacy schedule alias policy must be an exact bool",
+            code="internal_argument_type_invalid",
+        )
 
     diagnostics: List[CINDiagnostic] = []
     legacy_alias_candidates: List[
@@ -1155,21 +1176,7 @@ def _preflight_cin_structure_impl(  # noqa: C901
             shape = stored_field(node, "shape", path)
             shape_rank: Optional[int] = None
             if shape is not _MISSING_CIN_FIELD and shape is not None:
-                invalid_shape = type(shape) is not tuple
-                if type(shape) is tuple:
-                    invalid_shape = len(shape) > _MAX_CIN_TENSOR_RANK
-                    product = 1
-                    for extent in shape[:_MAX_CIN_TENSOR_RANK]:
-                        if (
-                            type(extent) is not int
-                            or extent < 0
-                            or extent > _MAX_RUNTIME_EXTENT
-                            or (extent != 0 and product > _MAX_RUNTIME_EXTENT // extent)
-                        ):
-                            invalid_shape = True
-                            break
-                        product *= extent
-                if invalid_shape:
+                if not _is_cin_shape(shape):
                     diagnose(
                         "invalid_cin_field",
                         "TensorVar.shape must be an exact rank-bounded tuple whose "
@@ -1914,7 +1921,8 @@ def _preflight_cin_structure(cin: IndexStmt) -> Tuple[CINDiagnostic, ...]:
     """Run the strict normalized-CIN structural preflight."""
 
     diagnostics, aliases_used = _preflight_cin_structure_impl(cin)
-    assert not aliases_used
+    if aliases_used:
+        raise ScorchAssertionError("not aliases_used", code="cin_aliases_unexpected")
     return diagnostics
 
 
@@ -1931,7 +1939,10 @@ def verify_cin_structure(cin: IndexStmt) -> None:
     """Fail closed on malformed CIN forward structure before recursive work."""
 
     if not _is_index_stmt_instance(cin):
-        raise TypeError("verify_cin_structure expects an IndexStmt")
+        raise ScorchTypeError(
+            "verify_cin_structure expects an IndexStmt",
+            code="internal_argument_type_invalid",
+        )
     if id(cin) in _TRUSTED_CIN_ROOTS.get():
         return
     diagnostics = _preflight_cin_structure(cin)
@@ -1953,7 +1964,10 @@ def _verify_legacy_cin_lowering_structure(cin: IndexStmt) -> bool:
     """
 
     if not _is_index_stmt_instance(cin):
-        raise TypeError("legacy CIN lowering expects an IndexStmt")
+        raise ScorchTypeError(
+            "legacy CIN lowering expects an IndexStmt",
+            code="internal_argument_type_invalid",
+        )
     diagnostics, aliases_used = _preflight_cin_structure_impl(
         cin,
         allow_legacy_schedule_aliases=True,
@@ -2012,7 +2026,8 @@ class _IdPreflight:
                 path,
             )
             return
-        assert type(node_id) is NodeId
+        # _is_exact_identity has checked ``type(node_id) is NodeId``.
+        node_id = cast(NodeId, node_id)
         previous = self.node_objects.get(node_id)
         if previous is not None and previous is not node:
             self.diagnose(
@@ -2216,7 +2231,9 @@ def _compute_cin_analysis(cin: IndexStmt) -> CINAnalysis:  # noqa: C901
     # prematurely coupling Phase 1 ownership analysis to pass infrastructure.
 
     if not _is_index_stmt_instance(cin):
-        raise TypeError("analyze_cin expects an IndexStmt")
+        raise ScorchTypeError(
+            "analyze_cin expects an IndexStmt", code="internal_argument_type_invalid"
+        )
 
     structural_diagnostics = (
         () if id(cin) in _TRUSTED_CIN_ROOTS.get() else _preflight_cin_structure(cin)
@@ -2266,6 +2283,11 @@ def _compute_cin_analysis(cin: IndexStmt) -> CINAnalysis:  # noqa: C901
     tensor_accesses: Dict[SymbolId, List[AccessId]] = {}
     access_order: List[AccessId] = []
     assignment_order: List[NodeId] = []
+    # The Wheres around each assignment, outermost first, with the side it is on, and
+    # the indices bound by the ForAlls around each Where.
+    where_stack: List[Tuple[NodeId, str]] = []
+    assignment_where_paths: Dict[NodeId, Tuple[Tuple[NodeId, str], ...]] = {}
+    where_enclosing_indices: Dict[NodeId, Tuple[IndexId, ...]] = {}
     free_index_ids: List[IndexId] = []
     diagnostics: List[CINDiagnostic] = []
 
@@ -2651,6 +2673,8 @@ def _compute_cin_analysis(cin: IndexStmt) -> CINAnalysis:  # noqa: C901
             )
             return
         if isinstance(stmt, Where):
+            where_enclosing_indices[stmt.node_id] = active_indices
+            where_stack.append((stmt.node_id, "producer"))
             visit_stmt(
                 stmt.producer,
                 stmt.node_id,
@@ -2660,6 +2684,7 @@ def _compute_cin_analysis(cin: IndexStmt) -> CINAnalysis:  # noqa: C901
                 active_indices,
                 path + ("producer",),
             )
+            where_stack[-1] = (stmt.node_id, "consumer")
             visit_stmt(
                 stmt.consumer,
                 stmt.node_id,
@@ -2669,6 +2694,7 @@ def _compute_cin_analysis(cin: IndexStmt) -> CINAnalysis:  # noqa: C901
                 active_indices,
                 path + ("consumer",),
             )
+            where_stack.pop()
             return
         if isinstance(stmt, TensorAssign):
             lhs_kind = (
@@ -2715,6 +2741,7 @@ def _compute_cin_analysis(cin: IndexStmt) -> CINAnalysis:  # noqa: C901
                 multiplicative_access_ids=multiplicative_access_ids(stmt.rhs),
             )
             assignment_order.append(stmt.node_id)
+            assignment_where_paths[stmt.node_id] = tuple(where_stack)
             return
         diagnose(
             "unsupported_statement",
@@ -2724,6 +2751,78 @@ def _compute_cin_analysis(cin: IndexStmt) -> CINAnalysis:  # noqa: C901
         )
 
     visit_stmt(cin, None, "root", None, None, (), ("root",))
+
+    # A Where declares the workspaces its producer assigns and its consumer reads, and
+    # the innermost such Where declares each one.  The ForAlls around that Where give the
+    # workspace one instance per iteration of their indices: each iteration fills its own
+    # and its consumer reads that one.  So every access of the workspace carries those
+    # indices, as if they were leading indices of its own, and an index the left-hand
+    # side carries is not reduced into it.  ops.spmv's scalar workspace, declared inside
+    # ForAll(i), is one: i is free in the result and is not reduced into the workspace;
+    # only j is.  A workspace declared outside ForAll(i) carries no i, so an i its
+    # producer sums over is still reduced into it.
+    writing_paths: Dict[SymbolId, List[Tuple[Tuple[NodeId, str], ...]]] = {}
+    reading_paths: Dict[SymbolId, List[Tuple[Tuple[NodeId, str], ...]]] = {}
+    for assignment_id in assignment_order:
+        assignment_info = assignments[assignment_id]
+        where_path = assignment_where_paths.get(assignment_id, ())
+        lhs_info = accesses.get(assignment_info.lhs_access_id)
+        if lhs_info is not None:
+            writing_paths.setdefault(lhs_info.tensor_id, []).append(where_path)
+        for access_id in assignment_info.rhs_access_ids:
+            rhs_info = accesses.get(access_id)
+            if rhs_info is not None:
+                reading_paths.setdefault(rhs_info.tensor_id, []).append(where_path)
+    workspace_enclosing_indices: Dict[SymbolId, Tuple[IndexId, ...]] = {}
+    for symbol_id, paths_writing in writing_paths.items():
+        definition = symbol_definitions.get(symbol_id)
+        if definition is None or not definition.is_workspace:
+            continue
+        declaring: Optional[Tuple[int, NodeId]] = None
+        for where_path in paths_writing:
+            for depth, (where_id, side) in enumerate(where_path):
+                if side != "producer" or (
+                    declaring is not None and depth <= declaring[0]
+                ):
+                    continue
+                if any(
+                    (where_id, "consumer") in read_path
+                    for read_path in reading_paths.get(symbol_id, ())
+                ):
+                    declaring = (depth, where_id)
+        if declaring is not None:
+            workspace_enclosing_indices[symbol_id] = where_enclosing_indices[
+                declaring[1]
+            ]
+
+    def carried_index_ids(
+        symbol_id: SymbolId, index_ids: Tuple[IndexId, ...]
+    ) -> Tuple[IndexId, ...]:
+        enclosing = workspace_enclosing_indices.get(symbol_id, ())
+        return tuple(index_ids) + tuple(
+            index_id for index_id in enclosing if index_id not in index_ids
+        )
+
+    for assignment_id in assignment_order:
+        assignment_info = assignments[assignment_id]
+        lhs_info = accesses.get(assignment_info.lhs_access_id)
+        lhs_carried = (
+            carried_index_ids(lhs_info.tensor_id, assignment_info.lhs_index_ids)
+            if lhs_info is not None
+            else assignment_info.lhs_index_ids
+        )
+        carried_reductions: List[IndexId] = []
+        for access_id in assignment_info.rhs_access_ids:
+            rhs_info = accesses.get(access_id)
+            if rhs_info is None:
+                continue
+            for index_id in carried_index_ids(rhs_info.tensor_id, rhs_info.index_ids):
+                if index_id not in lhs_carried and index_id not in carried_reductions:
+                    carried_reductions.append(index_id)
+        if tuple(carried_reductions) != assignment_info.reduction_index_ids:
+            assignments[assignment_id] = replace(
+                assignment_info, reduction_index_ids=tuple(carried_reductions)
+            )
 
     def scope_contains(owner: NodeId, scope: NodeId) -> bool:
         current: Optional[NodeId] = scope
@@ -2839,9 +2938,15 @@ def _compute_cin_analysis(cin: IndexStmt) -> CINAnalysis:  # noqa: C901
         assignment = node_objects.get(access_info.scope_id)
         if not isinstance(assignment, TensorAssign):
             continue
-        lhs_ids = tuple(assignment.lhs.index_ids)
+        lhs_ids = carried_index_ids(
+            assignment.lhs.tensor_id, tuple(assignment.lhs.index_ids)
+        )
         reduction_evidence.update(
-            index_id for index_id in access_info.index_ids if index_id not in lhs_ids
+            index_id
+            for index_id in carried_index_ids(
+                access_info.tensor_id, access_info.index_ids
+            )
+            if index_id not in lhs_ids
         )
 
     used_index_ids = {
@@ -2982,7 +3087,10 @@ def _trusted_normalized_cin(cin: IndexStmt) -> Iterator[None]:
     """
 
     if not _is_exact_index_stmt(cin):
-        raise TypeError("trusted normalized CIN must be an exact IndexStmt")
+        raise ScorchTypeError(
+            "trusted normalized CIN must be an exact IndexStmt",
+            code="internal_argument_type_invalid",
+        )
     roots = _TRUSTED_CIN_ROOTS.get()
     token = _TRUSTED_CIN_ROOTS.set(roots | {id(cin)})
     try:
@@ -2996,7 +3104,10 @@ def get_full_cin_verification() -> bool:
 
     enabled = _VERIFY_CIN_CONTEXT.get()
     if type(enabled) is not bool:
-        raise TypeError("full CIN verification override must be a bool")
+        raise ScorchTypeError(
+            "full CIN verification override must be a bool",
+            code="internal_argument_type_invalid",
+        )
     return enabled
 
 
@@ -3024,7 +3135,10 @@ def _compile_options_at_cin_boundary(
 
     if compile_options is not None:
         if type(compile_options) is not CompileOptions:
-            raise TypeError("compile_options must be a CompileOptions snapshot")
+            raise ScorchTypeError(
+                "compile_options must be a CompileOptions snapshot",
+                code="internal_argument_type_invalid",
+            )
         return compile_options
 
     return CompileOptions.from_environment()
@@ -3038,7 +3152,10 @@ def verify_cin_if_enabled(
     if enabled is None:
         enabled = _compile_options_at_cin_boundary().verification.verify_cin
     if type(enabled) is not bool:
-        raise TypeError("CIN verification policy must be a bool")
+        raise ScorchTypeError(
+            "CIN verification policy must be a bool",
+            code="internal_argument_type_invalid",
+        )
     if enabled:
         return verify_cin(cin)
     return None
@@ -3063,7 +3180,9 @@ def normalize_cin(
     """
 
     if not _is_index_stmt_instance(cin):
-        raise TypeError("normalize_cin expects an IndexStmt")
+        raise ScorchTypeError(
+            "normalize_cin expects an IndexStmt", code="internal_argument_type_invalid"
+        )
     options = _compile_options_at_cin_boundary(compile_options)
     if compilation_context is None:
         return _normalize_cin_owned(cin, options)
@@ -3116,8 +3235,9 @@ def _normalize_cin_owned(cin: IndexStmt, options: CompileOptions) -> IndexStmt:
         if isinstance(index_var._expr, IndexVarAdd):
             clone._expr = clone_index_expr(index_var._expr)
         elif index_var._expr is not None:
-            raise TypeError(
-                f"unsupported CIN index expression {type(index_var._expr).__name__}"
+            raise ScorchTypeError(
+                f"unsupported CIN index expression {type(index_var._expr).__name__}",
+                code="cin_node_unknown",
             )
         return clone
 
@@ -3194,7 +3314,9 @@ def _normalize_cin_owned(cin: IndexStmt, options: CompileOptions) -> IndexStmt:
             object.__setattr__(unary_clone, "op", expr.op)
             object.__setattr__(unary_clone, "expr", clone_expr(expr.expr))
             return unary_clone
-        raise TypeError(f"unsupported CIN expression {type(expr).__name__}")
+        raise ScorchTypeError(
+            f"unsupported CIN expression {type(expr).__name__}", code="cin_node_unknown"
+        )
 
     def clone_stmt(stmt: IndexStmt) -> IndexStmt:
         key = id(stmt)
@@ -3231,7 +3353,9 @@ def _normalize_cin_owned(cin: IndexStmt, options: CompileOptions) -> IndexStmt:
             assign_clone.rhs = clone_expr(stmt.rhs)
             assign_clone.op = stmt.op
             return assign_clone
-        raise TypeError(f"unsupported CIN statement {type(stmt).__name__}")
+        raise ScorchTypeError(
+            f"unsupported CIN statement {type(stmt).__name__}", code="cin_node_unknown"
+        )
 
     return clone_stmt(cin)
 

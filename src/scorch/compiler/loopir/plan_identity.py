@@ -80,7 +80,13 @@ from ..compile_options import (
     SchedulerPolicy,
     VerificationPolicy,
 )
-from ..diagnostics import InvalidSchedule, UnsupportedFeature, VerificationError
+from ...exceptions import shape_capacity_error
+from ..diagnostics import (
+    InvalidSchedule,
+    ShapeCapacityVerificationError,
+    UnsupportedFeature,
+    VerificationError,
+)
 from ..identity import IndexId, SymbolId
 from ..llir_pass_manager import LLIRPassOptions
 from ..loop_plan import (
@@ -241,14 +247,18 @@ def _shape_payload(value: object, owner: str) -> List[int]:
     if type(value) not in (tuple, list):
         raise VerificationError(f"{owner} must be a tuple or list of exact ints")
     result: List[int] = []
-    for extent in cast(Sequence[object], value):
-        if (
-            type(extent) is not int
-            or isinstance(extent, bool)
-            or extent < 0
-            or extent > _MAX_RUNTIME_EXTENT
-        ):
+    for mode, extent in enumerate(cast(Sequence[object], value)):
+        if type(extent) is not int or isinstance(extent, bool) or extent < 0:
             raise VerificationError(f"{owner} must contain nonnegative int64 extents")
+        if extent > _MAX_RUNTIME_EXTENT:
+            raise shape_capacity_error(
+                ShapeCapacityVerificationError,
+                f"{owner} must contain nonnegative int64 extents",
+                owner,
+                result,
+                mode,
+                extent,
+            )
         result.append(extent)
     return result
 
@@ -566,6 +576,24 @@ def _plan_payload(
             }
             for conversion in verified.conversions
         ]
+    if verified.vector_loops is not None:
+        # Present only when a decision is recorded (the empty tuple included,
+        # which keeps no mark), so every plan without one keeps its identity
+        # bytes.  The field is a set of loops (``verify_loop_plan`` refuses a
+        # loop named twice, and the mark stays on exactly the named loops), so
+        # its entries are sorted by their canonical form: two plans naming the
+        # same loops in another order are one kernel and one identity.
+        ordered = sorted(
+            verified.vector_loops,
+            key=lambda loop: (index_map.get(loop.index_id, -1), loop.part.value),
+        )
+        payload["vector_loops"] = [
+            _loop_ref_payload(loop, index_map) for loop in ordered
+        ]
+    if verified.entries_of is not None:
+        # Present only when a decision is recorded, so every plan without one
+        # keeps its identity bytes.
+        payload["entries_of"] = _symbol_payload(verified.entries_of, symbol_map)
     if not provenance_free:
         payload["provenance"] = verified.provenance
     return payload

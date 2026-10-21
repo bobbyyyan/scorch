@@ -149,7 +149,11 @@ from typing import (
 
 from ...format import LevelType
 from ..identity import IndexId, SymbolId
-from ..sparse_assembly import partitionable_receiver_levels
+from ..sparse_assembly import (
+    entry_positioned_receiver,
+    partitionable_receiver_levels,
+    receiver_requirement,
+)
 from .nodes import (
     AppendEntry,
     AccumulatorStructure,
@@ -213,6 +217,8 @@ from .nodes import (
     TileId,
     TileInnerFor,
     TileOuterFor,
+    VectorLoop,
+    VectorLoopPart,
     WorkspaceDecl,
     WorkspaceId,
     WorkspaceRead,
@@ -2852,11 +2858,11 @@ def _check_tensor_decl(ctx: _Context, decl: object, path: str, depth: int) -> No
                 path,
                 "TensorDecl.dtype must be a ScalarType member",
             )
-        if type(decl.dimensions) is not tuple or not decl.dimensions:
+        if type(decl.dimensions) is not tuple:
             _fail(
                 "malformed_state",
                 path,
-                "TensorDecl.dimensions must be a nonempty owned tuple",
+                "TensorDecl.dimensions must be an owned tuple",
             )
         for position, dimension in enumerate(decl.dimensions):
             dimension_path = f"{path}.dimensions[{position}]"
@@ -2870,11 +2876,11 @@ def _check_tensor_decl(ctx: _Context, decl: object, path: str, depth: int) -> No
                     "tensor references an undeclared dimension",
                 )
             ctx.mapped_dimensions.add(checked)
-        if type(decl.levels) is not tuple or not decl.levels:
+        if type(decl.levels) is not tuple:
             _fail(
                 "malformed_state",
                 path,
-                "TensorDecl.levels must be a nonempty owned tuple",
+                "TensorDecl.levels must be an owned tuple",
             )
         rank = len(decl.dimensions)
         if len(decl.levels) != rank:
@@ -3411,6 +3417,9 @@ def verify_program(program: object) -> None:
             _check_parallel_selection(ctx, program)
         _check_assembly_strategy(ctx, program)
         _check_accumulator_structure(ctx, program)
+        _check_entries_of(ctx, program)
+        if program.vector_loops is not None:
+            _check_vector_loops(ctx, program)
     finally:
         _leave(ctx, program)
 
@@ -3424,7 +3433,10 @@ def _check_assembly_strategy(ctx: "_Context", program: LoopProgram) -> None:
     match.  And a strategy that distributes or splits the assembly requires the
     receiver contract every such strategy shares: level 0 dense with every level
     below it compressed, so the first compressed level's position array is
-    indexed by the outer loop over a statically known range.  ``None`` and the
+    indexed by the outer loop over a statically known range.  The parallel
+    single pass also admits a COO result that stores one input's entries
+    (``program.entries_of``), whose entries' positions are known before the
+    loops run.  ``None`` and the
     always-legal serial strategy impose nothing.
 
     Extents, densities and thread counts are deliberately absent: this is
@@ -3455,16 +3467,189 @@ def _check_assembly_strategy(ctx: "_Context", program: LoopProgram) -> None:
         levels = tuple(
             LEVEL_KIND_TO_LEVEL_TYPE.get(level.kind) for level in decl.levels
         )
+        if strategy is AssemblyStrategy.SINGLE_PASS_CHUNK_PARALLEL and (
+            entry_positioned_receiver(
+                cast(Tuple[LevelType, ...], levels),
+                program.entries_of is not None,
+            )
+        ):
+            # A COO result that stores one input's entries: each worker writes
+            # its entries at their known positions.
+            continue
         if any(level is None for level in levels) or not (
             partitionable_receiver_levels(cast(Tuple[LevelType, ...], levels))
         ):
             _fail(
                 "unsupported_assembly_strategy",
                 f"program.outputs[{position}]",
-                f"assembly strategy {strategy.value!r} requires a receiver with "
-                "a dense level zero and every level below it compressed; "
-                f"output {decl.name!r} does not have one",
+                f"assembly strategy {strategy.value!r} requires "
+                f"{receiver_requirement(strategy.value)}; "
+                f"output {decl.name!r} is not one",
             )
+
+
+def _vector_target_matches(node: object, index: IndexId, part: VectorLoopPart) -> bool:
+    """Whether one statement binds the named ``(index, part)`` loop identity."""
+
+    if part is VectorLoopPart.LOGICAL:
+        if type(node) is DenseFor:
+            return node.index == index
+        if type(node) is SparseFor or type(node) is MergedSparseFor:
+            return node.coord_index == index
+        return False
+    if part is VectorLoopPart.OUTER:
+        if type(node) is TileOuterFor or type(node) is PanelOuterFor:
+            return node.index == index
+        return False
+    return type(node) is TileInnerFor and node.index == index
+
+
+def _check_vector_loops(ctx: "_Context", program: LoopProgram) -> None:
+    """Require recorded vector marks to name distinct loops of the program.
+
+    ``program.vector_loops`` is an owned tuple of exact :class:`VectorLoop`
+    nodes, each naming by ``(index, part)`` a loop the program binds, no loop
+    twice.  Whether a named loop is one the target may mark (a loop of a sum
+    kept in a register, with no compressed-level loop in its body) is the
+    target's question; it fails closed where it may not.
+    """
+
+    marks = program.vector_loops
+    path = "program.vector_loops"
+    if type(marks) is not tuple:
+        _fail("malformed_state", path, "vector_loops must be a tuple or None")
+    body_nodes = [
+        node for node in _walk_declared_schema(program.body) if isinstance(node, Stmt)
+    ]
+    named: Set[Tuple[IndexId, VectorLoopPart]] = set()
+    for position, mark in enumerate(marks):
+        mark_path = f"{path}[{position}]"
+        if type(mark) is not VectorLoop:
+            _fail(
+                "malformed_state",
+                mark_path,
+                f"expected a VectorLoop, got {type(mark).__name__}",
+            )
+        _enter(ctx, mark, mark_path, 1)
+        try:
+            index = _check_index_id(mark.index, mark_path, "VectorLoop.index")
+            if type(mark.part) is not VectorLoopPart or not any(
+                mark.part is member for member in VectorLoopPart
+            ):
+                _fail(
+                    "malformed_state",
+                    f"{mark_path}.part",
+                    "part must be a canonical VectorLoopPart member",
+                )
+            if (index, mark.part) in named:
+                _fail(
+                    "invalid_vector_loops",
+                    mark_path,
+                    "a loop is named twice",
+                )
+            named.add((index, mark.part))
+            if not any(
+                _vector_target_matches(node, index, mark.part) for node in body_nodes
+            ):
+                _fail(
+                    "invalid_vector_loops",
+                    mark_path,
+                    "no loop in the program binds the named (index, part) identity",
+                )
+        finally:
+            _leave(ctx, mark)
+
+
+def _check_entries_of(ctx: "_Context", program: LoopProgram) -> None:
+    """Require a named entry source to be legal for this program.
+
+    ``program.entries_of`` names the input whose stored entries are the sparse
+    result's entries.  Legal only when:
+
+    * it is an exact :class:`SymbolId` naming one of the program's inputs;
+    * the program has one output, with a level that is not dense (a dense result
+      stores every cell whatever it names);
+    * the input has the result's dimensions, mode for mode, and no dimension
+      twice, so an entry of the input is a cell of the result;
+    * every write of the result is a :class:`StoreReduce` whose value is a
+      product with a factor read from that input, so a cell the input does not
+      store receives zero and storing only the input's entries loses no value.
+      A read through a cursor or a stored position of the input is such a
+      factor; so is a dense read of it.
+
+    Whether the target can build that structure for the program's loops is the
+    target's question, and it fails closed where it cannot.
+    """
+
+    source = program.entries_of
+    if source is None:
+        return
+    if type(source) is not SymbolId or type(getattr(source, "value", None)) is not int:
+        _fail(
+            "malformed_state",
+            "program.entries_of",
+            "entries_of must be a SymbolId or None",
+        )
+    if source not in program.inputs:
+        _fail(
+            "invalid_entries_of",
+            "program.entries_of",
+            "entries_of must name one of the program's inputs",
+        )
+    if len(program.outputs) != 1:
+        _fail(
+            "unsupported_entries_of",
+            "program.entries_of",
+            "entries_of names the entries of a program's one output",
+        )
+    result = ctx.tensors[program.outputs[0]]
+    if all(level.kind is LevelKind.DENSE for level in result.levels):
+        _fail(
+            "unsupported_entries_of",
+            "program.entries_of",
+            f"output {result.name!r} has dense levels only and stores every "
+            "cell, so no input's entries can be its entries",
+        )
+    driver = ctx.tensors[source]
+    if driver.dimensions != result.dimensions or len(set(result.dimensions)) != len(
+        result.dimensions
+    ):
+        _fail(
+            "unsupported_entries_of",
+            "program.entries_of",
+            f"input {driver.name!r} must have the dimensions of output "
+            f"{result.name!r}, mode for mode, with none repeated",
+        )
+    nodes = _walk_declared_schema(program.body)
+    cursor_tensors = {
+        node.cursor: node.tensor for node in nodes if type(node) is SparseCursorDecl
+    }
+
+    def reads_driver(expr: object) -> bool:
+        if type(expr) is BinaryExpr and expr.op is BinaryOp.MUL:
+            return reads_driver(expr.lhs) or reads_driver(expr.rhs)
+        if type(expr) is CursorValue:
+            return cursor_tensors.get(expr.cursor) == source
+        if type(expr) in (Load, PositionLoad):
+            return getattr(expr, "tensor", None) == source
+        return False
+
+    writes = [
+        node
+        for node in nodes
+        if type(node) in (Store, StoreReduce, AppendEntry)
+        and getattr(node, "tensor", None) == result.symbol
+    ]
+    if not writes or not all(
+        type(write) is StoreReduce and reads_driver(write.value) for write in writes
+    ):
+        _fail(
+            "unsupported_entries_of",
+            "program.entries_of",
+            f"every write of output {result.name!r} must be a reduction that "
+            f"multiplies by a value read from input {driver.name!r}, so the "
+            "cells that input does not store receive zero",
+        )
 
 
 def _check_accumulator_structure(ctx: "_Context", program: LoopProgram) -> None:

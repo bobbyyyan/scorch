@@ -211,8 +211,15 @@ class CompilationContext:
         *,
         compile_options: "CompileOptions",
         nested_within: Optional[CompilerStageId] = None,
+        started_ns: Optional[int] = None,
     ) -> CompilerStageToken:
-        """Reserve execution order and start one canonical compiler stage."""
+        """Reserve execution order and start one canonical compiler stage.
+
+        ``started_ns`` is a ``perf_counter_ns`` reading the caller took earlier, for a
+        stage whose work began before this context existed: a public call makes its
+        context only once it has to compile (``ops._DeferredCompilation``), after the
+        validation that belongs to its frontend stage.  It may not be later than now.
+        """
 
         if type(stage_id) is not CompilerStageId:
             _raise_context_error(
@@ -272,6 +279,18 @@ class CompilationContext:
                 ),
                 stage_id=stage_id,
             )
+        now_ns = perf_counter_ns()
+        if started_ns is not None and (
+            type(started_ns) is not int or not 0 <= started_ns <= now_ns
+        ):
+            _raise_context_error(
+                code="invalid_stage_start",
+                message=(
+                    "started_ns must be an exact int perf_counter_ns reading, "
+                    "not later than now"
+                ),
+                stage_id=stage_id,
+            )
         sequence_index = self._next_stage_sequence_index
         object.__setattr__(
             self,
@@ -282,7 +301,7 @@ class CompilationContext:
             stage_id=stage_id,
             sequence_index=sequence_index,
             nested_within=nested_within,
-            started_ns=perf_counter_ns(),
+            started_ns=now_ns if started_ns is None else started_ns,
             _owner_identity=self._owner_identity,
             _token_identity=object(),
         )

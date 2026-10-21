@@ -44,6 +44,7 @@ from __future__ import annotations
 
 import copy
 import hashlib
+import math
 import time
 from collections import deque
 from functools import reduce
@@ -62,9 +63,13 @@ from typing import (
 
 import torch
 
-from ...exceptions import CompileSpecError, raise_if_native_repeat
+from ...exceptions import (
+    CompileSpecError,
+    raise_if_native_coded,
+    shape_capacity_error,
+)
 from .. import llir
-from ..cin import ForAll, IndexStmt, TensorAccess, TensorAssign
+from ..cin import ForAll, IndexStmt, TensorAccess, TensorAssign, Workspace
 from ..cin_analysis import (
     _trusted_normalized_cin,
     normalize_cin,
@@ -73,7 +78,12 @@ from ..cin_analysis import (
 from ..cin_lowerer import CINLowerer
 from ..compilation_context import CompilationContext, CompilerStageId
 from ..compile_options import CompileOptions
-from ..diagnostics import InvalidSchedule, UnsupportedFeature, VerificationError
+from ..diagnostics import (
+    InvalidSchedule,
+    ShapeCapacityVerificationError,
+    UnsupportedFeature,
+    VerificationError,
+)
 from ...format import LevelType
 from ...layout import SUPPORTED_VALUE_DTYPES, common_value_dtype
 from ..identity import IndexId, SymbolId
@@ -91,6 +101,7 @@ from .lower_cin import (
     LoopIRLoweringError,
     LoopIRLoweringResult,
     lower_normalized_cin_to_loopir,
+    refuse_where_program,
     supported_scalar_type,
 )
 from .assembly_selection import (
@@ -813,6 +824,11 @@ def _apply_requested_schedule(
     # caller graph.  The narrow trust context lets the scheduler's immediately
     # following normalization reuse this exact successful scan.
     verify_cin_structure(cin_stmt)
+    # The lowering refuses every Where program, and the scheduler would first plan the
+    # ForAll chain above the Where alone, a plan its own verification refuses.  So a
+    # Where program meets the lowering's refusal here, as on the route without a
+    # schedule.
+    refuse_where_program(cin_stmt)
     if schedule.loop_order is None:
         # The scheduler chooses the order, so it must not see the spelling.
         renested = _nest_in_storage_order(cin_stmt)
@@ -880,16 +896,33 @@ def _bind_runtime_metadata(
         if rank > 64:
             raise VerificationError(f"{owner} rank must not exceed 64")
         result: List[int] = []
-        product = 1
-        for extent in shape:
-            if type(extent) is not int or extent < 0 or extent > max_int64:
+        for mode, extent in enumerate(shape):
+            if type(extent) is not int or extent < 0:
                 raise VerificationError(
                     f"{owner} must contain nonnegative int64 extents"
                 )
-            if extent and product > max_int64 // extent:
-                raise VerificationError(f"{owner} element count exceeds signed int64")
-            product *= extent
+            if extent > max_int64:
+                raise shape_capacity_error(
+                    ShapeCapacityVerificationError,
+                    f"{owner} must contain nonnegative int64 extents",
+                    owner,
+                    result,
+                    mode,
+                    extent,
+                )
             result.append(extent)
+        # A zero extent holds no element whatever the extents before it multiply to.
+        if 0 not in result:
+            count = math.prod(result)
+            if count > max_int64:
+                raise shape_capacity_error(
+                    ShapeCapacityVerificationError,
+                    f"{owner} element count exceeds signed int64",
+                    owner,
+                    result,
+                    None,
+                    count,
+                )
         return tuple(result)
 
     if type(input_bindings) is not tuple and type(input_bindings) is not list:
@@ -956,7 +989,13 @@ def _bind_runtime_metadata(
         output_dtype = common_value_dtype(*dtypes, operation="execute_cin_via_loopir")
     else:
         output_dtype = reduce(torch.promote_types, dtypes)
+    # get_result_tensor_vars() names every left-hand side, a Where's workspace included.
+    # A workspace is not the result: its rank is its own (Workspace.dim; a scalar one
+    # has none) and its dtype was declared with it, so the runtime result's shape and
+    # dtype are not bound onto it.
     for tensor_var in cin_stmt.get_result_tensor_vars():
+        if isinstance(tensor_var, Workspace):
+            continue
         tensor_var.shape = checked_result_shape
         tensor_var.dtype = output_dtype
     return tuple(checked_bindings), checked_result_shape
@@ -1081,6 +1120,9 @@ def _compile_normalized_cin_via_loopir_owned(
                 lowered_cin,
                 planned_loop_order=(
                     None if lowered_plan is None else lowered_plan.loop_order
+                ),
+                planned_entries_of=(
+                    None if lowered_plan is None else lowered_plan.entries_of
                 ),
             )
         if plan is not None and plan.conversions:
@@ -1480,7 +1522,7 @@ def execute_cin_via_loopir(
     try:
         result_cpp = module.evaluate(*module_args)
     except RuntimeError as error:
-        raise_if_native_repeat(error)
+        raise_if_native_coded(error)
         raise
     end_time = time.time()
     if time_dict is not None:
@@ -1579,7 +1621,7 @@ def _run_conversions(
                 snapshot.values,
             )
         except RuntimeError as error:
-            raise_if_native_repeat(error)
+            raise_if_native_coded(error)
             raise
         tensors[position] = _wrap_generated_result(
             shape,
@@ -1675,7 +1717,7 @@ def _execute_legacy_scheduled(
     try:
         result_cpp = module.evaluate(*module_args)
     except RuntimeError as error:
-        raise_if_native_repeat(error)
+        raise_if_native_coded(error)
         raise
     result_vars = scheduled.normalized_cin.get_result_tensor_vars()
     if len(result_vars) != 1 or result_vars[0].format is None:

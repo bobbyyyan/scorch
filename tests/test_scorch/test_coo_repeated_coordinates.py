@@ -47,7 +47,7 @@ from scorch.exceptions import (
     COALESCE_ADVICE,
     RepeatedCoordinateError,
     TensorIndexError,
-    raise_if_native_repeat,
+    raise_if_native_coded,
 )
 from scorch.prebuilt_kernels import execute_prebuilt_binary_kernel
 from scorch.stensor import STensor
@@ -451,7 +451,7 @@ def test_the_native_refusal_text_becomes_the_structured_error():
         "Exception raised from check_coo_strictly_ascending at native_abi.h:1790"
     )
     with pytest.raises(RepeatedCoordinateError) as caught:
-        raise_if_native_repeat(native)
+        raise_if_native_coded(native)
     assert_refusal(caught.value, (4, 0, 2), 7)
     assert caught.value.__cause__ is native
     assert str(caught.value).startswith("evaluate: A COO coordinate (4, 0, 2)")
@@ -460,7 +460,7 @@ def test_the_native_refusal_text_becomes_the_structured_error():
         "repeated coordinates [coo_repeated_coordinate]"
     )
     with pytest.raises(RepeatedCoordinateError) as caught:
-        raise_if_native_repeat(single)
+        raise_if_native_coded(single)
     assert_refusal(caught.value, (3,), 1)
 
 
@@ -471,7 +471,7 @@ def test_the_native_refusal_text_becomes_the_structured_error():
     "something else entirely",
 ])
 def test_every_other_native_error_passes_through_unchanged(text):
-    assert raise_if_native_repeat(RuntimeError(text)) is None
+    assert raise_if_native_coded(RuntimeError(text)) is None
 
 
 def test_the_structured_error_survives_pickling():

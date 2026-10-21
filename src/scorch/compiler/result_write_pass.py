@@ -48,6 +48,34 @@ if TYPE_CHECKING:
 
 ResultWriteMode = Literal["count", "fill"]
 
+
+def phase_state_type(level: int) -> llir.DataType:
+    """The type of one cell's count, fill cursor and previous count at ``level``.
+
+    The two-pass assembly of a ``d,s[,s...]`` result counts, then fills, one cell of its
+    dense level 0 at a time (``_cnt{L}``, ``_pos{L}``, ``_prev{L}``).  At level 1, the
+    first compressed level, a cell holds distinct coordinates of that level: at most its
+    extent, which the entry check holds to ``int``.  A deeper level's count in one cell is
+    bounded only by the product of the extents from level 1 down to it, which can pass
+    ``int`` (the one cell of a 1 x 46,341 x 46,341 result holds 2,147,488,281 entries of
+    level 2), so it is int64_t.  An ``int`` there would overflow in the count pass, before
+    the level's total is checked (``scorch_check_level_total``), and the total would be
+    summed from wrapped counts.
+    """
+
+    return llir.DataType.INT if level == 1 else llir.DataType.INT64
+
+
+def phase_count_vector_type(level: int) -> llir.DataType:
+    """The type of ``_count{L}``, which holds each cell's count at ``level``."""
+
+    return (
+        llir.DataType.STD_VECTOR_C_INT
+        if phase_state_type(level) is llir.DataType.INT
+        else llir.DataType.STD_VECTOR_INT
+    )
+
+
 #: The vector-append member calls this compiler emits for a result array.  Two
 #: spellings, both meaning "append one entry", produced by two different
 #: lowerings: the legacy CIN lowerer emits ``push_back`` and the LoopIR
@@ -569,7 +597,7 @@ class _ResultWriteRewriter(LLIRRewriter):
     def _phase_state(prefix: str, level: int) -> llir.Var:
         """Build one fresh, exactly typed mutable count/fill state reference."""
 
-        return llir.Var(name=f"{prefix}{level}", type=llir.DataType.INT)
+        return llir.Var(name=f"{prefix}{level}", type=phase_state_type(level))
 
     @staticmethod
     def _array_name(target: llir.AssignmentTarget) -> Optional[str]:

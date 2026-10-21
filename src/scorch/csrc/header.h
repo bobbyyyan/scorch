@@ -50,6 +50,12 @@ typedef struct {
 // builders are sequential unless they pre-size their vectors before an OpenMP
 // region. Rejecting gaps turns the old cvector's silent out-of-range behavior
 // into a deterministic failure while preserving its amortized append cost.
+//
+// An append is refused once the array holds INT32_MAX entries. The kernel that appends keeps
+// its position in an `int` and increments it after the append, so one entry more would
+// overflow that position (undefined behaviour; the negative-index failure above at best).
+// The check is in the append branch only, one compare against a constant on a value already
+// loaded, and the refusal itself is out of line.
 template <typename T, typename Index, typename U>
 SCORCH_FORCE_INLINE void scorch_vector_set(
     std::vector<T>& values, Index index, U&& value) {
@@ -58,10 +64,62 @@ SCORCH_FORCE_INLINE void scorch_vector_set(
   }
   const auto position = static_cast<typename std::vector<T>::size_type>(index);
   if (position == values.size()) {
+    if (C10_UNLIKELY(position >= static_cast<typename std::vector<T>::size_type>(
+                                     scorch_native::kMaxIndexPosition))) {
+      scorch_native::refuse_index_capacity("a level array a kernel appends to",
+                                           static_cast<int64_t>(position) + 1);
+    }
     values.emplace_back(std::forward<U>(value));
     return;
   }
   values.at(position) = std::forward<U>(value);
+}
+
+// The 32-bit position bound for one block of a result's dense levels below a compressed level,
+// checked where the block opens. The coordinate at `parent_position` of the compressed level
+// above owns the cells parent_position * block to (parent_position + 1) * block - 1, and the
+// kernel narrows each of their positions to `int` as it forms it, before anything is stored; a
+// compressed level below the block (compressed_below) has one position entry more. The entry
+// check has held every product of the block's extents to the bound (check_result_positions,
+// DenseBoundedInKernel), and parent_position counts the blocks committed before this one, so
+// the product is exact in int64. One compare per block opened; the refusal is out of line.
+SCORCH_FORCE_INLINE void scorch_check_dense_block(int64_t parent_position, int64_t block,
+                                                  bool compressed_below, int first_level,
+                                                  int last_level) {
+  const int64_t limit = scorch_native::kMaxIndexPosition - (compressed_below ? 1 : 0);
+  if (C10_UNLIKELY((parent_position + 1) * block > limit)) {
+    scorch_native::refuse_dense_block_positions(parent_position, block, compressed_below,
+                                                first_level, last_level);
+  }
+}
+
+// The 32-bit position bound for one compressed level of a result the two-pass assembly
+// builds, checked between its two passes. The count pass sums each cell's entries of the
+// level into an int64_t prefix sum, whose last entry `total` is the level's entry count; the
+// fill pass then allocates the level's arrays and stores every entry of the prefix sum, and
+// every position it fills, as `int`. So the count must fit before anything is allocated or
+// stored, and a compressed level below (compressed_below) has one position entry more. The
+// count is exact: each cell's count is held in a type its bound fits (the first compressed
+// level's in `int`, at most that level's extent; a deeper level's in int64_t). One compare
+// per level per call; the refusal is out of line.
+SCORCH_FORCE_INLINE void scorch_check_level_total(int64_t total, bool compressed_below,
+                                                  int level) {
+  const int64_t limit = scorch_native::kMaxIndexPosition - (compressed_below ? 1 : 0);
+  if (C10_UNLIKELY(total > limit)) {
+    scorch_native::refuse_level_total(total, compressed_below, level);
+  }
+}
+
+// The 32-bit position bound for a sparse workspace drained into a coordinate tensor that the
+// kernel then reads back, checked after the drain: the reading loop narrows the drained
+// count to `int` (`int pT0_end = T0_crd_tensor.size(0)`). The drain's appends are indexed by
+// an int64_t counter, so `entries` is exact whether or not each append checks its index
+// (scorch_vector_set does today); this check is the bound that holds either way. One compare
+// per call; the refusal is out of line.
+SCORCH_FORCE_INLINE void scorch_check_drained_entries(int64_t entries) {
+  if (C10_UNLIKELY(entries > scorch_native::kMaxIndexPosition)) {
+    scorch_native::refuse_drained_entries(entries);
+  }
 }
 
 template <typename T>
@@ -417,6 +475,21 @@ inline void scorch_concat_chunks(std::vector<T>& out,
   }
 }
 
+// The two merges below store a chunk's local position plus the child coordinates of
+// every earlier chunk, computed in 64 bits and narrowed to the position type P. The
+// largest value either stores is the child coordinates all chunks hold, so that
+// total is what has to fit P; past it the narrowing wraps and the result comes back
+// with wrong positions. Checked once per merge, before its parallel loop (a refusal
+// thrown inside the region could not leave it).
+template <typename P>
+inline void scorch_check_position_capacity(int64_t child_coordinates) {
+  if (child_coordinates > static_cast<int64_t>(std::numeric_limits<P>::max())) {
+    scorch_native::refuse_index_capacity(
+        "a result level's coordinates, merged from the parallel chunks,",
+        child_coordinates);
+  }
+}
+
 // Append each chunk's position entries after its leading zero, shifted by the
 // running total of that chunk's child coordinates. Chunk c's local positions
 // count into its own child buffer, so the shift is the number of child
@@ -445,6 +518,7 @@ inline void scorch_concat_chunk_positions(
     shifts[chunk + 1] =
         shifts[chunk] + static_cast<int64_t>(child_parts[chunk].size());
   }
+  scorch_check_position_capacity<P>(shifts.back());
   const size_t total = offsets.back();
   if (total == begin) {
     return;
@@ -496,6 +570,7 @@ inline void scorch_shift_chunk_positions(
     shifts[chunk + 1] =
         shifts[chunk] + static_cast<int64_t>(child_parts[chunk].size());
   }
+  scorch_check_position_capacity<P>(shifts.back());
   if (static_cast<int64_t>(positions.size()) < rows + 1) {
     throw std::out_of_range("position array was not pre-sized for the chunks");
   }

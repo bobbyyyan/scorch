@@ -82,6 +82,8 @@ from .nodes import (
     TileId,
     TileInnerFor,
     TileOuterFor,
+    VectorLoop,
+    VectorLoopPart,
     WorkspaceDecl,
     WorkspaceId,
     WorkspaceRead,
@@ -617,6 +619,9 @@ class LoopIRBuilder:
             intent,
         )
 
+    def vector_loop(self, index: IndexId, part: VectorLoopPart) -> VectorLoop:
+        return VectorLoop(self._node_id(), index, part)
+
     def program(
         self,
         dimensions: Sequence[DimensionDecl],
@@ -625,6 +630,7 @@ class LoopIRBuilder:
         outputs: Sequence[SymbolId],
         body: Block,
         parallel: Optional[ParallelSelection] = None,
+        entries_of: Optional[SymbolId] = None,
     ) -> LoopProgram:
         return LoopProgram(
             self._node_id(),
@@ -634,4 +640,5 @@ class LoopIRBuilder:
             tuple(outputs),
             body,
             parallel,
+            entries_of=entries_of,
         )

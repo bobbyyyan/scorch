@@ -2728,3 +2728,210 @@ def test_workspace_fact_structure_is_exact() -> None:
     object.__delattr__(deleted, "dense")
     with pytest.raises(VerificationError, match="invalid stored fields"):
         verify_loop_plan(cin, replace(plan, workspace=deleted))
+
+
+# ---------------------------------------------------------------------------
+# vector_loops: the loops a plan keeps marked for vector instructions.
+# ---------------------------------------------------------------------------
+
+
+def _dense_matmul_plan(schedule: Schedule = Schedule()) -> ScheduledCIN:
+    return Scheduler.apply_schedule(_build_dense_matmul(), schedule)
+
+
+def _unsplit_index(scheduled: ScheduledCIN) -> IndexId:
+    """An index of the plan that no tile splits: the automatic plan of the dense
+    product tiles some of its loops, and naming such a loop unsplit is refused."""
+
+    ids = _index_ids_by_name(scheduled.normalized_cin)
+    tiled = {tile.loop.index_id for tile in scheduled.verified_loop_plan.tiles}
+    unsplit = [ids[name] for name in ("j", "k", "i") if ids[name] not in tiled]
+    assert unsplit, "the premise: the automatic plan leaves a loop unsplit"
+    return unsplit[0]
+
+
+def test_vector_loops_snapshot_a_list_and_refuse_other_containers() -> None:
+    scheduled = _dense_matmul_plan()
+    index = _unsplit_index(scheduled)
+    marks = [LoopRef(index)]
+    plan = replace(scheduled.verified_loop_plan, vector_loops=cast(Tuple, marks))
+    marks.clear()
+    assert plan.vector_loops == (LoopRef(index),)
+    assert type(plan.vector_loops) is tuple
+    assert verify_scheduled_cin(ScheduledCIN(scheduled.normalized_cin, plan))
+
+    with pytest.raises(TypeError, match="vector_loops must be a tuple or list"):
+        replace(
+            scheduled.verified_loop_plan,
+            vector_loops=cast(Tuple, frozenset({LoopRef(index)})),
+        )
+    forged = replace(scheduled.verified_loop_plan, vector_loops=())
+    object.__setattr__(forged, "vector_loops", frozenset({LoopRef(index)}))
+    with pytest.raises(VerificationError, match="vector_loops must be a tuple or None"):
+        verify_loop_plan(scheduled.normalized_cin, forged)
+
+
+@pytest.mark.parametrize(
+    "build_marks, message",
+    [
+        (
+            lambda index: (cast(LoopRef, index),),
+            r"vector_loops\[0\] must be a LoopRef",
+        ),
+        (
+            lambda index: (LoopRef(IndexId(10**9)),),
+            r"vector_loops\[0\] references unknown IndexId",
+        ),
+        (
+            lambda index: (LoopRef(index, LoopPart.INNER),),
+            r"vector_loops\[0\] references a split part of a non-affine loop",
+        ),
+        (
+            lambda index: (LoopRef(index), LoopRef(index)),
+            "vector_loops names a loop twice",
+        ),
+    ],
+    ids=["not-a-loop-ref", "unknown-index", "split-part-untiled", "named-twice"],
+)
+def test_vector_loops_refuse_malformed_references(build_marks, message) -> None:
+    scheduled = _dense_matmul_plan()
+    index = _unsplit_index(scheduled)
+    plan = replace(scheduled.verified_loop_plan, vector_loops=build_marks(index))
+    _assert_plan_rejected(scheduled.normalized_cin, plan, VerificationError, message)
+
+
+def test_vector_loops_refuse_the_unsplit_loop_an_affine_tile_replaces() -> None:
+    scheduled = _dense_matmul_plan(Schedule(tiles=(TileSpec("k", 4, accum="direct"),)))
+    ids = _index_ids_by_name(scheduled.normalized_cin)
+    unsplit = replace(scheduled.verified_loop_plan, vector_loops=(LoopRef(ids["k"]),))
+    _assert_plan_rejected(
+        scheduled.normalized_cin,
+        unsplit,
+        VerificationError,
+        "names an unsplit loop that an affine tile replaces",
+    )
+    for part in (LoopPart.OUTER, LoopPart.INNER):
+        named = replace(
+            scheduled.verified_loop_plan, vector_loops=(LoopRef(ids["k"], part),)
+        )
+        assert verify_loop_plan(scheduled.normalized_cin, named) is named
+
+
+def test_vector_loops_refuse_a_loop_a_panel_tile_splits() -> None:
+    scheduled = Scheduler.apply_schedule(
+        _build_spmm(),
+        Schedule(
+            loop_order=("i", "j", "k"),
+            tiles=(TileSpec("j", 32, kind="panel", accum="direct"),),
+            parallel_loop="i",
+        ),
+    )
+    ids = _index_ids_by_name(scheduled.normalized_cin)
+    for part in (LoopPart.LOGICAL, LoopPart.OUTER):
+        plan = replace(
+            scheduled.verified_loop_plan, vector_loops=(LoopRef(ids["j"], part),)
+        )
+        _assert_plan_rejected(
+            scheduled.normalized_cin,
+            plan,
+            VerificationError,
+            (
+                "panel tile splits"
+                if part is LoopPart.LOGICAL
+                else "split part of a non-affine loop"
+            ),
+        )
+
+
+def test_vector_loop_reference_refusals_carry_codes() -> None:
+    """Review finding 4: a request naming a loop the automatic plan tiled reaches
+    these from the public schedule, so each refusal carries a code."""
+
+    tiled = _dense_matmul_plan(Schedule(tiles=(TileSpec("k", 4, accum="direct"),)))
+    ids = _index_ids_by_name(tiled.normalized_cin)
+    untiled = _dense_matmul_plan()
+    index = _unsplit_index(untiled)
+    panel = Scheduler.apply_schedule(
+        _build_spmm(),
+        Schedule(
+            loop_order=("i", "j", "k"),
+            tiles=(TileSpec("j", 32, kind="panel", accum="direct"),),
+            parallel_loop="i",
+        ),
+    )
+    panel_ids = _index_ids_by_name(panel.normalized_cin)
+    cases = [
+        (tiled, (LoopRef(ids["k"]),), "invalid_vector_loops"),
+        (untiled, (LoopRef(index, LoopPart.INNER),), "invalid_vector_loops"),
+        (untiled, (LoopRef(index), LoopRef(index)), "invalid_vector_loops"),
+        (untiled, (LoopRef(IndexId(10**9)),), "invalid_vector_loops"),
+        (panel, (LoopRef(panel_ids["j"]),), "unsupported_vector_loop"),
+    ]
+    for scheduled, marks, code in cases:
+        plan = replace(scheduled.verified_loop_plan, vector_loops=marks)
+        with pytest.raises(VerificationError) as error:
+            verify_loop_plan(scheduled.normalized_cin, plan)
+        assert [d.code for d in error.value.diagnostics] == [code], marks
+        assert str(error.value).startswith(f"stage=LoopPlan: {code} at plan/")
+
+
+def test_entries_of_is_validated_against_the_programs_tensors() -> None:
+    scheduled = _dense_matmul_plan()
+    symbols = _symbol_ids_by_name(scheduled.normalized_cin)
+    plan = scheduled.verified_loop_plan
+    forged = replace(plan, entries_of=symbols["A"])
+    object.__setattr__(forged, "entries_of", "A")
+    with pytest.raises(VerificationError, match="entries_of"):
+        verify_loop_plan(scheduled.normalized_cin, forged)
+    with pytest.raises(VerificationError, match="entries_of references unknown"):
+        verify_loop_plan(
+            scheduled.normalized_cin, replace(plan, entries_of=SymbolId(10**9))
+        )
+    # A dense result stores no entries: the rule refuses every input.
+    with pytest.raises(UnsupportedFeature) as error:
+        verify_loop_plan(
+            scheduled.normalized_cin, replace(plan, entries_of=symbols["A"])
+        )
+    assert error.value.diagnostics[0].code == "unsupported_entries_of"
+
+
+def test_vector_loops_on_a_loop_free_program() -> None:
+    auto = Scheduler.apply_schedule(_build_scalar_assignment(), Schedule())
+    unmarked = replace(auto.verified_loop_plan, vector_loops=())
+    assert verify_loop_plan(auto.normalized_cin, unmarked) is unmarked
+    named = replace(auto.verified_loop_plan, vector_loops=(LoopRef(IndexId(1)),))
+    with pytest.raises(VerificationError, match="normalized CIN defines none"):
+        verify_loop_plan(auto.normalized_cin, named)
+
+
+@pytest.mark.parametrize(
+    "schedule, part",
+    [
+        (Schedule(parallel_loop="i"), LoopPart.LOGICAL),
+        (
+            Schedule(tiles=(TileSpec("i", 4, parallel=True, accum="direct"),)),
+            LoopPart.OUTER,
+        ),
+    ],
+    ids=["parallel-loop", "parallel-tile"],
+)
+def test_vector_loops_refuse_the_plans_parallel_loop(schedule, part) -> None:
+    """The shared rule never marks a parallel loop, so a plan naming its own
+    parallel loop is refused at plan legality, before either compiler lowers."""
+
+    scheduled = _dense_matmul_plan(schedule)
+    ids = _index_ids_by_name(scheduled.normalized_cin)
+    plan = replace(
+        scheduled.verified_loop_plan, vector_loops=(LoopRef(ids["i"], part),)
+    )
+    with pytest.raises(UnsupportedFeature) as error:
+        verify_loop_plan(scheduled.normalized_cin, plan)
+    assert error.value.diagnostics[0].code == "unsupported_vector_loop"
+    assert error.value.diagnostics[0].path == ("plan", "vector_loops", "0")
+    with pytest.raises(UnsupportedFeature, match="unsupported_vector_loop"):
+        Scheduler.apply_schedule(
+            _build_dense_matmul(),
+            replace(
+                schedule, vector_loops=("i_out" if part is LoopPart.OUTER else "i",)
+            ),
+        )

@@ -120,13 +120,15 @@ def test_float64_matrix_vector_product_accumulates_in_float64(monkeypatch, fmt):
     vector = _filled((40,), 1.0, 1747)
     workspaces = _recording_workspaces(monkeypatch, ops)
     reached_generic_route = []
-    generic_spmv = ops.spmv
+    generic_spmv = ops._spmv_owned
 
-    def spmv(*args, **kwargs):
+    def spmv_owned(*args, **kwargs):
         reached_generic_route.append(True)
         return generic_spmv(*args, **kwargs)
 
-    monkeypatch.setattr(ops, "spmv", spmv)
+    # The generated kernel's entry: ops.spmv calls it, and so does matmul's
+    # matrix-vector branch, directly, under the call's own options holder.
+    monkeypatch.setattr(ops, "_spmv_owned", spmv_owned)
 
     result = scorch.matmul(_stored(matrix, fmt, "A"), vector)
 

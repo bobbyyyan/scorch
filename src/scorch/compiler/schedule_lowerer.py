@@ -20,6 +20,13 @@ from .llir_traversal import (
 )
 from .scheduler import Schedule, TileSpec, _RelayoutPlan, _ResultTilePlan
 from .iterator import match_mode_position_bounds
+from ..exceptions import (
+    ScorchAssertionError,
+    ScorchLookupError,
+    ScorchNotImplementedError,
+    ScorchTypeError,
+    ScorchValueError,
+)
 
 LoopLocation = Tuple[List[llir.Stmt], int, llir.ForLoop]
 
@@ -76,7 +83,10 @@ def _find_tagged_loop(
                     return _find_tagged_loop(body, name, ancestors)
                 except LookupError:
                     pass
-    raise LookupError(f"No generated loop is tagged for index variable {name!r}")
+    raise ScorchLookupError(
+        f"No generated loop is tagged for index variable {name!r}",
+        code="generated_llir_not_found",
+    )
 
 
 def _find_coordinate_array(stmts: List[llir.Stmt], position: str) -> llir.Var:
@@ -109,8 +119,9 @@ def _find_coordinate_array(stmts: List[llir.Stmt], position: str) -> llir.Var:
                 return _find_coordinate_array(body, position)
             except LookupError:
                 pass
-    raise LookupError(
-        f"Cannot find a coordinate array indexed by sparse position {position!r}"
+    raise ScorchLookupError(
+        f"Cannot find a coordinate array indexed by sparse position {position!r}",
+        code="generated_llir_not_found",
     )
 
 
@@ -132,14 +143,20 @@ def _panel_bound_expression(
         and coordinate_array.is_restrict is False
         and coordinate_array.tensor_access is None
     ):
-        raise TypeError("panel coordinate array must be a plain PTR_INT Var")
+        raise ScorchTypeError(
+            "panel coordinate array must be a plain PTR_INT Var",
+            code="panel_bound_array_invalid",
+        )
 
     rewriter = LLIRRewriter(_PANEL_WINDOW_CONTEXT)
 
     def detach(expression: llir.Expr) -> llir.Expr:
         detached = rewriter.rewrite(expression)
         if not isinstance(detached, llir.Expr):
-            raise AssertionError("a panel bound child must remain an expression")
+            raise ScorchAssertionError(
+                "a panel bound child must remain an expression",
+                code="llir_rewrite_kind_changed",
+            )
         return detached
 
     expression = llir.Cast(
@@ -170,7 +187,10 @@ def _find_end_init(
         stmt = container[index]
         if isinstance(stmt, llir.VarInit) and stmt.var.name == end_name:
             return index, stmt
-    raise LookupError(f"Cannot find sparse iterator end declaration {end_name!r}")
+    raise ScorchLookupError(
+        f"Cannot find sparse iterator end declaration {end_name!r}",
+        code="generated_llir_not_found",
+    )
 
 
 def _window_sparse_loop(
@@ -180,11 +200,20 @@ def _window_sparse_loop(
 ) -> None:
     container, loop_index, sparse_loop = location
     if not isinstance(sparse_loop.init, llir.VarInit):
-        raise NotImplementedError("Panel tiling requires a canonical sparse for-loop")
+        raise ScorchNotImplementedError(
+            "Panel tiling requires a canonical sparse for-loop",
+            code="panel_tiling_lowering_unsupported",
+        )
     if not isinstance(sparse_loop.cond, llir.BinOp):
-        raise NotImplementedError("Panel tiling requires a canonical sparse bound")
+        raise ScorchNotImplementedError(
+            "Panel tiling requires a canonical sparse bound",
+            code="panel_tiling_lowering_unsupported",
+        )
     if not isinstance(sparse_loop.cond.right, llir.Var):
-        raise NotImplementedError("Panel tiling requires a named CSR row end")
+        raise ScorchNotImplementedError(
+            "Panel tiling requires a named CSR row end",
+            code="panel_tiling_lowering_unsupported",
+        )
 
     position = sparse_loop.init.var.name
     end_name = sparse_loop.cond.right.name
@@ -196,16 +225,18 @@ def _window_sparse_loop(
         and end_init.var.is_restrict is False
         and end_init.var.tensor_access is None
     ):
-        raise NotImplementedError(
-            "Panel tiling requires a plain INT sparse iterator end"
+        raise ScorchNotImplementedError(
+            "Panel tiling requires a plain INT sparse iterator end",
+            code="panel_tiling_lowering_unsupported",
         )
     row_begin = match_mode_position_bounds(
         sparse_loop.init.value,
         end_init.value,
     )
     if row_begin is None:
-        raise NotImplementedError(
-            "Panel tiling requires matching structured CSR row bounds"
+        raise ScorchNotImplementedError(
+            "Panel tiling requires matching structured CSR row bounds",
+            code="panel_tiling_lowering_unsupported",
         )
     coordinate_array = _find_coordinate_array(sparse_loop.body, position)
 
@@ -249,9 +280,10 @@ def _parallel_ancestor(ancestors: List[LoopLocation]) -> LoopLocation:
         loop = location[2]
         if loop.omp_parallel_for or getattr(loop, "_use_atomic_scheduling", False):
             return location
-    raise NotImplementedError(
+    raise ScorchNotImplementedError(
         "Sparse panel tiling requires a parallel row loop surrounding the "
-        "compressed iterator"
+        "compressed iterator",
+        code="panel_tiling_lowering_unsupported",
     )
 
 
@@ -278,22 +310,25 @@ def _apply_panel_tile(
             None,
         )
         if parent_position is None:
-            raise ValueError(
+            raise ScorchValueError(
                 f"Panel placement parent {requested_parent!r} is not a generated "
-                "ancestor loop"
+                "ancestor loop",
+                code="panel_placement_invalid",
             )
         if parent_position >= row_position:
-            raise ValueError(
+            raise ScorchValueError(
                 "A sparse panel loop must surround the selected parallel loop; "
-                f"it cannot be placed inside {requested_parent!r}"
+                f"it cannot be placed inside {requested_parent!r}",
+                code="panel_placement_invalid",
             )
         insertion_location = ancestors[parent_position + 1]
     elif tile.placement == "outermost":
         insertion_location = ancestors[0]
     elif tile.placement != "outermost":
-        raise NotImplementedError(
+        raise ScorchNotImplementedError(
             "Sparse panel tiles support outermost or child_of:<generated-loop> "
-            "placement"
+            "placement",
+            code="panel_tiling_lowering_unsupported",
         )
 
     panel_var = f"{tile.index_var}_out"
@@ -357,7 +392,10 @@ def _find_var_init(stmts: List[llir.Stmt], name: str) -> llir.VarInit:
                 return _find_var_init(body, name)
             except LookupError:
                 pass
-    raise LookupError(f"Cannot find generated declaration for {name!r}")
+    raise ScorchLookupError(
+        f"Cannot find generated declaration for {name!r}",
+        code="generated_llir_not_found",
+    )
 
 
 def _declared_names(function: llir.Function) -> set[str]:
@@ -439,8 +477,9 @@ class _TensorAccessRewriter(LLIRRewriter):
             self.rewrite_count += 1
             cloned = LLIRRewriter(self.context).rewrite(self.replacement)
             if not isinstance(cloned, llir.Expr):
-                raise AssertionError(
-                    "an expression replacement must remain an expression"
+                raise ScorchAssertionError(
+                    "an expression replacement must remain an expression",
+                    code="llir_rewrite_kind_changed",
                 )
             return cloned
         return rewritten
@@ -490,7 +529,10 @@ def _rewrite_expr_access(
     )
     rewritten = rewriter.rewrite(expr)
     if not isinstance(rewritten, llir.Expr):
-        raise AssertionError("an expression rewrite must remain an expression")
+        raise ScorchAssertionError(
+            "an expression rewrite must remain an expression",
+            code="llir_rewrite_kind_changed",
+        )
     return rewritten, rewriter.rewrite_count
 
 
@@ -893,14 +935,16 @@ def _redirect_sparse_prefetch(
     """
 
     if not isinstance(sparse_loop.init, llir.VarInit):
-        raise NotImplementedError(
-            "Packed relayout requires a canonical compressed iterator"
+        raise ScorchNotImplementedError(
+            "Packed relayout requires a canonical compressed iterator",
+            code="relayout_lowering_unsupported",
         )
     if not isinstance(sparse_loop.cond, llir.BinOp) or not isinstance(
         sparse_loop.cond.right, llir.Var
     ):
-        raise NotImplementedError(
-            "Packed relayout requires a named compressed iterator end"
+        raise ScorchNotImplementedError(
+            "Packed relayout requires a named compressed iterator end",
+            code="relayout_lowering_unsupported",
         )
     position = sparse_loop.init.var.name
     coordinate_name = (
@@ -937,9 +981,10 @@ def _redirect_sparse_prefetch(
     if stage_row_origin is not None:
         staged_names.append(stage_row_origin)
     if any(type(name) is not str or not name.isidentifier() for name in staged_names):
-        raise NotImplementedError(
+        raise ScorchNotImplementedError(
             "Packed relayout requires identifier spellings for the staged "
-            "prefetch guard"
+            "prefetch guard",
+            code="relayout_lowering_unsupported",
         )
 
     def _reference(name: str) -> llir.Var:
@@ -1008,8 +1053,9 @@ def _remove_dense_result_zero(function: llir.Function, result: str) -> None:
         and stmt.args[0].name == value_name
     ]
     if len(matches) != 1:
-        raise NotImplementedError(
-            "Heap accumulation requires exactly one generated dense-result zero"
+        raise ScorchNotImplementedError(
+            "Heap accumulation requires exactly one generated dense-result zero",
+            code="heap_accumulation_lowering_unsupported",
         )
     del function.body[matches[0]]
 
@@ -1024,7 +1070,10 @@ def _heap_result_storage_declaration(
     """Build one detached typed owner for reusable heap-result storage."""
 
     if not prefix_dimension_names:
-        raise ValueError("heap-result storage requires a nonempty dense prefix")
+        raise ScorchValueError(
+            "heap-result storage requires a nonempty dense prefix",
+            code="schedule_metadata_missing",
+        )
     prefix_dimensions = tuple(
         llir.Var(prefix_dimension_name, llir.DataType.INT64)
         for prefix_dimension_name in prefix_dimension_names
@@ -1343,15 +1392,19 @@ def _apply_heap_result_tile(
         None,
     )
     if tile is None:
-        raise ValueError("Missing heap TileSpec for a derived result-tile plan")
+        raise ScorchValueError(
+            "Missing heap TileSpec for a derived result-tile plan",
+            code="schedule_metadata_missing",
+        )
 
     tile_outer_name = f"{plan.tile_var}_out"
     tile_inner_name = f"{plan.tile_var}_in"
     tile_size_name = f"kTile_{plan.tile_var}"
     tile_location, tile_ancestors = _find_tagged_loop(function.body, tile_outer_name)
     if tile_ancestors or tile_location[0] is not function.body:
-        raise NotImplementedError(
-            "Heap accumulation requires the affine result tile to be outermost"
+        raise ScorchNotImplementedError(
+            "Heap accumulation requires the affine result tile to be outermost",
+            code="heap_accumulation_lowering_unsupported",
         )
     tile_loop = tile_location[2]
 
@@ -1365,8 +1418,9 @@ def _apply_heap_result_tile(
         scalar_type = llir.DataType.FLOAT64
         zero_value = "0.0"
     else:
-        raise NotImplementedError(
-            "Heap accumulation supports generated float or double result pointers"
+        raise ScorchNotImplementedError(
+            "Heap accumulation supports generated float or double result pointers",
+            code="heap_accumulation_lowering_unsupported",
         )
 
     (
@@ -1386,8 +1440,9 @@ def _apply_heap_result_tile(
     )
     prefix_extent = " * ".join(prefix_dimension_names)
     if not prefix_extent:
-        raise NotImplementedError(
-            "Heap accumulation requires at least one dense result prefix level"
+        raise ScorchNotImplementedError(
+            "Heap accumulation requires at least one dense result prefix level",
+            code="heap_accumulation_lowering_unsupported",
         )
 
     compact_access = _heap_compact_access(
@@ -1406,8 +1461,9 @@ def _apply_heap_result_tile(
     )
     tile_loop.body = cast(List[llir.Stmt], rewritten_body)
     if rewritten == 0:
-        raise NotImplementedError(
-            "Cannot redirect the selected logical result access to compact storage"
+        raise ScorchNotImplementedError(
+            "Cannot redirect the selected logical result access to compact storage",
+            code="heap_accumulation_lowering_unsupported",
         )
     if _contains_tensor_access(
         tile_loop.body,
@@ -1415,8 +1471,9 @@ def _apply_heap_result_tile(
         plan.access_index_ids,
         llir.TensorAccessRole.RESULT_WRITE,
     ):
-        raise NotImplementedError(
-            "Heap accumulation left a direct result write in the compute region"
+        raise ScorchNotImplementedError(
+            "Heap accumulation left a direct result write in the compute region",
+            code="heap_accumulation_lowering_unsupported",
         )
 
     _remove_dense_result_zero(function, plan.result)
@@ -1679,33 +1736,40 @@ def _apply_relayout(
 ) -> None:
     relayout = schedule.relayout
     if relayout is None:
-        raise ValueError("Missing RelayoutSpec for a derived relayout plan")
+        raise ScorchValueError(
+            "Missing RelayoutSpec for a derived relayout plan",
+            code="schedule_metadata_missing",
+        )
 
     pack_outer_name = f"{plan.pack_var}_out"
     pack_inner_name = f"{plan.pack_var}_in"
     panel_outer_name = f"{plan.panel_var}_out"
     pack_location, pack_ancestors = _find_tagged_loop(function.body, pack_outer_name)
     if pack_ancestors or pack_location[0] is not function.body:
-        raise NotImplementedError(
-            "Packed relayout requires the affine pack tile to be outermost"
+        raise ScorchNotImplementedError(
+            "Packed relayout requires the affine pack tile to be outermost",
+            code="relayout_lowering_unsupported",
         )
     panel_location, panel_ancestors = _find_tagged_loop(function.body, panel_outer_name)
     if not panel_ancestors or panel_ancestors[-1][2] is not pack_location[2]:
-        raise NotImplementedError(
-            "Packed relayout requires the panel loop directly inside the pack tile"
+        raise ScorchNotImplementedError(
+            "Packed relayout requires the panel loop directly inside the pack tile",
+            code="relayout_lowering_unsupported",
         )
     row_location, row_ancestors = _find_tagged_loop(function.body, plan.row_var)
     if not row_ancestors or row_ancestors[-1][2] is not panel_location[2]:
-        raise NotImplementedError(
+        raise ScorchNotImplementedError(
             "Packed relayout requires the parallel CSR row loop directly inside "
-            "the panel loop"
+            "the panel loop",
+            code="relayout_lowering_unsupported",
         )
     row_loop = row_location[2]
     if not row_loop.omp_parallel_for and not getattr(
         row_loop, "_use_atomic_scheduling", False
     ):
-        raise NotImplementedError(
-            "Packed relayout requires a generated parallel CSR row loop"
+        raise ScorchNotImplementedError(
+            "Packed relayout requires a generated parallel CSR row loop",
+            code="relayout_lowering_unsupported",
         )
     sparse_location, _ = _find_tagged_loop(row_loop.body, plan.panel_var)
     sparse_loop = sparse_location[2]
@@ -1719,8 +1783,9 @@ def _apply_relayout(
     elif pointer_type.value == "double*":
         scalar_type = llir.DataType.FLOAT64
     else:
-        raise NotImplementedError(
-            "Packed relayout supports generated float or double operand pointers"
+        raise ScorchNotImplementedError(
+            "Packed relayout supports generated float or double operand pointers",
+            code="relayout_lowering_unsupported",
         )
 
     used_names = _declared_names(function)
@@ -1761,8 +1826,9 @@ def _apply_relayout(
     )
     row_loop.body = cast(List[llir.Stmt], rewritten_body)
     if rewritten == 0:
-        raise NotImplementedError(
-            "Cannot redirect the selected logical operand access to packed storage"
+        raise ScorchNotImplementedError(
+            "Cannot redirect the selected logical operand access to packed storage",
+            code="relayout_lowering_unsupported",
         )
     _redirect_sparse_prefetch(
         sparse_loop,
@@ -1782,8 +1848,9 @@ def _apply_relayout(
         None,
     )
     if panel_coordinate_index is None:
-        raise LookupError(
-            "Cannot find the resolved sparse panel coordinate for packed access"
+        raise ScorchLookupError(
+            "Cannot find the resolved sparse panel coordinate for packed access",
+            code="generated_llir_not_found",
         )
     sparse_loop.body.insert(
         panel_coordinate_index + 1,
@@ -1795,8 +1862,9 @@ def _apply_relayout(
         plan.access_index_ids,
         llir.TensorAccessRole.INPUT_READ,
     ):
-        raise NotImplementedError(
-            "Packed relayout left an unpacked operand read in the compute region"
+        raise ScorchNotImplementedError(
+            "Packed relayout left an unpacked operand read in the compute region",
+            code="relayout_lowering_unsupported",
         )
 
     pack_row = _unique_name(f"{plan.panel_var}_pack", used_names)
@@ -1834,7 +1902,10 @@ def _apply_relayout(
         stage_index = 0
         scope_description = f"full {plan.panel_var} axis"
     if stage_index is None:
-        raise LookupError("Cannot place packed operand at its requested loop scope")
+        raise ScorchLookupError(
+            "Cannot place packed operand at its requested loop scope",
+            code="generated_llir_not_found",
+        )
     stage_container[stage_index:stage_index] = [
         llir.Comment(
             f"Pack {plan.operand} {scope_description} into contiguous "
@@ -1873,14 +1944,23 @@ def apply_schedule_to_llir(
     for tile in panel_tiles:
         bound = panel_bounds.get(tile.index_var)
         if bound is None:
-            raise ValueError(f"Missing dense bound for panel {tile.index_var!r}")
+            raise ScorchValueError(
+                f"Missing dense bound for panel {tile.index_var!r}",
+                code="schedule_metadata_missing",
+            )
         _apply_panel_tile(function, tile, bound)
     if any(tile.accum == "heap" for tile in schedule.tiles):
         if result_tile_plan is None:
-            raise ValueError("Missing CIN-derived metadata for heap result tile")
+            raise ScorchValueError(
+                "Missing CIN-derived metadata for heap result tile",
+                code="schedule_metadata_missing",
+            )
         _apply_heap_result_tile(function, schedule, result_tile_plan)
     if schedule.relayout is not None:
         if relayout_plan is None:
-            raise ValueError("Missing CIN-derived metadata for packed relayout")
+            raise ScorchValueError(
+                "Missing CIN-derived metadata for packed relayout",
+                code="schedule_metadata_missing",
+            )
         _apply_relayout(function, schedule, relayout_plan)
     return function

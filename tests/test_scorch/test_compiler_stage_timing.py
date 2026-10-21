@@ -13,7 +13,7 @@ from dataclasses import FrozenInstanceError, fields, replace
 from pathlib import Path
 from time import perf_counter_ns
 from types import SimpleNamespace
-from typing import Callable, NoReturn, Optional, Tuple, cast
+from typing import Callable, Iterable, NoReturn, Optional, Tuple, cast
 
 import pytest
 import torch
@@ -214,6 +214,14 @@ def _exact_stage_record_values(
 def _isolate_compiler_caches(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(ops, "_kernel_cache", {})
     monkeypatch.setattr(ops, "_einsum_dispatch_cache", {})
+
+
+@pytest.fixture(autouse=True)
+def _no_kept_generated_kernels(monkeypatch: pytest.MonkeyPatch) -> None:
+    # These tests read the stages a compile records, and several stop a conversion or an
+    # addition at its loader.  A kernel an earlier test in this process kept for the
+    # same call (stensor._GENERATED_KERNELS) would serve it without either.
+    monkeypatch.setattr(stensor_module, "_GENERATED_KERNELS", {})
 
 
 def _compile_explicit(
@@ -4265,8 +4273,9 @@ def test_malformed_all_coo_coordinate_read_fails_cin_lowering_and_stops_later_wo
     def transform_with_malformed_coordinate_read(
         self: CINLowerer,
         statements: list[llir.Stmt],
+        tensor_names: Iterable[str],
     ) -> list[llir.Stmt]:
-        transformed = original_transform(self, statements)
+        transformed = original_transform(self, statements, tensor_names)
 
         def inject(value: object) -> None:
             if type(value) is llir.VarInit:
@@ -4353,8 +4362,9 @@ def test_malformed_all_coo_end_bound_fails_cin_lowering_and_stops_later_work(
     def transform_with_malformed_end_bound(
         self: CINLowerer,
         statements: list[llir.Stmt],
+        tensor_names: Iterable[str],
     ) -> list[llir.Stmt]:
-        transformed = original_transform(self, statements)
+        transformed = original_transform(self, statements, tensor_names)
 
         def inject(value: object) -> None:
             if type(value) is llir.VarInit:

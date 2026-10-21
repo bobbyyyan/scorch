@@ -45,6 +45,7 @@ from .llir_traversal import (
     LLIRTraversalContext,
     LLIRWalker,
 )
+from ..exceptions import ScorchTypeError
 
 _PARALLEL_POOL_SCALAR_TYPES = frozenset(
     {
@@ -205,13 +206,18 @@ def _is_cpp_qualified_name(value: object) -> bool:
 def _cluster_instance_fields(value: object, owner: str) -> dict:
     fields = getattr(value, "__dict__", None)
     if type(fields) is not dict:
-        raise TypeError(f"{owner} fields must be stored directly")
+        raise ScorchTypeError(
+            f"{owner} fields must be stored directly",
+            code="parallel_workspace_cluster_invalid",
+        )
     return fields
 
 
 def _validate_cluster_var(value: object, owner: str) -> None:
     if type(value) is not llir.Var:
-        raise TypeError(f"{owner} must be an exact Var")
+        raise ScorchTypeError(
+            f"{owner} must be an exact Var", code="parallel_workspace_cluster_invalid"
+        )
     fields = _cluster_instance_fields(value, owner)
     if (
         not _is_cpp_identifier(fields.get("name", _MISSING_PARALLEL_FIELD))
@@ -220,7 +226,10 @@ def _validate_cluster_var(value: object, owner: str) -> None:
         or type(fields.get("is_restrict", _MISSING_PARALLEL_FIELD)) is not bool
         or fields.get("tensor_access", _MISSING_PARALLEL_FIELD) is not None
     ):
-        raise TypeError(f"{owner} must be a complete metadata-free C++ identifier Var")
+        raise ScorchTypeError(
+            f"{owner} must be a complete metadata-free C++ identifier Var",
+            code="parallel_workspace_cluster_invalid",
+        )
 
 
 def _validate_cluster_expression(
@@ -233,10 +242,15 @@ def _validate_cluster_expression(
     if active is None:
         active = set()
     if not isinstance(value, llir.Expr):
-        raise TypeError(f"{owner} must be an LLIR expression")
+        raise ScorchTypeError(
+            f"{owner} must be an LLIR expression",
+            code="parallel_workspace_cluster_invalid",
+        )
     value_id = id(value)
     if value_id in active:
-        raise TypeError(f"{owner} must be acyclic")
+        raise ScorchTypeError(
+            f"{owner} must be acyclic", code="parallel_workspace_cluster_invalid"
+        )
     active.add(value_id)
     try:
         if type(value) is llir.Var:
@@ -246,7 +260,10 @@ def _validate_cluster_expression(
         if type(value) in (llir.Add, llir.Mul):
             expected_op = "+" if type(value) is llir.Add else "*"
             if fields.get("op", _MISSING_PARALLEL_FIELD) != expected_op:
-                raise TypeError(f"{owner}.op must remain {expected_op!r}")
+                raise ScorchTypeError(
+                    f"{owner}.op must remain {expected_op!r}",
+                    code="parallel_workspace_cluster_invalid",
+                )
             _validate_cluster_expression(
                 fields.get("left", _MISSING_PARALLEL_FIELD),
                 f"{owner}.left",
@@ -263,7 +280,10 @@ def _validate_cluster_expression(
                 type(fields.get("data_type", _MISSING_PARALLEL_FIELD))
                 is not llir.DataType
             ):
-                raise TypeError(f"{owner}.data_type must be a DataType")
+                raise ScorchTypeError(
+                    f"{owner}.data_type must be a DataType",
+                    code="parallel_workspace_cluster_invalid",
+                )
             _validate_cluster_expression(
                 fields.get("expr", _MISSING_PARALLEL_FIELD),
                 f"{owner}.expr",
@@ -272,25 +292,40 @@ def _validate_cluster_expression(
             return
         if type(value) is llir.FunctionCall:
             if not _is_cpp_qualified_name(fields.get("name", _MISSING_PARALLEL_FIELD)):
-                raise TypeError(f"{owner}.name must be a qualified C++ name")
+                raise ScorchTypeError(
+                    f"{owner}.name must be a qualified C++ name",
+                    code="parallel_workspace_cluster_invalid",
+                )
         elif type(value) is llir.MemberCall:
             if not _is_cpp_identifier(fields.get("member", _MISSING_PARALLEL_FIELD)):
-                raise TypeError(f"{owner}.member must be a C++ identifier")
+                raise ScorchTypeError(
+                    f"{owner}.member must be a C++ identifier",
+                    code="parallel_workspace_cluster_invalid",
+                )
             _validate_cluster_expression(
                 fields.get("base", _MISSING_PARALLEL_FIELD),
                 f"{owner}.base",
                 active,
             )
         else:
-            raise TypeError(f"{owner} must use the workspace-borrow expression grammar")
+            raise ScorchTypeError(
+                f"{owner} must use the workspace-borrow expression grammar",
+                code="parallel_workspace_cluster_invalid",
+            )
         template_args = fields.get("template_args", _MISSING_PARALLEL_FIELD)
         if type(template_args) is not tuple or any(
             type(argument) is not llir.DataType for argument in template_args
         ):
-            raise TypeError(f"{owner}.template_args must be a DataType tuple")
+            raise ScorchTypeError(
+                f"{owner}.template_args must be a DataType tuple",
+                code="parallel_workspace_cluster_invalid",
+            )
         args = fields.get("args", _MISSING_PARALLEL_FIELD)
         if type(args) is not tuple:
-            raise TypeError(f"{owner}.args must be an expression tuple")
+            raise ScorchTypeError(
+                f"{owner}.args must be an expression tuple",
+                code="parallel_workspace_cluster_invalid",
+            )
         for index, argument in enumerate(args):
             _validate_cluster_expression(argument, f"{owner}.args[{index}]", active)
     finally:
@@ -300,22 +335,32 @@ def _validate_cluster_expression(
 def _validate_pool_spec_fields(spec: object) -> None:
     fields = getattr(spec, "__dict__", None)
     if type(fields) is not dict:
-        raise TypeError("ParallelWorkspacePoolSpec fields must be stored directly")
+        raise ScorchTypeError(
+            "ParallelWorkspacePoolSpec fields must be stored directly",
+            code="parallel_workspace_cluster_invalid",
+        )
     name = fields.get("name", _MISSING_PARALLEL_FIELD)
     if not _is_cpp_identifier(name):
-        raise TypeError("ParallelWorkspacePoolSpec.name must be a C++ identifier")
+        raise ScorchTypeError(
+            "ParallelWorkspacePoolSpec.name must be a C++ identifier",
+            code="parallel_workspace_cluster_invalid",
+        )
     scalar_type = fields.get("scalar_type", _MISSING_PARALLEL_FIELD)
     if (
         type(scalar_type) is not llir.DataType
         or scalar_type not in _PARALLEL_POOL_SCALAR_TYPES
     ):
-        raise TypeError(
+        raise ScorchTypeError(
             "ParallelWorkspacePoolSpec.scalar_type must be a supported scalar "
-            "DataType"
+            "DataType",
+            code="parallel_workspace_cluster_invalid",
         )
     extent = fields.get("extent", _MISSING_PARALLEL_FIELD)
     if not _is_cpp_identifier(extent):
-        raise TypeError("ParallelWorkspacePoolSpec.extent must be a C++ identifier")
+        raise ScorchTypeError(
+            "ParallelWorkspacePoolSpec.extent must be a C++ identifier",
+            code="parallel_workspace_cluster_invalid",
+        )
 
 
 @dataclass(frozen=True)
@@ -358,21 +403,26 @@ def _validate_cluster_fields(cluster: object) -> None:
     """Revalidate a cluster, including forged frozen-dataclass state."""
 
     if type(cluster) is not ParallelWorkspaceCluster:
-        raise TypeError(
-            "parallel workspace cluster must be an exact " "ParallelWorkspaceCluster"
+        raise ScorchTypeError(
+            "parallel workspace cluster must be an exact " "ParallelWorkspaceCluster",
+            code="parallel_workspace_cluster_invalid",
         )
     fields = getattr(cluster, "__dict__", None)
     if type(fields) is not dict:
-        raise TypeError("ParallelWorkspaceCluster fields must be stored directly")
+        raise ScorchTypeError(
+            "ParallelWorkspaceCluster fields must be stored directly",
+            code="parallel_workspace_cluster_invalid",
+        )
     for field_name in ("alloc", "free"):
         statements = fields.get(field_name, _MISSING_PARALLEL_FIELD)
         if type(statements) is not tuple or any(
             type(statement) not in _PARALLEL_CLUSTER_STATEMENT_TYPES
             for statement in statements
         ):
-            raise TypeError(
+            raise ScorchTypeError(
                 f"ParallelWorkspaceCluster.{field_name} must be a tuple of "
-                "VarInit or MemberCallStmt templates"
+                "VarInit or MemberCallStmt templates",
+                code="parallel_workspace_cluster_invalid",
             )
         for index, statement in enumerate(statements):
             if type(statement) is llir.VarInit:
@@ -393,9 +443,10 @@ def _validate_cluster_fields(cluster: object) -> None:
                     or statement_fields.get("cast", _MISSING_PARALLEL_FIELD)
                     is not False
                 ):
-                    raise TypeError(
+                    raise ScorchTypeError(
                         f"ParallelWorkspaceCluster.{field_name}[{index}] must "
-                        "be a complete plain VarInit template"
+                        "be a complete plain VarInit template",
+                        code="parallel_workspace_cluster_invalid",
                     )
                 _validate_cluster_var(
                     statement_fields["var"],
@@ -413,9 +464,10 @@ def _validate_cluster_fields(cluster: object) -> None:
                 if not _is_cpp_identifier(
                     statement_fields.get("member", _MISSING_PARALLEL_FIELD)
                 ):
-                    raise TypeError(
+                    raise ScorchTypeError(
                         f"ParallelWorkspaceCluster.{field_name}[{index}].member "
-                        "must be a C++ identifier"
+                        "must be a C++ identifier",
+                        code="parallel_workspace_cluster_invalid",
                     )
                 template_args = statement_fields.get(
                     "template_args", _MISSING_PARALLEL_FIELD
@@ -423,9 +475,10 @@ def _validate_cluster_fields(cluster: object) -> None:
                 if type(template_args) is not tuple or any(
                     type(argument) is not llir.DataType for argument in template_args
                 ):
-                    raise TypeError(
+                    raise ScorchTypeError(
                         f"ParallelWorkspaceCluster.{field_name}[{index}]."
-                        "template_args must be a DataType tuple"
+                        "template_args must be a DataType tuple",
+                        code="parallel_workspace_cluster_invalid",
                     )
                 _validate_cluster_expression(
                     statement_fields.get("base", _MISSING_PARALLEL_FIELD),
@@ -433,9 +486,10 @@ def _validate_cluster_fields(cluster: object) -> None:
                 )
                 args = statement_fields.get("args", _MISSING_PARALLEL_FIELD)
                 if type(args) is not tuple:
-                    raise TypeError(
+                    raise ScorchTypeError(
                         f"ParallelWorkspaceCluster.{field_name}[{index}].args "
-                        "must be an expression tuple"
+                        "must be an expression tuple",
+                        code="parallel_workspace_cluster_invalid",
                     )
                 for argument_index, argument in enumerate(args):
                     _validate_cluster_expression(
@@ -447,9 +501,10 @@ def _validate_cluster_fields(cluster: object) -> None:
     if type(pool_specs) is not tuple or any(
         type(spec) is not ParallelWorkspacePoolSpec for spec in pool_specs
     ):
-        raise TypeError(
+        raise ScorchTypeError(
             "ParallelWorkspaceCluster.pool_specs must be a tuple of "
-            "ParallelWorkspacePoolSpec values"
+            "ParallelWorkspacePoolSpec values",
+            code="parallel_workspace_cluster_invalid",
         )
     for spec in pool_specs:
         _validate_pool_spec_fields(spec)
@@ -663,12 +718,21 @@ def atomic_work_stealing_prelude(
     loop-condition variable.
     """
     if type(sparse_pos) is not str:
-        raise TypeError("atomic prelude sparse_pos must be a string")
+        raise ScorchTypeError(
+            "atomic prelude sparse_pos must be a string",
+            code="internal_argument_type_invalid",
+        )
     if type(bound) is not llir.Var:
-        raise TypeError("atomic prelude bound must be an exact Var")
+        raise ScorchTypeError(
+            "atomic prelude bound must be an exact Var",
+            code="internal_argument_type_invalid",
+        )
     bound_fields = getattr(bound, "__dict__", None)
     if type(bound_fields) is not dict:
-        raise TypeError("atomic prelude bound fields must be stored directly")
+        raise ScorchTypeError(
+            "atomic prelude bound fields must be stored directly",
+            code="internal_argument_type_invalid",
+        )
     bound_name = bound_fields.get("name", _MISSING_PARALLEL_FIELD)
     bound_type = bound_fields.get("type", _MISSING_PARALLEL_FIELD)
     if (
@@ -679,14 +743,16 @@ def atomic_work_stealing_prelude(
         or bound_fields.get("is_restrict", _MISSING_PARALLEL_FIELD) is not False
         or bound_fields.get("tensor_access", _MISSING_PARALLEL_FIELD) is not None
     ):
-        raise TypeError(
+        raise ScorchTypeError(
             "atomic prelude bound must be a metadata-free scalar Var with "
-            "complete fields"
+            "complete fields",
+            code="internal_argument_type_invalid",
         )
     if sparse_pos_work_expr(sparse_pos, bound_name) is None:
-        raise TypeError(
+        raise ScorchTypeError(
             "atomic prelude sparse_pos and bound must form a validated "
-            "position-work pair"
+            "position-work pair",
+            code="internal_argument_type_invalid",
         )
     return [
         llir.VarInit(
@@ -869,16 +935,18 @@ def attach_serial_workspace_pools(
     if not pool_specs:
         return
     if any(type(spec) is not ParallelWorkspacePoolSpec for spec in pool_specs):
-        raise TypeError(
+        raise ScorchTypeError(
             "attach_serial_workspace_pools requires exact "
-            "ParallelWorkspacePoolSpec values"
+            "ParallelWorkspacePoolSpec values",
+            code="parallel_workspace_cluster_invalid",
         )
     for spec in pool_specs:
         _validate_pool_spec_fields(spec)
     if thread_policy_factory is None and loop.omp_num_threads:
         raise CompilerInvariantError(
             "the workspace-pool thread-count policy has no typed value for "
-            f"applied policy {loop.omp_num_threads!r}"
+            f"applied policy {loop.omp_num_threads!r}",
+            code="workspace_pool_policy_unknown",
         )
 
     before: List[llir.Stmt] = []

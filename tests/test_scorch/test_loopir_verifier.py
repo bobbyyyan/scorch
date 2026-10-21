@@ -769,6 +769,15 @@ PRODUCTION_SUBSET_DEFECT_CODES = {
     # (2026-10-12): an append out of its result's storage order is admitted
     # only under a two-pass record, as a relabelled copy of one input.
     "unordered_append",
+    # Entry-source codes added with the COO result that stores one input's
+    # entries (2026-10-12): ``LoopProgram.entries_of`` must name an input, and
+    # the input must share the result's dimensions and multiply every write.
+    "invalid_entries_of",
+    "unsupported_entries_of",
+    # Vector-mark code added with the schedule field for vector marks
+    # (2026-10-13): ``LoopProgram.vector_loops`` names distinct loops the
+    # program binds.
+    "invalid_vector_loops",
 }
 
 

@@ -73,6 +73,8 @@ def emitted(monkeypatch, call):
         captured.append(prepared.request.cpp_sources[-1])
         raise _Emitted
 
+    # A kernel an earlier test kept for this call would serve it without reaching the stop.
+    monkeypatch.setattr(stensor, "_GENERATED_KERNELS", {})
     monkeypatch.setattr(stensor, "_load_validated_prepared_kernel", stop_before_native)
     try:
         call()

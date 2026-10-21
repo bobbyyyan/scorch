@@ -1,5 +1,8 @@
+import itertools
+import math
 import os
 import re
+import string
 import sys
 import time
 from contextlib import contextmanager
@@ -8,6 +11,7 @@ from typing import (
     Any,
     Callable,
     Dict,
+    FrozenSet,
     Iterator,
     List,
     Mapping,
@@ -22,6 +26,7 @@ import scorch_ops as _scorch_ops
 import torch
 from torch.fx import Proxy
 
+from .compiler import compile_options as _compile_options_module
 from .compiler import llir
 from .compiler.cin import (
     IndexExpr,
@@ -40,11 +45,21 @@ from .compiler.cin_analysis import (
     normalize_cin,
     verify_cin_structure,
 )
-from .compiler.compile_options import CompileOptions
+from .compiler.compile_options import (
+    CompileOptions,
+    environment_reuse_key,
+    note_environment_parsed,
+    parsed_options_key,
+)
 from .compiler.codegen import LLIRLowerer
-from .compiler.diagnostics import CompileOptionsDiagnostic, CompileOptionsError
+from .compiler.diagnostics import (
+    CompileOptionsDiagnostic,
+    CompileOptionsError,
+    ScheduleNotThreadedThroughSpMVError,
+)
 from .compiler.loop_plan import ScheduledCIN
 from .compiler.scheduler import (
+    _SCHEDULE_FORCE,
     Schedule,
     Scheduler,
     get_forced_schedule,
@@ -53,15 +68,29 @@ from .compiler.compilation_context import (
     CompilerStageId,
     CompilerStageToken,
     CompilationContext,
+    CompilationContextDiagnostic,
+    CompilationContextError,
 )
 from .exceptions import (
     CompileSpecError,
     EinsumRepeatedIndexError,
+    EinsumScalarResultError,
+    MatmulOperandRankError,
+    ScheduleWithoutSparseOperandError,
+    ScorchAssertionError,
+    ScorchTypeError,
+    ScorchValueError,
+    ShapeCapacitySpecError,
     TensorTypeError,
-    raise_if_native_repeat,
+    raise_if_native_coded,
+    shape_capacity_error,
 )
 from .format import TensorFormat, LevelFormat, LevelType
-from .format import conversion_format, stores_only_its_entries
+from .format import (
+    conversion_format,
+    dense_prefix_unaddressable,
+    stores_only_its_entries,
+)
 from .layout import (
     TensorLayout,
     TensorSpec,
@@ -89,6 +118,7 @@ from .tiling import _current_level as _tiling_current_level
 from .storage import _WRAP_GRAIN as _STORAGE_WRAP_GRAIN
 from .stensor import (
     STensor,
+    _generated_kernel,
     _wrap_generated_result,
     _compilation_context_at_boundary,
 )
@@ -100,6 +130,7 @@ from .stensor import (
 # own line so the suppression covers this name only.
 from .stensor import _finalize_generated_mode_indices  # noqa: F401 - re-export
 from . import autograd as _autograd
+from .result_bound import EntryBound, entry_bound, level_totals_in_source
 from .utils import (
     _PreparedJITBuild,
     parse_format,
@@ -110,6 +141,10 @@ from .utils import (
 )
 
 _kernel_cache = {}
+#: The result levels each kept kernel checks the total of before allocating them (the
+#: two-pass assembly), read from its source when it is built (patch 0056): beside
+#: ``_kernel_cache``, under the same key.  A key missing here counts no level as checked.
+_kernel_level_totals: Dict[Any, FrozenSet[int]] = {}
 _einsum_dispatch_cache = {}
 
 
@@ -119,10 +154,16 @@ def _requested_schedule(kwargs: dict) -> Optional[Schedule]:
     public = kwargs.get("schedule")
     internal = kwargs.get("_schedule")
     if public is not None and internal is not None and public != internal:
-        raise ValueError("schedule and _schedule specify different schedules")
+        raise ScorchValueError(
+            "schedule and _schedule specify different schedules",
+            code="conflicting_schedule",
+        )
     schedule = public if public is not None else internal
     if schedule is not None and not isinstance(schedule, Schedule):
-        raise TypeError("schedule must be a scorch.compiler.scheduler.Schedule")
+        raise ScorchTypeError(
+            "schedule must be a scorch.compiler.scheduler.Schedule",
+            code="schedule_type_invalid",
+        )
     return schedule
 
 
@@ -133,27 +174,18 @@ def _effective_schedule(kwargs: dict) -> Optional[Schedule]:
     return schedule if schedule is not None else get_forced_schedule()
 
 
-_UNRESOLVED_SCHEDULE = object()
-
-
-def _compile_options_from_kwargs(
-    kwargs: dict,
-    *,
-    resolved_schedule: object = _UNRESOLVED_SCHEDULE,
-) -> CompileOptions:
+def _compile_options_from_kwargs(kwargs: dict) -> CompileOptions:
     """Create or validate the one snapshot owned by a public compile call."""
 
     provided = kwargs.get("_compile_options")
     requested = _requested_schedule(kwargs)
     if provided is not None:
         if type(provided) is not CompileOptions:
-            raise TypeError("_compile_options must be a CompileOptions instance")
-        expected = (
-            requested
-            if resolved_schedule is _UNRESOLVED_SCHEDULE
-            else resolved_schedule
-        )
-        if expected is not None and provided.requested_schedule != expected:
+            raise ScorchTypeError(
+                "_compile_options must be a CompileOptions instance",
+                code="compile_options_type_invalid",
+            )
+        if requested is not None and provided.requested_schedule != requested:
             raise CompileOptionsError(
                 (
                     CompileOptionsDiagnostic(
@@ -167,12 +199,7 @@ def _compile_options_from_kwargs(
             )
         return provided
 
-    if resolved_schedule is _UNRESOLVED_SCHEDULE:
-        return CompileOptions.from_environment(requested_schedule=requested)
-    return CompileOptions.from_environment(
-        requested_schedule=cast(Optional[Schedule], resolved_schedule),
-        forced_schedule=None,
-    )
+    return CompileOptions.from_environment(requested_schedule=requested)
 
 
 def _compilation_context_from_kwargs(
@@ -184,6 +211,204 @@ def _compilation_context_from_kwargs(
     return _compilation_context_at_boundary(
         kwargs.get("_compilation_context"), compile_options
     )
+
+
+class _DeferredOptions:
+    """The options snapshot of one public call, made when the call first needs it.
+
+    A call whose kernel is in the dispatch cache compiles nothing.  It needs only the
+    snapshot's cache key, which decides whether an earlier call's kernel is the one it
+    would select, plus the knowledge that its options would not be refused.  Making the
+    snapshot anyway cost 85 us of a 329 us warm ``einsum`` on sapling (job 82682), with
+    the parse itself kept.  So the key comes from the last parse under the same
+    environment and schedule (``parsed_options_key``), and the snapshot is made
+    (``options()``) only where something reads it: a compilation, or a relayout or
+    conversion on the cached path.
+
+    It is made at once, as before, when:
+    - the call was handed one (``_compile_options``), which it validates.  Nothing else
+      is read then: the snapshot already holds what the environment and the context
+      held;
+    - the call was handed a context (``_compilation_context``), which it validates
+      against the snapshot;
+    - no parse under the call's environment and schedule has yet succeeded in this
+      process.  So the parse still refuses every environment it refuses, at the same
+      point of the call.
+
+    ``reuse_key`` is the options' part of the dispatch key: the snapshot's cache
+    fingerprint (``CompileOptions.cache_fingerprint``, the SHA-256 of its cache key's
+    canonical encoding), however the call came by it, so a call handed a snapshot and a
+    call that made one from the same environment select the same kernel.  The
+    fingerprint and not the cache key itself, because a dict lookup hashes its key on
+    every call and CPython keeps no hash for a tuple: the cache key is a nested tuple of
+    about 100 objects (the build flags, the include paths, every ``PATH`` entry), and
+    hashing it visited each of them on every warm call, a cache miss apiece after the
+    caches were evicted.  A string keeps its hash, and the fingerprint the parse memo
+    hands back is the same string object on every call.  Two cache keys give the same
+    fingerprint only when they are equal (the encoding tags each value's type), so
+    the key selects the kernels it selected before.
+    """
+
+    __slots__ = (
+        "_kwargs",
+        "_options",
+        "_environment_key",
+        "requested_schedule",
+        "reuse_key",
+    )
+
+    def __init__(self, kwargs: dict) -> None:
+        self._kwargs = kwargs
+        self._options: Optional[CompileOptions] = None
+        self._environment_key: Optional[tuple] = None
+        if not kwargs:
+            # A call with no keyword arguments, which every warm product of a model
+            # makes: no snapshot or context was handed in and no schedule named, so the
+            # schedule is the context's forced one.  The same steps as below, with the
+            # context variable and the parse memo read in place of their accessors
+            # (``get_forced_schedule``, ``_schedule_cache_key`` and
+            # ``parsed_options_key``), so the holder makes one Python call,
+            # ``environment_reuse_key``.
+            key = environment_reuse_key()
+            self._environment_key = key
+            if key is not None:
+                forced = _SCHEDULE_FORCE.get()
+                known = _compile_options_module._parsed_options_keys.get(
+                    (key, forced.cache_key if forced is not None else None)
+                )
+                if known is not None:
+                    self.requested_schedule: Optional[Schedule] = forced
+                    self.reuse_key: str = known
+                    return
+            options = self.options()
+            self.requested_schedule = options.requested_schedule
+            self.reuse_key = options.cache_fingerprint
+            return
+        if kwargs.get("_compile_options") is None:
+            self._environment_key = environment_reuse_key()
+            if (
+                self._environment_key is not None
+                and kwargs.get("_compilation_context") is None
+            ):
+                requested = _requested_schedule(kwargs)
+                schedule = requested if requested is not None else get_forced_schedule()
+                known = parsed_options_key(
+                    self._environment_key, _schedule_cache_key(schedule)
+                )
+                if known is not None:
+                    self.requested_schedule = schedule
+                    self.reuse_key = known
+                    return
+        options = self.options()
+        self.requested_schedule = options.requested_schedule
+        self.reuse_key = options.cache_fingerprint
+
+    def options(self) -> CompileOptions:
+        """The call's snapshot, made now if need be."""
+
+        if self._options is None:
+            options = _compile_options_from_kwargs(self._kwargs)
+            if self._environment_key is not None:
+                note_environment_parsed(self._environment_key, options)
+            self._options = options
+        return self._options
+
+    def still_reusable(self) -> bool:
+        """Whether a kernel built during the call may be kept under ``reuse_key``.
+
+        Only when the snapshot it was built from has that fingerprint.  It may not when
+        the host changed since the parse ``reuse_key`` came from (a header file, the
+        working directory): the kernel then belongs to the new snapshot, and the next
+        call, keyed by the new snapshot through ``parsed_options_key``, builds and keeps
+        its own.
+        """
+
+        return (
+            self._options is None or self._options.cache_fingerprint == self.reuse_key
+        )
+
+
+class _DeferredCompilation:
+    """The compilation context of one public call, made when the call first needs one.
+
+    A context times the stages of a compilation.  A call whose kernel is already in the
+    dispatch cache compiles nothing: it begins the frontend stage, cancels it at the
+    cache hit, and the context is dropped unread.  Making it, beginning the stage and
+    cancelling it cost 24 us of a 390 us warm ``einsum`` call on sapling (job 82239),
+    against a kernel of about 146 us.  So a call that was not handed a context
+    makes one only when it reaches a stage that records something: the frontend stage
+    of a compilation, which then starts at the reading taken when the call began it
+    here, or a relayout or conversion on the cached path.  A call handed a context
+    (``_compilation_context``) begins its frontend stage at once, as before, since the
+    caller reads that context afterwards.
+    """
+
+    __slots__ = ("_options", "_context", "_frontend", "_started_ns", "_cancelled")
+
+    def __init__(self, kwargs: dict, options: _DeferredOptions) -> None:
+        self._options = options
+        provided = kwargs.get("_compilation_context")
+        self._context: Optional[CompilationContext] = None
+        self._frontend: Optional[CompilerStageToken] = None
+        self._cancelled = False
+        if provided is not None:
+            compile_options = options.options()
+            self._context = _compilation_context_at_boundary(provided, compile_options)
+            self._frontend = self._context.begin_stage(
+                CompilerStageId.FRONTEND_VALIDATED_OPERATION_CONSTRUCTION,
+                compile_options=compile_options,
+            )
+        self._started_ns = time.perf_counter_ns()
+
+    def frontend(self) -> Tuple[CompilationContext, CompilerStageToken]:
+        """The context and its active frontend stage, made now if need be."""
+
+        if self._cancelled:
+            raise CompilationContextError(
+                CompilationContextDiagnostic(
+                    code="cancelled_frontend_stage",
+                    message="the frontend stage of this call was already cancelled",
+                    stage_id=CompilerStageId.FRONTEND_VALIDATED_OPERATION_CONSTRUCTION,
+                )
+            )
+        if self._context is None:
+            self._context = CompilationContext(compile_options=self._options.options())
+        if self._frontend is None:
+            self._frontend = self._context.begin_stage(
+                CompilerStageId.FRONTEND_VALIDATED_OPERATION_CONSTRUCTION,
+                compile_options=self._options.options(),
+                started_ns=self._started_ns,
+            )
+        return self._context, self._frontend
+
+    def cancel_frontend(self) -> None:
+        """Retire the frontend stage at a cache hit: it produced no artifact."""
+
+        if self._frontend is not None and self._context is not None:
+            self._context.cancel_stage(self._frontend)
+        self._cancelled = True
+
+    def context(self) -> CompilationContext:
+        """The context after the frontend stage was cancelled, made now if need be."""
+
+        if self._context is None:
+            self._context = CompilationContext(compile_options=self._options.options())
+        return self._context
+
+    def nested_context(self) -> Optional[CompilationContext]:
+        """The context a conversion inside the call records into, or None.
+
+        The caller's context when it handed one, which reads the conversion's stages
+        afterwards; else one this call already made.  None otherwise: a conversion that
+        hits its kernel cache then needs none, and one that misses makes its own.
+        """
+
+        return self._context
+
+    def fail_frontend_if_active(self) -> None:
+        context, token = self._context, self._frontend
+        if context is not None and token is not None and context.is_stage_active(token):
+            context.fail_stage(token)
 
 
 def _lower_generated_llir(
@@ -251,21 +476,6 @@ def _matmul_compile_policy(
     return options, options.requested_schedule
 
 
-def _ensure_compile_options(
-    kwargs: dict,
-    effective_schedule: Optional[Schedule],
-    compile_options: Optional[CompileOptions],
-) -> CompileOptions:
-    """Create the one deferred matmul snapshot at its first compiler boundary."""
-
-    if compile_options is not None:
-        return compile_options
-    return _compile_options_from_kwargs(
-        kwargs,
-        resolved_schedule=effective_schedule,
-    )
-
-
 def _schedule_cache_key(schedule: Optional[Schedule]) -> Optional[str]:
     return schedule.cache_key if schedule is not None else None
 
@@ -295,8 +505,15 @@ def _einsum_cache_key(
     output_mode_order: Any,
     schedule: Optional[Schedule],
     compile_options: Optional[CompileOptions] = None,
+    *,
+    options_key: object = None,
 ) -> tuple:
-    """Build the early dispatch key, including every scheduling decision."""
+    """Build the early dispatch key, including every scheduling decision.
+
+    The options enter as ``compile_options.cache_fingerprint`` when a snapshot is
+    given, else as ``options_key`` (``_DeferredOptions.reuse_key``, the same
+    fingerprint), which names them without making them.
+    """
 
     def layout_contract(tensor: Any) -> Any:
         layout = getattr(tensor, "layout", None)
@@ -339,7 +556,11 @@ def _einsum_cache_key(
         str(output_format) if output_format is not None else None,
         tuple(output_mode_order) if output_mode_order else None,
         _schedule_cache_key(schedule),
-        compile_options.cache_key if compile_options is not None else None,
+        (
+            compile_options.cache_fingerprint
+            if compile_options is not None
+            else options_key
+        ),
     )
 
 
@@ -434,15 +655,26 @@ def _validated_labels(
     if cached is not None:
         # Fresh lists: callers downstream sort and rewrite what they get back.
         return [list(group) for group in cached[0]], list(cached[1])
+    # An empty term is a rank-0 tensor: a result that sums over every index (``"ij->"``),
+    # or an operand that holds one value (``",i->i"``).
     if any(
-        not group or not all(label.isascii() and label.isalpha() for label in group)
+        not all(label.isascii() and label.isalpha() for label in group)
         for group in input_groups
     ):
-        raise CompileSpecError("einsum input labels must be non-empty ASCII letters")
-    if not result_expression or not all(
-        label.isascii() and label.isalpha() for label in result_expression
-    ):
-        raise CompileSpecError("einsum result labels must be non-empty ASCII letters")
+        raise CompileSpecError(
+            "einsum input labels must be ASCII letters",
+            code="einsum_label_invalid",
+        )
+    if not all(label.isascii() and label.isalpha() for label in result_expression):
+        raise CompileSpecError(
+            "einsum result labels must be ASCII letters",
+            code="einsum_label_invalid",
+        )
+    if not result_expression and not any(input_groups):
+        raise EinsumScalarResultError(
+            f"einsum {expression!r} has no index: its scalar result is a product "
+            "without a loop, which no kernel computes"
+        )
     _refuse_repeated_index(input_groups, result_expression)
     input_labels = set("".join(input_groups))
     unknown_result_labels = [
@@ -451,7 +683,8 @@ def _validated_labels(
     if unknown_result_labels:
         raise CompileSpecError(
             "einsum result labels must appear in an input; unknown labels: "
-            + ", ".join(unknown_result_labels)
+            + ", ".join(unknown_result_labels),
+            code="einsum_result_label_unknown",
         )
     input_index_strs = [list(group) for group in input_groups]
     result_index_strs = list(result_expression)
@@ -461,6 +694,38 @@ def _validated_labels(
             list(result_index_strs),
         )
     return input_index_strs, result_index_strs
+
+
+def _einsum_tensor_names() -> Iterator[str]:
+    """The names einsum gives its operands, in order, and then its result: ``A`` to
+    ``Z``, then ``AA``, ``AB``, ..., ``ZZ``, ``AAA`` and so on, without end.
+
+    The first 26 are the single letters einsum has always used, in the same order, so a
+    call with 25 operands or fewer names its tensors as before and emits the same
+    kernel. A 26th operand used to leave no name for the result (``IndexError: pop from
+    empty list``).
+
+    Capital letters only, and no digit: every identifier a kernel builds from a tensor
+    name puts a digit, an underscore or nothing after the name, and ``p``, an index name
+    with an underscore, or nothing before it (``A_values``, ``A1_crd``, ``pA1_end``,
+    ``i_A``, ``M_A_coord``). A run of capitals that is not an index name is therefore
+    one whole tensor name, and two names never share an identifier; a name that ends in
+    a digit cannot promise that (``T26`` at level 1 and ``T261`` would both give
+    ``pT261``).
+
+    No name is left out. Some of them would complete a macro of the C library behind an
+    upper-case index letter and an underscore (``OK``: ``F_OK``; ``PI``: ``M_PI``;
+    ``IFMT``: ``S_IFMT``); ``scorch.compiler.merged_coordinate`` spells the one
+    identifier of that form so that it cannot, and its tests read the preprocessor's
+    macro list against every identifier a kernel builds from a tensor name of any
+    length.
+    """
+
+    length = 1
+    while True:
+        for letters in itertools.product(string.ascii_uppercase, repeat=length):
+            yield "".join(letters)
+        length += 1
 
 
 def _logical_index_sizes(
@@ -474,7 +739,8 @@ def _logical_index_sizes(
         if len(index_strs) != len(mode_order):
             raise CompileSpecError(
                 f"einsum operand {operand} has {len(index_strs)} indices but "
-                f"tensor rank {len(mode_order)}"
+                f"tensor rank {len(mode_order)}",
+                code="einsum_operand_rank_mismatch",
             )
         for logical_axis, index_str in enumerate(index_strs):
             physical_axis = mode_order.index(logical_axis)
@@ -483,7 +749,8 @@ def _logical_index_sizes(
             if previous is not None and previous != size:
                 raise CompileSpecError(
                     f"einsum index {index_str!r} has incompatible dimensions "
-                    f"{previous} and {size}"
+                    f"{previous} and {size}",
+                    code="einsum_index_extent_mismatch",
                 )
             index_to_size[index_str] = size
     return index_to_size
@@ -588,6 +855,16 @@ def _einsum_operand_relayout(
         ``L`` adds cells a later conversion would keep.  If the last aligned order
         is the input order, it does not move at all.
       - Otherwise the moves einsum always made, letters kept.
+
+    One case comes before all of these: a move that keeps ``L`` can put a dense level
+    on a mode whose extent the operand's own layout never multiplied (``"ds"`` of
+    shape (1, 2**31 - 1) moved to its column order has a dense level of 2**31 - 1
+    positions for two stored entries).  When the dense levels a moved layout starts
+    with hold more positions than a kernel addresses
+    (:func:`scorch.format.dense_prefix_unaddressable`), no kernel could read the moved
+    operand, and building it would allocate that many position entries first.  The
+    operand is then converted as above, with every level compressed, which stores its
+    entries and nothing else; every stored entry is copied.
     """
 
     letters = operand_letters[operand]
@@ -601,6 +878,16 @@ def _einsum_operand_relayout(
             current = order
     if not moves:
         return _OperandRelayout((), None, False)
+    indices = operand_indices[operand]
+    if any(
+        dense_prefix_unaddressable(letters, [extents[indices[mode]] for mode in order])
+        for order in moves
+    ):
+        # Unaddressable: converted, one move, whatever the result stores.
+        final_order = moves[-1]
+        if final_order == input_order:
+            return _OperandRelayout((), None, False)
+        return _OperandRelayout((final_order,), "s" * len(letters), True)
     if "s" not in result_letters or "s" not in letters:
         return _OperandRelayout(tuple(moves), None, False)
     if stores_only_its_entries(letters) or any(
@@ -618,7 +905,6 @@ def _einsum_operand_relayout(
         modes = [indices[mode] for mode in order]
         return set(modes[: deepest + 1]), set(modes[deepest + 1 :])
 
-    indices = operand_indices[operand]
     input_below = above_and_below(indices, letters, input_order)[1]
     added = (
         set().union(*(above_and_below(indices, letters, order)[1] for order in moves))
@@ -727,10 +1013,39 @@ def _conversion_compile_inputs(
     return conversion_options, CompilationContext(compile_options=conversion_options)
 
 
+def _conversion_kwargs(
+    options: Union[CompileOptions, _DeferredOptions],
+    compilation_context: Optional[CompilationContext],
+) -> Dict[str, Any]:
+    """The keyword arguments that hand a conversion inside a compile call its options.
+
+    A call's options holder (``_DeferredOptions``) is handed on as it is, so the
+    conversion and the call make at most one snapshot between them, and a conversion
+    that hits its kernel cache makes none.  Under a requested schedule the conversion
+    needs the schedule-free copy of the snapshot (``_conversion_compile_inputs``), so
+    the snapshot is made, as it always was for these conversions.
+    """
+
+    if type(options) is _DeferredOptions:
+        if options.requested_schedule is None:
+            return {
+                "_deferred_options": options,
+                "_compilation_context": compilation_context,
+            }
+        options = options.options()
+    conversion_options, conversion_context = _conversion_compile_inputs(
+        cast(CompileOptions, options), compilation_context
+    )
+    return {
+        "_compile_options": conversion_options,
+        "_compilation_context": conversion_context,
+    }
+
+
 def _with_compiler_mode_order(
     tensor: Union[STensor, TensorSpec],
     mode_order: Sequence[int],
-    compile_options: CompileOptions,
+    compile_options: Union[CompileOptions, _DeferredOptions],
     compilation_context: Optional[CompilationContext] = None,
     *,
     format_letters: Optional[str] = None,
@@ -741,27 +1056,22 @@ def _with_compiler_mode_order(
     ``format_letters`` and ``keep_every_stored_entry`` come from
     :func:`_einsum_operand_relayout`; the defaults are the relayout as it always
     was (letters kept by storage position, nonzero values copied).
+    ``compile_options`` is the call's snapshot, or its holder on einsum's cached path
+    (see :func:`_conversion_kwargs`).
     """
     target_format = None if format_letters is None else parse_format(format_letters)
     if isinstance(tensor, TensorSpec):
         return tensor.with_mode_order(mode_order, tensor_format=target_format)
     result = tensor.copy()
-    conversion_options, conversion_context = _conversion_compile_inputs(
-        compile_options, compilation_context
-    )
+    conversion_kwargs = _conversion_kwargs(compile_options, compilation_context)
     if target_format is None and not keep_every_stored_entry:
-        result.change_mode_order(
-            list(mode_order),
-            _compile_options=conversion_options,
-            _compilation_context=conversion_context,
-        )
+        result.change_mode_order(list(mode_order), **conversion_kwargs)
     else:
         result.change_mode_order(
             list(mode_order),
-            _compile_options=conversion_options,
-            _compilation_context=conversion_context,
             _target_format=target_format,
             _keep_every_stored_entry=keep_every_stored_entry,
+            **conversion_kwargs,
         )
     return result
 
@@ -954,9 +1264,10 @@ def spmv(
 
     Notes
     -----
-    ``spmv`` itself keeps no module cache; each call recompiles unless the
-    persistent ``.so`` cache in ``_load_kernel`` (keyed under
-    ``TORCH_EXTENSIONS_DIR``) hits.
+    The kernel is kept in the generated-kernel cache that the conversions use
+    (``scorch.stensor._GENERATED_KERNELS``), keyed by both operands' layouts and
+    value dtypes, the result format and the options key, so a warm call lowers
+    nothing and makes no options snapshot.
 
     Examples
     --------
@@ -968,26 +1279,113 @@ def spmv(
     >>> torch.allclose(y, A.to_torch() @ x, atol=1e-3, rtol=1e-3)
     True
     """
-    compile_options = _compile_options_from_kwargs(kwargs)
-    _reject_unsupported_requested_schedule(compile_options, "spmv")
-    compilation_context = _compilation_context_from_kwargs(kwargs, compile_options)
-    frontend_token = compilation_context.begin_stage(
-        CompilerStageId.FRONTEND_VALIDATED_OPERATION_CONSTRUCTION,
-        compile_options=compile_options,
-    )
-    try:
-        if output_format is None:
-            output_format = parse_format("d")
-        elif not isinstance(output_format, TensorFormat):
-            output_format = parse_format(output_format)
+    return _spmv_owned(a, b, output_format, kwargs, _DeferredOptions(kwargs))
 
-        result_shape = (a.shape[0],)
+
+def _compile_spmv_cin(
+    cin_stmt: IndexStmt,
+    compile_options: CompileOptions,
+    compilation_context: CompilationContext,
+) -> Any:
+    """Lower, emit, name and load an SpMV kernel, as ``spmv`` always has."""
+
+    cin_stmt = normalize_cin(
+        cin_stmt,
+        compile_options=compile_options,
+        compilation_context=compilation_context,
+    )
+    lowerer = CINLowerer(
+        compile_options=compile_options,
+        compilation_context=compilation_context,
+    )
+    lowered_llir = lowerer._lower_owned_IndexStmt(cin_stmt)
+    cpp_code = _lower_generated_llir(
+        lowered_llir,
+        compile_options,
+        compilation_context,
+    )
+
+    header_cpp_code = compile_options.build.preamble_source
+
+    prepared_build = _prepare_generated_kernel_build(
+        header_cpp_code,
+        cpp_code,
+        compile_options,
+        compilation_context,
+    )
+    return _load_validated_prepared_kernel(prepared_build)
+
+
+def _spmv_owned(
+    a: STensor,
+    b: STensor,
+    output_format: Optional[Union[TensorFormat, str, List[str]]],
+    kwargs: dict,
+    options: _DeferredOptions,
+) -> STensor:
+    """``spmv`` under the options holder of the call it belongs to.
+
+    ``matmul`` calls this with its own holder, so a matmul and its SpMV make at most
+    one snapshot, and a warm one makes none.
+    """
+
+    # Every spelling of a schedule lands in requested_schedule, a schedule_force context
+    # included.  The SpMV path takes none yet: the refusal matmul's SpMV branch makes.
+    if options.requested_schedule is not None:
+        raise ScheduleNotThreadedThroughSpMVError()
+    compilation = _DeferredCompilation(kwargs, options)
+    # The kernel below reads A by rows, in its storage order, so an A stored in another
+    # mode order is moved first, as matmul's matrix-vector branch moves it.  The move
+    # takes the call's holder, so a warm call hits its kernel with no snapshot, and the
+    # key below holds the moved operand's layout.
+    if a.storage.index.mode_order not in (None, [0, 1]):
+        a = a.copy()
+        a.change_mode_order(
+            [0, 1], **_conversion_kwargs(options, compilation.nested_context())
+        )
+
+    def requested_format() -> TensorFormat:
+        if output_format is None:
+            return parse_format("d")
+        if isinstance(output_format, TensorFormat):
+            return output_format
+        return parse_format(output_format)
+
+    parsed_format: Optional[TensorFormat]
+    try:
+        parsed_format = requested_format()
+    except Exception:
+        # Parsed again in the frontend stage, which raises it as it always did.
+        parsed_format = None
+    result_shape = (a.shape[0],)
+    # What the lowering reads: both layouts and value dtypes and the result format.
+    key = (
+        None
+        if parsed_format is None
+        else (
+            "spmv",
+            a.layout,
+            b.layout,
+            a.dtype,
+            b.dtype,
+            a.device,
+            b.device,
+            parsed_format,
+            options.reuse_key,
+        )
+    )
+
+    def build_cin() -> IndexStmt:
+        nonlocal parsed_format
+        if parsed_format is None:
+            parsed_format = requested_format()
+
         # One value dtype, as torch requires of a product (it raises RuntimeError
         # and does not promote); a mixed pair raises before anything is built.
         y = TensorVar(
             "y",
             shape=result_shape,
-            fmt=output_format,
+            fmt=parsed_format,
             dtype=require_same_value_dtype(
                 a.dtype, b.dtype, operation="matrix-vector product"
             ),
@@ -1021,42 +1419,14 @@ def spmv(
                 ),
             ),
         )
-    except Exception:
-        compilation_context.fail_stage(frontend_token)
-        raise
+        return cin_stmt
 
-    compilation_context.complete_stage(frontend_token)
-    cin_stmt = normalize_cin(
-        cin_stmt,
-        compile_options=compile_options,
-        compilation_context=compilation_context,
-    )
-    lowerer = CINLowerer(
-        compile_options=compile_options,
-        compilation_context=compilation_context,
-    )
-    lowered_llir = lowerer._lower_owned_IndexStmt(cin_stmt)
-    cpp_code = _lower_generated_llir(
-        lowered_llir,
-        compile_options,
-        compilation_context,
-    )
-
-    header_cpp_code = compile_options.build.preamble_source
-
-    prepared_build = _prepare_generated_kernel_build(
-        header_cpp_code,
-        cpp_code,
-        compile_options,
-        compilation_context,
-    )
-    # start_time = time.time()
-    module = _load_validated_prepared_kernel(prepared_build)
-    # end_time = time.time()
-
-    # compile_time = end_time - start_time
-    #  Print kernel compile time to 5 decimal places
-    # print(f"Kernel compile time: {compile_time:.5f} seconds")
+    module = _generated_kernel(key, options, compilation, build_cin, _compile_spmv_cin)
+    # set above or by build_cin
+    if parsed_format is None:
+        raise ScorchAssertionError(
+            "parsed_format is not None", code="generated_kernel_format_missing"
+        )
 
     args = [result_shape]
 
@@ -1069,7 +1439,7 @@ def spmv(
     try:
         result_cpp = module.evaluate(*args)
     except RuntimeError as error:
-        raise_if_native_repeat(error)
+        raise_if_native_coded(error)
         raise
     end_time = time.time()
     eval_time = end_time - start_time
@@ -1080,7 +1450,7 @@ def spmv(
 
     result = _wrap_generated_result(
         shape=result_shape,
-        tensor_format=output_format,
+        tensor_format=parsed_format,
         result_cpp=result_cpp,
     )
 
@@ -1316,6 +1686,87 @@ def _require_one_product_dtype(a: object, b: object) -> None:
         require_same_value_dtype(a_dtype, b_dtype, operation="matmul")
 
 
+def _dense_result_as_tensor(
+    result: Union[torch.Tensor, STensor],
+) -> Union[torch.Tensor, STensor]:
+    """What ``matmul`` returns for ``result``: a ``torch.Tensor`` when it is an
+    ``STensor`` in a dense format, the object itself otherwise.
+
+    The return type follows the result's format, not the kernel that computed the
+    product: a prebuilt kernel and a generated one that both produce a dense result
+    hand back the same type.  A separate function so ``matmul`` has one statement
+    of the rule and stays within the project's complexity bound.
+    """
+
+    if isinstance(result, STensor) and result.format.is_dense():
+        return result.to_torch()
+    return result
+
+
+# The einsum expression of each pair of operand ranks under torch.matmul's rules: a
+# vector first operand is a row (``"j,jk->k"``), a vector second operand a column, and
+# two vectors give their dot product, a scalar.  ``matmul`` sends matrix x vector to
+# ``spmv`` before the generated path; the entry is here so the table is the whole rule.
+_MATMUL_EXPRESSIONS = {
+    (2, 2): "ij,jk->ik",
+    (1, 2): "j,jk->k",
+    (2, 1): "ij,j->i",
+    (1, 1): "j,j->",
+}
+
+
+def _generated_matmul(
+    a: Union[torch.Tensor, STensor],
+    b: Union[torch.Tensor, STensor],
+    einsum_kwargs: dict[str, Any],
+    options: Optional[_DeferredOptions],
+) -> Union[STensor, TensorSpec]:
+    """The product ``matmul`` sends to the generated path, as an ``einsum``.
+
+    The expression follows ``torch.matmul``'s rank rules (``_MATMUL_EXPRESSIONS``).  A
+    pair of ranks with no entry, a batched product, is refused by code
+    (``MatmulOperandRankError``) before anything is built; vector x vector is refused
+    by ``einsum``, by code, until a scalar result is computed.
+
+    ``options`` is the call's options holder when an earlier step of the call made it
+    (a relayout), and ``einsum`` then runs under it, so the call makes at most one
+    snapshot.  Otherwise ``einsum`` makes its own holder from the same keyword
+    arguments, which resolves the same schedule.  ``einsum_kwargs`` already carries any
+    context the caller handed in.  A separate function so ``matmul`` stays within the
+    project's complexity bound.
+    """
+
+    expression = _MATMUL_EXPRESSIONS.get((a.dim(), b.dim()))
+    if expression is None:
+        raise MatmulOperandRankError((a.dim(), b.dim()))
+    if options is not None:
+        einsum_kwargs["_deferred_options"] = options
+    return einsum(expression, a, b, **einsum_kwargs)
+
+
+def _matmul_options(
+    options: Optional[_DeferredOptions],
+    kwargs: dict,
+    compilation_context: Optional[CompilationContext],
+) -> _DeferredOptions:
+    """The options holder of one ``matmul`` call, made by the first step that needs it.
+
+    Every later step of the call (a relayout, the dense product's conversion, ``spmv``,
+    ``einsum``) takes the same holder, so a call makes at most one snapshot, and a call
+    whose kernels are all kept makes none.  Made from the call's keyword arguments, so
+    it resolves the schedule ``_matmul_compile_policy`` resolved.  A context the caller
+    handed in is checked against the call's options here, where the call first needs
+    them, as before; the holder made its snapshot already, being handed a context.
+    """
+
+    if options is not None:
+        return options
+    options = _DeferredOptions(kwargs)
+    if compilation_context is not None:
+        _compilation_context_at_boundary(compilation_context, options.options())
+    return options
+
+
 def matmul(
     a: Union[torch.Tensor, STensor],
     b: Union[torch.Tensor, STensor],
@@ -1338,7 +1789,8 @@ def matmul(
        (``tiling.maybe_dispatch``, provably no-regression because v2 is always the
        probe baseline) and the host-thread composition hints.
     3. **Generic JIT compiler pipeline.** On a prebuilt miss the product is emitted
-       as ``einsum("ij,jk->ik", a, b, ...)`` (2-D x 1-D goes to :func:`spmv`),
+       as the ``einsum`` of ``torch.matmul``'s rank rules, ``einsum("ij,jk->ik", a,
+       b, ...)`` for two matrices (2-D x 1-D goes to :func:`spmv`),
        compiling a C++ kernel through the CIN -> LLIR -> codegen pipeline.
 
     Sparse 2-D operands are normalized to canonical mode order ``[0, 1]`` before
@@ -1373,8 +1825,9 @@ def matmul(
     -------
     torch.Tensor or STensor
         A dense ``torch.Tensor`` when the result format is dense (the common SpMM
-        case, e.g. ``ds @ dd -> dd``, and every dense-dense product), otherwise an
-        ``STensor`` (e.g. the SpGEMM ``ds @ ds -> ds``).
+        case, e.g. ``ds @ dd -> dd``, a matrix times a vector in any layout, and
+        every dense-dense product), otherwise an ``STensor`` (e.g. the SpGEMM
+        ``ds @ ds -> ds``).
 
     Other Parameters
     ----------------
@@ -1455,10 +1908,12 @@ def matmul(
         # ``kwargs`` directly because ``_compile_options`` did not exist on it; this
         # block sits above where the policy is resolved, so reading only ``kwargs``
         # would let that spelling through and silently return torch's product.
-        if _matmul_compile_policy(kwargs)[1] is not None:
-            raise NotImplementedError(
-                "Explicit compiler schedules currently require a sparse operand"
-            )
+        # With no keyword arguments the policy is the context's forced schedule alone,
+        # read here directly: every dense product a dense model makes comes this way.
+        if (
+            _matmul_compile_policy(kwargs)[1] if kwargs else get_forced_schedule()
+        ) is not None:
+            raise ScheduleWithoutSparseOperandError()
         return torch.matmul(a, b)
     # ``scorch.compile`` traces user functions with torch.fx.  Keep the leaf
     # behavior on the function itself so tracing never has to replace the
@@ -1475,7 +1930,26 @@ def matmul(
     # pair and does not promote, so this raises the same, before anything below looks
     # up or builds a kernel (autograd.py, plans, prebuilt kernels, spmv, einsum).  Two
     # dense torch tensors were handed to torch above, which raises it itself.
-    _require_one_product_dtype(a, b)
+    # The three pairs a warm call makes are compared inline, because torch dtypes are
+    # singletons, so ``is`` is equality.  The function's frame, its two getattr calls
+    # and STensor.dtype cost 0.7 us of a 41 us warm STensor call on mkt1 (beat-mkl,
+    # sc8r).  The third pair, two STensors, is every sparse x sparse product.  Every
+    # other pair, and every mismatch, goes through the function.
+    if not (
+        (
+            type(b) is _TENSOR
+            and (
+                (type(a) is STensor and a._metadata.dtype is b.dtype)
+                or (type(a) is _TENSOR and a.dtype is b.dtype)
+            )
+        )
+        or (
+            type(b) is STensor
+            and type(a) is STensor
+            and a._metadata.dtype is b._metadata.dtype
+        )
+    ):
+        _require_one_product_dtype(a, b)
 
     plan_via = None
     # autograd.py next (autograd.serve): a product a gradient is wanted through is recorded
@@ -1520,13 +1994,24 @@ def matmul(
             if served is not None:
                 return served
 
-    compile_options, effective_schedule = _matmul_compile_policy(kwargs)
+    # With no keyword arguments the policy is the context's forced schedule.  Read
+    # directly, it skips the policy's two frames on every call that gets this far.  The
+    # policy also checks a ``_compile_options`` handed in against the call's schedule.
+    effective_schedule = (
+        _matmul_compile_policy(kwargs)[1] if kwargs else get_forced_schedule()
+    )
     compilation_context = kwargs.get("_compilation_context")
     if (
         compilation_context is not None
         and type(compilation_context) is not CompilationContext
     ):
-        raise TypeError("_compilation_context must be a CompilationContext instance")
+        raise ScorchTypeError(
+            "_compilation_context must be a CompilationContext instance",
+            code="compilation_context_type_invalid",
+        )
+    # The call's options holder, made by the first step that needs options
+    # (``_matmul_options``) and handed to every later one.
+    options: Optional[_DeferredOptions] = None
 
     if isinstance(a, torch.Tensor) and isinstance(b, torch.Tensor):
         if (
@@ -1556,9 +2041,7 @@ def matmul(
     # scheduling paths for fully dense operands.
     if a.format.is_dense() and b.format.is_dense():
         if effective_schedule is not None:
-            raise NotImplementedError(
-                "Explicit compiler schedules currently require a sparse operand"
-            )
+            raise ScheduleWithoutSparseOperandError()
         start_time = time.time()
         result_torch = torch.matmul(
             a.to_torch(in_place=False),
@@ -1578,22 +2061,9 @@ def matmul(
         if output_format.is_dense():
             return result_torch
 
-        compile_options = _ensure_compile_options(
-            kwargs,
-            effective_schedule,
-            compile_options,
-        )
-        compilation_context = _compilation_context_at_boundary(
-            compilation_context,
-            compile_options,
-        )
-        conversion_options, conversion_context = _conversion_compile_inputs(
-            compile_options, compilation_context
-        )
+        options = _matmul_options(options, kwargs, compilation_context)
         return STensor.from_torch(result_torch).to_sparse(
-            output_format,
-            _compile_options=conversion_options,
-            _compilation_context=conversion_context,
+            output_format, **_conversion_kwargs(options, compilation_context)
         )
 
     # Never silently swallow a codegen schedule in a prebuilt dispatch.
@@ -1606,30 +2076,15 @@ def matmul(
 
     if a.dim() == 2 and b.dim() == 1:
         if effective_schedule is not None:
-            raise NotImplementedError(
-                "Explicit schedules are not yet threaded through the SpMV compiler"
-            )
+            raise ScheduleNotThreadedThroughSpMVError()
         default_mode_order = [0, 1]
         if (
             not a.format.is_dense()
         ) and a.storage.index.mode_order != default_mode_order:
             a = a.copy()
-            compile_options = _ensure_compile_options(
-                kwargs,
-                effective_schedule,
-                compile_options,
-            )
-            compilation_context = _compilation_context_at_boundary(
-                compilation_context,
-                compile_options,
-            )
-            conversion_options, conversion_context = _conversion_compile_inputs(
-                compile_options, compilation_context
-            )
+            options = _matmul_options(options, kwargs, compilation_context)
             a.change_mode_order(
-                default_mode_order,
-                _compile_options=conversion_options,
-                _compilation_context=conversion_context,
+                default_mode_order, **_conversion_kwargs(options, compilation_context)
             )
 
         if use_cache:
@@ -1645,22 +2100,25 @@ def matmul(
                     tensor_format=resolved.output_format,
                     result_cpp=result_cpp,
                 )
-                if result.format.is_dense():
-                    return result.to_torch()
-                return result
+                return _dense_result_as_tensor(result)
 
         spmv_kwargs = dict(kwargs)
         if "format" in spmv_kwargs and "output_format" not in spmv_kwargs:
             spmv_kwargs["output_format"] = spmv_kwargs.pop("format")
-        compile_options = _ensure_compile_options(
-            kwargs,
-            effective_schedule,
-            compile_options,
+        spmv_output_format = spmv_kwargs.pop("output_format", None)
+        # Under the call's holder, so the SpMV makes a snapshot only when its kernel is
+        # not kept.  ``spmv_kwargs`` carries any context the caller handed in.
+        # ``spmv`` itself still returns the STensor it built; ``matmul`` hands a dense
+        # result back as a torch.Tensor, as its prebuilt branch above does.
+        return _dense_result_as_tensor(
+            _spmv_owned(
+                a,
+                b,
+                spmv_output_format,
+                spmv_kwargs,
+                _matmul_options(options, kwargs, compilation_context),
+            )
         )
-        spmv_kwargs["_compile_options"] = compile_options
-        if compilation_context is not None:
-            spmv_kwargs["_compilation_context"] = compilation_context
-        return spmv(a, b, **spmv_kwargs)
 
     # Normalize sparse 2D operands to canonical mode order before dispatch.
     # This keeps fast kernels correct and avoids known non-default mode-order
@@ -1675,41 +2133,17 @@ def matmul(
         if has_non_default_mode_order and has_sparse_input:
             if a.storage.index.mode_order != default_mode_order:
                 a = a.copy()
-                compile_options = _ensure_compile_options(
-                    kwargs,
-                    effective_schedule,
-                    compile_options,
-                )
-                compilation_context = _compilation_context_at_boundary(
-                    compilation_context,
-                    compile_options,
-                )
-                conversion_options, conversion_context = _conversion_compile_inputs(
-                    compile_options, compilation_context
-                )
+                options = _matmul_options(options, kwargs, compilation_context)
                 a.change_mode_order(
                     default_mode_order,
-                    _compile_options=conversion_options,
-                    _compilation_context=conversion_context,
+                    **_conversion_kwargs(options, compilation_context),
                 )
             if b.storage.index.mode_order != default_mode_order:
                 b = b.copy()
-                compile_options = _ensure_compile_options(
-                    kwargs,
-                    effective_schedule,
-                    compile_options,
-                )
-                compilation_context = _compilation_context_at_boundary(
-                    compilation_context,
-                    compile_options,
-                )
-                conversion_options, conversion_context = _conversion_compile_inputs(
-                    compile_options, compilation_context
-                )
+                options = _matmul_options(options, kwargs, compilation_context)
                 b.change_mode_order(
                     default_mode_order,
-                    _compile_options=conversion_options,
-                    _compilation_context=conversion_context,
+                    **_conversion_kwargs(options, compilation_context),
                 )
 
     if use_cache:
@@ -1762,30 +2196,16 @@ def matmul(
                 result_cpp=result_cpp,
             )
         else:
-            compile_options = _ensure_compile_options(
-                kwargs,
-                effective_schedule,
-                compile_options,
-            )
-            einsum_kwargs["_compile_options"] = compile_options
-            if compilation_context is not None:
-                einsum_kwargs["_compilation_context"] = compilation_context
-            result = einsum("ij,jk->ik", a, b, **einsum_kwargs)
+            # A snapshot made here would be made on every call, kernel cached or not.
+            # ``einsum`` makes one only where it needs one, under the holder a relayout
+            # above made, or under its own from the same keyword arguments and context,
+            # which resolves the same schedule.  So the call has at most one snapshot.
+            result = _generated_matmul(a, b, einsum_kwargs, options)
     else:
-        compile_options = _ensure_compile_options(
-            kwargs,
-            effective_schedule,
-            compile_options,
-        )
-        einsum_kwargs["_compile_options"] = compile_options
-        if compilation_context is not None:
-            einsum_kwargs["_compilation_context"] = compilation_context
-        result = einsum("ij,jk->ik", a, b, **einsum_kwargs)
+        # As above: ``einsum`` makes the snapshot where it needs one.
+        result = _generated_matmul(a, b, einsum_kwargs, options)
 
-    if isinstance(result, STensor) and result.format.is_dense():
-        result = result.to_torch()
-
-    return result
+    return _dense_result_as_tensor(result)
 
 
 # The planned fast path in C (csrc/planned_matmul.h). It serves exactly the calls the probe at
@@ -2581,7 +3001,10 @@ def _build_regblock_dual_path(
     if compile_options is None:
         compile_options = CompileOptions.from_environment()
     elif type(compile_options) is not CompileOptions:
-        raise TypeError("compile_options must be a CompileOptions instance")
+        raise ScorchTypeError(
+            "compile_options must be a CompileOptions instance",
+            code="internal_argument_type_invalid",
+        )
 
     if not Scheduler._has_dense_output(cin_unscheduled):
         return None
@@ -2712,27 +3135,57 @@ def _without_mixed_coordinate_levels(
 
 
 def _evaluate_native(kernel: Callable[..., Any], *args: Any) -> Any:
-    """Call a native kernel; a repeated COO coordinate its index check refuses is raised
-    as ``RepeatedCoordinateError`` (``raise_if_native_repeat``), anything else unchanged.
+    """Call a native kernel; a refusal its checks mark with a code (a repeated COO
+    coordinate, an index past the 32-bit position bound) is raised as its structured
+    error (``raise_if_native_coded``), anything else unchanged.
 
     A separate function so that ``_einsum_owned``, whose three native calls need the
-    mapping, does not grow past its complexity (the project bound is 43, .flake8).
+    mapping, does not grow past its complexity (the project bound is 43, .flake8).  Its
+    dispatch-cache hit, the path of every warm call, maps inline instead, so that path
+    makes no Python call for the mapping.
     """
 
     try:
         return kernel(*args)
     except RuntimeError as error:
-        raise_if_native_repeat(error)
+        raise_if_native_coded(error)
         raise
+
+
+def _refuse_einsum_result_past_bound(
+    bound: Optional[EntryBound],
+    checked: FrozenSet[int],
+    tensors: Sequence[Any],
+    compile_only: Optional[bool],
+) -> Optional[EntryBound]:
+    """An einsum result's bound (patch 0056) with the levels its kernel checks itself,
+    after refusing the call when a level assembled one entry at a time may pass the
+    position bound.  ``None`` (a shape that cannot pass) is returned as it is.  A
+    ``compile_only`` call has no stored counts and is not refused.
+
+    A separate function so that ``_einsum_owned`` keeps within its complexity.
+    """
+
+    if bound is None:
+        return None
+    bound = bound.with_checked(checked)
+    if not compile_only:
+        bound.refuse_past_limit(_stored_counts(tensors))
+    return bound
+
+
+def _stored_counts(tensors: Sequence[Any]) -> List[int]:
+    """Each operand's stored entries, the counts a result bound reads (patch 0056)."""
+
+    return [tensor.values.numel() for tensor in tensors]
 
 
 def _einsum_owned(
     expression: str,
     *tensors: Optional[Union[torch.Tensor, STensor, TensorSpec]],
     compile_only: Optional[bool] = False,
-    compile_options: CompileOptions,
-    compilation_context: CompilationContext,
-    frontend_token: CompilerStageToken,
+    options: _DeferredOptions,
+    compilation: _DeferredCompilation,
     **kwargs: Any,
 ) -> Union[STensor, TensorSpec]:
     """Compile and evaluate a numpy-style einsum over sparse/dense operands.
@@ -2750,7 +3203,10 @@ def _einsum_owned(
         output, e.g. ``"ik,kj->ij"`` (matmul / SpMM / SpGEMM), ``"ij,ij->ij"``
         (elementwise multiply), or ``"ij,ik,jk->ij"`` (SDDMM). One character per
         index. An implicit-output form (no ``"->"``) is **not** supported and
-        raises ``CompileSpecError``.
+        raises ``CompileSpecError``. A term may be empty: an empty result term
+        sums over every index into a rank-0 result (``"ij->"``, ``"i,i->"``), and
+        an empty operand term names a rank-0 operand (``",i->i"``). An expression
+        with no index in any term (``"->"``) raises ``EinsumScalarResultError``.
     *tensors : torch.Tensor, STensor, or TensorSpec
         The operands, one per comma-separated input group. ``torch.Tensor`` inputs
         are auto-converted with ``STensor.from_torch``. ``TensorSpec`` operands
@@ -2780,6 +3236,8 @@ def _einsum_owned(
     STensor
         The result (dense or sparse per the output format). Callers such as
         :func:`matmul` convert a dense-format result back to a ``torch.Tensor``.
+        A rank-0 result is an ``STensor`` of shape ``()`` and format ``""``
+        holding one value.
 
     Raises
     ------
@@ -2844,15 +3302,21 @@ def _einsum_owned(
         STensor.from_torch(t) if isinstance(t, torch.Tensor) else t for t in tensors
     )
     if not isinstance(expression, str) or expression.count("->") != 1:
-        raise CompileSpecError("einsum expression must contain an explicit '->'")
+        raise CompileSpecError(
+            "einsum expression must contain an explicit '->'",
+            code="einsum_implicit_output_unsupported",
+        )
     input_expression, result_expression = expression.split("->")
     input_groups = input_expression.split(",")
     if len(input_groups) != len(tensors):
         raise CompileSpecError(
-            f"einsum expression expects {len(input_groups)} operands, got {len(tensors)}"
+            f"einsum expression expects {len(input_groups)} operands, got {len(tensors)}",
+            code="einsum_operand_count_mismatch",
         )
     if any(tensor is None for tensor in tensors):
-        raise TensorTypeError("einsum operands cannot be None")
+        raise TensorTypeError(
+            "einsum operands cannot be None", code="einsum_operand_type_invalid"
+        )
     invalid = [
         type(tensor).__name__
         for tensor in tensors
@@ -2861,7 +3325,8 @@ def _einsum_owned(
     if invalid:
         raise TensorTypeError(
             "einsum operands must be torch.Tensor, STensor, or TensorSpec; got "
-            + ", ".join(invalid)
+            + ", ".join(invalid),
+            code="einsum_operand_type_invalid",
         )
     input_index_strs, result_index_strs = _validated_labels(
         expression, input_groups, result_expression
@@ -2872,45 +3337,56 @@ def _einsum_owned(
         if requested_output_format.get_order() != len(result_index_strs):
             raise CompileSpecError(
                 f"einsum output format rank {requested_output_format.get_order()} "
-                f"does not match result rank {len(result_index_strs)}"
+                f"does not match result rank {len(result_index_strs)}",
+                code="einsum_output_format_rank_mismatch",
             )
         if any(
             level_type == LevelType.SINGLETON
             for level_type in requested_output_format.get_level_types()
         ):
             raise CompileSpecError(
-                "singleton output levels are not supported by the compiler"
+                "singleton output levels are not supported by the compiler",
+                code="singleton_level_unsupported",
             )
     for operand, (labels, tensor) in enumerate(zip(input_index_strs, tensors)):
         if len(labels) != tensor.dim():
             raise CompileSpecError(
                 f"einsum operand {operand} has {len(labels)} labels but tensor "
-                f"rank {tensor.dim()}"
+                f"rank {tensor.dim()}",
+                code="einsum_operand_rank_mismatch",
             )
     output_mode_order = kwargs.get("output_mode_order")
     if output_mode_order is not None:
         if isinstance(output_mode_order, (str, bytes)) or not isinstance(
             output_mode_order, Sequence
         ):
-            raise CompileSpecError("output_mode_order must be a sequence of integers")
+            raise CompileSpecError(
+                "output_mode_order must be a sequence of integers",
+                code="output_mode_order_type_invalid",
+            )
         if any(
             isinstance(mode, bool) or not isinstance(mode, int)
             for mode in output_mode_order
         ):
-            raise CompileSpecError("output_mode_order entries must be integers")
+            raise CompileSpecError(
+                "output_mode_order entries must be integers",
+                code="output_mode_order_type_invalid",
+            )
         if len(output_mode_order) != len(result_index_strs) or sorted(
             output_mode_order
         ) != list(range(len(result_index_strs))):
             raise CompileSpecError(
-                "output_mode_order must be a permutation of the result modes"
+                "output_mode_order must be a permutation of the result modes",
+                code="output_mode_order_not_permutation",
             )
         output_mode_order = list(output_mode_order)
     logical_index_sizes = _logical_index_sizes(input_index_strs, tensors)
     if not compile_only and any(isinstance(tensor, TensorSpec) for tensor in tensors):
         raise CompileSpecError(
-            "TensorSpec has no runtime payload; pass compile_only=True or use STensor"
+            "TensorSpec has no runtime payload; pass compile_only=True or use STensor",
+            code="tensor_spec_without_payload",
         )
-    effective_schedule = compile_options.requested_schedule
+    effective_schedule = options.requested_schedule
 
     # ── Prebuilt SDDMM dispatch ────────────────────────────────────────
     # Pattern: 'ij,ik,jk->ij' with S(COO), A(dense), B(dense)
@@ -2931,7 +3407,7 @@ def _einsum_owned(
 
         _sddmm_fn = getattr(_ops, "sddmm_coo_float_prebuilt", None)
         if _sddmm_fn is not None:
-            compilation_context.cancel_stage(frontend_token)
+            compilation.cancel_frontend()
             S, A, B = tensors
             result_shape = S.shape
             result_cpp = _evaluate_native(
@@ -2971,11 +3447,21 @@ def _einsum_owned(
             kwargs.get("format", None),
             output_mode_order,
             effective_schedule,
-            compile_options,
+            options_key=options.reuse_key,
         )
         _cached = _einsum_dispatch_cache.get(_dispatch_key)
         if _cached is not None:
-            compilation_context.cancel_stage(frontend_token)
+            # ``cancel_frontend`` without its call: only a call handed a context began
+            # a frontend stage to retire, and a warm call is handed none.
+            if compilation._frontend is None:
+                compilation._cancelled = True
+            else:
+                compilation.cancel_frontend()
+            # The result bound (patch 0056): None unless the result's shape can pass
+            # the 32-bit position bound at a level assembled one entry at a time, so a
+            # call whose shape cannot pays this test and no call.  Before any move.
+            if _cached[8] is not None:
+                _cached[8].refuse_past_limit(_stored_counts(tensors))
             _module = _cached[0]
             _output_fmt = _cached[1]
             _temp_mo = _cached[2]
@@ -2988,7 +3474,9 @@ def _einsum_owned(
             # Set correct mode orders on input tensors.  One move each, to the order
             # the kernel reads, as _einsum_operand_relayout decided for this entry:
             # its letters, and whether every stored entry is copied.  The key holds
-            # each operand's layout, so the decision is this call's.
+            # each operand's layout, so the decision is this call's.  The move is
+            # handed the call's options holder, not a snapshot, so a move whose kernel
+            # is kept makes none either (``_conversion_kwargs``).
             cached_tensors = list(tensors)
             _relayouted = False
             for _index, (_t, _mo) in enumerate(zip(cached_tensors, _input_mos)):
@@ -2996,8 +3484,8 @@ def _einsum_owned(
                     cached_tensors[_index] = _with_compiler_mode_order(
                         _t,
                         _mo,
-                        compile_options,
-                        compilation_context,
+                        options,
+                        compilation.nested_context(),
                         **_move_kwargs[_index],
                     )
                     _relayouted = True
@@ -3029,8 +3517,14 @@ def _einsum_owned(
                 _args.append(_t._native_mode_indices())
                 _args.append(_t.values)
 
+            # ``_evaluate_native`` without its call.  A try block costs nothing until
+            # it raises (CPython 3.11 and later).
             _t0 = time.time()
-            _result_cpp = _evaluate_native(_module.evaluate, *_args)
+            try:
+                _result_cpp = _module.evaluate(*_args)
+            except RuntimeError as error:
+                raise_if_native_coded(error)
+                raise
             _eval_time = time.time() - _t0
 
             _result = _wrap_generated_result(
@@ -3048,17 +3542,16 @@ def _einsum_owned(
             # the permutation, takes a defensive copy of the result's own mode order and
             # sorts it, all to discover there is nothing to do. 1.0 us of a 15 us call.
             if _temp_mo and _temp_mo != _final_mo:
-                conversion_options, conversion_context = _conversion_compile_inputs(
-                    compile_options, compilation_context
-                )
                 _result.change_mode_order(
                     _final_mo,
-                    _compile_options=conversion_options,
-                    _compilation_context=conversion_context,
+                    **_conversion_kwargs(options, compilation.nested_context()),
                 )
 
             return _result
     # ── End fast dispatch ────────────────────────────────────────────────
+    compile_options = options.options()
+    # This call compiles: its frontend stage, timed from where `einsum` began the call.
+    compilation_context, frontend_token = compilation.frontend()
 
     # unique_index_strs should be a list of unique index strings
     # e.g. ["i", "j", "k"]
@@ -3117,7 +3610,10 @@ def _einsum_owned(
     tensors_new = []
     for sorted_index_strs, tensor in zip(input_index_strs_sorted, tensors):
         if not isinstance(tensor, (STensor, TensorSpec)):
-            raise TensorTypeError("input tensor is not a Scorch tensor or spec")
+            raise TensorTypeError(
+                "input tensor is not a Scorch tensor or spec",
+                code="einsum_operand_type_invalid",
+            )
         tensors_new.append(tensor)
 
         for i, index_str in enumerate(sorted_index_strs):
@@ -3131,11 +3627,11 @@ def _einsum_owned(
 
     # Create TensorVar's for each tensor
     tensor_vars = []
-    tensor_names_available = list("ABCDEFGHIJKLMNOPQRSTUVWXYZ")
+    tensor_names = _einsum_tensor_names()
     output_tensor_dtype = None
     for i, tensor in enumerate(tensors):
         if isinstance(tensor, (STensor, TensorSpec)):
-            tensor_name = tensor_names_available.pop(0)
+            tensor_name = next(tensor_names)
             tensor_vars.append(
                 TensorVar(
                     name=tensor_name,
@@ -3250,12 +3746,24 @@ def _einsum_owned(
     physical_result_shape = tuple(
         logical_result_shape[logical_mode] for logical_mode in result_mode_order
     )
+    # Patch 0056: the result's levels bounded from the shapes and stored counts, for a
+    # result whose shape can pass the position bound at a sparse level (else None).  The
+    # expression is one product of every operand, each carrying its own indices.
+    result_bound = entry_bound(
+        "einsum",
+        [result_index_strs[logical_mode] for logical_mode in result_mode_order],
+        physical_result_shape,
+        output_format.level_types,
+        [[(k, letters) for k, letters in enumerate(input_index_strs)]],
+    )
 
     # Create the result TensorVar
     if output_tensor_dtype is None:
-        raise CompileSpecError("einsum requires at least one typed operand")
+        raise CompileSpecError(
+            "einsum requires at least one typed operand", code="einsum_operand_missing"
+        )
     result_tensor_var = TensorVar(
-        name=tensor_names_available.pop(0),
+        name=next(tensor_names),
         fmt=output_format,
         shape=physical_result_shape,
         dtype=output_tensor_dtype,
@@ -3264,7 +3772,10 @@ def _einsum_owned(
 
     # Build RHS expression: product of all tensor accesses
     if not index_var_dict:
-        raise CompileSpecError("einsum expression does not define any indices")
+        raise CompileSpecError(
+            "einsum expression does not define any indices",
+            code="einsum_expression_empty",
+        )
     rhs_expr = None
     for i, tensor_var in enumerate(tensor_vars):
         indices = [index_var_dict[s] for s in input_index_strs[i]]
@@ -3411,6 +3922,12 @@ def _einsum_owned(
     if _kernel_cache_key in _kernel_cache:
         # print(f"Using cached kernel for {cin_stmt}")
         module = _kernel_cache[_kernel_cache_key]
+        result_bound = _refuse_einsum_result_past_bound(
+            result_bound,
+            _kernel_level_totals.get(_kernel_cache_key, frozenset()),
+            tensors,
+            compile_only,
+        )
     else:
         if _dual_llir is not None:
             lowered_llir: Union[llir.Stmt, List[llir.Stmt]] = _dual_llir
@@ -3427,6 +3944,11 @@ def _einsum_owned(
             compile_options,
             compilation_context,
         )
+        level_totals = level_totals_in_source(cpp_code)
+        # After lowering, before the build: the levels the kernel checks itself.
+        result_bound = _refuse_einsum_result_past_bound(
+            result_bound, level_totals, tensors, compile_only
+        )
 
         # print("\n\n", cpp_code)
 
@@ -3441,9 +3963,10 @@ def _einsum_owned(
         module = _load_validated_prepared_kernel(prepared_build)
 
         _kernel_cache[_kernel_cache_key] = module
+        _kernel_level_totals[_kernel_cache_key] = level_totals
 
     # Populate the dispatch cache so future calls skip scheduling entirely.
-    if _dispatch_key is not None:
+    if _dispatch_key is not None and options.still_reusable():
         _einsum_dispatch_cache[_dispatch_key] = (
             module,
             output_format,
@@ -3453,6 +3976,7 @@ def _einsum_owned(
             input_index_strs,
             result_index_strs,
             [relayout.move_kwargs() for relayout in operand_relayouts],
+            result_bound,
         )
 
     if compile_only:
@@ -3517,25 +4041,29 @@ def einsum(
 ) -> Union[STensor, TensorSpec]:
     """Compile and evaluate a validated numpy-style sparse/dense einsum."""
 
-    compile_options = _compile_options_from_kwargs(kwargs)
-    compilation_context = _compilation_context_from_kwargs(kwargs, compile_options)
-    frontend_token = compilation_context.begin_stage(
-        CompilerStageId.FRONTEND_VALIDATED_OPERATION_CONSTRUCTION,
-        compile_options=compile_options,
-    )
+    # ``_deferred_options``: the options holder of a call this one runs inside
+    # (``matmul``), made from the same keyword arguments, so the two make at most one
+    # snapshot between them.
+    options = kwargs.pop("_deferred_options", None)
+    if options is None:
+        options = _DeferredOptions(kwargs)
+    elif type(options) is not _DeferredOptions:
+        raise ScorchTypeError(
+            "_deferred_options must be a _DeferredOptions instance",
+            code="deferred_options_type_invalid",
+        )
+    compilation = _DeferredCompilation(kwargs, options)
     try:
         return _einsum_owned(
             expression,
             *tensors,
             compile_only=compile_only,
-            compile_options=compile_options,
-            compilation_context=compilation_context,
-            frontend_token=frontend_token,
+            options=options,
+            compilation=compilation,
             **kwargs,
         )
     except Exception:
-        if compilation_context.is_stage_active(frontend_token):
-            compilation_context.fail_stage(frontend_token)
+        compilation.fail_frontend_if_active()
         raise
 
 
@@ -3582,16 +4110,33 @@ def _checked_runtime_shape(shape: object, owner: str) -> Tuple[int, ...]:
         raise CompileSpecError(f"{owner} rank must not exceed 64")
     max_int64 = (1 << 63) - 1
     checked: List[int] = []
-    element_count = 1
-    for extent in shape:
-        if type(extent) is not int or extent < 0 or extent > max_int64:
+    for mode, extent in enumerate(shape):
+        if type(extent) is not int or extent < 0:
             raise CompileSpecError(
                 f"{owner} must contain nonnegative signed int64 extents"
             )
-        if extent and element_count > max_int64 // extent:
-            raise CompileSpecError(f"{owner} element count exceeds signed int64")
-        element_count *= extent
+        if extent > max_int64:
+            raise shape_capacity_error(
+                ShapeCapacitySpecError,
+                f"{owner} must contain nonnegative signed int64 extents",
+                owner,
+                checked,
+                mode,
+                extent,
+            )
         checked.append(extent)
+    # A zero extent holds no element whatever the extents before it multiply to.
+    if 0 not in checked:
+        count = math.prod(checked)
+        if count > max_int64:
+            raise shape_capacity_error(
+                ShapeCapacitySpecError,
+                f"{owner} element count exceeds signed int64",
+                owner,
+                checked,
+                None,
+                count,
+            )
     return tuple(checked)
 
 
@@ -4146,7 +4691,7 @@ def lower_and_exec_cin(
     try:
         result_cpp = module.evaluate(*module_args)
     except RuntimeError as error:
-        raise_if_native_repeat(error)
+        raise_if_native_coded(error)
         raise
     end_time = time.time()
     eval_time = end_time - start_time

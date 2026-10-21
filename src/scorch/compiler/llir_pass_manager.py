@@ -67,6 +67,7 @@ from .sparse_prefetch_pass import (
     SparsePrefetchContext,
     insert_sparse_prefetch,
 )
+from ..exceptions import ScorchTypeError
 
 if TYPE_CHECKING:
     from .compile_options import CompileOptions
@@ -375,12 +376,16 @@ class LLIRPassPartialFailure(CompilerInvariantError):
         completed_run_records: Tuple[LLIRPassRunRecord, ...],
     ) -> None:
         if not isinstance(failure, Exception):
-            raise TypeError("LLIRPassPartialFailure requires an exception")
+            raise ScorchTypeError(
+                "LLIRPassPartialFailure requires an exception",
+                code="internal_argument_type_invalid",
+            )
         if type(completed_run_records) is not tuple or any(
             type(record) is not LLIRPassRunRecord for record in completed_run_records
         ):
-            raise TypeError(
-                "LLIRPassPartialFailure requires exact completed run records"
+            raise ScorchTypeError(
+                "LLIRPassPartialFailure requires exact completed run records",
+                code="internal_argument_type_invalid",
             )
         self.failure = failure
         self.completed_run_records = tuple(

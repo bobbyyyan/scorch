@@ -9,7 +9,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from enum import Enum
-from typing import TYPE_CHECKING, Dict, Optional, Tuple, cast
+from typing import TYPE_CHECKING, Callable, Dict, NoReturn, Optional, Set, Tuple, cast
 
 from ..format import LevelType, parse_format
 from .cin_analysis import CINAnalysis, analyze_cin
@@ -17,6 +17,7 @@ from .diagnostics import VerificationError
 from .identity import IndexId, SymbolId
 from .sparse_accumulator import is_accumulator_structure
 from .sparse_assembly import is_assembly_strategy
+from ..exceptions import ScorchTypeError
 
 if TYPE_CHECKING:
     from .cin import IndexStmt, TensorVar
@@ -37,7 +38,8 @@ def _verify_cpp_int_width(width: int, field: str) -> None:
 
     if width > MAX_AFFINE_TILE_WIDTH:
         raise VerificationError(
-            f"LoopPlan {field} must fit the C++ constexpr int target"
+            f"LoopPlan {field} must fit the C++ constexpr int target",
+            code="loop_plan_reference_invalid",
         )
 
 
@@ -45,7 +47,10 @@ def _tuple_snapshot(value: object, field_name: str) -> Tuple[object, ...]:
     """Detach one tuple-valued plan field from caller-owned containers."""
 
     if not isinstance(value, (tuple, list)):
-        raise TypeError(f"{field_name} must be a tuple or list of typed plan values")
+        raise ScorchTypeError(
+            f"{field_name} must be a tuple or list of typed plan values",
+            code="loop_plan_artifact_invalid",
+        )
     return tuple(value)
 
 
@@ -276,6 +281,31 @@ class LoopPlan:
     before the main kernel runs (:class:`OperandConversion`); every other
     decision of the plan is verified against the program with those operands
     converted.  It is empty on every plan the legacy scheduler originates.
+
+    ``vector_loops`` records which loops keep a vector mark
+    (``#pragma omp simd``).  ``None`` records no decision: each compiler places
+    the marks it placed before this field existed.  Both apply the shared rule
+    ``iter_lattice.mark_simd_on_reduction_loops`` in one place, the loops below
+    a sparse result entry whose sum is kept in a register (a loop is safe when
+    its body holds no loop over a compressed level's positions, it is not
+    parallel or unrolled, and it has no early exit); with no decision the
+    shipped compiler marks the safe loops there and the new compiler marks
+    none.  A tuple, the empty one included, keeps the mark on exactly the named
+    loops, in both compilers; naming a loop the rule does not find safe is
+    refused when the kernel is lowered (``unsupported_vector_loop``), since
+    only there is the loop's body known.  Like ``assembly`` it is independent
+    of the loop order, so an automatic plan may carry it.
+
+    ``entries_of`` records the input whose stored entries a COO result stores:
+    one result entry per stored entry of that input, in its storage order, an
+    entry whose inner sum ran zero times included.  Plan legality admits it
+    only where the loops over the result's indices walk that input's stored
+    entries with a reduction below them (``sparse_assembly.entry_source``);
+    each entry's position is then that input's, known before the loops run,
+    and the parallel single pass of a COO result needs it.  ``None`` records no
+    decision: the shipped compiler stores every entry of the input its scalar
+    accumulation walks, and the new compiler appends only the entries some
+    term reached.  An automatic plan may carry it, like ``assembly``.
     """
 
     loop_order: Tuple[IndexId, ...]
@@ -291,8 +321,19 @@ class LoopPlan:
     provenance: str = "explicit"
     tag: str = ""
     conversions: Tuple[OperandConversion, ...] = ()
+    vector_loops: Optional[Tuple[LoopRef, ...]] = None
+    entries_of: Optional[SymbolId] = None
 
     def __post_init__(self) -> None:
+        if self.vector_loops is not None:
+            object.__setattr__(
+                self,
+                "vector_loops",
+                cast(
+                    Tuple[LoopRef, ...],
+                    _tuple_snapshot(self.vector_loops, "LoopPlan.vector_loops"),
+                ),
+            )
         object.__setattr__(
             self,
             "loop_order",
@@ -340,9 +381,15 @@ class ScheduledCIN:
         from .cin import _is_exact_index_stmt
 
         if not _is_exact_index_stmt(self.normalized_cin):
-            raise TypeError("ScheduledCIN.normalized_cin must be an IndexStmt")
+            raise ScorchTypeError(
+                "ScheduledCIN.normalized_cin must be an IndexStmt",
+                code="loop_plan_artifact_invalid",
+            )
         if not isinstance(self.verified_loop_plan, LoopPlan):
-            raise TypeError("ScheduledCIN.verified_loop_plan must be a LoopPlan")
+            raise ScorchTypeError(
+                "ScheduledCIN.verified_loop_plan must be a LoopPlan",
+                code="loop_plan_artifact_invalid",
+            )
 
     def __str__(self) -> str:
         return str(self.normalized_cin)
@@ -352,7 +399,9 @@ def _collect_entities(cin: object) -> Tuple[Dict[IndexId, str], Dict[SymbolId, s
     from .cin import _is_index_stmt_instance
 
     if not _is_index_stmt_instance(cin):
-        raise VerificationError("normalized CIN must be an IndexStmt")
+        raise VerificationError(
+            "normalized CIN must be an IndexStmt", code="loop_plan_artifact_invalid"
+        )
     analysis = analyze_cin(cast("IndexStmt", cin))
     reference_errors = tuple(
         diagnostic
@@ -388,7 +437,9 @@ def _analyze_loop_plan_cin(cin: object) -> CINAnalysis:
     from .cin import _is_index_stmt_instance
 
     if not _is_index_stmt_instance(cin):
-        raise VerificationError("normalized CIN must be an IndexStmt")
+        raise VerificationError(
+            "normalized CIN must be an IndexStmt", code="loop_plan_artifact_invalid"
+        )
     analysis = analyze_cin(cast("IndexStmt", cin))
     if analysis.diagnostics:
         first = analysis.diagnostics[0]
@@ -433,12 +484,21 @@ def _validate_stored_fields(
 
     state = object.__getattribute__(value, "__dict__")
     if type(state) is not dict:
-        raise VerificationError(f"LoopPlan {path} has invalid stored fields")
+        raise VerificationError(
+            f"LoopPlan {path} has invalid stored fields",
+            code="loop_plan_structure_invalid",
+        )
     keys = tuple(state.keys())
     if any(type(key) is not str for key in keys):
-        raise VerificationError(f"LoopPlan {path} has invalid stored fields")
+        raise VerificationError(
+            f"LoopPlan {path} has invalid stored fields",
+            code="loop_plan_structure_invalid",
+        )
     if tuple(sorted(keys)) != tuple(sorted(expected_fields)):
-        raise VerificationError(f"LoopPlan {path} has invalid stored fields")
+        raise VerificationError(
+            f"LoopPlan {path} has invalid stored fields",
+            code="loop_plan_structure_invalid",
+        )
 
 
 def _diagnostic_int(value: int) -> str:
@@ -454,25 +514,39 @@ def _diagnostic_int(value: int) -> str:
 
 def _validate_index_id(index_id: object, path: str) -> IndexId:
     if type(index_id) is not IndexId:
-        raise VerificationError(f"LoopPlan {path} must be a well-formed IndexId")
+        raise VerificationError(
+            f"LoopPlan {path} must be a well-formed IndexId",
+            code="loop_plan_structure_invalid",
+        )
     _validate_stored_fields(index_id, path, ("value",))
     if not _is_non_bool_int(index_id.value):
-        raise VerificationError(f"LoopPlan {path} must be a well-formed IndexId")
+        raise VerificationError(
+            f"LoopPlan {path} must be a well-formed IndexId",
+            code="loop_plan_structure_invalid",
+        )
     return index_id
 
 
 def _validate_symbol_id(symbol_id: object, path: str) -> SymbolId:
     if type(symbol_id) is not SymbolId:
-        raise VerificationError(f"LoopPlan {path} must be a well-formed SymbolId")
+        raise VerificationError(
+            f"LoopPlan {path} must be a well-formed SymbolId",
+            code="loop_plan_structure_invalid",
+        )
     _validate_stored_fields(symbol_id, path, ("value",))
     if not _is_non_bool_int(symbol_id.value):
-        raise VerificationError(f"LoopPlan {path} must be a well-formed SymbolId")
+        raise VerificationError(
+            f"LoopPlan {path} must be a well-formed SymbolId",
+            code="loop_plan_structure_invalid",
+        )
     return symbol_id
 
 
 def _validate_loop_ref(loop: object, path: str) -> LoopRef:
     if type(loop) is not LoopRef:
-        raise VerificationError(f"LoopPlan {path} must be a LoopRef")
+        raise VerificationError(
+            f"LoopPlan {path} must be a LoopRef", code="loop_plan_structure_invalid"
+        )
     _validate_stored_fields(loop, path, ("index_id", "part"))
     typed_loop = cast(LoopRef, loop)
     _validate_index_id(typed_loop.index_id, f"{path}.index_id")
@@ -480,13 +554,19 @@ def _validate_loop_ref(loop: object, path: str) -> LoopRef:
         typed_loop.part is expected
         for expected in (LoopPart.LOGICAL, LoopPart.OUTER, LoopPart.INNER)
     ):
-        raise VerificationError(f"LoopPlan {path}.part must be a LoopPart")
+        raise VerificationError(
+            f"LoopPlan {path}.part must be a LoopPart",
+            code="loop_plan_structure_invalid",
+        )
     return typed_loop
 
 
 def _validate_loop_placement(placement: object, path: str) -> LoopPlacement:
     if type(placement) is not LoopPlacement:
-        raise VerificationError(f"LoopPlan {path} must be a LoopPlacement")
+        raise VerificationError(
+            f"LoopPlan {path} must be a LoopPlacement",
+            code="loop_plan_structure_invalid",
+        )
     _validate_stored_fields(placement, path, ("kind", "parent", "depth"))
     typed_placement = cast(LoopPlacement, placement)
     if not any(
@@ -497,13 +577,19 @@ def _validate_loop_placement(placement: object, path: str) -> LoopPlacement:
             PlacementKind.AT_DEPTH,
         )
     ):
-        raise VerificationError(f"LoopPlan {path}.kind must be a PlacementKind")
+        raise VerificationError(
+            f"LoopPlan {path}.kind must be a PlacementKind",
+            code="loop_plan_structure_invalid",
+        )
     if typed_placement.parent is not None:
         _validate_loop_ref(typed_placement.parent, f"{path}.parent")
     if typed_placement.depth is not None and not _is_non_bool_int(
         typed_placement.depth
     ):
-        raise VerificationError(f"LoopPlan {path}.depth must be an integer or None")
+        raise VerificationError(
+            f"LoopPlan {path}.depth must be an integer or None",
+            code="loop_plan_structure_invalid",
+        )
     return typed_placement
 
 
@@ -518,12 +604,14 @@ def _validate_output_decision_tokens(plan: LoopPlan) -> None:
 
     if plan.assembly is not None and not is_assembly_strategy(plan.assembly):
         raise VerificationError(
-            "LoopPlan.assembly must be a recorded sparse assembly strategy or None"
+            "LoopPlan.assembly must be a recorded sparse assembly strategy or None",
+            code="loop_plan_structure_invalid",
         )
     if plan.accumulator is not None and not is_accumulator_structure(plan.accumulator):
         raise VerificationError(
             "LoopPlan.accumulator must be a recorded sparse accumulation "
-            "structure or None"
+            "structure or None",
+            code="loop_plan_structure_invalid",
         )
 
 
@@ -531,7 +619,10 @@ def _validate_loop_plan_structure(plan: object) -> LoopPlan:
     """Reject malformed typed fields before semantic plan verification."""
 
     if type(plan) is not LoopPlan:
-        raise VerificationError("LoopPlan verifier received a non-LoopPlan value")
+        raise VerificationError(
+            "LoopPlan verifier received a non-LoopPlan value",
+            code="loop_plan_structure_invalid",
+        )
     _validate_stored_fields(
         plan,
         "plan",
@@ -549,18 +640,27 @@ def _validate_loop_plan_structure(plan: object) -> LoopPlan:
             "provenance",
             "tag",
             "conversions",
+            "vector_loops",
+            "entries_of",
         ),
     )
     typed_plan = cast(LoopPlan, plan)
     if type(typed_plan.loop_order) is not tuple:
-        raise VerificationError("LoopPlan.loop_order must be a tuple")
+        raise VerificationError(
+            "LoopPlan.loop_order must be a tuple", code="loop_plan_structure_invalid"
+        )
     for position, index_id in enumerate(typed_plan.loop_order):
         _validate_index_id(index_id, f"loop_order[{position}]")
     if type(typed_plan.tiles) is not tuple:
-        raise VerificationError("LoopPlan.tiles must be a tuple")
+        raise VerificationError(
+            "LoopPlan.tiles must be a tuple", code="loop_plan_structure_invalid"
+        )
     for position, tile in enumerate(typed_plan.tiles):
         if type(tile) is not LoopTile:
-            raise VerificationError(f"LoopPlan tiles[{position}] must be a LoopTile")
+            raise VerificationError(
+                f"LoopPlan tiles[{position}] must be a LoopTile",
+                code="loop_plan_structure_invalid",
+            )
         _validate_stored_fields(
             tile,
             f"tiles[{position}]",
@@ -577,25 +677,38 @@ def _validate_loop_plan_structure(plan: object) -> LoopPlan:
         _validate_loop_ref(tile.loop, f"tiles[{position}].loop")
         _validate_loop_placement(tile.placement, f"tiles[{position}].placement")
         if not _is_non_bool_int(tile.width):
-            raise VerificationError("LoopPlan tile widths must be integers")
+            raise VerificationError(
+                "LoopPlan tile widths must be integers",
+                code="loop_plan_structure_invalid",
+            )
         if type(tile.parallel) is not bool or type(tile.unroll) is not bool:
-            raise VerificationError("LoopPlan tile policy flags must be bool values")
+            raise VerificationError(
+                "LoopPlan tile policy flags must be bool values",
+                code="loop_plan_structure_invalid",
+            )
         if type(tile.kind) is not str or tile.kind not in ("affine", "panel"):
-            raise VerificationError("LoopPlan tile kind must be 'affine' or 'panel'")
+            raise VerificationError(
+                "LoopPlan tile kind must be 'affine' or 'panel'",
+                code="loop_plan_structure_invalid",
+            )
         if type(tile.accumulation) is not str or tile.accumulation not in (
             "stack",
             "direct",
             "heap",
         ):
             raise VerificationError(
-                "LoopPlan tile accumulation must be 'stack', 'direct', or 'heap'"
+                "LoopPlan tile accumulation must be 'stack', 'direct', or 'heap'",
+                code="loop_plan_structure_invalid",
             )
     if type(typed_plan.panel_bounds) is not tuple:
-        raise VerificationError("LoopPlan.panel_bounds must be a tuple")
+        raise VerificationError(
+            "LoopPlan.panel_bounds must be a tuple", code="loop_plan_structure_invalid"
+        )
     for position, bound in enumerate(typed_plan.panel_bounds):
         if type(bound) is not PanelBound:
             raise VerificationError(
-                f"LoopPlan panel_bounds[{position}] must be a PanelBound"
+                f"LoopPlan panel_bounds[{position}] must be a PanelBound",
+                code="loop_plan_structure_invalid",
             )
         _validate_stored_fields(
             bound,
@@ -605,11 +718,15 @@ def _validate_loop_plan_structure(plan: object) -> LoopPlan:
         _validate_loop_ref(bound.loop, f"panel_bounds[{position}].loop")
         _validate_symbol_id(bound.tensor_id, f"panel_bounds[{position}].tensor_id")
         if not _is_non_bool_int(bound.level):
-            raise VerificationError("LoopPlan panel-bound levels must be integers")
+            raise VerificationError(
+                "LoopPlan panel-bound levels must be integers",
+                code="loop_plan_structure_invalid",
+            )
     if typed_plan.relayout is not None:
         if type(typed_plan.relayout) is not OperandRelayout:
             raise VerificationError(
-                "LoopPlan.relayout must be an OperandRelayout or None"
+                "LoopPlan.relayout must be an OperandRelayout or None",
+                code="loop_plan_structure_invalid",
             )
         relayout = typed_plan.relayout
         _validate_stored_fields(
@@ -636,18 +753,30 @@ def _validate_loop_plan_structure(plan: object) -> LoopPlan:
         ):
             _validate_loop_ref(loop, f"relayout.{field}")
         if not _is_non_bool_int(relayout.strip_width):
-            raise VerificationError("LoopPlan relayout strip width must be an integer")
+            raise VerificationError(
+                "LoopPlan relayout strip width must be an integer",
+                code="loop_plan_structure_invalid",
+            )
         if type(relayout.access_indices) is not tuple:
-            raise VerificationError("LoopPlan relayout access_indices must be a tuple")
+            raise VerificationError(
+                "LoopPlan relayout access_indices must be a tuple",
+                code="loop_plan_structure_invalid",
+            )
         for position, index_id in enumerate(relayout.access_indices):
             _validate_index_id(index_id, f"relayout.access_indices[{position}]")
         if not _is_non_bool_int(relayout.operand_panel_level) or not _is_non_bool_int(
             relayout.operand_pack_level
         ):
-            raise VerificationError("LoopPlan relayout levels must be integers")
+            raise VerificationError(
+                "LoopPlan relayout levels must be integers",
+                code="loop_plan_structure_invalid",
+            )
     if typed_plan.result_tile is not None:
         if type(typed_plan.result_tile) is not ResultTile:
-            raise VerificationError("LoopPlan.result_tile must be a ResultTile or None")
+            raise VerificationError(
+                "LoopPlan.result_tile must be a ResultTile or None",
+                code="loop_plan_structure_invalid",
+            )
         result_tile = typed_plan.result_tile
         _validate_stored_fields(
             result_tile,
@@ -663,13 +792,19 @@ def _validate_loop_plan_structure(plan: object) -> LoopPlan:
         _validate_symbol_id(result_tile.result_id, "result_tile.result_id")
         _validate_loop_ref(result_tile.tile_loop, "result_tile.tile_loop")
         if not _is_non_bool_int(result_tile.result_level):
-            raise VerificationError("LoopPlan result-tile level must be an integer")
+            raise VerificationError(
+                "LoopPlan result-tile level must be an integer",
+                code="loop_plan_structure_invalid",
+            )
         for field, index_ids in (
             ("result_prefix", result_tile.result_prefix),
             ("access_indices", result_tile.access_indices),
         ):
             if type(index_ids) is not tuple:
-                raise VerificationError(f"LoopPlan result {field} must be a tuple")
+                raise VerificationError(
+                    f"LoopPlan result {field} must be a tuple",
+                    code="loop_plan_structure_invalid",
+                )
             for position, index_id in enumerate(index_ids):
                 _validate_index_id(index_id, f"result_tile.{field}[{position}]")
     if typed_plan.parallel_loop is not None:
@@ -677,7 +812,8 @@ def _validate_loop_plan_structure(plan: object) -> LoopPlan:
     if typed_plan.workspace is not None:
         if type(typed_plan.workspace) is not WorkspaceInsertion:
             raise VerificationError(
-                "LoopPlan.workspace must be a WorkspaceInsertion or None"
+                "LoopPlan.workspace must be a WorkspaceInsertion or None",
+                code="loop_plan_structure_invalid",
             )
         workspace = typed_plan.workspace
         _validate_stored_fields(
@@ -688,24 +824,44 @@ def _validate_loop_plan_structure(plan: object) -> LoopPlan:
         _validate_loop_ref(workspace.reduction_loop, "workspace.reduction_loop")
         if type(workspace.axis_loops) is not tuple or not workspace.axis_loops:
             raise VerificationError(
-                "LoopPlan workspace.axis_loops must be a non-empty tuple"
+                "LoopPlan workspace.axis_loops must be a non-empty tuple",
+                code="loop_plan_structure_invalid",
             )
         for position, axis in enumerate(workspace.axis_loops):
             _validate_loop_ref(axis, f"workspace.axis_loops[{position}]")
         if type(workspace.dense) is not bool:
-            raise VerificationError("LoopPlan workspace.dense must be a bool")
+            raise VerificationError(
+                "LoopPlan workspace.dense must be a bool",
+                code="loop_plan_structure_invalid",
+            )
         if workspace.dense and len(workspace.axis_loops) != 1:
             raise VerificationError(
-                "LoopPlan dense workspace insertion stores exactly one axis"
+                "LoopPlan dense workspace insertion stores exactly one axis",
+                code="loop_plan_structure_invalid",
             )
     _validate_output_decision_tokens(typed_plan)
     if typed_plan.auto_policy is not None:
         _validate_auto_policy_structure(typed_plan.auto_policy)
     if type(typed_plan.provenance) is not str or not typed_plan.provenance:
-        raise VerificationError("LoopPlan.provenance must be a non-empty string")
+        raise VerificationError(
+            "LoopPlan.provenance must be a non-empty string",
+            code="loop_plan_structure_invalid",
+        )
     if type(typed_plan.tag) is not str:
-        raise VerificationError("LoopPlan.tag must be a string")
+        raise VerificationError(
+            "LoopPlan.tag must be a string", code="loop_plan_structure_invalid"
+        )
     _validate_conversions_structure(typed_plan.conversions)
+    if typed_plan.vector_loops is not None:
+        if type(typed_plan.vector_loops) is not tuple:
+            raise VerificationError(
+                "LoopPlan.vector_loops must be a tuple or None",
+                code="loop_plan_structure_invalid",
+            )
+        for position, loop in enumerate(typed_plan.vector_loops):
+            _validate_loop_ref(loop, f"vector_loops[{position}]")
+    if typed_plan.entries_of is not None:
+        _validate_symbol_id(typed_plan.entries_of, "entries_of")
     return typed_plan
 
 
@@ -713,11 +869,14 @@ def _validate_conversions_structure(conversions: object) -> None:
     """Reject malformed stored operand conversions exactly."""
 
     if type(conversions) is not tuple:
-        raise VerificationError("LoopPlan.conversions must be a tuple")
+        raise VerificationError(
+            "LoopPlan.conversions must be a tuple", code="loop_plan_conversion_invalid"
+        )
     for position, conversion in enumerate(conversions):
         if type(conversion) is not OperandConversion:
             raise VerificationError(
-                f"LoopPlan conversions[{position}] must be an OperandConversion"
+                f"LoopPlan conversions[{position}] must be an OperandConversion",
+                code="loop_plan_conversion_invalid",
             )
         _validate_stored_fields(
             conversion,
@@ -727,7 +886,8 @@ def _validate_conversions_structure(conversions: object) -> None:
         if type(conversion.format) is not str or set(conversion.format) - {"d", "s"}:
             raise VerificationError(
                 f"LoopPlan conversions[{position}].format must be a string of "
-                "'d' (dense) and 's' (compressed) levels"
+                "'d' (dense) and 's' (compressed) levels",
+                code="loop_plan_conversion_invalid",
             )
         _validate_symbol_id(
             conversion.operand_id, f"conversions[{position}].operand_id"
@@ -736,7 +896,8 @@ def _validate_conversions_structure(conversions: object) -> None:
             _is_non_bool_int(mode) for mode in conversion.mode_order
         ):
             raise VerificationError(
-                "LoopPlan conversion mode orders must be tuples of integers"
+                "LoopPlan conversion mode orders must be tuples of integers",
+                code="loop_plan_conversion_invalid",
             )
 
 
@@ -745,7 +906,8 @@ def _validate_auto_policy_structure(auto_policy: object) -> None:
 
     if type(auto_policy) is not AutoOriginPolicy:
         raise VerificationError(
-            "LoopPlan.auto_policy must be an AutoOriginPolicy or None"
+            "LoopPlan.auto_policy must be an AutoOriginPolicy or None",
+            code="loop_plan_auto_policy_invalid",
         )
     _validate_stored_fields(
         auto_policy,
@@ -758,14 +920,24 @@ def _validate_auto_policy_structure(auto_policy: object) -> None:
     ):
         raise VerificationError(
             "LoopPlan auto_policy.schema must be the exact "
-            f"{AUTO_ORIGIN_POLICY_SCHEMA!r} version token"
+            f"{AUTO_ORIGIN_POLICY_SCHEMA!r} version token",
+            code="loop_plan_auto_policy_invalid",
         )
     if type(auto_policy.regblock_enabled) is not bool:
-        raise VerificationError("LoopPlan auto_policy.regblock_enabled must be a bool")
+        raise VerificationError(
+            "LoopPlan auto_policy.regblock_enabled must be a bool",
+            code="loop_plan_auto_policy_invalid",
+        )
     if not _is_non_bool_int(auto_policy.tile_width):
-        raise VerificationError("LoopPlan auto_policy.tile_width must be an integer")
+        raise VerificationError(
+            "LoopPlan auto_policy.tile_width must be an integer",
+            code="loop_plan_auto_policy_invalid",
+        )
     if auto_policy.tile_width <= 0:
-        raise VerificationError("LoopPlan auto_policy.tile_width must be positive")
+        raise VerificationError(
+            "LoopPlan auto_policy.tile_width must be positive",
+            code="loop_plan_auto_policy_invalid",
+        )
     _verify_cpp_int_width(auto_policy.tile_width, "auto_policy.tile_width")
 
 
@@ -778,21 +950,27 @@ def _verify_empty_loop_plan(plan: LoopPlan) -> None:
         or plan.result_tile is not None
         or plan.parallel_loop is not None
         or plan.workspace is not None
+        or plan.vector_loops
     ):
         raise VerificationError(
-            "LoopPlan references loops but normalized CIN defines none"
+            "LoopPlan references loops but normalized CIN defines none",
+            code="loop_plan_reference_invalid",
         )
 
 
 def _verify_complete_loop_order(plan: LoopPlan, indices: Dict[IndexId, str]) -> None:
     if len(plan.loop_order) != len(set(plan.loop_order)):
-        raise VerificationError("LoopPlan.loop_order contains duplicate IndexId values")
+        raise VerificationError(
+            "LoopPlan.loop_order contains duplicate IndexId values",
+            code="loop_plan_loop_order_invalid",
+        )
     for position, index_id in enumerate(plan.loop_order):
         if index_id not in indices:
             raise VerificationError(
                 "LoopPlan loop_order"
                 f"[{position}] references unknown IndexId "
-                f"{_diagnostic_int(index_id.value)}"
+                f"{_diagnostic_int(index_id.value)}",
+                code="loop_plan_loop_order_invalid",
             )
     missing_loop_ids = tuple(
         index_id for index_id in indices if index_id not in plan.loop_order
@@ -803,7 +981,8 @@ def _verify_complete_loop_order(plan: LoopPlan, indices: Dict[IndexId, str]) -> 
         )
         raise VerificationError(
             "LoopPlan.loop_order must contain every bound IndexId exactly once; "
-            f"missing {missing_values}"
+            f"missing {missing_values}",
+            code="loop_plan_loop_order_invalid",
         )
 
 
@@ -842,11 +1021,13 @@ def converted_cin(
         rank = len(access.indices)
         if sorted(target) != list(range(rank)):
             raise VerificationError(
-                "LoopPlan conversion mode order must permute the operand's modes"
+                "LoopPlan conversion mode order must permute the operand's modes",
+                code="loop_plan_conversion_invalid",
             )
         if len(conversion.format) != rank:
             raise VerificationError(
-                "LoopPlan conversion format must name one level per operand mode"
+                "LoopPlan conversion format must name one level per operand mode",
+                code="loop_plan_conversion_invalid",
             )
         if id(tensor) not in rewritten:
             tensor.format = parse_format(conversion.format)
@@ -966,48 +1147,125 @@ def _verify_conversions(cin: object, plan: LoopPlan) -> None:
         tensor = rhs.get(conversion.operand_id)
         if tensor is None:
             raise VerificationError(
-                f"LoopPlan {path} must name a right-hand-side tensor"
+                f"LoopPlan {path} must name a right-hand-side tensor",
+                code="loop_plan_conversion_invalid",
             )
         if conversion.operand_id in seen:
-            raise VerificationError("LoopPlan converts one operand twice")
+            raise VerificationError(
+                "LoopPlan converts one operand twice",
+                code="loop_plan_conversion_invalid",
+            )
         seen.add(conversion.operand_id)
         levels = tensor.get_level_types()
         if sorted(conversion.mode_order) != list(range(len(levels))):
             raise VerificationError(
-                f"LoopPlan {path} mode order must permute the operand's modes"
+                f"LoopPlan {path} mode order must permute the operand's modes",
+                code="loop_plan_conversion_invalid",
             )
         current = tuple(tensor.mode_order or range(len(levels)))
         if conversion.mode_order == current:
             raise VerificationError(
-                f"LoopPlan {path} must change the operand's mode order"
+                f"LoopPlan {path} must change the operand's mode order",
+                code="loop_plan_conversion_invalid",
             )
         if all(level is LevelType.DENSE for level in levels):
             # An all-dense operand is addressed by its coordinates in any
             # loop order, so converting one is never needed.
             raise VerificationError(
-                f"LoopPlan {path} must name an operand with a compressed level"
+                f"LoopPlan {path} must name an operand with a compressed level",
+                code="loop_plan_conversion_invalid",
             )
         if any(
             level not in (LevelType.DENSE, LevelType.COMPRESSED) for level in levels
         ):
             raise VerificationError(
-                f"LoopPlan {path} must name an operand of dense and compressed levels"
+                f"LoopPlan {path} must name an operand of dense and compressed levels",
+                code="loop_plan_conversion_invalid",
             )
         if len(conversion.format) != len(levels):
             raise VerificationError(
-                f"LoopPlan {path} format must name one level per operand mode"
+                f"LoopPlan {path} format must name one level per operand mode",
+                code="loop_plan_conversion_invalid",
             )
         if "sd" in conversion.format:
             # A dense level below a compressed one stores every cell under
             # each stored parent: cells the operand does not hold.
             raise VerificationError(
                 f"LoopPlan {path} format must store only the operand's entries: "
-                "no dense level below a compressed one"
+                "no dense level below a compressed one",
+                code="loop_plan_conversion_invalid",
             )
         if "s" not in conversion.format:
             raise VerificationError(
-                f"LoopPlan {path} format must keep a compressed level"
+                f"LoopPlan {path} format must keep a compressed level",
+                code="loop_plan_conversion_invalid",
             )
+
+
+def _verify_vector_loop_refs(
+    plan: LoopPlan,
+    check_loop: Callable[[LoopRef, str], None],
+    check_derived_loop: Callable[[LoopRef, str], None],
+    affine_tiled_ids: Set[IndexId],
+    panel_tile_ids: Set[IndexId],
+) -> None:
+    """Each loop ``vector_loops`` names is a loop of the plan's nest, named once.
+
+    ``check_loop`` and ``check_derived_loop`` are :func:`verify_loop_plan`'s
+    checks of a reference against the program's indices and the plan's affine
+    tiles.  Whether the rule would mark the loop is decided only when the
+    kernel is lowered, where the loop's body is known.
+
+    Each refusal carries a code (``invalid_vector_loops`` for a reference to
+    no loop of the nest, ``unsupported_vector_loop`` for a loop a panel tile
+    splits): a request naming a loop the automatic plan tiled reaches these
+    from the public schedule.
+    """
+
+    if plan.vector_loops is None:
+        return
+    if len(set(plan.vector_loops)) != len(plan.vector_loops):
+        _vector_loop_refusal(
+            "invalid_vector_loops", None, "LoopPlan.vector_loops names a loop twice"
+        )
+    for position, loop in enumerate(plan.vector_loops):
+        for check in (check_loop, check_derived_loop):
+            try:
+                check(loop, f"vector_loops[{position}]")
+            except VerificationError as error:
+                _vector_loop_refusal("invalid_vector_loops", position, str(error))
+        if loop.part == LoopPart.LOGICAL and loop.index_id in affine_tiled_ids:
+            _vector_loop_refusal(
+                "invalid_vector_loops",
+                position,
+                f"LoopPlan vector_loops[{position}] names an unsplit loop "
+                "that an affine tile replaces with its two parts",
+            )
+        if loop.index_id in panel_tile_ids:
+            # A panel tile becomes a sparse coordinate window only after
+            # lowering, so which of its loops a mark would stay on is not
+            # defined by the plan; it is refused rather than guessed.
+            _vector_loop_refusal(
+                "unsupported_vector_loop",
+                position,
+                f"LoopPlan vector_loops[{position}] names a loop that a panel "
+                "tile splits into a sparse coordinate window after lowering",
+            )
+
+
+def _vector_loop_refusal(code: str, position: Optional[int], message: str) -> NoReturn:
+    """A coded refusal of one ``vector_loops`` reference, as plan legality spells
+    its refusals (``stage=LoopPlan: <code> at <path>: <message>``)."""
+
+    from .loop_plan_legality import LoopPlanDiagnostic
+
+    path: Tuple[str, ...] = ("plan", "vector_loops")
+    if position is not None:
+        path = (*path, str(position))
+    raise VerificationError(
+        f"stage=LoopPlan: {code} at {'/'.join(path)}: {message}",
+        diagnostics=(LoopPlanDiagnostic(code=code, message=message, path=path),),
+    )
 
 
 def verify_loop_plan(
@@ -1049,14 +1307,16 @@ def verify_loop_plan(
         if loop.index_id not in indices:
             raise VerificationError(
                 f"LoopPlan {path} references unknown IndexId "
-                f"{_diagnostic_int(loop.index_id.value)}"
+                f"{_diagnostic_int(loop.index_id.value)}",
+                code="loop_plan_reference_invalid",
             )
 
     def check_symbol(symbol_id: SymbolId, path: str) -> None:
         if symbol_id not in symbols:
             raise VerificationError(
                 f"LoopPlan {path} references unknown SymbolId "
-                f"{_diagnostic_int(symbol_id.value)}"
+                f"{_diagnostic_int(symbol_id.value)}",
+                code="loop_plan_reference_invalid",
             )
 
     _verify_complete_loop_order(plan, indices)
@@ -1066,32 +1326,45 @@ def verify_loop_plan(
     for position, tile in enumerate(plan.tiles):
         check_loop(tile.loop, f"tiles[{position}].loop")
         if tile.loop.part != LoopPart.LOGICAL:
-            raise VerificationError("LoopPlan tiles must target logical loops")
+            raise VerificationError(
+                "LoopPlan tiles must target logical loops",
+                code="loop_plan_reference_invalid",
+            )
         if tile.loop.index_id in tiled_ids:
-            raise VerificationError("LoopPlan tiles the same logical loop twice")
+            raise VerificationError(
+                "LoopPlan tiles the same logical loop twice",
+                code="loop_plan_reference_invalid",
+            )
         tiled_ids.add(tile.loop.index_id)
         if tile.kind == "affine":
             affine_tiled_ids.add(tile.loop.index_id)
         if tile.width <= 0:
-            raise VerificationError("LoopPlan tile widths must be positive")
+            raise VerificationError(
+                "LoopPlan tile widths must be positive",
+                code="loop_plan_reference_invalid",
+            )
         _verify_cpp_int_width(tile.width, "tile widths")
         if tile.placement.kind == PlacementKind.CHILD_OF:
             if tile.placement.parent is None or tile.placement.depth is not None:
                 raise VerificationError(
-                    "LoopPlan child placement requires only a parent loop"
+                    "LoopPlan child placement requires only a parent loop",
+                    code="loop_plan_reference_invalid",
                 )
         elif tile.placement.kind == PlacementKind.AT_DEPTH:
             if tile.placement.depth is None or tile.placement.depth < 0:
                 raise VerificationError(
-                    "LoopPlan depth placement requires a non-negative depth"
+                    "LoopPlan depth placement requires a non-negative depth",
+                    code="loop_plan_reference_invalid",
                 )
             if tile.placement.parent is not None:
                 raise VerificationError(
-                    "LoopPlan depth placement cannot also name a parent"
+                    "LoopPlan depth placement cannot also name a parent",
+                    code="loop_plan_reference_invalid",
                 )
         elif tile.placement.parent is not None or tile.placement.depth is not None:
             raise VerificationError(
-                "LoopPlan outermost placement cannot name a parent or depth"
+                "LoopPlan outermost placement cannot name a parent or depth",
+                code="loop_plan_reference_invalid",
             )
         if tile.placement.parent is not None:
             check_loop(tile.placement.parent, f"tiles[{position}].placement.parent")
@@ -1099,7 +1372,8 @@ def verify_loop_plan(
     def check_derived_loop(loop: LoopRef, path: str) -> None:
         if loop.part != LoopPart.LOGICAL and loop.index_id not in affine_tiled_ids:
             raise VerificationError(
-                f"LoopPlan {path} references a split part of a non-affine loop"
+                f"LoopPlan {path} references a split part of a non-affine loop",
+                code="loop_plan_reference_invalid",
             )
 
     for position, tile in enumerate(plan.tiles):
@@ -1111,26 +1385,43 @@ def verify_loop_plan(
     panel_tile_ids = {tile.loop.index_id for tile in plan.tiles if tile.kind == "panel"}
     bound_ids = {bound.loop.index_id for bound in plan.panel_bounds}
     if len(bound_ids) != len(plan.panel_bounds):
-        raise VerificationError("LoopPlan panel bounds must reference unique loops")
+        raise VerificationError(
+            "LoopPlan panel bounds must reference unique loops",
+            code="loop_plan_reference_invalid",
+        )
     if panel_tile_ids != bound_ids:
         raise VerificationError(
-            "LoopPlan panel tiles and dense panel bounds must correspond exactly"
+            "LoopPlan panel tiles and dense panel bounds must correspond exactly",
+            code="loop_plan_reference_invalid",
         )
     for position, bound in enumerate(plan.panel_bounds):
         check_loop(bound.loop, f"panel_bounds[{position}].loop")
         check_symbol(bound.tensor_id, f"panel_bounds[{position}].tensor_id")
         if bound.level < 0:
-            raise VerificationError("LoopPlan panel-bound levels must be non-negative")
+            raise VerificationError(
+                "LoopPlan panel-bound levels must be non-negative",
+                code="loop_plan_reference_invalid",
+            )
 
     if plan.parallel_loop is not None:
         check_loop(plan.parallel_loop, "parallel_loop")
         check_derived_loop(plan.parallel_loop, "parallel_loop")
     if plan.parallel_loop is not None and any(tile.parallel for tile in plan.tiles):
         raise VerificationError(
-            "LoopPlan may select parallelism either on the plan or a tile, not both"
+            "LoopPlan may select parallelism either on the plan or a tile, not both",
+            code="loop_plan_reference_invalid",
         )
     if sum(tile.parallel for tile in plan.tiles) > 1:
-        raise VerificationError("LoopPlan may mark at most one tile parallel")
+        raise VerificationError(
+            "LoopPlan may mark at most one tile parallel",
+            code="loop_plan_reference_invalid",
+        )
+
+    _verify_vector_loop_refs(
+        plan, check_loop, check_derived_loop, affine_tiled_ids, panel_tile_ids
+    )
+    if plan.entries_of is not None:
+        check_symbol(plan.entries_of, "entries_of")
 
     if plan.relayout is not None:
         relayout = plan.relayout
@@ -1144,10 +1435,16 @@ def verify_loop_plan(
             check_loop(loop, f"relayout.{field}")
             check_derived_loop(loop, f"relayout.{field}")
         if relayout.strip_width <= 0:
-            raise VerificationError("LoopPlan relayout strip width must be positive")
+            raise VerificationError(
+                "LoopPlan relayout strip width must be positive",
+                code="loop_plan_reference_invalid",
+            )
         _verify_cpp_int_width(relayout.strip_width, "relayout strip width")
         if relayout.operand_panel_level < 0 or relayout.operand_pack_level < 0:
-            raise VerificationError("LoopPlan relayout levels must be non-negative")
+            raise VerificationError(
+                "LoopPlan relayout levels must be non-negative",
+                code="loop_plan_reference_invalid",
+            )
         for position, index_id in enumerate(relayout.access_indices):
             check_loop(LoopRef(index_id), f"relayout.access_indices[{position}]")
 
@@ -1157,7 +1454,10 @@ def verify_loop_plan(
         check_loop(result_tile.tile_loop, "result_tile.tile_loop")
         check_derived_loop(result_tile.tile_loop, "result_tile.tile_loop")
         if result_tile.result_level < 0:
-            raise VerificationError("LoopPlan result-tile level must be non-negative")
+            raise VerificationError(
+                "LoopPlan result-tile level must be non-negative",
+                code="loop_plan_reference_invalid",
+            )
         for field, index_ids in (
             ("result_prefix", result_tile.result_prefix),
             ("access_indices", result_tile.access_indices),
@@ -1177,7 +1477,10 @@ def verify_scheduled_cin(scheduled: ScheduledCIN) -> ScheduledCIN:
     """Verify the exact transitional scheduling carrier."""
 
     if type(scheduled) is not ScheduledCIN:
-        raise VerificationError("ScheduledCIN verifier received the wrong artifact")
+        raise VerificationError(
+            "ScheduledCIN verifier received the wrong artifact",
+            code="loop_plan_artifact_invalid",
+        )
     _validate_stored_fields(
         scheduled,
         "scheduled carrier",

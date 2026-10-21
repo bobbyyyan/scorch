@@ -69,8 +69,22 @@ DENSE = LevelKind.DENSE
 COMPRESSED = LevelKind.COMPRESSED
 
 
+def sequential_sum(terms):
+    """Add the terms left to right, one rounding per addition.
+
+    This is the order the interpreter accumulates in, which the exact comparisons
+    below rely on.  The built-in ``sum`` of floats is compensated (Neumaier) from
+    Python 3.12 on, so it can differ from a left-to-right sum in the last place.
+    """
+
+    total = 0.0
+    for term in terms:
+        total += term
+    return total
+
+
 def dense_spmv(rows, x):
-    return [sum(entry * x[j] for j, entry in enumerate(row)) for row in rows]
+    return [sequential_sum(entry * x[j] for j, entry in enumerate(row)) for row in rows]
 
 
 def dense_add(a, b):
@@ -554,7 +568,7 @@ def test_sparse_dense_spmv_randomized_against_other_layouts(seed, shape, density
 
 def dense_csf_reference(cube, shape, x):
     return [
-        sum(
+        sequential_sum(
             cube[i][j][k] * x[k]
             for j in range(shape[1])
             for k in range(shape[2])

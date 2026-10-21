@@ -48,6 +48,7 @@ from scorch.compiler.loopir.pipeline import (
 )
 from scorch.compiler.scheduler import Schedule, Scheduler, regblock_force
 from scorch.stensor import STensor
+from tests.test_scorch.openmp_shared_writes import shared_scalar_writes
 
 FLOAT64_RELATIVE_TOLERANCE = 1e-12
 FLOAT32_RELATIVE_TOLERANCE = 2e-5
@@ -89,7 +90,7 @@ _COORDINATE_MASK_HOISTED_LOOP = (
     "      _accum += _Query_val_ptr[q] * _Key_val_ptr[q];\n"
     "    }\n"
     "    _accum *= _inv_17;\n"
-    "    Sampled_values[pSampled1] = _accum;\n"
+    "    Sampled_values[pMask0] = _accum;\n"
 )
 _COMPRESSED_MASK_HOISTED_LOOP = (
     "      float _accum = 0.0f;\n"
@@ -127,6 +128,11 @@ def test_float32_sddmm_kernel_keeps_its_hoisted_loop_byte_for_byte(
 
     assert cpp.count(hoisted_loop) == 1
     assert cpp.count("_inv_") == 2
+    # The coordinate-mask kernel runs its loop over the mask in parallel.  Before patch
+    # 0047 it wrote the result at a shared counter (pSampled1++) inside that loop, a
+    # data race; it now writes at the mask entry's own position (pMask0).  No kernel
+    # here may write a scalar that the parallel loop shares.
+    assert shared_scalar_writes(cpp) == []
 
 
 def _options(regblock_enabled: bool) -> CompileOptions:

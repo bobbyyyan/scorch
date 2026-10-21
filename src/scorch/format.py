@@ -3,7 +3,7 @@ from __future__ import annotations
 from array import array as _Array
 from collections import deque as _Deque
 from collections.abc import Mapping as _AbcMapping, Sequence
-from dataclasses import FrozenInstanceError, dataclass
+from dataclasses import dataclass
 from enum import Enum
 import json
 
@@ -29,7 +29,11 @@ from typing import (
 import torch  # noqa: F401  -- loads libtorch, which scorch_ops links against
 import scorch_ops as _native  # type: ignore[import-not-found]
 
-from .exceptions import TensorFormatError, TensorTypeError
+from .exceptions import (
+    ScorchFrozenInstanceError,
+    TensorFormatError,
+    TensorTypeError,
+)
 
 if TYPE_CHECKING:
     from .compiler import llir
@@ -139,6 +143,37 @@ def conversion_format(format_letters: str) -> str:
     return "s" * len(format_letters)
 
 
+#: The most positions a kernel's 32-bit ``int`` position addresses (csrc/native_abi.h,
+#: ``kMaxIndexPosition``).
+MAX_INDEX_POSITION = 2**31 - 1
+
+
+def dense_prefix_unaddressable(
+    format_letters: str, level_extents: Sequence[int]
+) -> bool:
+    """Whether the dense levels a sparse layout starts with pass a kernel's positions.
+
+    A dense level holds one position per cell under each parent position.  So the
+    dense levels above a layout's first other level hold the product of their
+    extents, and a compressed level (``"s"``) under them has a position array of that
+    many entries plus one; a coordinate level (``"o"``) has none.  Kernels address
+    positions with a 32-bit ``int`` (csrc/native_abi.h, ``checked_dense_positions``),
+    so past ``MAX_INDEX_POSITION`` no kernel reads the layout, and building it
+    allocates that position array first.  This is the part of the kernels' bound that
+    extents and letters decide; what the levels below store is known only from the
+    arrays.  False for an all-dense layout, whose bound is its element count and is
+    stated by the kernel that reads it.
+    """
+
+    positions = 1
+    for letter, extent in zip(format_letters, level_extents):
+        if letter != "d":
+            entries = positions if letter == "o" else positions + 1
+            return entries > MAX_INDEX_POSITION
+        positions *= extent
+    return False
+
+
 def _actual_type_name(value: object) -> str:
     """Return the real type name without invoking caller-owned descriptors."""
 
@@ -215,14 +250,16 @@ def _parse_level_type(s: str) -> LevelType:
         key = str.lower(str.strip(text))
     else:
         raise TensorTypeError(
-            f"level format must be a string or LevelType, got {_actual_type_name(s)}"
+            f"level format must be a string or LevelType, got {_actual_type_name(s)}",
+            code="level_format_type_invalid",
         )
     try:
         return _STR_TO_LEVEL_TYPE[key]
     except KeyError as error:
         aliases = ", ".join(sorted(_STR_TO_LEVEL_TYPE))
         raise TensorFormatError(
-            f"invalid level format {text!r}; expected one of: {aliases}"
+            f"invalid level format {text!r}; expected one of: {aliases}",
+            code="level_format_unknown",
         ) from error
 
 
@@ -411,14 +448,18 @@ class LevelFormat(_LevelFormatFields):
         else:
             raise TensorTypeError(
                 "level format mode must be a string alias or LevelType, "
-                f"got {_actual_type_name(mode)}"
+                f"got {_actual_type_name(mode)}",
+                code="level_format_type_invalid",
             )
         if bit_width is not None:
             bit_width_type = type(bit_width)
             if bit_width_type is int:
                 canonical_bit_width = bit_width
             elif bit_width_type is bool or not issubclass(bit_width_type, int):
-                raise TensorTypeError("level format bit_width must be an integer")
+                raise TensorTypeError(
+                    "level format bit_width must be an integer",
+                    code="level_format_bit_width_invalid",
+                )
             else:
                 # Validate the underlying integer without trusting subclass
                 # comparison or conversion hooks.  Retain the caller's value
@@ -426,9 +467,14 @@ class LevelFormat(_LevelFormatFields):
                 # canonicalize it to the exact integer proven by this check.
                 canonical_bit_width = int.__int__(bit_width)
             if canonical_bit_width <= 0:
-                raise TensorFormatError("level format bit_width must be positive")
+                raise TensorFormatError(
+                    "level format bit_width must be positive",
+                    code="level_format_bit_width_invalid",
+                )
         if not _seal(self, parsed_mode, bit_width):
-            raise FrozenInstanceError("cannot assign to field '_mode'")
+            raise ScorchFrozenInstanceError(
+                "cannot assign to field '_mode'", code="value_object_already_sealed"
+            )
 
     def get_level_type(self) -> LevelType:
         return self._mode
@@ -635,17 +681,23 @@ class TensorFormat(_TensorFormatFields):
                 # callback-free *recognition* contract, but their exceptions must
                 # not escape this public constructor as arbitrary builtins.
                 raise TensorFormatError(
-                    "tensor format sequence is malformed"
+                    "tensor format sequence is malformed",
+                    code="tensor_format_malformed",
                 ) from error
             try:
                 fields = _format_fields(normalized)
             except Exception as error:
                 # Only a LevelFormat subclass's own accessors run here.
-                raise TensorFormatError("tensor format levels are malformed") from error
+                raise TensorFormatError(
+                    "tensor format levels are malformed", code="tensor_format_malformed"
+                ) from error
             if text is not None and len(_TEXT_FIELDS) < _TEXT_CACHE_MAX:
                 _TEXT_FIELDS[text] = fields
         if not _seal(self, *fields):
-            raise FrozenInstanceError("cannot assign to field '_level_formats'")
+            raise ScorchFrozenInstanceError(
+                "cannot assign to field '_level_formats'",
+                code="value_object_already_sealed",
+            )
 
     def get_level_formats(self) -> Tuple[LevelFormat, ...]:
         """Return immutable per-mode :class:`LevelFormat` values in storage order.
@@ -804,7 +856,10 @@ def _tokenize_format_string(value: str) -> Tuple[str, ...]:
         source = str.__str__(value)
         text = str.lower(str.strip(source))
     else:
-        raise TensorTypeError("tensor format must be a string or sequence of levels")
+        raise TensorTypeError(
+            "tensor format must be a string or sequence of levels",
+            code="tensor_format_type_invalid",
+        )
     if not text:
         return tuple()
     if text in _STR_TO_LEVEL_TYPE:
@@ -812,7 +867,10 @@ def _tokenize_format_string(value: str) -> Tuple[str, ...]:
     if "," in text:
         tokens = tuple(token.strip() for token in text.split(","))
         if any(not token for token in tokens):
-            raise TensorFormatError(f"invalid comma-separated tensor format {source!r}")
+            raise TensorFormatError(
+                f"invalid comma-separated tensor format {source!r}",
+                code="tensor_format_malformed",
+            )
         return tokens
     return tuple(text)
 
@@ -848,7 +906,8 @@ def _normalize_level_formats(
             value_type, *_SEQUENCE_BASES
         ):
             raise TensorTypeError(
-                "tensor format must be a string, level, or sequence of levels"
+                "tensor format must be a string, level, or sequence of levels",
+                code="tensor_format_type_invalid",
             )
         normalized_value = cast(Sequence[Union[LevelFormat, LevelType, str]], value)
     result: List[LevelFormat] = []
@@ -867,7 +926,8 @@ def _normalize_level_formats(
         else:
             raise TensorTypeError(
                 "tensor format levels must be LevelFormat, LevelType, or string; "
-                f"got {_actual_type_name(level)}"
+                f"got {_actual_type_name(level)}",
+                code="level_format_type_invalid",
             )
     return tuple(result)
 
@@ -904,7 +964,9 @@ def parse_format(fmt: FormatInput) -> TensorFormat:
     except (TensorFormatError, TensorTypeError):
         raise
     except Exception as error:
-        raise TensorFormatError("tensor format is malformed") from error
+        raise TensorFormatError(
+            "tensor format is malformed", code="tensor_format_malformed"
+        ) from error
     if text is not None and len(_TEXT_FORMATS) < _TEXT_CACHE_MAX:
         _TEXT_FORMATS[text] = parsed
     return parsed
@@ -967,9 +1029,13 @@ def owned_format(tensor_format: TensorFormat) -> TensorFormat:
                 return tensor_format
         except AttributeError:
             raise TensorFormatError(
-                "tensor format has malformed stored state"
+                "tensor format has malformed stored state",
+                code="value_object_state_corrupt",
             ) from None
     owned_levels = audit_format_state(tensor_format)
     if owned_levels is None:
-        raise TensorFormatError("tensor format has malformed stored state")
+        raise TensorFormatError(
+            "tensor format has malformed stored state",
+            code="value_object_state_corrupt",
+        )
     return TensorFormat(owned_levels)

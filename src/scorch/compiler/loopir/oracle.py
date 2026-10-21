@@ -69,10 +69,12 @@ Everything unexpected fails closed with :class:`LoopIROracleError`.
 
 from __future__ import annotations
 
+import itertools
 from typing import (
     Any,
     Callable,
     Dict,
+    FrozenSet,
     List,
     Mapping,
     Optional,
@@ -660,7 +662,18 @@ class _Oracle:
         return known[0]
 
     def run(self) -> Dict[SymbolId, TensorValue]:
+        source_cells = self._seed_entries_of()
         self._exec_stmt(self.program.body)
+        if source_cells is not None:
+            result = self.program.outputs[0]
+            outside = sorted(set(self.sparse_reductions.get(result, {})) - source_cells)
+            if outside:
+                raise LoopIROracleError(
+                    f"output {self.decls[result].name} was written at "
+                    f"{outside[0]}, a cell input "
+                    f"{self.decls[cast(SymbolId, self.program.entries_of)].name} "
+                    "does not store"
+                )
         results: Dict[SymbolId, TensorValue] = {}
         for symbol, appended in self.unordered_appends.items():
             for coords in sorted(appended):
@@ -688,6 +701,42 @@ class _Oracle:
             else:
                 results[symbol] = self.values[symbol]
         return results
+
+    def _seed_entries_of(self) -> Optional[FrozenSet[Tuple[int, ...]]]:
+        """Store a zero at every entry of the input the program names as the
+        result's entries (``LoopProgram.entries_of``); return those cells.
+
+        The input has the result's dimensions mode for mode (the verifier's
+        rule), so its logical coordinates are the result's.  A dense input
+        stores every cell.  ``None`` when the program names no input.
+
+        The zero is ``0.0`` for every value type, the additive identity every
+        other accumulation here starts from.  :meth:`run` emits the entries
+        sorted by logical coordinate, which is the result's storage order: the
+        pipeline lowers every tensor with a compressed or coordinate level in
+        the identity-order form of its storage order, and the target refuses a
+        result in another mode order (``unsupported_mode_order``).
+        """
+
+        source = self.program.entries_of
+        if source is None:
+            return None
+        result = self.program.outputs[0]
+        storage = self.storages.get(source)
+        cells: List[Tuple[int, ...]] = (
+            storage.stored_coordinates()
+            if storage is not None
+            else [
+                tuple(cell)
+                for cell in itertools.product(
+                    *(range(extent) for extent in self.shapes[source])
+                )
+            ]
+        )
+        entries = self.sparse_reductions.setdefault(result, {})
+        for cell in cells:
+            entries[cell] = 0.0
+        return frozenset(cells)
 
     def _eval_coord(self, expr: Expr) -> int:
         result = self._eval(expr)

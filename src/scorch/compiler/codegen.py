@@ -20,6 +20,7 @@ from .llir_traversal import (
     SUPPORTED_LLIR_NODE_TYPES,
     SUPPORTED_LLIR_STATEMENT_NODE_TYPES,
 )
+from ..exceptions import ScorchTypeError
 
 if TYPE_CHECKING:
     from .compile_options import CompileOptions
@@ -113,7 +114,10 @@ class LLIRLowerer:
             from .compile_options import CompileOptions
 
             if type(compile_options) is not CompileOptions:
-                raise TypeError("compile_options must be a CompileOptions instance")
+                raise ScorchTypeError(
+                    "compile_options must be a CompileOptions instance",
+                    code="internal_argument_type_invalid",
+                )
         self.compile_options = compile_options
         self.no_comments = (
             not compile_options.emit_comments if compile_options is not None else False
@@ -125,7 +129,8 @@ class LLIRLowerer:
         if type(var) is not llir.Var:
             raise CodegenError(
                 "typed variable emission requires an exact LLIR Var; got "
-                f"{type(var).__name__}"
+                f"{type(var).__name__}",
+                code="unknown_llir_node",
             )
         qualifier = "__restrict__ " if var.is_restrict else ""
         return f"{var.type.value} {qualifier}{var.name}"
@@ -138,7 +143,8 @@ class LLIRLowerer:
             type(argument) is not llir.DataType for argument in value
         ):
             raise CodegenError(
-                f"{owner}.template_args must be a tuple of DataType values"
+                f"{owner}.template_args must be a tuple of DataType values",
+                code="invalid_call_template_args",
             )
         if not value:
             return ""
@@ -147,12 +153,16 @@ class LLIRLowerer:
     @staticmethod
     def _validate_expression_sequence(value: object, field: str) -> None:
         if type(value) is not list and type(value) is not tuple:
-            raise CodegenError(f"{field} must be an exact list or tuple")
+            raise CodegenError(
+                f"{field} must be an exact list or tuple",
+                code="invalid_expression_sequence",
+            )
         for expression in value:
             if type(expression) not in EMITTED_LLIR_EXPRESSION_NODE_TYPES:
                 raise CodegenError(
                     f"{field} must contain exact LLIR expressions; got "
-                    f"{type(expression).__name__}"
+                    f"{type(expression).__name__}",
+                    code="invalid_expression_sequence",
                 )
 
     @staticmethod
@@ -161,20 +171,24 @@ class LLIRLowerer:
         try:
             llir._validate_address_of_operand(operand)
         except TypeError as error:
-            raise CodegenError(str(error)) from error
+            raise CodegenError(str(error), code="invalid_address_of_operand") from error
         return cast(llir.AssignmentTarget, operand)
 
     @classmethod
     def _validate_statement_sequence(cls, value: object, field: str) -> None:
         if type(value) is not list and type(value) is not tuple:
-            raise CodegenError(f"{field} must be an exact list or tuple")
+            raise CodegenError(
+                f"{field} must be an exact list or tuple",
+                code="invalid_statement_sequence",
+            )
         for statement in value:
             if type(statement) is list or type(statement) is tuple:
                 cls._validate_statement_sequence(statement, field)
             elif type(statement) not in EMITTED_LLIR_STATEMENT_NODE_TYPES:
                 raise CodegenError(
                     f"{field} must contain exact LLIR statements; got "
-                    f"{type(statement).__name__}"
+                    f"{type(statement).__name__}",
+                    code="invalid_statement_sequence",
                 )
 
     @classmethod
@@ -195,22 +209,25 @@ class LLIRLowerer:
             return
         if isinstance(value, str):
             raise CodegenError(
-                f"{path} must not contain a string subclass; got {type(value).__name__}"
+                f"{path} must not contain a string subclass; got {type(value).__name__}",
+                code="invalid_llir_value",
             )
         if isinstance(value, llir.Node):
             if type(value) not in EMITTED_LLIR_NODE_TYPES:
                 raise CodegenError(
                     "No C++ codegen implemented for LLIR node type: "
-                    f"{type(value).__name__} at {path}"
+                    f"{type(value).__name__} at {path}",
+                    code="invalid_llir_value",
                 )
             if active is None:
                 active = set()
             value_id = id(value)
             if value_id in active:
-                raise CodegenError(f"{path} must be acyclic")
+                raise CodegenError(f"{path} must be acyclic", code="invalid_llir_value")
             if len(active) >= cls._MAX_CODEGEN_TREE_DEPTH:
                 raise CodegenError(
-                    f"{path} exceeds the maximum supported nesting depth"
+                    f"{path} exceeds the maximum supported nesting depth",
+                    code="invalid_llir_value",
                 )
             active.add(value_id)
             try:
@@ -228,10 +245,11 @@ class LLIRLowerer:
                 active = set()
             value_id = id(value)
             if value_id in active:
-                raise CodegenError(f"{path} must be acyclic")
+                raise CodegenError(f"{path} must be acyclic", code="invalid_llir_value")
             if len(active) >= cls._MAX_CODEGEN_TREE_DEPTH:
                 raise CodegenError(
-                    f"{path} exceeds the maximum supported nesting depth"
+                    f"{path} exceeds the maximum supported nesting depth",
+                    code="invalid_llir_value",
                 )
             active.add(value_id)
             try:
@@ -247,7 +265,8 @@ class LLIRLowerer:
         if isinstance(value, (list, tuple)):
             raise CodegenError(
                 f"{path} must not contain a list/tuple subclass; got "
-                f"{type(value).__name__}"
+                f"{type(value).__name__}",
+                code="invalid_llir_value",
             )
 
     def _validate_direct_entry(self, value: object) -> None:
@@ -324,7 +343,8 @@ class LLIRLowerer:
                 LLIRWalker(_FIXED_STACK_ARRAY_CODEGEN_CONTEXT).walk(declaration)
             except LLIRTraversalError as error:
                 raise CodegenError(
-                    f"Invalid LLIR fixed stack array declaration: {error}"
+                    f"Invalid LLIR fixed stack array declaration: {error}",
+                    code="invalid_fixed_stack_array_declaration",
                 ) from error
             return self.lower_llir(
                 f"{declaration.element_type.value} {declaration.name}"
@@ -346,7 +366,8 @@ class LLIRLowerer:
                 LLIRWalker(_DIRECT_INIT_CODEGEN_CONTEXT).walk(direct_initialization)
             except LLIRTraversalError as error:
                 raise CodegenError(
-                    f"Invalid LLIR direct initialization: {error}"
+                    f"Invalid LLIR direct initialization: {error}",
+                    code="invalid_fixed_stack_array_declaration",
                 ) from error
             return self.lower_llir(
                 f"{self._lower_typed_var(direct_initialization.var)}("
@@ -361,16 +382,29 @@ class LLIRLowerer:
                 llir._validate_assignment_target(assignment.var)
             except (TypeError, LLIRTraversalError) as error:
                 raise CodegenError(
-                    f"Invalid LLIR assignment target: {error}"
+                    f"Invalid LLIR assignment target: {error}",
+                    code="invalid_fixed_stack_array_declaration",
                 ) from error
             if type(assignment.op) is not llir.AssignOp:
-                raise CodegenError("LLIR Assign.op must be an AssignOp")
+                raise CodegenError(
+                    "LLIR Assign.op must be an AssignOp",
+                    code="invalid_fixed_stack_array_declaration",
+                )
             if type(assignment.cast) is not bool:
-                raise CodegenError("LLIR Assign.cast must be a bool")
+                raise CodegenError(
+                    "LLIR Assign.cast must be a bool",
+                    code="invalid_fixed_stack_array_declaration",
+                )
             if assignment.cast and type(assignment.var) is not llir.Var:
-                raise CodegenError("LLIR Assign.cast requires an exact Var target")
+                raise CodegenError(
+                    "LLIR Assign.cast requires an exact Var target",
+                    code="invalid_fixed_stack_array_declaration",
+                )
             if not isinstance(assignment.value, llir.Expr):
-                raise CodegenError("LLIR Assign.value must be an expression")
+                raise CodegenError(
+                    "LLIR Assign.value must be an expression",
+                    code="invalid_fixed_stack_array_declaration",
+                )
             target = self._render_expression(assignment.var)
             if no_semicolon:
                 return self.lower_llir(
@@ -442,7 +476,10 @@ class LLIRLowerer:
         elif type(ir) is llir.Increment:
             increment = cast(llir.Increment, ir)
             if type(increment.var) is not llir.Var:
-                raise CodegenError("Increment.var must be an exact LLIR Var")
+                raise CodegenError(
+                    "Increment.var must be an exact LLIR Var",
+                    code="invalid_fixed_stack_array_declaration",
+                )
             if no_semicolon:
                 return self.lower_llir(f"{increment.var.name}++", indent_level)
             return self.lower_llir(f"{increment.var.name}++;", indent_level)
@@ -456,7 +493,8 @@ class LLIRLowerer:
             )
 
         raise CodegenError(
-            f"No C++ codegen implemented for LLIR node type: {type(ir).__name__}"
+            f"No C++ codegen implemented for LLIR node type: {type(ir).__name__}",
+            code="invalid_fixed_stack_array_declaration",
         )
 
     def _lower_member_call_stmt(
@@ -466,23 +504,31 @@ class LLIRLowerer:
     ) -> str:
         base = getattr(member_call_stmt, "base", None)
         if not isinstance(base, llir.Expr):
-            raise CodegenError("MemberCallStmt.base must be an LLIR Expr")
+            raise CodegenError(
+                "MemberCallStmt.base must be an LLIR Expr",
+                code="invalid_member_call_stmt_base",
+            )
         member = getattr(member_call_stmt, "member", None)
         if type(member) is not str or not member.isidentifier():
-            raise CodegenError("MemberCallStmt.member must be a non-empty identifier")
+            raise CodegenError(
+                "MemberCallStmt.member must be a non-empty identifier",
+                code="invalid_member_call_stmt_member",
+            )
         template_args = getattr(member_call_stmt, "template_args", None)
         if type(template_args) is not tuple or any(
             type(argument) is not llir.DataType for argument in template_args
         ):
             raise CodegenError(
-                "MemberCallStmt.template_args must be a tuple of DataType values"
+                "MemberCallStmt.template_args must be a tuple of DataType values",
+                code="invalid_member_call_stmt_template_args",
             )
         args = getattr(member_call_stmt, "args", None)
         if type(args) is not tuple or any(
             not isinstance(argument, llir.Expr) for argument in args
         ):
             raise CodegenError(
-                "MemberCallStmt.args must be a tuple of LLIR expressions"
+                "MemberCallStmt.args must be a tuple of LLIR expressions",
+                code="invalid_member_call_stmt_args",
             )
         receiver = self._render_operand(
             base,
@@ -510,7 +556,7 @@ class LLIRLowerer:
         try:
             llir._validate_guarded_call_fields(guarded_call)
         except TypeError as error:
-            raise CodegenError(str(error)) from error
+            raise CodegenError(str(error), code="invalid_guarded_call_stmt") from error
         condition = self._render_expression(guarded_call.cond)
         call_statement = self._lower_llir_impl(guarded_call.call)
         return self.lower_llir(
@@ -541,12 +587,19 @@ class LLIRLowerer:
         if type(ir) is llir.QualifiedName:
             if type(ir.namespace) is not str or not ir.namespace.isidentifier():
                 raise CodegenError(
-                    "QualifiedName.namespace must be a non-empty identifier"
+                    "QualifiedName.namespace must be a non-empty identifier",
+                    code="invalid_qualified_name_namespace",
                 )
             if type(ir.name) is not str or not ir.name.isidentifier():
-                raise CodegenError("QualifiedName.name must be a non-empty identifier")
+                raise CodegenError(
+                    "QualifiedName.name must be a non-empty identifier",
+                    code="invalid_qualified_name_name",
+                )
             if type(ir.data_type) is not llir.DataType:
-                raise CodegenError("QualifiedName.data_type must be a DataType")
+                raise CodegenError(
+                    "QualifiedName.data_type must be a DataType",
+                    code="invalid_qualified_name_data_type",
+                )
             return f"{ir.namespace}::{ir.name}"
 
         if type(ir) is llir.Var:
@@ -554,9 +607,13 @@ class LLIRLowerer:
 
         if type(ir) is llir.Cast:
             if not isinstance(ir.expr, llir.Expr):
-                raise CodegenError("Cast.expr must be an LLIR Expr")
+                raise CodegenError(
+                    "Cast.expr must be an LLIR Expr", code="invalid_cast_expr"
+                )
             if type(ir.data_type) is not llir.DataType:
-                raise CodegenError("Cast.data_type must be a DataType")
+                raise CodegenError(
+                    "Cast.data_type must be a DataType", code="invalid_cast_data_type"
+                )
             operand = self._render_operand(
                 ir.expr,
                 parent_precedence=self._UNARY_PRECEDENCE,
@@ -570,7 +627,10 @@ class LLIRLowerer:
         if type(ir) is llir.Sizeof:
             data_type = getattr(ir, "data_type", None)
             if type(data_type) is not llir.DataType:
-                raise CodegenError("Sizeof.data_type must be a DataType")
+                raise CodegenError(
+                    "Sizeof.data_type must be a DataType",
+                    code="invalid_sizeof_data_type",
+                )
             return f"sizeof({data_type.value})"
 
         if type(ir) is llir.AddressOf:
@@ -585,15 +645,22 @@ class LLIRLowerer:
         if type(ir) in (llir.BinOp, llir.Add, llir.Mul):
             binary = cast(llir.BinOp, ir)
             if type(binary.op) is not str or not binary.op:
-                raise CodegenError("LLIR binary operator must be a non-empty string")
+                raise CodegenError(
+                    "LLIR binary operator must be a non-empty string",
+                    code="invalid_llir_value",
+                )
             if type(binary) is llir.Add and binary.op != "+":
-                raise CodegenError("Add.op must remain '+'")
+                raise CodegenError("Add.op must remain '+'", code="invalid_add_op")
             if type(binary) is llir.Mul and binary.op != "*":
-                raise CodegenError("Mul.op must remain '*'")
+                raise CodegenError("Mul.op must remain '*'", code="invalid_mul_op")
             if not isinstance(binary.left, llir.Expr):
-                raise CodegenError("BinOp.left must be an LLIR Expr")
+                raise CodegenError(
+                    "BinOp.left must be an LLIR Expr", code="invalid_bin_op_left"
+                )
             if not isinstance(binary.right, llir.Expr):
-                raise CodegenError("BinOp.right must be an LLIR Expr")
+                raise CodegenError(
+                    "BinOp.right must be an LLIR Expr", code="invalid_bin_op_right"
+                )
             precedence = self._binary_precedence(binary.op)
             left = self._render_operand(
                 binary.left,
@@ -609,7 +676,10 @@ class LLIRLowerer:
 
         if type(ir) is llir.UnaryOp:
             if ir.op not in self._UNARY_OPERATORS:
-                raise CodegenError(f"Unsupported LLIR unary operator: {ir.op!r}")
+                raise CodegenError(
+                    f"Unsupported LLIR unary operator: {ir.op!r}",
+                    code="invalid_llir_value",
+                )
             operand = self._render_operand(
                 ir.operand,
                 parent_precedence=self._UNARY_PRECEDENCE,
@@ -619,15 +689,22 @@ class LLIRLowerer:
 
         if type(ir) is llir.FunctionCall:
             if type(ir.name) is not str or not ir.name.strip():
-                raise CodegenError("FunctionCall.name must be a non-empty string")
+                raise CodegenError(
+                    "FunctionCall.name must be a non-empty string",
+                    code="invalid_function_call_name",
+                )
             template_args = self._render_call_template_args(
                 getattr(ir, "template_args", None), owner="FunctionCall"
             )
             if type(ir.args) is not tuple:
-                raise CodegenError("FunctionCall.args must be a tuple")
+                raise CodegenError(
+                    "FunctionCall.args must be a tuple",
+                    code="invalid_function_call_args",
+                )
             if any(not isinstance(argument, llir.Expr) for argument in ir.args):
                 raise CodegenError(
-                    "FunctionCall.args must contain only LLIR expressions"
+                    "FunctionCall.args must contain only LLIR expressions",
+                    code="invalid_function_call_args",
                 )
             return (
                 f"{ir.name}{template_args}"
@@ -636,18 +713,31 @@ class LLIRLowerer:
 
         if type(ir) is llir.Array:
             if type(ir.values) is not tuple:
-                raise CodegenError("Array.values must be a tuple")
+                raise CodegenError(
+                    "Array.values must be a tuple", code="invalid_array_values"
+                )
             if any(not isinstance(value, llir.Expr) for value in ir.values):
-                raise CodegenError("Array.values must contain only LLIR expressions")
+                raise CodegenError(
+                    "Array.values must contain only LLIR expressions",
+                    code="invalid_array_values",
+                )
             if type(ir.data_type) is not llir.DataType:
-                raise CodegenError("Array.data_type must be a DataType")
+                raise CodegenError(
+                    "Array.data_type must be a DataType", code="invalid_array_data_type"
+                )
             return "{" + ", ".join(self._render_expression(v) for v in ir.values) + "}"
 
         if type(ir) is llir.MemberAccess:
             if not isinstance(ir.base, llir.Expr):
-                raise CodegenError("MemberAccess.base must be an LLIR Expr")
+                raise CodegenError(
+                    "MemberAccess.base must be an LLIR Expr",
+                    code="invalid_member_access_base",
+                )
             if type(ir.member) is not str or not ir.member.isidentifier():
-                raise CodegenError("MemberAccess.member must be a non-empty identifier")
+                raise CodegenError(
+                    "MemberAccess.member must be a non-empty identifier",
+                    code="invalid_member_access_member",
+                )
             base = self._render_operand(
                 ir.base,
                 parent_precedence=self._POSTFIX_PRECEDENCE,
@@ -657,20 +747,28 @@ class LLIRLowerer:
 
         if type(ir) is llir.MemberCall:
             if not isinstance(ir.base, llir.Expr):
-                raise CodegenError("MemberCall.base must be an LLIR Expr")
+                raise CodegenError(
+                    "MemberCall.base must be an LLIR Expr",
+                    code="invalid_member_call_base",
+                )
             if type(ir.member) is not str or not ir.member.isidentifier():
-                raise CodegenError("MemberCall.member must be a non-empty identifier")
+                raise CodegenError(
+                    "MemberCall.member must be a non-empty identifier",
+                    code="invalid_member_call_member",
+                )
             if type(ir.template_args) is not tuple or any(
                 type(argument) is not llir.DataType for argument in ir.template_args
             ):
                 raise CodegenError(
-                    "MemberCall.template_args must be a tuple of DataType values"
+                    "MemberCall.template_args must be a tuple of DataType values",
+                    code="invalid_member_call_template_args",
                 )
             if type(ir.args) is not tuple or any(
                 not isinstance(argument, llir.Expr) for argument in ir.args
             ):
                 raise CodegenError(
-                    "MemberCall.args must be a tuple of LLIR expressions"
+                    "MemberCall.args must be a tuple of LLIR expressions",
+                    code="invalid_member_call_args",
                 )
             base = self._render_operand(
                 ir.base,
@@ -694,7 +792,8 @@ class LLIRLowerer:
             return f"{array}[{self._render_expression(ir.index)}]"
 
         raise CodegenError(
-            f"No C++ codegen implemented for LLIR expression type: {type(ir).__name__}"
+            f"No C++ codegen implemented for LLIR expression type: {type(ir).__name__}",
+            code="invalid_llir_value",
         )
 
     def _render_select(self, ir: llir.Select) -> str:
@@ -709,11 +808,18 @@ class LLIRLowerer:
         true_value = getattr(ir, "when_true", None)
         false_value = getattr(ir, "when_false", None)
         if not isinstance(condition_value, llir.Expr):
-            raise CodegenError("Select.cond must be an LLIR Expr")
+            raise CodegenError(
+                "Select.cond must be an LLIR Expr", code="invalid_select_cond"
+            )
         if not isinstance(true_value, llir.Expr):
-            raise CodegenError("Select.when_true must be an LLIR Expr")
+            raise CodegenError(
+                "Select.when_true must be an LLIR Expr", code="invalid_select_when_true"
+            )
         if not isinstance(false_value, llir.Expr):
-            raise CodegenError("Select.when_false must be an LLIR Expr")
+            raise CodegenError(
+                "Select.when_false must be an LLIR Expr",
+                code="invalid_select_when_false",
+            )
         condition = self._render_operand(
             condition_value,
             parent_precedence=self._CONDITIONAL_PRECEDENCE + 1,
@@ -733,9 +839,14 @@ class LLIRLowerer:
 
     def _render_literal(self, ir: llir.Literal) -> str:
         if type(ir.value) not in (bool, int, float, str):
-            raise CodegenError("Literal.value must be a bool, int, float, or string")
+            raise CodegenError(
+                "Literal.value must be a bool, int, float, or string",
+                code="invalid_literal_value",
+            )
         if type(ir.data_type) is not llir.DataType:
-            raise CodegenError("Literal.data_type must be a DataType")
+            raise CodegenError(
+                "Literal.data_type must be a DataType", code="invalid_literal_value"
+            )
         if type(ir.value) is str and ir.data_type is llir.DataType.STRING:
             return self._render_string_literal(ir.value)
         if type(ir.value) is bool and ir.data_type is llir.DataType.BOOL:
@@ -761,7 +872,8 @@ class LLIRLowerer:
             else:
                 raise CodegenError(
                     "Literal STRING value contains an unsupported character: "
-                    f"{character!r}"
+                    f"{character!r}",
+                    code="invalid_literal_value",
                 )
         rendered.append('"')
         return "".join(rendered)
@@ -811,14 +923,18 @@ class LLIRLowerer:
         ):
             return self._PRIMARY_PRECEDENCE
         raise CodegenError(
-            f"No C++ precedence defined for LLIR expression type: {type(ir).__name__}"
+            f"No C++ precedence defined for LLIR expression type: {type(ir).__name__}",
+            code="unhandled_supported_llir_node",
         )
 
     def _binary_precedence(self, op: str) -> int:
         try:
             return self._BINARY_PRECEDENCE[op]
         except KeyError as exc:
-            raise CodegenError(f"Unsupported LLIR binary operator: {op!r}") from exc
+            raise CodegenError(
+                f"Unsupported LLIR binary operator: {op!r}",
+                code="invalid_binary_operator",
+            ) from exc
 
     @staticmethod
     def _omp_num_threads_clause(ir: "llir.ForLoop") -> str:
@@ -846,7 +962,10 @@ class LLIRLowerer:
         pragma_lines: List[str] = []
         if type(ir) is llir.WhileLoop:
             if type(ir.cond) not in EMITTED_LLIR_EXPRESSION_NODE_TYPES:
-                raise CodegenError("LLIR WhileLoop.cond must be an exact expression")
+                raise CodegenError(
+                    "LLIR WhileLoop.cond must be an exact expression",
+                    code="invalid_while_loop_cond",
+                )
             self._validate_statement_sequence(ir.body, "LLIR WhileLoop.body")
             header = f"while ({self.lower_llir(ir.cond)}) {{"
         elif type(ir) is llir.ForLoop:
@@ -855,17 +974,22 @@ class LLIRLowerer:
                 llir.VarDecl,
             ):
                 raise CodegenError(
-                    "LLIR ForLoop.init must be an exact VarInit, VarDecl, or None"
+                    "LLIR ForLoop.init must be an exact VarInit, VarDecl, or None",
+                    code="invalid_for_loop_init",
                 )
             if type(ir.cond) not in EMITTED_LLIR_EXPRESSION_NODE_TYPES:
-                raise CodegenError("LLIR ForLoop.cond must be an exact expression")
+                raise CodegenError(
+                    "LLIR ForLoop.cond must be an exact expression",
+                    code="invalid_for_loop_cond",
+                )
             if type(ir.update) not in (
                 llir.Increment,
                 llir.FunctionCall,
                 llir.Assign,
             ):
                 raise CodegenError(
-                    "LLIR ForLoop.update must be an exact supported update node"
+                    "LLIR ForLoop.update must be an exact supported update node",
+                    code="invalid_for_loop_update",
                 )
             self._validate_statement_sequence(ir.body, "LLIR ForLoop.body")
             for field in (
@@ -895,13 +1019,26 @@ class LLIRLowerer:
                 # bound, ``std::min(_start + _chunk, A0_size)`` mixes ``int``
                 # and ``int64_t`` and has no overload, so the kernel did not
                 # build.  A 64-bit loop keeps its type throughout.
+                #
+                # The shared counter is int64_t whatever the loop's type.  Each
+                # worker's last fetch_add, the one that finds the counter past
+                # the bound, still adds a chunk, so with T workers the counter
+                # ends at up to bound - 1 + (T + 1) x chunk.  An ``int`` counter
+                # wraps there once the bound is within (T + 1) x chunk of
+                # 2**31 - 1, and a worker that reads the wrapped, negative start
+                # passes ``_start >= bound`` and runs iterations below zero.  The
+                # start and the chunk end are therefore formed in int64_t, and
+                # only the end, at most the bound, is narrowed to the loop's type.
                 wide = ir.init is not None and ir.init.var.type is llir.DataType.INT64
-                counter_type = "int64_t" if wide else "int"
+                counter_type = "int64_t"
+                loop_type = "int64_t" if wide else "int"
                 chunk_end = (
                     f"std::min<int64_t>(_start + {chunk_var}, {loop_bound})"
                     if wide
-                    else f"std::min(_start + {chunk_var}, {loop_bound})"
+                    else f"static_cast<int>(std::min<int64_t>(_start + {chunk_var}, "
+                    f"{loop_bound}))"
                 )
+                loop_start = "_start" if wide else "static_cast<int>(_start)"
                 parts = []
                 if ir.before_parallel_body:
                     parts.append(self.lower_llir(ir.before_parallel_body, indent_level))
@@ -937,13 +1074,13 @@ class LLIRLowerer:
                 )
                 parts.append(
                     self.lower_llir(
-                        f"const {counter_type} _end = {chunk_end};",
+                        f"const {loop_type} _end = {chunk_end};",
                         indent_level + 2,
                     )
                 )
                 parts.append(
                     self.lower_llir(
-                        f"for ({counter_type} {loop_var} = _start; {loop_var} < _end; {loop_var}++) {{",
+                        f"for ({loop_type} {loop_var} = {loop_start}; {loop_var} < _end; {loop_var}++) {{",
                         indent_level + 2,
                     )
                 )
@@ -1011,9 +1148,15 @@ class LLIRLowerer:
             )
         elif type(ir) is llir.ForLoopAuto:
             if type(ir.var) is not llir.Var:
-                raise CodegenError("LLIR ForLoopAuto.var must be an exact Var")
+                raise CodegenError(
+                    "LLIR ForLoopAuto.var must be an exact Var",
+                    code="invalid_for_loop_auto_var",
+                )
             if type(ir.array) not in EMITTED_LLIR_EXPRESSION_NODE_TYPES:
-                raise CodegenError("LLIR ForLoopAuto.array must be an exact expression")
+                raise CodegenError(
+                    "LLIR ForLoopAuto.array must be an exact expression",
+                    code="invalid_for_loop_auto_array",
+                )
             self._validate_statement_sequence(ir.body, "LLIR ForLoopAuto.body")
             header = (
                 f"for ({ir.var.type.value} {self.lower_llir(ir.var)}"
@@ -1021,7 +1164,8 @@ class LLIRLowerer:
             )
         else:
             raise CodegenError(
-                f"No C++ codegen implemented for LLIR loop type: {type(ir).__name__}"
+                f"No C++ codegen implemented for LLIR loop type: {type(ir).__name__}",
+                code="invalid_llir_value",
             )
 
         loop_text = (
@@ -1060,13 +1204,20 @@ class LLIRLowerer:
         if type(ir) is not llir.LambdaDef:
             raise CodegenError(
                 "lambda emission requires an exact LLIR LambdaDef; got "
-                f"{type(ir).__name__}"
+                f"{type(ir).__name__}",
+                code="unknown_llir_node",
             )
         if type(ir.params) not in (list, tuple):
-            raise CodegenError("LLIR LambdaDef.params must be a list or tuple")
+            raise CodegenError(
+                "LLIR LambdaDef.params must be a list or tuple",
+                code="invalid_lambda_def_params",
+            )
         for param in ir.params:
             if type(param) is not llir.Var:
-                raise CodegenError("LLIR LambdaDef.params must hold exact LLIR Vars")
+                raise CodegenError(
+                    "LLIR LambdaDef.params must hold exact LLIR Vars",
+                    code="invalid_lambda_def_params",
+                )
         self._validate_statement_sequence(ir.body, "LLIR LambdaDef.body")
         parameters = ", ".join(self._lower_typed_var(param) for param in ir.params)
         return "\n".join(
@@ -1084,12 +1235,16 @@ class LLIRLowerer:
         if type(ir) is not llir.IfThenElse:
             raise CodegenError(
                 "conditional emission requires an exact LLIR IfThenElse; got "
-                f"{type(ir).__name__}"
+                f"{type(ir).__name__}",
+                code="unknown_llir_node",
             )
         if ir.cond is not None and type(ir.cond) not in (
             EMITTED_LLIR_EXPRESSION_NODE_TYPES
         ):
-            raise CodegenError("LLIR IfThenElse.cond must be an exact expression")
+            raise CodegenError(
+                "LLIR IfThenElse.cond must be an exact expression",
+                code="invalid_if_then_else_cond",
+            )
         if ir.then_body is not None:
             self._validate_statement_sequence(
                 ir.then_body,
@@ -1106,7 +1261,8 @@ class LLIRLowerer:
                 and type(ir.then_body_list) is not tuple
             ):
                 raise CodegenError(
-                    "LLIR IfThenElse.then_body_list must be an exact list or tuple"
+                    "LLIR IfThenElse.then_body_list must be an exact list or tuple",
+                    code="invalid_if_then_else_then_body_list",
                 )
             for branch in ir.then_body_list:
                 self._validate_statement_sequence(
@@ -1122,11 +1278,13 @@ class LLIRLowerer:
         if ir.cond_list:
             if not ir.then_body_list:
                 raise CodegenError(
-                    "LLIR IfThenElse with cond_list requires then_body_list"
+                    "LLIR IfThenElse with cond_list requires then_body_list",
+                    code="invalid_llir_value",
                 )
             if len(ir.cond_list) != len(ir.then_body_list):
                 raise CodegenError(
-                    "LLIR IfThenElse condition and body counts must match"
+                    "LLIR IfThenElse condition and body counts must match",
+                    code="invalid_llir_value",
                 )
 
             total_num_conds = len(ir.cond_list) + (1 if ir.else_body else 0)
@@ -1159,9 +1317,13 @@ class LLIRLowerer:
                     )
         else:
             if ir.cond is None:
-                raise CodegenError("LLIR IfThenElse requires a condition")
+                raise CodegenError(
+                    "LLIR IfThenElse requires a condition", code="invalid_llir_value"
+                )
             if not ir.then_body:
-                raise CodegenError("LLIR IfThenElse requires a then body")
+                raise CodegenError(
+                    "LLIR IfThenElse requires a then body", code="invalid_llir_value"
+                )
             result += (
                 self.lower_llir(f"if ({self.lower_llir(ir.cond)}) {{", indent_level)
                 + "\n"
@@ -1187,7 +1349,8 @@ class LLIRLowerer:
         if type(ir) is not llir.Function:
             raise CodegenError(
                 "function emission requires an exact LLIR Function; got "
-                f"{type(ir).__name__}"
+                f"{type(ir).__name__}",
+                code="unknown_llir_node",
             )
         self._validate_expression_sequence(ir.args, "LLIR Function.args")
         self._validate_statement_sequence(ir.body, "LLIR Function.body")
@@ -1197,11 +1360,14 @@ class LLIRLowerer:
             ]
             raise CodegenError(
                 "LLIR Function arguments must be Var nodes; got "
-                + ", ".join(invalid_types)
+                + ", ".join(invalid_types),
+                code="invalid_llir_value",
             )
         args = cast(List[llir.Var], ir.args)
         if not all(arg.type for arg in args):
-            raise CodegenError("All LLIR Function arguments must have types")
+            raise CodegenError(
+                "All LLIR Function arguments must have types", code="invalid_llir_value"
+            )
         header = (
             f"{ir.return_type.value} {ir.name}"
             + f"({', '.join([self._lower_typed_var(arg) for arg in args])}) {{"

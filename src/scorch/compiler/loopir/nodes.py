@@ -347,6 +347,21 @@ class ParallelIntent(Enum):
 
 
 @unique
+class VectorLoopPart(Enum):
+    """Which loop of an index a recorded vector mark names.
+
+    ``LOGICAL`` is the unsplit loop that binds the index; ``OUTER`` and
+    ``INNER`` are the origin loop and the point loop of the index's split.
+    Unlike :class:`ParallelPart`, the point loop is representable: it is the
+    innermost loop of a strip-mined sum, the loop vector instructions run.
+    """
+
+    LOGICAL = "logical"
+    OUTER = "outer"
+    INNER = "inner"
+
+
+@unique
 class BinaryOp(Enum):
     """Value-typed binary operators; coordinates never flow through these."""
 
@@ -1297,6 +1312,24 @@ class ParallelSelection(LoopIRNode):
     intent: ParallelIntent
 
 
+@dataclass(frozen=True)
+class VectorLoop(LoopIRNode):
+    """One loop a schedule keeps marked for vector instructions.
+
+    Names the loop by ``(index, part)``, the identity scheme of
+    :class:`ParallelSelection`.  Which loops are safe to mark is a target
+    fact (the shared rule ``iter_lattice.mark_simd_on_reduction_loops``: a
+    loop of a sum kept in a register, with no loop over a compressed level's
+    positions in its body, not parallel or unrolled, and with no early exit);
+    the recorded marks choose among them.  The pragma spelling and any
+    reduction clause are target decisions and appear nowhere in LoopIR.
+    """
+
+    node_id: LoopIRNodeId
+    index: IndexId
+    part: VectorLoopPart
+
+
 @unique
 class AssemblyStrategy(Enum):
     """How a sparse result is assembled, target-neutrally.
@@ -1360,6 +1393,40 @@ class LoopProgram(LoopIRNode):
     and every existing layer keeps choosing what it chooses today — including
     the two-phase transform's substitution, which is why a program that records
     nothing emits exactly what it emitted before this field existed.
+
+    ``entries_of`` optionally names the input whose stored entries are the
+    sparse result's entries.  ``None`` means the result stores the entries its
+    statements write: an :class:`AppendEntry` or :class:`StoreReduce` that
+    executes.  With an input named, every stored entry of that input is a
+    result entry, written or not, and its value is what the statements add
+    there (zero where nothing reaches it); a statement may write no entry the
+    input does not store.  The two give the same values and differ in which
+    zeros are stored.  The front end names an input only when the plan does
+    (``LoopPlan.entries_of``, which a schedule requests as
+    ``Schedule.entries_of``), and only where a reduction into a COO result is a
+    product with one factor that has exactly the result's indices, in the
+    result's logical and storage order, under the result's loops
+    (:func:`~scorch.compiler.sparse_assembly.entry_source`): that is the
+    structure the shipped compiler builds under scalar accumulation, and its
+    size is known before the loops run, so the result is allocated once and
+    written by position.  With no plan decision it names none.  Unlike the
+    three fields above, this one is program semantics (it decides which zeros
+    are stored): the front end records it from the plan, every scheduling pass
+    keeps it, and schedule erasure does not remove it.
+
+    ``vector_loops`` optionally records which loops keep a vector mark
+    (:class:`VectorLoop`), on the same terms as ``parallel``, ``assembly`` and
+    ``accumulator``: a scheduling decision, stamped last, erased with the
+    schedule.  ``None`` means no decision was recorded and the target places
+    the marks it placed before this field existed, which is none: the shared
+    rule runs only on a recorded decision, so a program that records nothing
+    emits exactly what it emitted before.  (The shipped compiler, with no
+    decision, marks the safe loops below a sparse result entry whose sum is
+    kept in a register.)  A tuple, the empty one included, keeps the mark on
+    exactly the named loops; naming a loop the rule does not find safe is
+    refused (``unsupported_vector_loop``).  The shipped compiler reads the same
+    decision from ``LoopPlan.vector_loops``, so one tuple marks the same loops
+    in both compilers.
     """
 
     node_id: LoopIRNodeId
@@ -1371,3 +1438,5 @@ class LoopProgram(LoopIRNode):
     parallel: Optional[ParallelSelection] = None
     assembly: Optional[AssemblyStrategy] = None
     accumulator: Optional[AccumulatorStructure] = None
+    entries_of: Optional[SymbolId] = None
+    vector_loops: Optional[Tuple[VectorLoop, ...]] = None

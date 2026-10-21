@@ -514,6 +514,25 @@ def _phase_state_statements(value: object) -> List[llir.Stmt]:
     return statements
 
 
+def _state_type(name: str) -> llir.DataType:
+    """``_cnt{L}``, ``_pos{L}`` and ``_prev{L}``: ``int`` at level 1, int64_t below.
+
+    A cell's count at level 1 is at most that level's extent; a deeper level's is
+    bounded only by a product of extents and can pass ``int`` (patch 0038c).
+    """
+
+    level = int(re.sub(r"^\D+", "", name))
+    return llir.DataType.INT if level == 1 else llir.DataType.INT64
+
+
+def _count_vector_type(level: int) -> llir.DataType:
+    """``_count{L}`` holds each cell's ``_cnt{L}``: ``std::vector<int>`` at level 1."""
+
+    return (
+        llir.DataType.STD_VECTOR_C_INT if level == 1 else llir.DataType.STD_VECTOR_INT
+    )
+
+
 def _phase_state_codes(value: object) -> List[str]:
     return [
         LLIRLowerer().lower_llir(statement).removesuffix(";")
@@ -852,8 +871,9 @@ def test_dss_transform_builds_each_compressed_boundary_once() -> None:
     )
 
     assert "int _cnt1 = 0" in count_state_codes
-    assert "int _cnt2 = 0" in count_state_codes
-    assert "int _prev2 = 0" in count_state_codes
+    # A deeper level's count in one cell can pass `int` (patch 0038c): int64_t.
+    assert "int64_t _cnt2 = 0" in count_state_codes
+    assert "int64_t _prev2 = 0" in count_state_codes
     assert cast(llir.BinOp, count_boundary.cond).op == ">"
     assert _phase_state_codes(count_boundary.then_body) == [
         "_cnt1++",
@@ -1603,7 +1623,7 @@ def test_count_fill_state_is_typed_structural_fresh_and_never_raw() -> None:
         if type(statement) is llir.VarInit:
             initialization = cast(llir.VarInit, statement)
             assert type(initialization.var) is llir.Var
-            assert initialization.var.type is llir.DataType.INT
+            assert initialization.var.type is _state_type(initialization.var.name)
             assert type(initialization.value) is llir.Literal
             literal = cast(llir.Literal, initialization.value)
             assert literal.value == 0
@@ -1611,17 +1631,17 @@ def test_count_fill_state_is_typed_structural_fresh_and_never_raw() -> None:
         elif type(statement) is llir.Increment:
             increment = cast(llir.Increment, statement)
             assert type(increment.var) is llir.Var
-            assert increment.var.type is llir.DataType.INT
+            assert increment.var.type is _state_type(increment.var.name)
         else:
             assignment = cast(llir.Assign, statement)
             assert type(assignment.var) is llir.Var
             assert type(assignment.value) is llir.Var
-            assert assignment.var.type is llir.DataType.INT
-            assert assignment.value.type is llir.DataType.INT
+            assert assignment.var.type is _state_type(assignment.var.name)
+            assert assignment.value.type is _state_type(assignment.value.name)
             assert assignment.var is not assignment.value
 
     assert all(type(var) is llir.Var for var in first_state_vars)
-    assert all(var.type is llir.DataType.INT for var in first_state_vars)
+    assert all(var.type is _state_type(var.name) for var in first_state_vars)
     assert Counter(var.name for var in first_state_vars) == {
         "_cnt1": 4,
         "_cnt2": 5,
@@ -1897,7 +1917,7 @@ def test_offset_family_is_typed_owned_structural_fresh_and_never_raw() -> None:
         assert type(owner) is llir.DirectInit
         assert type(owner.var) is llir.Var
         assert owner.var.name == f"_count{level}"
-        assert owner.var.type is llir.DataType.STD_VECTOR_C_INT
+        assert owner.var.type is _count_vector_type(level)
         assert owner.var.is_ptr is False
         assert owner.var.is_restrict is False
         assert owner.var.tensor_access is None
@@ -1916,7 +1936,7 @@ def test_offset_family_is_typed_owned_structural_fresh_and_never_raw() -> None:
         assert type(fill) is llir.Literal
         assert (fill.value, fill.data_type) == (0, llir.DataType.INT)
         expected = llir.DirectInit(
-            llir.Var(f"_count{level}", llir.DataType.STD_VECTOR_C_INT),
+            llir.Var(f"_count{level}", _count_vector_type(level)),
             (
                 llir.Cast(
                     llir.Var("A0_size", llir.DataType.INT64),
@@ -2066,7 +2086,7 @@ def test_offset_family_is_typed_owned_structural_fresh_and_never_raw() -> None:
         assert (
             cast(llir.Var, count_access.array).name,
             cast(llir.Var, count_access.array).type,
-        ) == (f"_count{level}", llir.DataType.STD_VECTOR_C_INT)
+        ) == (f"_count{level}", _count_vector_type(level))
         assert type(offset_access.index) is llir.Var
         assert type(count_access.index) is llir.Var
         assert (
@@ -2115,7 +2135,7 @@ def test_offset_family_is_typed_owned_structural_fresh_and_never_raw() -> None:
 
     assert [LLIRLowerer().lower_llir(owner) for owner in first_owners] == [
         "std::vector<int> _count1((size_t)A0_size, 0);",
-        "std::vector<int> _count2((size_t)A0_size, 0);",
+        "std::vector<int64_t> _count2((size_t)A0_size, 0);",
         "std::vector<int64_t> _offset1((size_t)A0_size + 1);",
         "std::vector<int64_t> _offset2((size_t)A0_size + 1);",
     ]
@@ -4129,7 +4149,7 @@ def test_production_ds_generated_cpp_locks_typed_offset_family(
         LLIRLowerer().lower_llir(statement) for statement in function.body[:3]
     ]
     assert validation[0] == (
-        'scorch_native::validate_jit_result_shape(result_shape, {}, 2, "evaluate");'
+        'scorch_native::validate_jit_result_shape(result_shape, {}, {0, 1}, "evaluate");'
     )
     assert '"SparseLeft"' in validation[1]
     assert '"SparseRight"' in validation[2]
@@ -4177,9 +4197,9 @@ def test_production_ds_generated_cpp_locks_typed_offset_family(
     assert len({id(bound) for bound in production_bounds}) == 4
     cpp = LLIRLowerer().lower_llir(function)
 
-    assert len(cpp) == 7113
+    assert len(cpp) == 7165
     assert hashlib.sha256(cpp.encode()).hexdigest() == (
-        "5c537aad764cbb172ee5214fe758bfc8a98592f967963bc269fcb7a87d24b542"
+        "46c841dbf06bc466ce6c4266979abd12783dbb32409fb2fc8b12cea02782f45e"
     )
     assert cpp.count("wksp.insert_unchecked(") == 2
     assert "wksp.insert(" not in cpp
@@ -4317,9 +4337,9 @@ def test_production_dss_generated_cpp_locks_typed_offset_family() -> None:
     assert len({id(bound) for bound in production_bounds}) == 8
     cpp = LLIRLowerer().lower_llir(lowered)
 
-    assert len(cpp) == 8630
+    assert len(cpp) == 8843
     assert hashlib.sha256(cpp.encode()).hexdigest() == (
-        "ce718a78faa7a5aeef43e25e8ffaffa077882e0fdbfc5988e24d7465da2f65a5"
+        "b9d701fcf97b28ee77c17cb7aac1ca718fb651333c1d1f8f030ec868c5e7d492"
     )
     assert cpp.count("wksp.insert(") == 2
     assert "wksp.insert_unchecked(" not in cpp
@@ -4379,9 +4399,9 @@ def test_production_ds_float64_locks_typed_value_source() -> None:
         for code in _raw_codes(lowered)
     )
     cpp = LLIRLowerer().lower_llir(lowered)
-    assert len(cpp) == 6273
+    assert len(cpp) == 6325
     assert hashlib.sha256(cpp.encode()).hexdigest() == (
-        "c5be37ed95b12660e3f8ce950deafc0f512669c30155e2c6afcfdaf84a2b88f2"
+        "96915e68a0782bb446e29483cd25c568105d5eac36f05efb11b92f81751c85ac"
     )
 
 

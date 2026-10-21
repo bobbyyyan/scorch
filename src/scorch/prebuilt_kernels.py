@@ -17,7 +17,10 @@ from typing import (
 import torch
 import scorch_ops as native_ops
 
-from .exceptions import raise_if_native_repeat
+from .exceptions import (
+    ScorchValueError,
+    raise_if_native_coded,
+)
 from .format import TensorFormat
 from .utils import parse_format
 
@@ -298,7 +301,10 @@ def execute_prebuilt_binary_kernel(
     elif b.dim() == 1:
         result_shape = (a.shape[0],)
     else:
-        raise ValueError(f"Unsupported RHS rank for prebuilt matmul kernel: {b.dim()}")
+        raise ScorchValueError(
+            f"Unsupported RHS rank for prebuilt matmul kernel: {b.dim()}",
+            code="prebuilt_kernel_operand_rank_mismatch",
+        )
 
     args = [result_shape]
     for tensor in (a, b):
@@ -315,8 +321,9 @@ def execute_prebuilt_binary_kernel(
     # per matmul are not free next to a kernel that can finish in a couple of
     # microseconds, and every caller that does not pass time_dict was paying them.
     #
-    # A COO operand's index check refuses a repeated coordinate as text; it leaves here as
-    # RepeatedCoordinateError (exceptions.raise_if_native_repeat).
+    # The native checks refuse a repeated COO coordinate and an index past the 32-bit
+    # position bound as coded text; either leaves here as its structured error
+    # (exceptions.raise_if_native_coded).
     try:
         if time_dict is None:
             if nthreads is not None:
@@ -334,7 +341,7 @@ def execute_prebuilt_binary_kernel(
         else:
             result_cpp = kernel_fn(*args)
     except RuntimeError as error:
-        raise_if_native_repeat(error)
+        raise_if_native_coded(error)
         raise
     time_dict["eval_time"] = time.time() - start_time
     return result_cpp, result_shape

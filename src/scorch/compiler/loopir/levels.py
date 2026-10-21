@@ -887,7 +887,8 @@ class LevelTensorStorage:
     def to_dense(self) -> object:
         """Materialize the stored tensor as nested lists in logical order."""
 
-        self.validate()
+        # Validated before anything is allocated from the shape.
+        coordinates = self.stored_coordinates()
 
         def zeros(depth: int) -> Any:
             if depth == len(self.shape) - 1:
@@ -895,6 +896,17 @@ class LevelTensorStorage:
             return [zeros(depth + 1) for _ in range(self.shape[depth])]
 
         dense: Any = zeros(0)
+        for position, logical in enumerate(coordinates):
+            target = dense
+            for coordinate in logical[:-1]:
+                target = target[coordinate]
+            target[logical[-1]] = self.values[position]
+        return dense
+
+    def stored_coordinates(self) -> List[Tuple[int, ...]]:
+        """The logical coordinates of every stored entry, one per leaf position."""
+
+        self.validate()
         prefixes: List[Tuple[int, ...]] = [()]
         for number, level in enumerate(self.levels):
             if type(level) is DenseLevel:
@@ -932,15 +944,13 @@ class LevelTensorStorage:
                         for position in range(start, end)
                     )
                 prefixes = expanded
-        for position, prefix in enumerate(prefixes):
+        coordinates: List[Tuple[int, ...]] = []
+        for prefix in prefixes:
             logical = [0] * len(self.shape)
             for number, coordinate in enumerate(prefix):
                 logical[self.modes[number]] = coordinate
-            target = dense
-            for coordinate in logical[:-1]:
-                target = target[coordinate]
-            target[logical[-1]] = self.values[position]
-        return dense
+            coordinates.append(tuple(logical))
+        return coordinates
 
 
 def from_csr(matrix: CsrMatrix) -> LevelTensorStorage:

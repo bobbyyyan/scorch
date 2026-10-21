@@ -82,6 +82,44 @@ _SEALED_COMPARAND_DIR = Path(
 _SEALED_SPGEMM_SHA256 = (
     "fa1026bec895f9fcebf212babea4fa2fa02e610372e6ff8a494e80e303a4791c"
 )
+# The sealed capture with 0038's result check in place of the one it was sealed with.
+_SEALED_RESULT_CHECK = (
+    'scorch_native::validate_jit_result_shape(result_shape, {4, 5}, 2, "evaluate");'
+)
+_CURRENT_RESULT_CHECK = (
+    "scorch_native::validate_jit_result_shape(result_shape, {4, 5}, {0, 1}, "
+    '"evaluate");'
+)
+# And 0038c's check of the level's total, between the prefix sum and the allocations.
+_TOTAL_LOAD = "  int64_t _total1 = _offset1[A0_size];\n"
+_TOTAL_CHECK = "  scorch_check_level_total(_total1, false, 1);\n"
+# f718fa51... with 0038's result check alone; this one with 0038c's check as well.
+_CURRENT_SPGEMM_SHA256 = (
+    "5302541ffe8278a8de0eaa6f8de846ae1eb96317d262ce41aaa35de7624186f7"
+)
+
+
+def _with_current_result_check(sealed: str) -> str:
+    """The sealed spgemm capture (sha256 ``_SEALED_SPGEMM_SHA256``, fa1026be...) with
+    0038's entry-check form of its result check and 0038c's check of the level total,
+    and every other byte as sealed.
+
+    The capture's first statement passes the result's rank (``2``) to
+    ``validate_jit_result_shape``.  Since 0038 the check takes the result's level kinds,
+    ``{0, 1}`` for a ``ds`` result (csrc/native_abi.h), and no overload takes a rank, so
+    the sealed text no longer builds against the current preamble.  Since 0038c the
+    two-pass assembly holds ``_total1`` to the 32-bit position bound right after reading
+    it (``scorch_check_level_total``, csrc/header.h).  Those two statements are the only
+    permitted changes, and each must occur exactly once.
+    """
+
+    assert sealed.count(_SEALED_RESULT_CHECK) == 1
+    assert _CURRENT_RESULT_CHECK not in sealed
+    assert sealed.count(_TOTAL_LOAD) == 1
+    assert _TOTAL_CHECK not in sealed
+    return sealed.replace(_SEALED_RESULT_CHECK, _CURRENT_RESULT_CHECK).replace(
+        _TOTAL_LOAD, _TOTAL_LOAD + _TOTAL_CHECK
+    )
 
 
 def build_spgemm_cin(
@@ -222,8 +260,18 @@ def test_source_parity_matches_legacy_in_both_arms(dtype):
 
 
 def test_generated_source_matches_sealed_comparand_hash():
-    """The exact sized request reproduces the sealed automatic capture."""
+    """The exact sized request reproduces the sealed automatic capture, with 0038's
+    result check (``_with_current_result_check``)."""
 
+    comparand_path = _SEALED_COMPARAND_DIR / "spgemm_ds_ds_ds_armBASE.cpp"
+    if comparand_path.exists():
+        sealed = comparand_path.read_bytes()
+        assert hashlib.sha256(sealed).hexdigest() == _SEALED_SPGEMM_SHA256
+        current = _with_current_result_check(sealed.decode("utf-8"))
+        assert (
+            hashlib.sha256(current.encode("utf-8")).hexdigest()
+            == _CURRENT_SPGEMM_SHA256
+        )
     for regblock_enabled in (False, True):
         kernel = compile_cin_via_loopir(
             build_spgemm_cin(),
@@ -232,7 +280,7 @@ def test_generated_source_matches_sealed_comparand_hash():
             compile_options=auto_options(regblock_enabled),
         )
         digest = hashlib.sha256(kernel.cpp_source.encode("utf-8")).hexdigest()
-        assert digest == _SEALED_SPGEMM_SHA256, (
+        assert digest == _CURRENT_SPGEMM_SHA256, (
             f"regblock={regblock_enabled} source digest {digest} diverges "
             "from the sealed comparand"
         )
@@ -436,7 +484,7 @@ def test_sealed_comparand_executes_identically():
     storage = validated_ds_storage(result, (4, 5))
 
     sealed_raw = execute_legacy_module(
-        sealed.decode("utf-8"),
+        _with_current_result_check(sealed.decode("utf-8")),
         (4, 5),
         sparse_ds(dense_a, "A"),
         sparse_ds(dense_b, "B"),

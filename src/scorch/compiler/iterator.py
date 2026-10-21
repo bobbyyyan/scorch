@@ -16,6 +16,7 @@ from .llir_traversal import (
 )
 from .merged_coordinate import merged_coordinate_name
 from ..format import LevelType
+from ..exceptions import ScorchAssertionError, ScorchError
 
 ModePositionBegin = Tuple[str, Optional[str]]
 _RAW_POSITION_ACCESS = re.compile(r"(\w+_pos)\[")
@@ -212,50 +213,77 @@ class ModeIterator:
 
     @property
     def level(self) -> int:
-        assert self._level is not None, "level is None"
+        if self._level is None:
+            raise ScorchAssertionError(
+                "level is None", code="mode_iterator_state_missing"
+            )
         return self._level
 
     @property
     def tensor_var(self) -> TensorVar:
-        assert self._tensor_var is not None, "tensor_var is None"
+        if self._tensor_var is None:
+            raise ScorchAssertionError(
+                "tensor_var is None", code="mode_iterator_state_missing"
+            )
         return self._tensor_var
 
     def get_index_var(self) -> IndexVar:
-        assert self.index_var is not None, "index_var is None"
+        if self.index_var is None:
+            raise ScorchAssertionError(
+                "index_var is None", code="mode_iterator_state_missing"
+            )
         return self.index_var
 
     def get_coord_var_llir(self) -> llir.Var:
-        assert self.coord_var_llir is not None, "coord_var_llir is None"
+        if self.coord_var_llir is None:
+            raise ScorchAssertionError(
+                "coord_var_llir is None", code="mode_iterator_state_missing"
+            )
         return self.coord_var_llir
 
     def get_coord_var_value_llir(self) -> llir.Expr:
-        assert self.coord_var_value_llir is not None, "coord_var_value_llir is None"
+        if self.coord_var_value_llir is None:
+            raise ScorchAssertionError(
+                "coord_var_value_llir is None", code="mode_iterator_state_missing"
+            )
         return self.coord_var_value_llir
 
     def get_iterator_var_llir(self) -> llir.Var:
-        assert self.iterator_var_llir is not None, "iterator_var_llir is None"
+        if self.iterator_var_llir is None:
+            raise ScorchAssertionError(
+                "iterator_var_llir is None", code="mode_iterator_state_missing"
+            )
         return self.iterator_var_llir
 
     def get_iterator_var_begin_value_llir(self) -> llir.Expr:
-        assert (
-            self.iterator_var_begin_value_llir is not None
-        ), "iterator_var_begin_value_llir is None"
+        if self.iterator_var_begin_value_llir is None:
+            raise ScorchAssertionError(
+                "iterator_var_begin_value_llir is None",
+                code="mode_iterator_state_missing",
+            )
         return self.iterator_var_begin_value_llir
 
     def get_iterator_var_end_var_llir(self) -> llir.Var:
-        assert (
-            self.iterator_var_end_var_llir is not None
-        ), "iterator_var_end_var_llir is None"
+        if self.iterator_var_end_var_llir is None:
+            raise ScorchAssertionError(
+                "iterator_var_end_var_llir is None", code="mode_iterator_state_missing"
+            )
         return self.iterator_var_end_var_llir
 
     def get_iterator_var_end_value_llir(self) -> llir.Expr:
-        assert (
-            self.iterator_var_end_value_llir is not None
-        ), "iterator_var_end_value_llir is None"
+        if self.iterator_var_end_value_llir is None:
+            raise ScorchAssertionError(
+                "iterator_var_end_value_llir is None",
+                code="mode_iterator_state_missing",
+            )
         return self.iterator_var_end_value_llir
 
     def _compressed_position_access(self, offset: int) -> llir.ArrayAccess:
-        assert offset in (0, 1), "compressed position offset must be zero or one"
+        if offset not in (0, 1):
+            raise ScorchAssertionError(
+                "compressed position offset must be zero or one",
+                code="mode_iterator_state_missing",
+            )
         if self.parent_index_var is None:
             index: llir.Expr = llir.Literal(offset, llir.DataType.INT)
         else:
@@ -406,34 +434,44 @@ class ModeIterator:
 
     def __post_init__(self):
         # IndexVar must be provided
-        assert (
-            self.index_var is not None
-        ), "An IndexVar must be provided to construct a ModeIterator"
+        if self.index_var is None:
+            raise ScorchAssertionError(
+                "An IndexVar must be provided to construct a ModeIterator",
+                code="mode_iterator_state_missing",
+            )
         # Either TensorVar or TensorAccess must be provided
-        assert (self._tensor_var is not None) or (
-            self.tensor_access is not None
-        ), "Either a TensorVar or a TensorAccess must be provided to construct a ModeIterator"
+        if not ((self._tensor_var is not None) or (self.tensor_access is not None)):
+            raise ScorchAssertionError(
+                "Either a TensorVar or a TensorAccess must be provided to construct a ModeIterator",
+                code="mode_iterator_state_missing",
+            )
         # Either parent_iterator or parent_index_var must be provided, or tensor_access must be provided
-        assert (
+        if not (
             (self.parent_iterator is not None)
             or (self.parent_index_var is not None)
             or (self.tensor_access is not None)
-        ), (
-            "Either parent_iterator or parent_index_var or a TensorAccess"
-            + " must be provided to construct a ModeIterator"
-        )
+        ):
+            raise ScorchAssertionError(
+                "Either parent_iterator or parent_index_var or a TensorAccess"
+                + " must be provided to construct a ModeIterator",
+                code="mode_iterator_state_missing",
+            )
 
         # If TensorVar is none, get it from TensorAccess
         if self._tensor_var is None:
-            assert (
-                self.tensor_access is not None
-            ), "If _tensor_var is not provided, tensor_access must be provided"
+            if self.tensor_access is None:
+                raise ScorchAssertionError(
+                    "If _tensor_var is not provided, tensor_access must be provided",
+                    code="mode_iterator_state_missing",
+                )
             self._tensor_var = self.tensor_access.get_tensor()
 
         if self._level is None:
-            assert (
-                self.tensor_access is not None
-            ), "If _level is not provided, tensor_access must be provided"
+            if self.tensor_access is None:
+                raise ScorchAssertionError(
+                    "If _level is not provided, tensor_access must be provided",
+                    code="mode_iterator_state_missing",
+                )
             # TODO: if self.index_var is not in self.tensor_access,
             #  check if the parent index var is in self.tensor_access
             tensor_access_index_vars = self.tensor_access.get_index_vars()
@@ -447,14 +485,17 @@ class ModeIterator:
                     self.index_var.parent
                 )
             else:
-                raise Exception(
-                    f"IndexVar {self.index_var} not in TensorAccess {self.tensor_access}"
+                raise ScorchError(
+                    f"IndexVar {self.index_var} not in TensorAccess {self.tensor_access}",
+                    code="mode_iterator_state_missing",
                 )
 
         if self.level_type is None:
-            assert (
-                self.tensor_access is not None
-            ), "If level_type is not provided, tensor_access must be provided"
+            if self.tensor_access is None:
+                raise ScorchAssertionError(
+                    "If level_type is not provided, tensor_access must be provided",
+                    code="mode_iterator_state_missing",
+                )
             self.level_type = self._tensor_var.get_level_types()[
                 self.tensor_access.level_of_index_var(self.index_var)
             ]
@@ -467,7 +508,9 @@ class ModeIterator:
             elif self.parent_iterator is not None:
                 self.parent_index_var = self.parent_iterator.index_var
             else:
-                raise Exception("Cannot infer parent_index_var")
+                raise ScorchError(
+                    "Cannot infer parent_index_var", code="mode_iterator_state_missing"
+                )
 
         if self.iterator_var_llir is None:
             if (

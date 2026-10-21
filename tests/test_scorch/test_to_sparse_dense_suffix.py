@@ -14,6 +14,7 @@ conditional-parent discipline the compiled assembly families use.
 import pytest
 import torch
 
+import scorch.stensor as stensor_module  # type: ignore[import-untyped]
 from scorch.compiler.compilation_context import CompilationContext
 from scorch.compiler.compile_options import CompileOptions
 from scorch.exceptions import TensorStorageError
@@ -157,7 +158,11 @@ def test_rank_mismatch_fails_atomically_before_opening_a_stage():
     assert context.stage_run_records == ()
 
 
-def test_sparse_source_densification_uses_the_supplied_context():
+def test_sparse_source_densification_uses_the_supplied_context(monkeypatch):
+    # A densification the generated-kernel cache serves lowers nothing and records no
+    # stage, in the caller's context or any other.  A kernel an earlier test in this
+    # process kept for the same call (stensor._GENERATED_KERNELS) would serve this one.
+    monkeypatch.setattr(stensor_module, "_GENERATED_KERNELS", {})
     dense = torch.tensor([[0.0, 5.0], [3.0, 0.0], [0.0, 0.0]])
     source = STensor.from_torch(dense.to_sparse_csr(), "A")
     options = CompileOptions.from_environment()
@@ -172,6 +177,22 @@ def test_sparse_source_densification_uses_the_supplied_context():
     assert torch.equal(converted.to_torch(), dense)
     assert context.stage_run_records
     assert context.llir_pass_run_records
+
+    # Warm: the same densification under another supplied context runs the kept kernel,
+    # keeps nothing new and records nothing (the cache's design, stensor.py).
+    kept = dict(stensor_module._GENERATED_KERNELS)
+    assert kept
+    warm_context = CompilationContext(options)
+    warm = STensor.from_torch(dense.to_sparse_csr(), "A").to_sparse(
+        "sd",
+        _compile_options=options,
+        _compilation_context=warm_context,
+    )
+    assert stensor_module._GENERATED_KERNELS.keys() == kept.keys()
+    assert all(stensor_module._GENERATED_KERNELS[key] is kept[key] for key in kept)
+    assert warm_context.stage_run_records == ()
+    assert warm_context.llir_pass_run_records == ()
+    assert torch.equal(warm.to_torch(), dense)
 
 
 def test_dense_suffix_conversion_is_exception_atomic(monkeypatch):

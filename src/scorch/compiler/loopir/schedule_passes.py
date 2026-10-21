@@ -121,7 +121,9 @@ from ..identity import IndexId
 from ..sparse_assembly import (
     PARALLEL_ASSEMBLY_STRATEGIES,
     TWO_PASS_STRATEGIES,
+    entry_positioned_receiver,
     partitionable_receiver_levels,
+    receiver_requirement,
 )
 from ..loop_plan import (
     MAX_AFFINE_TILE_WIDTH,
@@ -181,6 +183,7 @@ from .nodes import (
     TileId,
     TileInnerFor,
     TileOuterFor,
+    VectorLoopPart,
     WorkspaceRead,
     WorkspaceReduce,
     WorkspaceRegion,
@@ -466,6 +469,9 @@ def _rebuild_program(
     through structural rebuilds; erasure passes ``False`` because the
     selection is schedule state and the erased program must be the
     unscheduled base.
+
+    The input whose entries the result stores (``entries_of``) is program
+    semantics, not schedule state, and every rebuild keeps it.
     """
 
     body = _wrap_loops(builder, loops, builder.block((leaf,)))
@@ -476,6 +482,7 @@ def _rebuild_program(
         program.outputs,
         body,
         program.parallel if keep_parallel else None,
+        entries_of=program.entries_of,
     )
     verify_program(rebuilt)
     return rebuilt
@@ -2169,6 +2176,7 @@ def apply_relayout(program: LoopProgram, relayout: OperandRelayout) -> LoopProgr
         program.outputs,
         body,
         program.parallel,
+        entries_of=program.entries_of,
     )
     if _collect_operand_loads(rebuilt.body, relayout.operand_id):
         _fail(
@@ -2463,6 +2471,7 @@ def apply_result_tile(program: LoopProgram, result_tile: ResultTile) -> LoopProg
         program.inputs,
         program.outputs,
         builder.block((new_origin,)),
+        entries_of=program.entries_of,
     )
     if _collect_result_writes(rebuilt.body, result_tile.result_id):
         _fail(
@@ -2634,6 +2643,7 @@ def select_parallel_loop(program: LoopProgram, plan: LoopPlan) -> LoopProgram:
         program.outputs,
         program.body,
         selection,
+        entries_of=program.entries_of,
     )
     verify_program(stamped)
     return stamped
@@ -3309,14 +3319,18 @@ def select_assembly_strategy(program: LoopProgram, plan: LoopPlan) -> LoopProgra
             levels = tuple(
                 LEVEL_KIND_TO_LEVEL_TYPE.get(level.kind) for level in decl.levels
             )
+            if strategy == "single_pass_chunk_parallel" and entry_positioned_receiver(
+                cast(Tuple[LevelType, ...], levels), program.entries_of is not None
+            ):
+                # A COO result that stores one input's entries.
+                continue
             if any(level is None for level in levels) or not (
                 partitionable_receiver_levels(cast(Tuple[LevelType, ...], levels))
             ):
                 _fail(
                     "unsupported_schedule_assembly",
-                    f"assembly strategy {strategy!r} requires a result whose "
-                    "level zero is dense with every level below it compressed; "
-                    f"{decl.name!r} does not have one",
+                    f"assembly strategy {strategy!r} requires "
+                    f"{receiver_requirement(strategy)}; {decl.name!r} is not one",
                 )
         if (
             checked.panel_bounds
@@ -3392,17 +3406,76 @@ def select_accumulator_structure(program: LoopProgram, plan: LoopPlan) -> LoopPr
     return stamped
 
 
-def _apply_schedule_program(program: LoopProgram, plan: LoopPlan) -> LoopProgram:
-    """Apply every supported plan decision, then stamp the two output decisions.
+_VECTOR_LOOP_PARTS = {
+    LoopPart.LOGICAL: VectorLoopPart.LOGICAL,
+    LoopPart.OUTER: VectorLoopPart.OUTER,
+    LoopPart.INNER: VectorLoopPart.INNER,
+}
 
-    The assembly and accumulator facts are consumed at the single exit rather
-    than at each of the family-specific returns below, so no family can forget
-    either.
+
+def select_vector_loops(program: LoopProgram, plan: LoopPlan) -> LoopProgram:
+    """Consume the plan's ``vector_loops`` fact exactly once.
+
+    Runs last, beside :func:`select_accumulator_structure` and for the same
+    reason: which loops carry a vector mark changes the emitted kernel, so it is
+    program semantics that target lowering consumes.  ``None`` consumes nothing
+    and leaves ``program.vector_loops`` unset, so a program scheduled without
+    the decision carries no mark, as this compiler has always emitted it.
+
+    The legality this pass owns is that each named loop exists in the
+    scheduled program (the verifier re-proves it).  Whether the target may
+    mark it is proved by target lowering, where the loop's body is known.
     """
 
-    return select_accumulator_structure(
-        select_assembly_strategy(
-            _apply_schedule_decisions(program, plan),
+    checked = _validate_plan_for_pass(plan)
+    requested = checked.vector_loops
+    if requested is None:
+        if program.vector_loops is not None:
+            _fail(
+                "invalid_vector_loops",
+                "a program already carrying vector marks cannot be paired with "
+                "a plan that has no vector_loops fact",
+            )
+        return program
+    verify_program(program)
+    if program.vector_loops is not None:
+        _fail(
+            "invalid_vector_loops",
+            "the scheduled program already carries vector marks; the plan fact "
+            "would not be consumed exactly once",
+        )
+    builder = LoopIRBuilder.resuming(program)
+    marks = tuple(
+        builder.vector_loop(loop.index_id, _VECTOR_LOOP_PARTS[loop.part])
+        for loop in requested
+    )
+    stamped = replace(program, vector_loops=marks)
+    verify_program(stamped)
+    return stamped
+
+
+def _apply_schedule_program(program: LoopProgram, plan: LoopPlan) -> LoopProgram:
+    """Apply every supported plan decision, then stamp the output decisions.
+
+    The assembly, accumulator and vector-loop facts are consumed at the single
+    exit rather than at each of the family-specific returns below, so no family
+    can forget one.  ``entries_of`` is not consumed here: the front end records
+    the plan's on the program it builds, and a program that disagrees with its
+    plan is refused rather than scheduled.
+    """
+
+    if _validate_plan_for_pass(plan).entries_of != program.entries_of:
+        _fail(
+            "invalid_entries_of",
+            "the program records the entries of a different input than its plan "
+            "names (entries_of)",
+        )
+    return select_vector_loops(
+        select_accumulator_structure(
+            select_assembly_strategy(
+                _apply_schedule_decisions(program, plan),
+                plan,
+            ),
             plan,
         ),
         plan,
@@ -3591,6 +3664,7 @@ def _verify_scheduled_loopir(
         or base_program.parallel is not None
         or base_program.assembly is not None
         or base_program.accumulator is not None
+        or base_program.vector_loops is not None
         or type(base_leaf) is WorkspaceRegion
         or type(base_leaf) is SparseWorkspaceRegion
         or type(base_leaf) is TiledReduce
@@ -3603,8 +3677,8 @@ def _verify_scheduled_loopir(
             "scheduled_base_not_unscheduled",
             "ScheduledLoopIR.base_program must not already contain split "
             "loops, panels, dense or sparse workspace regions, staging regions, "
-            "result-tile regions, a parallel selection, an assembly strategy, or "
-            "an accumulation structure",
+            "result-tile regions, a parallel selection, an assembly strategy, an "
+            "accumulation structure, or vector marks",
         )
 
     replayed = (
@@ -3719,12 +3793,14 @@ def erase_schedule(program: LoopProgram) -> LoopProgram:
             program.parallel is None
             and program.assembly is None
             and program.accumulator is None
+            and program.vector_loops is None
         ):
             return program
         # An abstract parallel selection is schedule state, and so are the
-        # recorded assembly strategy and accumulator structure: erasing a
-        # program that carries only selections still returns the unscheduled
-        # base.  (A program with splits loses them in the rebuild below.)
+        # recorded assembly strategy, accumulator structure and vector marks:
+        # erasing a program that carries only selections still returns the
+        # unscheduled base.  (A program with splits loses them in the rebuild
+        # below.)
         stripped_builder = LoopIRBuilder.resuming(program)
         return _rebuild_program(
             program,

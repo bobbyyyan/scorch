@@ -3,7 +3,7 @@ import math
 from collections import defaultdict, deque
 from contextlib import contextmanager
 from contextvars import ContextVar
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, fields as dataclass_fields, replace
 from typing import Any, Dict, List, NoReturn, Optional, Sequence, Set, Tuple
 
 import torch
@@ -68,10 +68,19 @@ from .sparse_accumulator import (
 )
 from .sparse_assembly import (
     SPARSE_ASSEMBLY_STRATEGIES,
+    entry_positioned_receiver,
     is_assembly_strategy,
     partitionable_receiver_levels,
+    receiver_requirement,
 )
 from scorch.format import LevelType
+from ..exceptions import (
+    ScorchAssertionError,
+    ScorchNotImplementedError,
+    ScorchTypeError,
+    ScorchValueError,
+    defect_code,
+)
 
 # Compatibility override read only while constructing a snapshot at a direct
 # scheduler boundary. Compiler stages receive the resulting immutable options
@@ -92,7 +101,10 @@ def get_forced_regblock() -> Optional[bool]:
 
     value = _REGBLOCK_FORCE.get()
     if value is not None and type(value) is not bool:
-        raise TypeError("register-block override must be a bool or None")
+        raise ScorchTypeError(
+            "register-block override must be a bool or None",
+            code="regblock_override_type_invalid",
+        )
     return value
 
 
@@ -103,7 +115,10 @@ def _compile_options_at_scheduler_boundary(
 
     if compile_options is not None:
         if type(compile_options) is not CompileOptions:
-            raise TypeError("compile_options must be a CompileOptions snapshot")
+            raise ScorchTypeError(
+                "compile_options must be a CompileOptions snapshot",
+                code="internal_argument_type_invalid",
+            )
         return compile_options
 
     return _compile_options_at_cin_boundary()
@@ -247,49 +262,85 @@ class TileSpec:
 
     def __post_init__(self) -> None:
         if type(self.index_var) is not str or not self.index_var:
-            raise ValueError("TileSpec.index_var must be a non-empty string")
+            raise ScorchValueError(
+                "TileSpec.index_var must be a non-empty string",
+                code="tile_spec_field_value_invalid",
+            )
         if type(self.width) is not int:
-            raise TypeError("TileSpec.width must be an integer")
+            raise ScorchTypeError(
+                "TileSpec.width must be an integer", code="tile_spec_field_type_invalid"
+            )
         if self.width <= 0:
-            raise ValueError("TileSpec.width must be greater than zero")
+            raise ScorchValueError(
+                "TileSpec.width must be greater than zero",
+                code="tile_spec_field_value_invalid",
+            )
         if self.width > MAX_AFFINE_TILE_WIDTH:
-            raise ValueError("TileSpec.width must fit the C++ constexpr int target")
+            raise ScorchValueError(
+                "TileSpec.width must fit the C++ constexpr int target",
+                code="tile_spec_field_value_invalid",
+            )
         if type(self.placement) is not str:
-            raise TypeError("TileSpec.placement must be a string")
+            raise ScorchTypeError(
+                "TileSpec.placement must be a string",
+                code="tile_spec_field_type_invalid",
+            )
         if type(self.parallel) is not bool:
-            raise TypeError("TileSpec.parallel must be a bool")
+            raise ScorchTypeError(
+                "TileSpec.parallel must be a bool", code="tile_spec_field_type_invalid"
+            )
         if type(self.kind) is not str:
-            raise TypeError("TileSpec.kind must be a string")
+            raise ScorchTypeError(
+                "TileSpec.kind must be a string", code="tile_spec_field_type_invalid"
+            )
         if self.kind not in ("affine", "panel"):
-            raise ValueError("TileSpec.kind must be 'affine' or 'panel'")
+            raise ScorchValueError(
+                "TileSpec.kind must be 'affine' or 'panel'",
+                code="tile_spec_field_value_invalid",
+            )
         if type(self.accum) is not str:
-            raise TypeError("TileSpec.accum must be a string")
+            raise ScorchTypeError(
+                "TileSpec.accum must be a string", code="tile_spec_field_type_invalid"
+            )
         if self.accum not in ("stack", "direct", "heap"):
-            raise ValueError("TileSpec.accum must be 'stack', 'direct', or 'heap'")
+            raise ScorchValueError(
+                "TileSpec.accum must be 'stack', 'direct', or 'heap'",
+                code="tile_spec_field_value_invalid",
+            )
         if type(self.unroll) is not bool:
-            raise TypeError("TileSpec.unroll must be a bool")
+            raise ScorchTypeError(
+                "TileSpec.unroll must be a bool", code="tile_spec_field_type_invalid"
+            )
         if not (
             self.placement == "outermost"
             or self.placement.startswith("child_of:")
             or self.placement.startswith("at_depth:")
         ):
-            raise ValueError(
+            raise ScorchValueError(
                 "TileSpec.placement must be 'outermost', 'child_of:<var>', "
-                "or 'at_depth:<n>'"
+                "or 'at_depth:<n>'",
+                code="tile_spec_field_value_invalid",
             )
         if self.placement.startswith("child_of:"):
             if not self.placement.split(":", 1)[1]:
-                raise ValueError("child_of placement requires an index variable")
+                raise ScorchValueError(
+                    "child_of placement requires an index variable",
+                    code="tile_spec_field_value_invalid",
+                )
         elif self.placement.startswith("at_depth:"):
             depth = self.placement.split(":", 1)[1]
             try:
                 parsed_depth = int(depth)
             except ValueError as exc:
-                raise ValueError(
-                    "at_depth placement requires a non-negative integer"
+                raise ScorchValueError(
+                    "at_depth placement requires a non-negative integer",
+                    code="tile_spec_field_value_invalid",
                 ) from exc
             if parsed_depth < 0:
-                raise ValueError("at_depth placement requires a non-negative integer")
+                raise ScorchValueError(
+                    "at_depth placement requires a non-negative integer",
+                    code="tile_spec_field_value_invalid",
+                )
 
 
 @dataclass(frozen=True)
@@ -320,22 +371,41 @@ class RelayoutSpec:
 
     def __post_init__(self) -> None:
         if type(self.operand) is not str or type(self.pack_var) is not str:
-            raise TypeError("RelayoutSpec operand and pack_var must be strings")
+            raise ScorchTypeError(
+                "RelayoutSpec operand and pack_var must be strings",
+                code="relayout_spec_field_type_invalid",
+            )
         if not self.operand or not self.pack_var:
-            raise ValueError("RelayoutSpec operand and pack_var must be non-empty")
+            raise ScorchValueError(
+                "RelayoutSpec operand and pack_var must be non-empty",
+                code="relayout_spec_field_value_invalid",
+            )
         if type(self.strip_width) is not int:
-            raise TypeError("RelayoutSpec.strip_width must be an integer")
+            raise ScorchTypeError(
+                "RelayoutSpec.strip_width must be an integer",
+                code="relayout_spec_field_type_invalid",
+            )
         if self.strip_width <= 0:
-            raise ValueError("RelayoutSpec.strip_width must be greater than zero")
+            raise ScorchValueError(
+                "RelayoutSpec.strip_width must be greater than zero",
+                code="relayout_spec_field_value_invalid",
+            )
         if self.strip_width > MAX_AFFINE_TILE_WIDTH:
-            raise ValueError(
-                "RelayoutSpec.strip_width must fit the C++ constexpr int target"
+            raise ScorchValueError(
+                "RelayoutSpec.strip_width must fit the C++ constexpr int target",
+                code="relayout_spec_field_value_invalid",
             )
         if self.scope_var is not None:
             if type(self.scope_var) is not str:
-                raise TypeError("RelayoutSpec.scope_var must be a string or None")
+                raise ScorchTypeError(
+                    "RelayoutSpec.scope_var must be a string or None",
+                    code="relayout_spec_field_type_invalid",
+                )
             if not self.scope_var:
-                raise ValueError("RelayoutSpec.scope_var must be non-empty")
+                raise ScorchValueError(
+                    "RelayoutSpec.scope_var must be non-empty",
+                    code="relayout_spec_field_value_invalid",
+                )
 
 
 @dataclass(frozen=True)
@@ -400,6 +470,36 @@ class Schedule:
     remains the chain it substitutes today; it is not a synonym for
     ``"coordinate_list"``.  A structure this program cannot use is refused rather
     than silently ignored.
+
+    ``vector_loops`` names the loops that keep a vector mark
+    (``#pragma omp simd``), each spelled like ``parallel_loop``: a logical loop,
+    or a generated ``*_out``/``*_in`` loop.  ``None`` requests nothing: each
+    compiler places the marks it placed before this field existed.  Both
+    compilers apply one rule, in one place: the loops below a sparse result
+    entry whose sum is kept in a register, each marked when it is safe (no loop
+    over a compressed level's positions in its body, not parallel or unrolled,
+    no early exit).  With no request this compiler marks those loops and the
+    new compiler marks none.  A tuple, the empty one included, keeps the mark
+    on exactly the named loops; naming a loop the rule does not find safe is
+    refused (``unsupported_vector_loop``) rather than ignored.  The new
+    compiler reads the same decision, so one tuple marks the same loops in
+    both; a comparison of the two compilers names the loops rather than
+    relying on ``None``.
+
+    ``entries_of`` names the input whose stored entries a COO result stores:
+    one result entry for each stored entry of that input, in its storage order,
+    an entry whose inner sum ran zero times included (its value is zero).  It
+    applies where the loops over the result's indices walk that input's
+    stored entries with a reduction below them
+    (``sparse_assembly.entry_source``); each entry's position is then that
+    input's, known before the loops run, which the parallel single pass of a
+    COO result (``single_pass_chunk_parallel``) needs.  ``None`` requests
+    nothing: each compiler stores what it stored before this field existed.
+    This compiler stores every entry of the input its scalar accumulation
+    walks; the new compiler appends only the entries some term reached.  A
+    comparison of the two compilers names the input rather than relying on
+    ``None``.  An input whose entries the loops do not walk that way, or a
+    request a compiler cannot build, is refused (``unsupported_entries_of``).
     """
 
     loop_order: Optional[Tuple[str, ...]] = None
@@ -409,31 +509,81 @@ class Schedule:
     parallel_loop: Optional[str] = None
     assembly: Optional[str] = None
     accumulator: Optional[str] = None
+    vector_loops: Optional[Tuple[str, ...]] = None
+    entries_of: Optional[str] = None
 
     def __post_init__(self) -> None:
+        if self.entries_of is not None:
+            if type(self.entries_of) is not str:
+                raise ScorchTypeError(
+                    "Schedule.entries_of must be an input name or None",
+                    code="schedule_field_type_invalid",
+                )
+            if not self.entries_of:
+                raise ScorchValueError(
+                    "Schedule.entries_of must be a non-empty name",
+                    code="schedule_field_value_invalid",
+                )
+        if self.vector_loops is not None:
+            if type(self.vector_loops) not in (list, tuple):
+                raise ScorchTypeError(
+                    "Schedule.vector_loops must be an owned list or tuple of names",
+                    code="schedule_field_type_invalid",
+                )
+            if type(self.vector_loops) is list:
+                object.__setattr__(self, "vector_loops", tuple(self.vector_loops))
+            if any(type(name) is not str or not name for name in self.vector_loops):
+                raise ScorchValueError(
+                    "Schedule.vector_loops must contain non-empty strings",
+                    code="schedule_field_value_invalid",
+                )
+            if len(self.vector_loops) != len(set(self.vector_loops)):
+                raise ScorchValueError(
+                    "Schedule.vector_loops names a loop twice",
+                    code="schedule_loop_name_duplicate",
+                )
         if self.loop_order is not None:
             if type(self.loop_order) is str:
-                raise TypeError("Schedule.loop_order must be a sequence of names")
+                raise ScorchTypeError(
+                    "Schedule.loop_order must be a sequence of names",
+                    code="schedule_field_type_invalid",
+                )
             if type(self.loop_order) not in (list, tuple):
-                raise TypeError(
-                    "Schedule.loop_order must be an owned list or tuple of names"
+                raise ScorchTypeError(
+                    "Schedule.loop_order must be an owned list or tuple of names",
+                    code="schedule_field_type_invalid",
                 )
             if type(self.loop_order) is list:
                 object.__setattr__(self, "loop_order", tuple(self.loop_order))
             if any(type(name) is not str or not name for name in self.loop_order):
-                raise ValueError("Schedule.loop_order must contain non-empty strings")
+                raise ScorchValueError(
+                    "Schedule.loop_order must contain non-empty strings",
+                    code="schedule_field_value_invalid",
+                )
             if len(self.loop_order) != len(set(self.loop_order)):
-                raise ValueError("Schedule.loop_order contains duplicate variables")
+                raise ScorchValueError(
+                    "Schedule.loop_order contains duplicate variables",
+                    code="schedule_loop_name_duplicate",
+                )
         if type(self.tiles) not in (list, tuple):
-            raise TypeError("Schedule.tiles must be an owned list or tuple")
+            raise ScorchTypeError(
+                "Schedule.tiles must be an owned list or tuple",
+                code="schedule_field_type_invalid",
+            )
         if type(self.tiles) is list:
             object.__setattr__(self, "tiles", tuple(self.tiles))
         if any(type(tile) is not TileSpec for tile in self.tiles):
             # Exact-type admission: a TileSpec subclass is caller code that
             # would otherwise execute inside compiler-trusted scopes.
-            raise TypeError("Schedule.tiles must contain exact TileSpec instances")
+            raise ScorchTypeError(
+                "Schedule.tiles must contain exact TileSpec instances",
+                code="schedule_field_type_invalid",
+            )
         if self.relayout is not None and type(self.relayout) is not RelayoutSpec:
-            raise TypeError("Schedule.relayout must be an exact RelayoutSpec or None")
+            raise ScorchTypeError(
+                "Schedule.relayout must be an exact RelayoutSpec or None",
+                code="schedule_field_type_invalid",
+            )
         if self.relayout is not None and self.relayout.scope_var is None:
             panel_tiles = [tile for tile in self.tiles if tile.kind == "panel"]
             if len(panel_tiles) == 1:
@@ -444,37 +594,76 @@ class Schedule:
                 )
         tile_names = [tile.index_var for tile in self.tiles]
         if len(tile_names) != len(set(tile_names)):
-            raise ValueError("Schedule cannot tile the same index variable twice")
+            raise ScorchValueError(
+                "Schedule cannot tile the same index variable twice",
+                code="schedule_tiles_duplicate_index",
+            )
         if sum(tile.parallel for tile in self.tiles) > 1:
-            raise ValueError("Schedule may select at most one parallel tile loop")
+            raise ScorchValueError(
+                "Schedule may select at most one parallel tile loop",
+                code="schedule_parallel_selection_conflict",
+            )
         if self.parallel_loop is not None and any(tile.parallel for tile in self.tiles):
-            raise ValueError(
-                "Use either Schedule.parallel_loop or TileSpec.parallel, not both"
+            raise ScorchValueError(
+                "Use either Schedule.parallel_loop or TileSpec.parallel, not both",
+                code="schedule_parallel_selection_conflict",
             )
         if self.parallel_loop is not None:
             if type(self.parallel_loop) is not str:
-                raise TypeError("Schedule.parallel_loop must be a string or None")
+                raise ScorchTypeError(
+                    "Schedule.parallel_loop must be a string or None",
+                    code="schedule_field_type_invalid",
+                )
             if not self.parallel_loop:
-                raise ValueError("Schedule.parallel_loop must be a non-empty string")
+                raise ScorchValueError(
+                    "Schedule.parallel_loop must be a non-empty string",
+                    code="schedule_parallel_selection_conflict",
+                )
         if type(self.tag) is not str:
-            raise TypeError("Schedule.tag must be a string")
+            raise ScorchTypeError(
+                "Schedule.tag must be a string", code="schedule_field_type_invalid"
+            )
         if self.assembly is not None and not is_assembly_strategy(self.assembly):
-            raise ValueError(
+            raise ScorchValueError(
                 "Schedule.assembly must name a sparse assembly strategy "
-                f"({', '.join(SPARSE_ASSEMBLY_STRATEGIES)}) or be None"
+                f"({', '.join(SPARSE_ASSEMBLY_STRATEGIES)}) or be None",
+                code="schedule_assembly_unknown",
             )
         if self.accumulator is not None and not is_accumulator_structure(
             self.accumulator
         ):
-            raise ValueError(
+            raise ScorchValueError(
                 "Schedule.accumulator must name a sparse accumulation structure "
-                f"({', '.join(SPARSE_ACCUMULATOR_STRUCTURES)}) or be None"
+                f"({', '.join(SPARSE_ACCUMULATOR_STRUCTURES)}) or be None",
+                code="schedule_accumulator_unknown",
             )
 
     @property
     def cache_key(self) -> str:
-        """Canonical cache discriminator containing every schedule field."""
-        return repr(_validate_schedule_structure(self))
+        """Canonical cache discriminator containing every schedule field.
+
+        The dataclass ``repr`` of the validated schedule, except that a field
+        added after the key was first spelled (:data:`_SCHEDULE_KEY_WHEN_SET`)
+        enters it only when set: a schedule that sets none of them keeps the
+        key it had before they existed, and so does every options digest that
+        carries it.
+        """
+
+        schedule = _validate_schedule_structure(self)
+        keyed = [
+            f"{field.name}={getattr(schedule, field.name)!r}"
+            for field in dataclass_fields(schedule)
+            if field.repr
+            and (
+                field.name not in _SCHEDULE_KEY_WHEN_SET
+                or getattr(schedule, field.name) is not None
+            )
+        ]
+        return f"{type(schedule).__qualname__}({', '.join(keyed)})"
+
+
+#: Schedule fields whose unset value (``None``) leaves the cache key unchanged.
+_SCHEDULE_KEY_WHEN_SET = frozenset({"vector_loops", "entries_of"})
 
 
 def _stored_schedule_fields(
@@ -486,26 +675,37 @@ def _stored_schedule_fields(
     """Snapshot one exact frozen schedule carrier without invoking caller code."""
 
     if type(value) is not expected_type:
-        raise InvalidSchedule(f"{what} must be an exact {expected_type.__name__}")
+        raise InvalidSchedule(
+            f"{what} must be an exact {expected_type.__name__}",
+            code="schedule_state_invalid",
+        )
     try:
         state = object.__getattribute__(value, "__dict__")
     except Exception as error:
-        raise InvalidSchedule(f"{what} has inaccessible stored state") from error
+        raise InvalidSchedule(
+            f"{what} has inaccessible stored state", code="schedule_state_invalid"
+        ) from error
     if (
         type(state) is not dict
         or any(type(key) is not str for key in state)
         or set(state) != set(expected_fields)
     ):
-        raise InvalidSchedule(f"{what} has invalid stored fields")
+        raise InvalidSchedule(
+            f"{what} has invalid stored fields", code="schedule_state_invalid"
+        )
     for field_name in expected_fields:
         try:
             observed = object.__getattribute__(value, field_name)
         except Exception as error:
             raise InvalidSchedule(
-                f"{what}.{field_name} is not safely readable"
+                f"{what}.{field_name} is not safely readable",
+                code="schedule_state_invalid",
             ) from error
         if observed is not state[field_name]:
-            raise InvalidSchedule(f"{what}.{field_name} diverges from its stored value")
+            raise InvalidSchedule(
+                f"{what}.{field_name} diverges from its stored value",
+                code="schedule_state_invalid",
+            )
     return state
 
 
@@ -525,6 +725,24 @@ def _assembly_diagnostic(code: str, strategy: str, reason: str) -> Tuple[str, ob
         code=code,
         message=f"{strategy!r} {reason}",
         path=("schedule", "assembly"),
+        stage="schedule",
+        pass_name="apply_schedule",
+    )
+
+
+def _schedule_field_diagnostic(
+    code: str, path: Tuple[str, ...], reason: str
+) -> Tuple[str, object]:
+    """One structured refusal of a schedule field, spelled like the others."""
+
+    from .loop_plan_legality import LoopPlanDiagnostic
+
+    full_path = ("schedule", *path)
+    message = f"stage=Schedule: {code} at {'/'.join(full_path)}: {reason}"
+    return message, LoopPlanDiagnostic(
+        code=code,
+        message=reason,
+        path=full_path,
         stage="schedule",
         pass_name="apply_schedule",
     )
@@ -582,6 +800,8 @@ def _validate_schedule_structure(schedule: object) -> Schedule:
             "parallel_loop",
             "assembly",
             "accumulator",
+            "vector_loops",
+            "entries_of",
         ),
         "Schedule",
     )
@@ -592,24 +812,54 @@ def _validate_schedule_structure(schedule: object) -> Schedule:
     parallel_loop = state["parallel_loop"]
     assembly = state["assembly"]
     accumulator = state["accumulator"]
+    vector_loops = state["vector_loops"]
+    entries_of = state["entries_of"]
     if loop_order is not None and type(loop_order) is not tuple:
-        raise InvalidSchedule("Schedule.loop_order must be an owned tuple or None")
+        raise InvalidSchedule(
+            "Schedule.loop_order must be an owned tuple or None",
+            code="schedule_state_invalid",
+        )
     if type(tiles) is not tuple:
-        raise InvalidSchedule("Schedule.tiles must be an owned tuple")
+        raise InvalidSchedule(
+            "Schedule.tiles must be an owned tuple", code="schedule_state_invalid"
+        )
     if relayout is not None and type(relayout) is not RelayoutSpec:
-        raise InvalidSchedule("Schedule.relayout must be an exact RelayoutSpec or None")
+        raise InvalidSchedule(
+            "Schedule.relayout must be an exact RelayoutSpec or None",
+            code="schedule_state_invalid",
+        )
     if type(tag) is not str:
-        raise InvalidSchedule("Schedule.tag must be an exact str")
+        raise InvalidSchedule(
+            "Schedule.tag must be an exact str", code="schedule_state_invalid"
+        )
     if parallel_loop is not None and type(parallel_loop) is not str:
-        raise InvalidSchedule("Schedule.parallel_loop must be an exact str or None")
+        raise InvalidSchedule(
+            "Schedule.parallel_loop must be an exact str or None",
+            code="schedule_state_invalid",
+        )
     if assembly is not None and not is_assembly_strategy(assembly):
         raise InvalidSchedule(
-            "Schedule.assembly must name a sparse assembly strategy or be None"
+            "Schedule.assembly must name a sparse assembly strategy or be None",
+            code="schedule_state_invalid",
         )
     if accumulator is not None and not is_accumulator_structure(accumulator):
         raise InvalidSchedule(
             "Schedule.accumulator must name a sparse accumulation structure "
-            "or be None"
+            "or be None",
+            code="schedule_state_invalid",
+        )
+    if vector_loops is not None and (
+        type(vector_loops) is not tuple
+        or any(type(name) is not str for name in vector_loops)
+    ):
+        raise InvalidSchedule(
+            "Schedule.vector_loops must be an owned tuple of exact str or None",
+            code="schedule_state_invalid",
+        )
+    if entries_of is not None and type(entries_of) is not str:
+        raise InvalidSchedule(
+            "Schedule.entries_of must be an exact str or None",
+            code="schedule_state_invalid",
         )
 
     checked_tiles = []
@@ -632,7 +882,8 @@ def _validate_schedule_structure(schedule: object) -> Schedule:
             checked_tiles.append(TileSpec(**tile_state))
         except (TypeError, ValueError) as error:
             raise InvalidSchedule(
-                f"Schedule.tiles[{position}] has invalid stored values"
+                f"Schedule.tiles[{position}] has invalid stored values",
+                code="schedule_state_invalid",
             ) from error
 
     checked_relayout = None
@@ -647,7 +898,8 @@ def _validate_schedule_structure(schedule: object) -> Schedule:
             checked_relayout = RelayoutSpec(**relayout_state)
         except (TypeError, ValueError) as error:
             raise InvalidSchedule(
-                "Schedule.relayout has invalid stored values"
+                "Schedule.relayout has invalid stored values",
+                code="schedule_state_invalid",
             ) from error
 
     try:
@@ -659,11 +911,18 @@ def _validate_schedule_structure(schedule: object) -> Schedule:
             parallel_loop=parallel_loop,
             assembly=assembly,
             accumulator=accumulator,
+            vector_loops=vector_loops,
+            entries_of=entries_of,
         )
     except (TypeError, ValueError) as error:
-        raise InvalidSchedule("Schedule has invalid stored values") from error
+        raise InvalidSchedule(
+            "Schedule has invalid stored values", code="schedule_state_invalid"
+        ) from error
     if canonical != schedule:
-        raise InvalidSchedule("Schedule state is not in canonical owned form")
+        raise InvalidSchedule(
+            "Schedule state is not in canonical owned form",
+            code="schedule_state_invalid",
+        )
     return schedule
 
 
@@ -686,8 +945,9 @@ def _entity_ids_by_name(
         index_var = index_vars[index_id]
         previous = indices_by_name.get(name)
         if previous is not None and previous.index_id != index_id:
-            raise ValueError(
-                f"Schedule name {name!r} is ambiguous between distinct IndexId values"
+            raise ScorchValueError(
+                f"Schedule name {name!r} is ambiguous between distinct IndexId values",
+                code="schedule_name_ambiguous",
             )
         indices_by_name[name] = index_var
 
@@ -699,8 +959,9 @@ def _entity_ids_by_name(
         symbol = symbol_objects[symbol_id]
         previous = symbols_by_name.get(name)
         if previous is not None and previous.symbol_id != symbol_id:
-            raise ValueError(
-                f"Schedule name {name!r} is ambiguous between distinct SymbolId values"
+            raise ScorchValueError(
+                f"Schedule name {name!r} is ambiguous between distinct SymbolId values",
+                code="schedule_name_ambiguous",
             )
         symbols_by_name[name] = symbol
     return indices_by_name, symbols_by_name
@@ -718,7 +979,10 @@ def _loop_ref_from_name(
             index_var = indices_by_name.get(name[: -len(suffix)])
             if index_var is not None:
                 return LoopRef(index_var.index_id, part)
-    raise ValueError(f"Schedule references unknown logical loop {name!r}")
+    raise ScorchValueError(
+        f"Schedule references unknown logical loop {name!r}",
+        code="schedule_loop_unknown",
+    )
 
 
 def _loop_placement_from_public(
@@ -737,7 +1001,9 @@ def _loop_placement_from_public(
             PlacementKind.AT_DEPTH,
             depth=int(placement.split(":", 1)[1]),
         )
-    raise ValueError(f"Unsupported loop placement {placement!r}")
+    raise ScorchValueError(
+        f"Unsupported loop placement {placement!r}", code="tile_placement_invalid"
+    )
 
 
 def _build_loop_plan(
@@ -768,7 +1034,8 @@ def _build_loop_plan(
     if relayout_plan is not None:
         if schedule.relayout is None:
             raise CompilerInvariantError(
-                "validated relayout metadata has no public relayout decision"
+                "validated relayout metadata has no public relayout decision",
+                code="relayout_decision_missing",
             )
         relayout = OperandRelayout(
             operand_id=relayout_plan.operand_id,
@@ -811,8 +1078,93 @@ def _build_loop_plan(
         accumulator=schedule.accumulator,
         provenance=provenance,
         tag=schedule.tag,
+        vector_loops=_vector_loop_refs(cin, schedule.vector_loops),
+        entries_of=_entries_of_symbol(cin, schedule.entries_of),
     )
     return verify_loop_plan(cin, plan)
+
+
+def _vector_loop_refs(
+    cin: CIN, names: Optional[Tuple[str, ...]]
+) -> Optional[Tuple[LoopRef, ...]]:
+    """Resolve a public ``vector_loops`` request to stable loop references."""
+
+    if names is None:
+        return None
+    indices_by_name, _ = _entity_ids_by_name(cin)
+    refs: List[LoopRef] = []
+    for position, name in enumerate(names):
+        try:
+            refs.append(_loop_ref_from_name(name, indices_by_name))
+        except ValueError as error:
+            message, diagnostic = _schedule_field_diagnostic(
+                "invalid_vector_loops", ("vector_loops", str(position)), str(error)
+            )
+            raise InvalidSchedule(message, diagnostics=(diagnostic,)) from error
+    return tuple(refs)
+
+
+def _refuse_loop_requests_without_loops(schedule: Schedule) -> None:
+    """A statement with no loops has no loop to mark and no loops to walk an
+    input's entries: refuse either request with its code."""
+
+    if schedule.vector_loops:
+        message, diagnostic = _schedule_field_diagnostic(
+            "invalid_vector_loops",
+            ("vector_loops",),
+            "names a loop of a statement that has no loops",
+        )
+        raise InvalidSchedule(message, diagnostics=(diagnostic,))
+    if schedule.entries_of is not None:
+        message, diagnostic = _schedule_field_diagnostic(
+            "unsupported_entries_of",
+            ("entries_of",),
+            "names an input whose entries a statement with no loops cannot walk",
+        )
+        raise UnsupportedFeature(message, diagnostics=(diagnostic,))
+
+
+def _with_vector_loop_request(
+    cin: CIN, plan: LoopPlan, schedule: Schedule, dense_results_any_order: bool
+) -> LoopPlan:
+    """The automatic plan with the schedule's ``vector_loops``.
+
+    Marks are independent of the order and tiles the origin chose, so they are
+    attached to the verified plan rather than threaded through origination, and
+    the plan boundary verifies them again.  ``entries_of`` is not attached
+    here: the assembly's legality reads it, so origination records it with the
+    assembly.  A schedule that names no vector loops returns the plan unchanged.
+    """
+
+    if schedule.vector_loops is None:
+        return plan
+    return verify_loop_plan(
+        cin,
+        replace(plan, vector_loops=_vector_loop_refs(cin, schedule.vector_loops)),
+        dense_results_any_order=dense_results_any_order,
+    )
+
+
+def _entries_of_symbol(cin: CIN, name: Optional[str]) -> Optional[SymbolId]:
+    """Resolve a public ``entries_of`` request to the named tensor's identity.
+
+    Whether that tensor is an input whose stored entries the result's loops
+    walk is plan legality's rule (``unsupported_entries_of``); here the name
+    only has to name a tensor of the statement.
+    """
+
+    if name is None:
+        return None
+    _, symbols_by_name = _entity_ids_by_name(cin)
+    symbol = symbols_by_name.get(name)
+    if symbol is None:
+        message, diagnostic = _schedule_field_diagnostic(
+            "invalid_entries_of",
+            ("entries_of",),
+            f"{name!r} names no tensor of this statement",
+        )
+        raise InvalidSchedule(message, diagnostics=(diagnostic,))
+    return symbol.symbol_id
 
 
 def _render_loop_ref(loop: LoopRef, index_names: Dict[IndexId, str]) -> str:
@@ -843,10 +1195,14 @@ def _render_placement(
         return "outermost"
     if placement.kind == PlacementKind.CHILD_OF:
         if placement.parent is None:
-            raise VerificationError("child placement has no parent loop")
+            raise VerificationError(
+                "child placement has no parent loop", code="loop_placement_unrenderable"
+            )
         return f"child_of:{_render_loop_ref(placement.parent, index_names)}"
     if placement.depth is None:
-        raise VerificationError("depth placement has no depth")
+        raise VerificationError(
+            "depth placement has no depth", code="loop_placement_unrenderable"
+        )
     return f"at_depth:{placement.depth}"
 
 
@@ -924,6 +1280,14 @@ def materialize_legacy_schedule(
         ),
         assembly=plan.assembly,
         accumulator=plan.accumulator,
+        vector_loops=(
+            None
+            if plan.vector_loops is None
+            else tuple(
+                _render_loop_ref(loop, index_names) for loop in plan.vector_loops
+            )
+        ),
+        entries_of=(None if plan.entries_of is None else symbol_names[plan.entries_of]),
     )
     rendered_panel_bounds = {
         _render_loop_ref(bound.loop, index_names): (
@@ -1033,7 +1397,10 @@ class Scheduler:
         1. every strategy except the always-legal serial one needs the shared
            receiver contract -- a dense level zero with every level below it
            compressed -- because that is the correspondence that lets the
-           assembly be split by outer cell at all;
+           assembly be split by outer cell at all; the parallel single pass
+           also admits a COO result that stores one input's entries
+           (``Schedule.entries_of``), whose entries' positions are known
+           before the loops run;
         2. a requested strategy owns the result's assembly, so it cannot compose
            with a panel tile, a relayout, or an explicit parallel loop, each of
            which owns part of the same assembly.
@@ -1068,11 +1435,21 @@ class Scheduler:
                 "requires exactly one result tensor with a known format",
             )
         levels = tuple(receivers[0].format.get_level_types())
-        if not partitionable_receiver_levels(levels):
+        if strategy == "single_pass_chunk_parallel" and entry_positioned_receiver(
+            levels, schedule.entries_of is not None
+        ):
+            # A COO result that stores one input's entries.  Whether the final
+            # loop order walks that input is the rest of the rule
+            # (``sparse_assembly.entry_source``), which plan legality checks once
+            # the order is known.
+            levels_admitted = True
+        else:
+            levels_admitted = partitionable_receiver_levels(levels)
+        if not levels_admitted:
             _unsupported_assembly(
                 strategy,
-                "requires a result whose level zero is dense with every level "
-                f"below it compressed; {receivers[0].get_name()!r} is not one",
+                f"requires {receiver_requirement(strategy)}; "
+                f"{receivers[0].get_name()!r} is not one",
             )
         if (
             any(tile.kind == "panel" for tile in schedule.tiles)
@@ -2109,7 +2486,9 @@ class Scheduler:
     def _find_index_var_by_name(cin: CIN, name: str) -> IndexVar:
         matches = [index_var for index_var in cin.index_vars if index_var.name == name]
         if not matches:
-            raise ValueError(f"Unknown index variable {name!r}")
+            raise ScorchValueError(
+                f"Unknown index variable {name!r}", code="schedule_loop_unknown"
+            )
         return matches[0]
 
     @staticmethod
@@ -2118,7 +2497,9 @@ class Scheduler:
             index_var for index_var in cin.index_vars if index_var.index_id == index_id
         ]
         if not matches:
-            raise ValueError(f"Unknown IndexId {index_id.value}")
+            raise ScorchValueError(
+                f"Unknown IndexId {index_id.value}", code="index_id_unknown"
+            )
         return matches[0]
 
     @staticmethod
@@ -2139,16 +2520,20 @@ class Scheduler:
         elif placement.startswith("child_of:"):
             parent_name = placement.split(":", 1)[1]
             if not parent_name:
-                raise ValueError("child_of placement requires an index variable")
+                raise ScorchValueError(
+                    "child_of placement requires an index variable",
+                    code="tile_placement_invalid",
+                )
             exact = [
                 pos
                 for pos, loop in enumerate(prefix)
                 if loop.index_var.name == parent_name
             ]
             if not exact:
-                raise ValueError(
+                raise ScorchValueError(
                     f"Cannot place tile child of {parent_name!r}; it is not in "
-                    "the common outer loop prefix"
+                    "the common outer loop prefix",
+                    code="tile_placement_invalid",
                 )
             depth = exact[0] + 1
         elif placement.startswith("at_depth:"):
@@ -2156,14 +2541,21 @@ class Scheduler:
             try:
                 depth = int(value)
             except ValueError as exc:
-                raise ValueError("at_depth placement requires an integer") from exc
+                raise ScorchValueError(
+                    "at_depth placement requires an integer",
+                    code="tile_placement_invalid",
+                ) from exc
             if depth < 0 or depth > len(prefix):
-                raise ValueError(
+                raise ScorchValueError(
                     f"at_depth:{depth} is outside the common loop-prefix range "
-                    f"0..{len(prefix)}"
+                    f"0..{len(prefix)}",
+                    code="tile_placement_invalid",
                 )
         else:
-            raise ValueError(f"Unsupported tile placement {placement!r}")
+            raise ScorchValueError(
+                f"Unsupported tile placement {placement!r}",
+                code="tile_placement_invalid",
+            )
 
         target_in_prefix = next(
             (
@@ -2174,8 +2566,9 @@ class Scheduler:
             None,
         )
         if target_in_prefix is not None and depth > target_in_prefix:
-            raise ValueError(
-                f"Tile outer loop for {target_name!r} must dominate its inner loop"
+            raise ScorchValueError(
+                f"Tile outer loop for {target_name!r} must dominate its inner loop",
+                code="tile_placement_invalid",
             )
         return depth
 
@@ -2190,10 +2583,16 @@ class Scheduler:
         parent: CIN = cin
         for _ in range(depth - 1):
             if not isinstance(parent, ForAll):
-                raise ValueError("Tile placement does not name a common loop prefix")
+                raise ScorchValueError(
+                    "Tile placement does not name a common loop prefix",
+                    code="tile_placement_invalid",
+                )
             parent = parent.stmt
         if not isinstance(parent, ForAll):
-            raise ValueError("Tile placement does not name a common loop prefix")
+            raise ScorchValueError(
+                "Tile placement does not name a common loop prefix",
+                code="tile_placement_invalid",
+            )
 
         child = parent.stmt
         loop.stmt = child
@@ -2316,11 +2715,18 @@ class Scheduler:
         """
 
         if isinstance(tile_size, bool) or not isinstance(tile_size, int):
-            raise TypeError("tile_size must be an integer")
+            raise ScorchTypeError(
+                "tile_size must be an integer", code="tile_size_invalid"
+            )
         if tile_size <= 0:
-            raise ValueError("tile_size must be greater than zero")
+            raise ScorchValueError(
+                "tile_size must be greater than zero", code="tile_request_invalid"
+            )
         if not isinstance(cin, ForAll):
-            raise ValueError("Expected input CIN to be a ForAll statement")
+            raise ScorchValueError(
+                "Expected input CIN to be a ForAll statement",
+                code="tile_request_invalid",
+            )
         if compile_options is not None:
             _compile_options_at_scheduler_boundary(compile_options)
 
@@ -2339,7 +2745,10 @@ class Scheduler:
         # in the transformed graph instead of retaining the pre-copy identity.
         index_var = Scheduler._find_index_var_by_id(cin, target_id)
         if index_var.is_tiled or getattr(index_var, "_expr", None) is not None:
-            raise ValueError(f"Index variable {target_name!r} is already tiled")
+            raise ScorchValueError(
+                f"Index variable {target_name!r} is already tiled",
+                code="tile_request_invalid",
+            )
 
         sparse_accesses = [
             tensor_access
@@ -2348,9 +2757,10 @@ class Scheduler:
             and tensor_access.level_type_of_index_var(index_var) != LevelType.DENSE
         ]
         if sparse_accesses:
-            raise NotImplementedError(
+            raise ScorchNotImplementedError(
                 f"Affine tiling cannot split sparse index variable {target_name!r}; "
-                "windowed compressed iterators are not supported"
+                "windowed compressed iterators are not supported",
+                code="sparse_index_affine_tiling_unsupported",
             )
 
         if placement is None:
@@ -2413,8 +2823,9 @@ class Scheduler:
         )
         replace_index_var_visitor.visit(cin)
         if replace_index_var_visitor.replacements == 0:
-            raise ValueError(
-                f"Cannot tile {target_name!r}: no matching ForAll binder was found"
+            raise ScorchValueError(
+                f"Cannot tile {target_name!r}: no matching ForAll binder was found",
+                code="tile_request_invalid",
             )
 
         outer_forall = ForAll(
@@ -2444,7 +2855,11 @@ class Scheduler:
         cin_ivar_getter = CINIndexVariablesGetter()
         cin_ivar_getter.visit(cin)
 
-        assert isinstance(cin, ForAll), "Expected input CIN to be a ForAll statement."
+        if not isinstance(cin, ForAll):
+            raise ScorchAssertionError(
+                "Expected input CIN to be a ForAll statement.",
+                code="workspace_insertion_target_not_forall",
+            )
 
         result_tensor_accesses = cin.get_result_tensor_accesses()
         result_tensor_access: TensorAccess = result_tensor_accesses[0]
@@ -2534,9 +2949,11 @@ class Scheduler:
         ):
             parent_forall = parent_forall.stmt
 
-        assert isinstance(
-            parent_forall, ForAll
-        ), "Expected parent_forall to be a ForAll statement."
+        if not (isinstance(parent_forall, ForAll)):
+            raise ScorchAssertionError(
+                "Expected parent_forall to be a ForAll statement.",
+                code="workspace_insertion_target_not_forall",
+            )
 
         """
         For example, if parent_forall's stmt is:
@@ -2620,7 +3037,11 @@ class Scheduler:
         )
 
         if not are_all_dense_levels:
-            assert isinstance(producer_forall, ForAll)
+            if not isinstance(producer_forall, ForAll):
+                raise ScorchAssertionError(
+                    "isinstance(producer_forall, ForAll)",
+                    code="workspace_insertion_target_not_forall",
+                )
             new_cin.no_tile_list.append(producer_forall.index_var)
 
         # Replace the reduction forall with the Where statement
@@ -2674,7 +3095,10 @@ class Scheduler:
         )
         if pre_forced_order is not None:
             if type(pre_forced_order) is not list or pre_forced_order:
-                raise TypeError("pre_forced_order must be an empty exact list")
+                raise ScorchTypeError(
+                    "pre_forced_order must be an empty exact list",
+                    code="internal_argument_type_invalid",
+                )
             pre_forced_order.extend(loop_order)
 
         # For sparse output with reduction variables, ensure at least one free
@@ -2772,9 +3196,15 @@ class Scheduler:
         """Resolve and validate a tuner-provided logical loop permutation."""
         requested = list(loop_order)
         if any(not isinstance(name, str) or not name for name in requested):
-            raise ValueError("Schedule.loop_order must contain non-empty names")
+            raise ScorchValueError(
+                "Schedule.loop_order must contain non-empty names",
+                code="schedule_field_value_invalid",
+            )
         if len(requested) != len(set(requested)):
-            raise ValueError("Schedule.loop_order contains duplicate variables")
+            raise ScorchValueError(
+                "Schedule.loop_order contains duplicate variables",
+                code="schedule_loop_name_duplicate",
+            )
 
         available_vars = Scheduler.get_index_variables(cin)
         by_name = {index_var.name: index_var for index_var in available_vars}
@@ -2786,10 +3216,11 @@ class Scheduler:
                 details.append(f"unknown={unknown}")
             if missing:
                 details.append(f"missing={missing}")
-            raise ValueError(
+            raise ScorchValueError(
                 "Schedule.loop_order must be a complete permutation ("
                 + ", ".join(details)
-                + ")"
+                + ")",
+                code="schedule_loop_order_incomplete",
             )
 
         positions = {name: index for index, name in enumerate(requested)}
@@ -2801,9 +3232,10 @@ class Scheduler:
             ]
             for parent, child in zip(result_order, result_order[1:]):
                 if positions[parent] > positions[child]:
-                    raise ValueError(
+                    raise ScorchValueError(
                         "Schedule.loop_order violates result storage order: "
-                        f"{parent!r} must precede {child!r}"
+                        f"{parent!r} must precede {child!r}",
+                        code="loop_order_result_storage_discordant_unsupported",
                     )
         return [by_name[name] for name in requested]
 
@@ -2846,9 +3278,10 @@ class Scheduler:
 
         LoopFinder().visit(cin)
         if len(matches) != 1:
-            raise ValueError(
+            raise ScorchValueError(
                 f"Schedule.parallel_loop {loop_name!r} must identify exactly one "
-                f"ForAll loop; found {len(matches)}"
+                f"ForAll loop; found {len(matches)}",
+                code="schedule_parallel_loop_unknown",
             )
         matches[0].parallel = True
 
@@ -2868,17 +3301,22 @@ class Scheduler:
         if not heap_tiles:
             return None
         if len(heap_tiles) != 1:
-            raise NotImplementedError(
-                "Heap accumulation currently supports exactly one result tile"
+            raise ScorchNotImplementedError(
+                "Heap accumulation currently supports exactly one result tile",
+                code="heap_accumulation_tile_unsupported",
             )
 
         tile = heap_tiles[0]
         if tile.kind != "affine":
-            raise ValueError("Heap accumulation requires an affine result tile")
+            raise ScorchValueError(
+                "Heap accumulation requires an affine result tile",
+                code="heap_tile_schedule_invalid",
+            )
         if tile.placement != "outermost":
-            raise ValueError(
+            raise ScorchValueError(
                 "Heap accumulation requires its affine tile to be outermost so "
-                "the compact result spans every enclosed reduction"
+                "the compact result spans every enclosed reduction",
+                code="heap_tile_schedule_invalid",
             )
         tile_position = schedule.tiles.index(tile)
         outer_wrappers = []
@@ -2896,24 +3334,27 @@ class Scheduler:
             if affine_at_root or panel_at_root:
                 outer_wrappers.append(candidate.index_var)
         if outer_wrappers:
-            raise ValueError(
+            raise ScorchValueError(
                 "Heap accumulation requires its affine result tile to remain "
                 "outermost after all scheduled tiles are applied; later root "
-                f"tiles would wrap it: {outer_wrappers}"
+                f"tiles would wrap it: {outer_wrappers}",
+                code="heap_tile_schedule_invalid",
             )
         if tile.parallel:
-            raise ValueError(
+            raise ScorchValueError(
                 "A heap-backed result tile uses shared reusable storage; its "
-                "outer tile loop must be serial"
+                "outer tile loop must be serial",
+                code="heap_tile_schedule_invalid",
             )
         if schedule.parallel_loop in (
             tile.index_var,
             f"{tile.index_var}_out",
             f"{tile.index_var}_in",
         ):
-            raise ValueError(
+            raise ScorchValueError(
                 "A heap-backed result tile cannot select its shared tile loop "
-                "for parallel execution"
+                "for parallel execution",
+                code="heap_tile_schedule_invalid",
             )
 
         assignment: CIN = cin
@@ -2923,16 +3364,19 @@ class Scheduler:
             None,
             Operation.ADD,
         ):
-            raise NotImplementedError(
-                "Heap accumulation requires one additive result assignment"
+            raise ScorchNotImplementedError(
+                "Heap accumulation requires one additive result assignment",
+                code="heap_accumulation_result_unsupported",
             )
         if not reduction_names:
-            raise NotImplementedError(
-                "Heap accumulation requires an enclosed reduction to accumulate"
+            raise ScorchNotImplementedError(
+                "Heap accumulation requires an enclosed reduction to accumulate",
+                code="heap_accumulation_without_reduction_unsupported",
             )
         if tile.index_var in reduction_names:
-            raise ValueError(
-                "Heap accumulation must tile a free result axis, not a reduction"
+            raise ScorchValueError(
+                "Heap accumulation must tile a free result axis, not a reduction",
+                code="heap_tile_schedule_invalid",
             )
 
         result_accesses = [
@@ -2941,17 +3385,19 @@ class Scheduler:
             if not isinstance(access.tensor, Workspace)
         ]
         if len(result_accesses) != 1 or not result_accesses[0].is_dense():
-            raise NotImplementedError(
-                "Heap accumulation requires exactly one dense result tensor"
+            raise ScorchNotImplementedError(
+                "Heap accumulation requires exactly one dense result tensor",
+                code="heap_accumulation_result_unsupported",
             )
         result_access = result_accesses[0]
         result_names = tuple(
             index_var.name for index_var in result_access.get_sorted_index_vars()
         )
         if len(result_names) < 2 or result_names[-1] != tile.index_var:
-            raise NotImplementedError(
+            raise ScorchNotImplementedError(
                 "Heap accumulation requires the tiled free axis to be the dense "
-                "result's trailing storage level"
+                "result's trailing storage level",
+                code="heap_accumulation_tile_unsupported",
             )
         parallel_anchors = [
             candidate.index_var for candidate in schedule.tiles if candidate.parallel
@@ -2968,30 +3414,35 @@ class Scheduler:
                     logical_anchor = candidate.index_var
                     break
             if logical_anchor not in result_names[:-1]:
-                raise ValueError(
+                raise ScorchValueError(
                     "Heap accumulation may parallelize only a dense result-prefix "
-                    f"loop; {anchor!r} does not partition compact result rows"
+                    f"loop; {anchor!r} does not partition compact result rows",
+                    code="heap_tile_schedule_invalid",
                 )
         if any(level != LevelType.DENSE for level in result_access.level_types()):
-            raise NotImplementedError(
-                "Heap accumulation currently supports all-dense result storage"
+            raise ScorchNotImplementedError(
+                "Heap accumulation currently supports all-dense result storage",
+                code="heap_accumulation_result_unsupported",
             )
         tile_index_var = Scheduler._find_index_var_by_name(cin, tile.index_var)
         result_level = result_access.level_of_index_var(tile_index_var)
         if result_level != result_access.num_levels - 1:
-            raise NotImplementedError(
+            raise ScorchNotImplementedError(
                 "Heap accumulation requires the tiled free axis at the final "
-                "result storage level"
+                "result storage level",
+                code="heap_accumulation_tile_unsupported",
             )
         if result_access.tensor.dtype not in (torch.float32, torch.float64):
-            raise NotImplementedError(
-                "Heap accumulation supports float32 or float64 dense results"
+            raise ScorchNotImplementedError(
+                "Heap accumulation supports float32 or float64 dense results",
+                code="heap_accumulation_result_unsupported",
             )
         if not parallel_anchors:
-            raise ValueError(
+            raise ScorchValueError(
                 "Heap accumulation requires an explicit parallel dense "
                 "result-prefix loop so the shared outer result-tile loop remains "
-                "serial"
+                "serial",
+                code="heap_tile_schedule_invalid",
             )
 
         return _ResultTilePlan(
@@ -3045,8 +3496,9 @@ class Scheduler:
             None,
             Operation.ADD,
         ):
-            raise NotImplementedError(
-                "Packed relayout requires one additive contraction assignment"
+            raise ScorchNotImplementedError(
+                "Packed relayout requires one additive contraction assignment",
+                code="relayout_operand_shape_unsupported",
             )
 
         rhs_accesses = cin.get_rhs_tensor_accesses()
@@ -3054,51 +3506,61 @@ class Scheduler:
             access for access in rhs_accesses if access.tensor.name == relayout.operand
         ]
         if len(packed_accesses) != 1:
-            raise ValueError(
+            raise ScorchValueError(
                 "RelayoutSpec.operand must name exactly one input tensor access; "
-                f"found {len(packed_accesses)} for {relayout.operand!r}"
+                f"found {len(packed_accesses)} for {relayout.operand!r}",
+                code="relayout_schedule_invalid",
             )
         packed_access = packed_accesses[0]
         packed_names = [
             index_var.name for index_var in packed_access.get_sorted_index_vars()
         ]
         if relayout.pack_var not in packed_names:
-            raise ValueError(
+            raise ScorchValueError(
                 f"Relayout pack_var {relayout.pack_var!r} does not index operand "
-                f"{relayout.operand!r}"
+                f"{relayout.operand!r}",
+                code="relayout_schedule_invalid",
             )
         if not packed_access.is_dense() or packed_access.num_levels != 2:
-            raise NotImplementedError(
-                "Packed relayout requires a rank-2 dense input operand"
+            raise ScorchNotImplementedError(
+                "Packed relayout requires a rank-2 dense input operand",
+                code="relayout_operand_shape_unsupported",
             )
         if packed_names[-1] != relayout.pack_var:
-            raise NotImplementedError(
+            raise ScorchNotImplementedError(
                 "Packed relayout requires pack_var to be the operand's contiguous "
-                "last storage level"
+                "last storage level",
+                code="relayout_operand_shape_unsupported",
             )
         multiplicative_accesses = Scheduler._multiplicative_rhs_accesses(assignment.rhs)
         if multiplicative_accesses is None or sorted(
             id(access) for access in multiplicative_accesses
         ) != sorted(id(access) for access in rhs_accesses):
-            raise NotImplementedError(
+            raise ScorchNotImplementedError(
                 "Packed relayout requires the staged dense and compressed "
                 "accesses to participate in one multiplicative contraction "
-                "expression"
+                "expression",
+                code="relayout_operand_shape_unsupported",
             )
         panel_var = packed_names[0]
         scope_var = relayout.scope_var
         if scope_var not in (panel_var, relayout.pack_var):
-            raise ValueError(
+            raise ScorchValueError(
                 "RelayoutSpec.scope_var must name either the staged access's "
                 f"panel axis {panel_var!r} or tiled axis {relayout.pack_var!r}; "
-                f"got {scope_var!r}"
+                f"got {scope_var!r}",
+                code="relayout_schedule_invalid",
             )
-        assert scope_var is not None
+        if scope_var is None:
+            raise ScorchAssertionError(
+                "scope_var is not None", code="relayout_scope_unresolved"
+            )
 
         if len(panel_tiles) != 1 or panel_tiles[0].index_var != panel_var:
-            raise ValueError(
+            raise ScorchValueError(
                 "Packed relayout requires exactly one sparse panel tile on the "
-                f"other operand index {panel_var!r}"
+                f"other operand index {panel_var!r}",
+                code="relayout_schedule_invalid",
             )
         panel_tile = panel_tiles[0]
         affine_tiles = [tile for tile in schedule.tiles if tile.kind == "affine"]
@@ -3106,33 +3568,38 @@ class Scheduler:
             tile for tile in affine_tiles if tile.index_var == relayout.pack_var
         ]
         if len(pack_tiles) != 1:
-            raise ValueError(
+            raise ScorchValueError(
                 "Packed relayout requires exactly one affine tile for pack_var "
-                f"{relayout.pack_var!r}"
+                f"{relayout.pack_var!r}",
+                code="relayout_schedule_invalid",
             )
         pack_tile = pack_tiles[0]
         if len(schedule.tiles) != 2 or len(affine_tiles) != 1:
-            raise NotImplementedError(
+            raise ScorchNotImplementedError(
                 "Packed relayout currently supports only one affine pack tile "
-                "and one sparse panel tile"
+                "and one sparse panel tile",
+                code="relayout_operand_shape_unsupported",
             )
         if pack_tile.width != relayout.strip_width:
-            raise ValueError(
+            raise ScorchValueError(
                 "Relayout strip_width must match the affine pack tile width "
-                f"({relayout.strip_width} != {pack_tile.width})"
+                f"({relayout.strip_width} != {pack_tile.width})",
+                code="relayout_schedule_invalid",
             )
         if pack_tile.accum not in ("direct", "heap"):
-            raise NotImplementedError(
-                "Packed relayout supports direct or heap-backed output accumulation"
+            raise ScorchNotImplementedError(
+                "Packed relayout supports direct or heap-backed output accumulation",
+                code="relayout_accumulation_unsupported",
             )
         expected_panel_placement = f"child_of:{relayout.pack_var}_out"
         if (
             pack_tile.placement != "outermost"
             or panel_tile.placement != expected_panel_placement
         ):
-            raise ValueError(
+            raise ScorchValueError(
                 "Packed relayout requires an outermost pack tile followed by a "
-                f"panel placed at {expected_panel_placement!r}"
+                f"panel placed at {expected_panel_placement!r}",
+                code="relayout_schedule_invalid",
             )
 
         sparse_rhs = [access for access in rhs_accesses if not access.is_dense()]
@@ -3142,9 +3609,10 @@ class Scheduler:
             if LevelType.COMPRESSED in access.level_types()
         ]
         if len(rhs_accesses) != 2 or len(sparse_rhs) != 1 or len(compressed_rhs) != 1:
-            raise NotImplementedError(
+            raise ScorchNotImplementedError(
                 "Packed relayout requires exactly one CSR input and one dense "
-                "input tensor access"
+                "input tensor access",
+                code="relayout_operand_shape_unsupported",
             )
         compressed_access = compressed_rhs[0]
         if (
@@ -3155,49 +3623,56 @@ class Scheduler:
             ]
             or compressed_access.num_levels != 2
         ):
-            raise NotImplementedError(
-                "Packed relayout requires a rank-2 CSR input with a dense parent"
+            raise ScorchNotImplementedError(
+                "Packed relayout requires a rank-2 CSR input with a dense parent",
+                code="relayout_operand_shape_unsupported",
             )
         compressed_names = [
             index_var.name for index_var in compressed_access.get_sorted_index_vars()
         ]
         row_var, compressed_panel_var = compressed_names
         if compressed_panel_var != panel_var:
-            raise NotImplementedError(
+            raise ScorchNotImplementedError(
                 "The CSR compressed coordinate must be the packed operand's "
-                f"panel index {panel_var!r}"
+                f"panel index {panel_var!r}",
+                code="relayout_operand_shape_unsupported",
             )
 
         result_accesses = cin.get_result_tensor_accesses()
         if len(result_accesses) != 1 or not result_accesses[0].is_dense():
-            raise NotImplementedError(
-                "Packed relayout requires exactly one dense result tensor"
+            raise ScorchNotImplementedError(
+                "Packed relayout requires exactly one dense result tensor",
+                code="relayout_operand_shape_unsupported",
             )
         result_access = result_accesses[0]
         result_names = [
             index_var.name for index_var in result_access.get_sorted_index_vars()
         ]
         if result_names != [row_var, relayout.pack_var]:
-            raise NotImplementedError(
+            raise ScorchNotImplementedError(
                 "Packed relayout requires the dense result to be indexed by the "
-                "CSR row followed by pack_var"
+                "CSR row followed by pack_var",
+                code="relayout_operand_shape_unsupported",
             )
         if panel_var not in reduction_names or relayout.pack_var in reduction_names:
-            raise NotImplementedError(
+            raise ScorchNotImplementedError(
                 "Packed relayout requires panel_var to be a reduction and "
-                "pack_var to be a free result axis"
+                "pack_var to be a free result axis",
+                code="relayout_operand_shape_unsupported",
             )
 
         expected_order = (row_var, panel_var, relayout.pack_var)
         if schedule.loop_order != expected_order:
-            raise ValueError(
+            raise ScorchValueError(
                 "Packed relayout requires loop_order to match the structural "
-                f"(row, panel, pack) order {expected_order!r}"
+                f"(row, panel, pack) order {expected_order!r}",
+                code="relayout_schedule_invalid",
             )
         if schedule.parallel_loop != row_var:
-            raise ValueError(
+            raise ScorchValueError(
                 "Packed relayout requires the CSR row loop to be selected for "
-                "parallel execution"
+                "parallel execution",
+                code="relayout_schedule_invalid",
             )
 
         tensors = [access.tensor for access in rhs_accesses] + [result_access.tensor]
@@ -3206,9 +3681,10 @@ class Scheduler:
             torch.float32,
             torch.float64,
         ):
-            raise NotImplementedError(
+            raise ScorchNotImplementedError(
                 "Packed relayout supports matching float32 or float64 operand "
-                "and result dtypes"
+                "and result dtypes",
+                code="relayout_dtype_unsupported",
             )
 
         return _RelayoutPlan(
@@ -3263,8 +3739,9 @@ class Scheduler:
         # structure is a property of the accumulation workspace, so a schedule
         # carrying only one must reach the route that inserts the workspace.
         if not is_identity and cin.get_workspace_accesses():
-            raise NotImplementedError(
-                "CIN with an existing workspace supports only an empty auto Schedule"
+            raise ScorchNotImplementedError(
+                "CIN with an existing workspace supports only an empty auto Schedule",
+                code="schedule_scope_unsupported",
             )
         if len(cin.get_result_tensor_accesses()) == 1:
             return is_identity
@@ -3273,9 +3750,10 @@ class Scheduler:
             or schedule.relayout is not None
             or schedule.parallel_loop is not None
         ):
-            raise NotImplementedError(
+            raise ScorchNotImplementedError(
                 "Tiling, relayout, and explicit parallel scheduling require "
-                "one assignment"
+                "one assignment",
+                code="schedule_scope_unsupported",
             )
         prospective_order = (
             Scheduler.select_loop_order(cin, costs=costs)
@@ -3283,8 +3761,9 @@ class Scheduler:
             else Scheduler.resolve_loop_order(cin, schedule.loop_order)
         )
         if Scheduler.should_insert_workspace(cin, prospective_order):
-            raise NotImplementedError(
-                "Derived workspace scheduling requires one assignment"
+            raise ScorchNotImplementedError(
+                "Derived workspace scheduling requires one assignment",
+                code="schedule_scope_unsupported",
             )
         return is_identity
 
@@ -3304,8 +3783,9 @@ class Scheduler:
             if index_var.name in reduction_names
         ]
         if reduction_positions and max(reduction_positions) == 0:
-            raise NotImplementedError(
-                "Stack tiling cannot wrap a workspace inserted at the root scope"
+            raise ScorchNotImplementedError(
+                "Stack tiling cannot wrap a workspace inserted at the root scope",
+                code="stack_tiling_root_workspace_unsupported",
             )
 
     @staticmethod
@@ -3325,7 +3805,10 @@ class Scheduler:
         implicit tile heuristic is added on top of it.
         """
         if not isinstance(schedule, Schedule):
-            raise TypeError("apply_schedule expects a Schedule")
+            raise ScorchTypeError(
+                "apply_schedule expects a Schedule",
+                code="internal_argument_type_invalid",
+            )
         options, costs = _scheduler_costs_at_boundary(costs, compile_options)
         _validate_requested_schedule(options, schedule)
         source_cin = cin
@@ -3333,14 +3816,16 @@ class Scheduler:
         # behind this boundary by applying it only to a private working copy.
         cin = copy.deepcopy(cin)
         if not isinstance(cin, ForAll):
+            _refuse_loop_requests_without_loops(schedule)
             if (
                 schedule.loop_order is not None
                 or schedule.tiles
                 or schedule.relayout is not None
                 or schedule.parallel_loop is not None
             ):
-                raise NotImplementedError(
-                    "Non-empty schedules require a ForAll CIN statement"
+                raise ScorchNotImplementedError(
+                    "Non-empty schedules require a ForAll CIN statement",
+                    code="schedule_without_loops_unsupported",
                 )
             plan = verify_loop_plan(
                 source_cin,
@@ -3355,24 +3840,31 @@ class Scheduler:
         is_identity = Scheduler._validate_legacy_replay_scope(cin, schedule, costs)
         panel_tiles = [tile for tile in schedule.tiles if tile.kind == "panel"]
         if len(panel_tiles) > 1:
-            raise NotImplementedError("Only one sparse panel tile is supported")
+            raise ScorchNotImplementedError(
+                "Only one sparse panel tile is supported",
+                code="multiple_panel_tiles_unsupported",
+            )
         if panel_tiles and schedule.tiles[-1].kind != "panel":
-            raise ValueError(
-                "A sparse panel tile must follow all affine tiles in Schedule.tiles"
+            raise ScorchValueError(
+                "A sparse panel tile must follow all affine tiles in Schedule.tiles",
+                code="panel_tile_order_invalid",
             )
         if panel_tiles and not Scheduler._has_dense_output(cin):
-            raise NotImplementedError(
-                "Sparse panel tiling currently requires a dense result tensor"
+            raise ScorchNotImplementedError(
+                "Sparse panel tiling currently requires a dense result tensor",
+                code="panel_tile_sparse_result_unsupported",
             )
         if panel_tiles and panel_tiles[0].parallel:
-            raise ValueError(
+            raise ScorchValueError(
                 "Sparse panel outer loops must be serial; select the row loop "
-                "with Schedule.parallel_loop"
+                "with Schedule.parallel_loop",
+                code="panel_parallel_loop_invalid",
             )
         for tile in schedule.tiles:
             if tile.kind == "panel" and tile.accum != "direct":
-                raise NotImplementedError(
-                    "Sparse panel tiles currently require accum='direct'"
+                raise ScorchNotImplementedError(
+                    "Sparse panel tiles currently require accum='direct'",
+                    code="panel_tile_accumulation_unsupported",
                 )
 
         logical_names = {index_var.name for index_var in cin.index_vars}
@@ -3382,8 +3874,9 @@ class Scheduler:
             if tile.index_var not in logical_names
         ]
         if unknown_tiles:
-            raise ValueError(
-                f"Schedule tiles refer to unknown index variables {unknown_tiles}"
+            raise ScorchValueError(
+                f"Schedule tiles refer to unknown index variables {unknown_tiles}",
+                code="schedule_loop_unknown",
             )
 
         index_var_getter = CINIndexVariablesGetter()
@@ -3397,16 +3890,18 @@ class Scheduler:
             if tile.kind == "affine" and tile.index_var in reduction_names
         ]
         if affine_reductions:
-            raise NotImplementedError(
+            raise ScorchNotImplementedError(
                 "Affine reduction tiling requires an accumulator spanning outer "
-                f"tiles; unsupported reduction variables: {affine_reductions}"
+                f"tiles; unsupported reduction variables: {affine_reductions}",
+                code="reduction_tiling_accumulator_unsupported",
             )
         if any(tile.kind == "affine" for tile in schedule.tiles) and not (
             Scheduler._has_dense_output(cin)
         ):
-            raise NotImplementedError(
+            raise ScorchNotImplementedError(
                 "Explicit affine tiling currently requires a dense result tensor; "
-                "tiled sparse-output assembly is unsupported"
+                "tiled sparse-output assembly is unsupported",
+                code="tiling_sparse_result_unsupported",
             )
         Scheduler._require_legal_assembly_request(cin, schedule)
         Scheduler._require_legal_accumulator_request(cin, schedule)
@@ -3415,9 +3910,10 @@ class Scheduler:
         if schedule.parallel_loop is not None:
             parallel_names.append(schedule.parallel_loop)
         if parallel_names and not Scheduler._has_dense_output(cin):
-            raise NotImplementedError(
+            raise ScorchNotImplementedError(
                 "Explicit parallel-loop selection currently requires a dense "
-                "result tensor"
+                "result tensor",
+                code="explicit_parallel_sparse_result_unsupported",
             )
         tiled_inner_loops = {
             f"{tile.index_var}_in" for tile in schedule.tiles if tile.kind == "affine"
@@ -3426,9 +3922,10 @@ class Scheduler:
             name for name in parallel_names if name in tiled_inner_loops
         ]
         if parallel_inner_loops:
-            raise ValueError(
+            raise ScorchValueError(
                 "Tiled inner loops contain a ragged-tail break and cannot be "
-                f"parallelized: {parallel_inner_loops}"
+                f"parallelized: {parallel_inner_loops}",
+                code="parallel_ragged_tile_invalid",
             )
         parallel_reductions = []
         for parallel_name in parallel_names:
@@ -3446,9 +3943,10 @@ class Scheduler:
             if logical_name in reduction_names:
                 parallel_reductions.append(parallel_name)
         if parallel_reductions:
-            raise ValueError(
+            raise ScorchValueError(
                 "Reduction loops cannot be selected for parallel execution: "
-                f"{parallel_reductions}"
+                f"{parallel_reductions}",
+                code="parallel_reduction_loop_invalid",
             )
 
         result_tile_plan = Scheduler._validate_heap_result_tile(
@@ -3466,9 +3964,10 @@ class Scheduler:
                 and access.level_type_of_index_var(target) == LevelType.COMPRESSED
             ]
             if len(compressed_accesses) != 1:
-                raise NotImplementedError(
+                raise ScorchNotImplementedError(
                     f"Panel index {tile.index_var!r} must have exactly one "
-                    "compressed tensor access"
+                    "compressed tensor access",
+                    code="panel_compressed_access_unsupported",
                 )
             compressed_access = compressed_accesses[0]
             parent = compressed_access.get_parent_index_var(target)
@@ -3476,14 +3975,16 @@ class Scheduler:
                 parent is None
                 or compressed_access.level_type_of_index_var(parent) != LevelType.DENSE
             ):
-                raise NotImplementedError(
+                raise ScorchNotImplementedError(
                     "Sparse panel tiling currently requires a CSR-style "
-                    "compressed level with a dense parent"
+                    "compressed level with a dense parent",
+                    code="panel_tile_format_unsupported",
                 )
             if schedule.parallel_loop != parent.name:
-                raise ValueError(
+                raise ScorchValueError(
                     "Sparse panel tiling requires its CSR dense-parent row loop "
-                    f"{parent.name!r} as Schedule.parallel_loop"
+                    f"{parent.name!r} as Schedule.parallel_loop",
+                    code="panel_parallel_loop_invalid",
                 )
             if schedule.loop_order is None:
                 panel_logical_order = [
@@ -3501,13 +4002,15 @@ class Scheduler:
                 and panel_logical_order.index(parent.name)
                 > panel_logical_order.index(target.name)
             ):
-                raise ValueError(
+                raise ScorchValueError(
                     "Sparse panel tiling requires the CSR row loop to precede "
-                    "the compressed panel coordinate in logical loop_order"
+                    "the compressed panel coordinate in logical loop_order",
+                    code="panel_loop_order_invalid",
                 )
             if tile.placement.startswith("at_depth:"):
-                raise NotImplementedError(
-                    "Sparse panel tiles do not support at_depth placement"
+                raise ScorchNotImplementedError(
+                    "Sparse panel tiles do not support at_depth placement",
+                    code="panel_tile_depth_placement_unsupported",
                 )
             if tile.placement.startswith("child_of:"):
                 placement_parent = tile.placement.split(":", 1)[1]
@@ -3516,9 +4019,10 @@ class Scheduler:
                     f"{parent.name}_out",
                     f"{parent.name}_in",
                 ):
-                    raise ValueError(
+                    raise ScorchValueError(
                         "A sparse panel loop must be placed outside its parallel "
-                        "CSR row loop"
+                        "CSR row loop",
+                        code="panel_placement_invalid",
                     )
                 affine_parent = next(
                     (
@@ -3530,9 +4034,10 @@ class Scheduler:
                     None,
                 )
                 if affine_parent is None or affine_parent.placement != "outermost":
-                    raise ValueError(
+                    raise ScorchValueError(
                         "A child_of sparse panel placement must name an "
-                        "outermost affine tile loop"
+                        "outermost affine tile loop",
+                        code="panel_placement_invalid",
                     )
 
         relayout_plan = Scheduler._validate_relayout(
@@ -3551,8 +4056,12 @@ class Scheduler:
                 tag=schedule.tag,
                 assembly=schedule.assembly,
                 accumulator=schedule.accumulator,
+                entries_of=_entries_of_symbol(source_cin, schedule.entries_of),
                 composed_order_candidate=composed_order_candidate,
                 dense_results_any_order=dense_results_any_order,
+            )
+            plan = _with_vector_loop_request(
+                source_cin, plan, schedule, dense_results_any_order
             )
             return ScheduledCIN(scheduled_cin, plan)
 
@@ -3577,9 +4086,10 @@ class Scheduler:
             if not Scheduler._tile_target_needs_workspace(cin, tile.index_var)
         ]
         if unsupported_stack_tiles:
-            raise NotImplementedError(
+            raise ScorchNotImplementedError(
                 "Stack accumulation is only supported for a trailing dense free "
-                f"dimension after a reduction: {unsupported_stack_tiles}"
+                f"dimension after a reduction: {unsupported_stack_tiles}",
+                code="stack_accumulation_layout_unsupported",
             )
         stack_targets = {tile.index_var for tile in stack_tiles}
         Scheduler._validate_stack_workspace_scope(
@@ -3625,8 +4135,9 @@ class Scheduler:
                 and access.level_type_of_index_var(target) == LevelType.DENSE
             ]
             if not dense_accesses:
-                raise NotImplementedError(
-                    f"Panel index {tile.index_var!r} has no dense dimension bound"
+                raise ScorchNotImplementedError(
+                    f"Panel index {tile.index_var!r} has no dense dimension bound",
+                    code="panel_without_dense_bound_unsupported",
                 )
             access = dense_accesses[0]
             level = access.level_of_index_var(target)
@@ -3682,9 +4193,15 @@ class Scheduler:
         """
 
         if type(composed_order_candidate) is not bool:
-            raise TypeError("composed_order_candidate must be an exact bool")
+            raise ScorchTypeError(
+                "composed_order_candidate must be an exact bool",
+                code="internal_argument_type_invalid",
+            )
         if type(dense_results_any_order) is not bool:
-            raise TypeError("dense_results_any_order must be an exact bool")
+            raise ScorchTypeError(
+                "dense_results_any_order must be an exact bool",
+                code="internal_argument_type_invalid",
+            )
         _validate_schedule_structure(schedule)
         options, costs = _scheduler_costs_at_boundary(costs, compile_options)
         if compile_options is None and options.requested_schedule is None:
@@ -3724,9 +4241,14 @@ class Scheduler:
                 except (InvalidSchedule, UnsupportedFeature, VerificationError):
                     raise
                 except NotImplementedError as exc:
-                    raise UnsupportedFeature(str(exc)) from exc
+                    raise UnsupportedFeature(
+                        str(exc),
+                        code=defect_code(exc) or "schedule_rewrite_unsupported",
+                    ) from exc
                 except ValueError as exc:
-                    raise InvalidSchedule(str(exc)) from exc
+                    raise InvalidSchedule(
+                        str(exc), code=defect_code(exc) or "schedule_rewrite_invalid"
+                    ) from exc
                 scheduled = ScheduledCIN(
                     normalized_cin,
                     legacy_scheduled.verified_loop_plan,
@@ -3953,6 +4475,7 @@ class Scheduler:
         require_complete_plan: bool,
         assembly: Optional[str] = None,
         accumulator: Optional[str] = None,
+        entries_of: Optional[SymbolId] = None,
         dense_results_any_order: bool = False,
     ) -> Tuple[CIN, LoopPlan]:
         """Apply one automatic order and verify the plan that records it.
@@ -3967,6 +4490,11 @@ class Scheduler:
         ``accumulator`` rides along on exactly the same terms and for exactly the
         same reason: the structure applies only to sparse-output programs, whose
         workspace insertion is a decision only the automatic path can record.
+
+        ``entries_of`` (the input whose entries a COO result stores) is recorded
+        with them because the assembly's legality reads it: a parallel single
+        pass is legal only for a result that stores a named input's entries, so
+        the plan must carry the name when the boundary verifies the assembly.
         """
 
         auto_tiles: List[LoopTile] = []
@@ -3988,6 +4516,7 @@ class Scheduler:
                 workspace=auto_workspace[0] if auto_workspace else None,
                 assembly=assembly,
                 accumulator=accumulator,
+                entries_of=entries_of,
                 auto_policy=Scheduler._auto_origin_policy(scheduler_policy),
                 provenance="auto",
                 tag=tag,
@@ -4008,6 +4537,7 @@ class Scheduler:
         require_complete_plan: bool = False,
         assembly: Optional[str] = None,
         accumulator: Optional[str] = None,
+        entries_of: Optional[SymbolId] = None,
         composed_order_candidate: bool = False,
         dense_results_any_order: bool = False,
     ) -> Tuple[CIN, LoopPlan]:
@@ -4081,6 +4611,7 @@ class Scheduler:
                 require_complete_plan=require_complete_plan,
                 assembly=assembly,
                 accumulator=accumulator,
+                entries_of=entries_of,
                 in_storage_order=in_storage_order,
                 dense_results_any_order=dense_results_any_order,
             )
@@ -4098,6 +4629,7 @@ class Scheduler:
                 require_complete_plan=require_complete_plan,
                 assembly=assembly,
                 accumulator=accumulator,
+                entries_of=entries_of,
                 dense_results_any_order=dense_results_any_order,
             )
         except InvalidSchedule as error:
@@ -4125,7 +4657,10 @@ class Scheduler:
                     return sorted_plan
         if forced is not None:
             return forced
-        assert refusal is not None
+        if refusal is None:
+            raise ScorchAssertionError(
+                "refusal is not None", code="auto_plan_refusal_missing"
+            )
         if not reordered:
             raise refusal
         repaired = reoriginate(False)
@@ -4144,6 +4679,7 @@ class Scheduler:
         require_complete_plan: bool,
         assembly: Optional[str],
         accumulator: Optional[str],
+        entries_of: Optional[SymbolId] = None,
         in_storage_order: bool = False,
         dense_results_any_order: bool = False,
     ) -> Optional[Tuple[CIN, LoopPlan]]:
@@ -4174,6 +4710,7 @@ class Scheduler:
                 require_complete_plan=require_complete_plan,
                 assembly=assembly,
                 accumulator=accumulator,
+                entries_of=entries_of,
                 dense_results_any_order=dense_results_any_order,
             )
         except (InvalidSchedule, UnsupportedFeature, VerificationError):
@@ -4251,7 +4788,10 @@ class Scheduler:
         """Apply selected auto decisions on a CIN owned by the scheduler."""
 
         if type(require_complete_plan) is not bool:
-            raise TypeError("require_complete_plan must be an exact bool")
+            raise ScorchTypeError(
+                "require_complete_plan must be an exact bool",
+                code="internal_argument_type_invalid",
+            )
         if require_complete_plan and (
             type(plan_tiles) is not list
             or type(plan_workspace) is not list
@@ -4259,9 +4799,10 @@ class Scheduler:
             or plan_tiles
             or plan_workspace
         ):
-            raise TypeError(
+            raise ScorchTypeError(
                 "require_complete_plan needs empty exact plan tile and "
-                "workspace sinks"
+                "workspace sinks",
+                code="internal_argument_type_invalid",
             )
         if not isinstance(cin, ForAll):
             return cin
@@ -4318,7 +4859,8 @@ class Scheduler:
                     ):
                         raise VerificationError(
                             "stage=auto plan recording: the workspace "
-                            "insertion decision did not materialize as derived"
+                            "insertion decision did not materialize as derived",
+                            code="auto_plan_replay_mismatch",
                         )
 
         if isinstance(cin, ForAll):
@@ -4343,7 +4885,8 @@ class Scheduler:
                 raise UnsupportedFeature(
                     "stage=auto plan recording: a materialized dense "
                     "workspace without derived tiles is not represented by "
-                    "the automatic LoopPlan replay contract"
+                    "the automatic LoopPlan replay contract",
+                    code="auto_plan_dense_workspace_unrecorded",
                 )
         return cin
 
@@ -4390,7 +4933,8 @@ class Scheduler:
         if not isinstance(cin, ForAll):
             if plan.loop_order or plan.tiles:
                 raise VerificationError(
-                    "stage=legacy auto replay: non-loop CIN has loop decisions"
+                    "stage=legacy auto replay: non-loop CIN has loop decisions",
+                    code="auto_plan_replay_mismatch",
                 )
             return cin
         if (
@@ -4401,7 +4945,8 @@ class Scheduler:
         ):
             raise VerificationError(
                 "stage=legacy auto replay: auto LoopPlan contains explicit-only "
-                "decisions"
+                "decisions",
+                code="auto_plan_replay_mismatch",
             )
 
         index_names, _ = entity_display_names(cin)
@@ -4420,19 +4965,22 @@ class Scheduler:
             if derived != plan.workspace:
                 raise VerificationError(
                     "stage=legacy auto replay: the recorded workspace "
-                    "insertion does not match the replayed nest"
+                    "insertion does not match the replayed nest",
+                    code="auto_plan_replay_mismatch",
                 )
             cin = Scheduler.insert_workspace(cin, allow_dense=True)
             if not cin.inserted_workspace:
                 raise VerificationError(
                     "stage=legacy auto replay: the recorded workspace "
-                    "insertion did not materialize"
+                    "insertion did not materialize",
+                    code="auto_plan_replay_mismatch",
                 )
 
         for tile in plan.tiles:
             if tile.loop.part != LoopPart.LOGICAL or tile.kind != "affine":
                 raise VerificationError(
-                    "stage=legacy auto replay: unsupported recorded auto tile"
+                    "stage=legacy auto replay: unsupported recorded auto tile",
+                    code="auto_plan_replay_mismatch",
                 )
             target = Scheduler._find_index_var_by_id(cin, tile.loop.index_id)
             cin = Scheduler.add_tile(
@@ -4562,9 +5110,14 @@ class Scheduler:
         """Run one deterministic arm of the internal dual-path algorithm."""
 
         if type(enabled) is not bool:
-            raise TypeError("enabled must be an exact bool")
+            raise ScorchTypeError(
+                "enabled must be an exact bool", code="internal_argument_type_invalid"
+            )
         if type(compile_options) is not CompileOptions:
-            raise TypeError("compile_options must be an exact CompileOptions")
+            raise ScorchTypeError(
+                "compile_options must be an exact CompileOptions",
+                code="internal_argument_type_invalid",
+            )
         _validate_requested_schedule(compile_options, None)
         scheduler_policy = replace(
             compile_options.scheduler,
@@ -4589,7 +5142,10 @@ class Scheduler:
         """Shared owned implementation after the public boundary is resolved."""
 
         if not _is_index_stmt_instance(cin):
-            raise TypeError("auto_schedule expects an IndexStmt")
+            raise ScorchTypeError(
+                "auto_schedule expects an IndexStmt",
+                code="internal_argument_type_invalid",
+            )
         # Normalization owns the structural preflight; validate display names
         # on the normalized clone so a forged graph fails closed first (the
         # clone preserves every display name and stable ID).

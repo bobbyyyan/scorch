@@ -594,6 +594,23 @@ _MECHANISMS: Tuple[Mechanism, ...] = (
         "not a rebuild: 'tensor.name' is the ABI's own tensor name",
         unthreaded_constructions=1,
     ),
+    Mechanism(
+        "compiler/torch_cpp_abi.py::level_total_check",
+        KIND_REBUILD,
+        INERT,
+        "not a rebuild: 'total.name' is the name of the level's int64 total, an "
+        "llir.Var argument of the new check call, which collides with "
+        "FunctionCallStmt.name",
+        unthreaded_constructions=1,
+    ),
+    Mechanism(
+        "compiler/torch_cpp_abi.py::drained_entries_check",
+        KIND_REBUILD,
+        INERT,
+        "not a rebuild: 'entries.name', the drain's int64 counter, an llir.Var "
+        "argument of the new check call",
+        unthreaded_constructions=1,
+    ),
 )
 
 

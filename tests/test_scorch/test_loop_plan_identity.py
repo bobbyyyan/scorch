@@ -26,7 +26,12 @@ from scorch.compiler.diagnostics import (
     UnsupportedFeature,
     VerificationError,
 )
-from scorch.compiler.loop_plan import LoopRef, WorkspaceInsertion, verify_loop_plan
+from scorch.compiler.loop_plan import (
+    LoopPart,
+    LoopRef,
+    WorkspaceInsertion,
+    verify_loop_plan,
+)
 from scorch.compiler.loopir.plan_identity import (
     CANONICAL_PLAN_SCHEMA,
     CANONICAL_REQUEST_SCHEMA,
@@ -918,3 +923,60 @@ def test_every_element_type_the_lowering_accepts_has_a_request_token() -> None:
     assert len(set(plan_identity._DTYPE_TOKENS.values())) == len(
         plan_identity._DTYPE_TOKENS
     )
+
+
+def _with_vector_loops(artifact, names):
+    """``artifact``'s plan with ``vector_loops`` naming loops by letter: the
+    logical loop, or the point loop of an index the plan tiles (the automatic
+    plan of the product tiles some of its loops, and naming such a loop
+    unsplit is refused)."""
+
+    by_name = {}
+    stmt = artifact.normalized_cin
+    while isinstance(stmt, ForAll):
+        by_name[stmt.index_var.name] = stmt.index_var.index_id
+        stmt = stmt.stmt
+    tiled = {
+        tile.loop.index_id
+        for tile in artifact.verified_loop_plan.tiles
+        if tile.kind == "affine"
+    }
+
+    def loop(name):
+        index = by_name[name]
+        return LoopRef(index, LoopPart.INNER) if index in tiled else LoopRef(index)
+
+    marks = None if names is None else tuple(loop(name) for name in names)
+    return replace(artifact.verified_loop_plan, vector_loops=marks)
+
+
+def _vector_dump(artifact, names):
+    plan = _with_vector_loops(artifact, names)
+    return canonical_plan_dump(artifact.normalized_cin, plan)
+
+
+def test_vector_loops_enter_the_identity_only_when_recorded() -> None:
+    artifact = scheduled(build_matmul, Schedule())
+    unrecorded = canonical_plan_dump(
+        artifact.normalized_cin, artifact.verified_loop_plan
+    )
+    assert "vector_loops" not in json.loads(unrecorded)
+    assert _vector_dump(artifact, None) == unrecorded
+    assert _vector_dump(artifact, ()) != unrecorded
+    assert json.loads(_vector_dump(artifact, ()))["vector_loops"] == []
+    assert _vector_dump(artifact, ("j",)) != _vector_dump(artifact, ())
+
+
+def test_vector_loops_identity_ignores_the_order_the_loops_are_named_in() -> None:
+    artifact = scheduled(build_matmul, Schedule())
+    assert _vector_dump(artifact, ("j", "k")) == _vector_dump(artifact, ("k", "j"))
+    assert _vector_dump(artifact, ("j", "k")) != _vector_dump(artifact, ("j",))
+
+
+def test_vector_loops_identity_is_independent_of_index_identities() -> None:
+    first = scheduled(build_matmul, Schedule())
+    second = scheduled(build_matmul, Schedule())
+    assert (
+        first.verified_loop_plan.loop_order != second.verified_loop_plan.loop_order
+    ), "the probe needs fresh global identities to be meaningful"
+    assert _vector_dump(first, ("k", "j")) == _vector_dump(second, ("j", "k"))

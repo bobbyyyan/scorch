@@ -51,7 +51,11 @@ import torch.autograd.forward_ad as _fwad
 
 import scorch_ops as _native
 
-from .exceptions import TensorIndexError
+from .exceptions import (
+    ScorchAssertionError,
+    ScorchNotImplementedError,
+    TensorIndexError,
+)
 from .format import LevelType
 from .layout import TensorLayout
 from .plan import GRAD_ATTR, torch_object_state
@@ -180,7 +184,8 @@ class _Structure:
             ):
                 raise TensorIndexError(
                     "the sparse operand's index arrays do not describe a valid "
-                    f"{rows} x {cols} CSR structure"
+                    f"{rows} x {cols} CSR structure",
+                    code="csr_structure_invalid",
                 )
             if _first_unsorted_parent(positions, coordinates) is not None:
                 # Kept in canonical form, as an STensor over these arrays would be
@@ -528,10 +533,18 @@ def _mm_backward(
     graph = torch.is_grad_enabled()
     gv = gb = None
     if want_values:
-        assert b is not None  # saved whenever the values' gradient is wanted (_record)
+        # saved whenever the values' gradient is wanted (_record)
+        if b is None:
+            raise ScorchAssertionError(
+                "b is not None", code="autograd_saved_tensor_missing"
+            )
         gv = _SparseSDDMM.apply(op, g, b) if graph else op.sddmm(g, b)
     if want_b:
-        assert values is not None  # and the values whenever b's is
+        # and the values whenever b's is
+        if values is None:
+            raise ScorchAssertionError(
+                "values is not None", code="autograd_saved_tensor_missing"
+            )
         if graph:
             gb = _SparseMMT.apply(op, values, g)
         else:
@@ -554,11 +567,17 @@ def _mm_t_backward(
     graph = torch.is_grad_enabled()
     gv = gb = None
     if want_values:
-        assert b is not None
+        if b is None:
+            raise ScorchAssertionError(
+                "b is not None", code="autograd_saved_tensor_missing"
+            )
         # d/dA[i, j] of sum_j (A^T b)[j, :] . g[j, :] is b[i, :] . g[j, :].
         gv = _SparseSDDMM.apply(op, b, g) if graph else op.sddmm(b, g)
     if want_b:
-        assert values is not None
+        if values is None:
+            raise ScorchAssertionError(
+                "values is not None", code="autograd_saved_tensor_missing"
+            )
         if graph:
             gb = _SparseMM.apply(op, values, g)
         else:
@@ -959,11 +978,12 @@ class _NotDifferentiable(torch.autograd.Function):
 
     @staticmethod
     def backward(ctx: Any, *grads: torch.Tensor):
-        raise NotImplementedError(
+        raise ScorchNotImplementedError(
             f"scorch.matmul has no derivative for {ctx.what}; differentiable products "
             "are a 2-D sparse operand (torch CSR or COO, or a CSR, CSC, DCSR or sorted "
             "COO STensor) times a dense float32/float64 CPU matrix or vector, either way "
-            "round, with no keyword arguments"
+            "round, with no keyword arguments",
+            code="matmul_derivative_unsupported",
         )
 
     @staticmethod

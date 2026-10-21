@@ -2,10 +2,13 @@ from dataclasses import dataclass, replace
 from typing import (
     TYPE_CHECKING,
     Dict,
+    Iterable,
     List,
     NoReturn,
     Optional,
+    Pattern,
     Sequence,
+    Set,
     Tuple,
     Union,
     cast,
@@ -37,9 +40,7 @@ from .iter_lattice import (
     IterationLattice,
     compressed_child_catch_up,
     dense_block_commit,
-)
-from .iterator import (
-    collect_mode_position_arrays,
+    select_vector_marks,
 )
 from .identity import SymbolId
 from .llir import AssignOp, DataType
@@ -86,6 +87,7 @@ from .llir_pass_manager import (
 )
 from .compilation_context import CompilerStageId, CompilationContext
 from .llir_traversal import LLIRTraversalContext
+from .scalar_workspace_visit import place_visit_flag, visit_flag, visit_flag_set
 from .parallel_marking_pass import (
     EMPTY_PARALLEL_WORKSPACE_CLUSTER,
     ParallelWorkspaceCluster,
@@ -98,6 +100,8 @@ from .torch_cpp_abi import (
     KernelTensorABI,
     ResultTensorAssembler,
     TorchCppKernelABI,
+    dense_block_check,
+    drained_entries_check,
     tensor_data_ptr,
     tensor_storage_member,
 )
@@ -105,6 +109,12 @@ from ..format import LevelType, TensorFormat, LevelFormat
 from ..utils import (
     dtype_to_c_datatype,
     get_pytorch_c_dtype_name,
+)
+from ..exceptions import (
+    ScorchAssertionError,
+    ScorchNotImplementedError,
+    ScorchTypeError,
+    ScorchValueError,
 )
 
 if TYPE_CHECKING:
@@ -176,16 +186,22 @@ def _torch_cpp_kernel_abi(
     result_tensor_var: TensorVar,
     input_tensor_vars: List[TensorVar],
     post_ops: Optional[PostOps],
+    result_levels_bounded_in_kernel: Optional[Tuple[int, ...]] = (),
 ) -> TorchCppKernelABI:
-    """Snapshot one complete public kernel ABI without retaining semantic IR."""
+    """Snapshot one complete public kernel ABI without retaining semantic IR.
+
+    ``result_levels_bounded_in_kernel`` is ``None`` before the body is built
+    (``TorchCppKernelABI.result_levels_bounded_in_kernel``).
+    """
 
     extra_tensor_names = tuple(post_ops.extra_tensors) if post_ops is not None else ()
     return TorchCppKernelABI(
         result_shape=tuple(result_tensor_var.shape or ()),
-        result_rank=len(result_tensor_var.get_level_types()),
+        result_level_types=tuple(result_tensor_var.get_level_types()),
         input_tensors=tuple(_kernel_tensor_abi(tensor) for tensor in input_tensor_vars),
         extra_tensor_names=extra_tensor_names,
         extra_tensor_dtype=(result_tensor_var.dtype if extra_tensor_names else None),
+        result_levels_bounded_in_kernel=result_levels_bounded_in_kernel,
     )
 
 
@@ -288,20 +304,26 @@ class CINLowerer:
                 )
             )
         elif type(compile_options) is not CompileOptions:
-            raise TypeError("compile_options must be a CompileOptions instance")
+            raise ScorchTypeError(
+                "compile_options must be a CompileOptions instance",
+                code="internal_argument_type_invalid",
+            )
         elif llir_pass_options is not None:
-            raise TypeError(
-                "llir_pass_options and compile_options cannot both be provided"
+            raise ScorchTypeError(
+                "llir_pass_options and compile_options cannot both be provided",
+                code="internal_argument_type_invalid",
             )
         if compilation_context is not None:
             if type(compilation_context) is not CompilationContext:
-                raise TypeError(
-                    "compilation_context must be a CompilationContext instance"
+                raise ScorchTypeError(
+                    "compilation_context must be a CompilationContext instance",
+                    code="internal_argument_type_invalid",
                 )
             if compilation_context.compile_options is not compile_options:
-                raise TypeError(
+                raise ScorchTypeError(
                     "compilation_context must retain this lowering's exact "
-                    "CompileOptions snapshot"
+                    "CompileOptions snapshot",
+                    code="internal_argument_type_invalid",
                 )
         self._compilation_context = compilation_context
         self.compile_options = compile_options
@@ -328,6 +350,10 @@ class CINLowerer:
         self.normalized_cin: Optional[IndexStmt] = None
 
         self.result_value_array_sparse_index_llir = None
+        # The visit flag of each scalar workspace whose consumer appends it to a
+        # sparse result level, by workspace name, while its Where is being lowered
+        # (scalar_workspace_visit.py).
+        self._scalar_workspace_visit_flags: Dict[str, llir.Var] = {}
         self._scalar_accum_mode = False
         self._used_scalar_accum = False
         # The input whose stored entries the scalar-accumulation loops walk, one
@@ -352,6 +378,9 @@ class CINLowerer:
         # Whether some loop over a DENSE result level visits only stored
         # coordinates (set by the lattice that emits such a loop).
         self.result_dense_level_sparse_driven = False
+        # The result levels whose dense blocks the body checks where they open, filled
+        # by ``torch_cpp_abi.dense_block_check`` and read by the kernel's ABI.
+        self.result_levels_bounded_in_kernel: Set[int] = set()
         # Dense result level -> the bound variable of the dense loop over it,
         # when a dense loop drives it (set by the lattice that emits the loop).
         self.result_dense_level_bound_names: Dict[int, str] = {}
@@ -457,11 +486,13 @@ class CINLowerer:
                 descriptor_type = type(op).__qualname__
                 raise CompilerInvariantError(
                     f"stage=CIN lowering: unknown post-op descriptor type "
-                    f"'{descriptor_type}'"
+                    f"'{descriptor_type}'",
+                    code="post_op_descriptor_unknown",
                 )
             if op.kind not in self._SUPPORTED_POST_OP_KINDS:
                 raise UnsupportedFeature(
-                    f"stage=CIN lowering: unsupported post-op kind '{op.kind}'"
+                    f"stage=CIN lowering: unsupported post-op kind '{op.kind}'",
+                    code="post_op_kind_unsupported",
                 )
 
     @staticmethod
@@ -470,7 +501,8 @@ class CINLowerer:
         if not isinstance(stmt, (TensorAssign, ForAll, Where)):
             node_type = type(stmt).__qualname__
             raise CompilerInvariantError(
-                f"stage=CIN lowering: unknown IndexStmt node type '{node_type}'"
+                f"stage=CIN lowering: unknown IndexStmt node type '{node_type}'",
+                code="cin_node_unknown",
             )
 
     @staticmethod
@@ -512,41 +544,95 @@ class CINLowerer:
             )
 
     @staticmethod
-    def _validate_tensor_ranks(stmt: IndexStmt) -> None:
-        """Reject a rank-0 tensor, which the legacy position model cannot lower.
+    def _validate_loop_nest(stmt: IndexStmt) -> None:
+        """Reject a program with no loop, which this lowering has no rule for.
 
-        A scalar is a valid tensor: ``TensorVar(fmt="")`` declares the format of
-        rank 0.  This lowering addresses every tensor through the position of
-        its last level, so it has no rule for one with no levels.  Left to run,
-        it emitted a kernel that reads an undeclared ``y0_size`` and assigns to
-        an undeclared ``y`` for a scalar result, and raised ``IndexError`` for a
-        scalar operand.  Refused here, at the same ownership boundary as the
-        mixed coordinate hierarchies, with a code of its own.  A workspace of
-        dimension 0 is the scalar accumulator and is not a tensor in this sense.
+        A rank-0 tensor (``TensorVar(fmt="")``) holds one value, at position 0
+        of its value array: the root of its level tree, which has no levels.
+        ``lower_TensorAccess`` reads it there and ``lower_TensorAssign`` writes
+        it there.  A program whose tensors are all rank 0 can be one assignment
+        with no loop around it (``y[] = s[]``), and this lowering emits a
+        function body that is a loop nest or a ``Where`` (``_lower_outer_body``).
+        Left to run, such a program failed an assertion on its missing result
+        access.  Refused here, at the same ownership boundary as the mixed
+        coordinate hierarchies, with the code the rank-0 refusal has had since
+        this lowering refused every rank-0 tensor.
         """
 
-        for tensor_access in stmt.tensor_accesses:
-            tensor = tensor_access.get_tensor()
-            if isinstance(tensor, Workspace) or tensor.format is None:
-                continue
-            if tensor.format.get_order() != 0:
-                continue
-            diagnostic = CINDiagnostic(
-                code="unsupported_scalar_tensor",
-                message=(
-                    "legacy CIN lowering addresses a tensor through its levels "
-                    f"and has no rule for the rank-0 tensor {tensor.get_name()!r}"
-                ),
-                path=("root",),
-                entity_id=tensor.symbol_id,
-                stage="legacy_cin_lowering",
-                pass_name="prepare_stmt",
-            )
-            raise UnsupportedFeature(
-                "stage=legacy CIN lowering: "
-                f"unsupported_scalar_tensor for tensor {tensor.get_name()!r}",
-                diagnostics=(diagnostic,),
-            )
+        if not isinstance(stmt, TensorAssign):
+            return
+        tensor = stmt.lhs.get_tensor()
+        diagnostic = CINDiagnostic(
+            code="unsupported_scalar_tensor",
+            message=(
+                "legacy CIN lowering emits a loop nest and has no rule for the "
+                f"program without a loop that assigns the rank-0 tensor "
+                f"{tensor.get_name()!r}"
+            ),
+            path=("root",),
+            entity_id=tensor.symbol_id,
+            stage="legacy_cin_lowering",
+            pass_name="prepare_stmt",
+        )
+        raise UnsupportedFeature(
+            "stage=legacy CIN lowering: "
+            f"unsupported_scalar_tensor for tensor {tensor.get_name()!r}",
+            diagnostics=(diagnostic,),
+        )
+
+    @staticmethod
+    def _validate_update_operators(stmt: IndexStmt) -> None:
+        """Reject an assignment whose update operator this lowering cannot apply.
+
+        This lowering has a rule for ``=`` and ``+=`` only.  It reads
+        ``TensorAssign.op`` in two places, both as ``op == Operation.ADD`` (the
+        store into a dense block below a compressed level, and the ordinary
+        store), and the iteration lattice rebuilds each assignment it simplifies
+        with ``+=`` where the statement reduces and ``=`` where it does not
+        (``get_simplified_cin``).  So ``-=``, ``*=`` and ``/=`` were lowered as
+        ``+=`` or ``=`` with no message: ``C[i, j] *= A[i, j] * B[i, j]`` emitted
+        the kernel of ``C = A * B``, and ``C[i] -= A[i, j]`` summed with the
+        wrong sign.  No library entry builds those operators (einsum, matmul,
+        ``+`` and the conversions write ``=`` or ``+=``); a raw program that does
+        is refused here, at the same ownership boundary as the checks above,
+        with the code the new compiler gives it (its ``lower_cin.py``).
+        Every assignment of the statement is checked, a workspace's producer and
+        consumer included, and the first one found in program order is named.
+        """
+
+        pending: List[Tuple[IndexStmt, Tuple[str, ...]]] = [(stmt, ("root",))]
+        while pending:
+            node, path = pending.pop()
+            if isinstance(node, ForAll):
+                pending.append((node.stmt, path + ("stmt",)))
+            elif isinstance(node, Where):
+                # The consumer goes on the stack first so the producer, which
+                # runs first, is reported first.
+                pending.append((node.consumer, path + ("consumer",)))
+                pending.append((node.producer, path + ("producer",)))
+            elif isinstance(node, TensorAssign):
+                update = node.op
+                if update is None or update is Operation.ADD:
+                    continue
+                spelling = getattr(update, "value", update)
+                tensor = node.lhs.get_tensor()
+                diagnostic = CINDiagnostic(
+                    code="unsupported_update_op",
+                    message=(
+                        "legacy CIN lowering applies the update operators '=' "
+                        f"and '+=' only, not '{spelling}=' (the assignment to "
+                        f"{tensor.get_name()!r})"
+                    ),
+                    path=path + ("op",),
+                    entity_id=tensor.symbol_id,
+                    stage="legacy_cin_lowering",
+                    pass_name="prepare_stmt",
+                )
+                raise UnsupportedFeature(
+                    "stage=legacy CIN lowering: unsupported_update_op "
+                    f"'{spelling}=' for tensor {tensor.get_name()!r}",
+                    diagnostics=(diagnostic,),
+                )
 
     def _emit_post_ops(
         self,
@@ -632,7 +718,21 @@ class CINLowerer:
             raise CompilerInvariantError(
                 "stage=CIN lowering pass=lower_TensorAccess: "
                 f"workspace tensor '{tensor_var.get_name()}' reached generic value "
-                "lowering; workspace reads require a workspace-specific consumer"
+                "lowering; workspace reads require a workspace-specific consumer",
+                code="workspace_access_unlowered",
+            )
+
+        value_array = llir.Var(
+            name=f"{tensor_access.tensor.name}_val",
+            type=llir.DataType.ptr_type(tensor_access.tensor.dtype),
+        )
+        if not tensor_access.indices:
+            # A rank-0 tensor holds one value, at position 0: the root of its
+            # (empty) level tree.
+            return llir.ArrayAccess(
+                array=value_array,
+                index=llir.Literal(value=0, data_type=llir.DataType.INT64),
+                tensor_access=tensor_access_metadata,
             )
 
         sorted_index_vars = tensor_access.get_sorted_index_vars()
@@ -652,10 +752,7 @@ class CINLowerer:
             )
 
         return llir.ArrayAccess(
-            array=llir.Var(
-                name=f"{tensor_access.tensor.name}_val",
-                type=llir.DataType.ptr_type(tensor_access.tensor.dtype),
-            ),
+            array=value_array,
             index=llir.Var(name=physical_index, type=llir.DataType.INT),
             tensor_access=tensor_access_metadata,
         )
@@ -699,7 +796,8 @@ class CINLowerer:
             return self.lower_TensorAccess(cast(TensorAccess, index_expr))
         expression_name = type.__getattribute__(expression_type, "__qualname__")
         raise CompilerInvariantError(
-            "stage=CIN lowering: unknown IndexExpr node type " f"'{expression_name}'"
+            "stage=CIN lowering: unknown IndexExpr node type " f"'{expression_name}'",
+            code="cin_node_unknown",
         )
 
     @staticmethod
@@ -779,7 +877,10 @@ class CINLowerer:
             return llir_stmts
 
         # if we are at the bottommost level, we can emit compute code
-        assert self.result_tensor_access, "result tensor access is None"
+        if not self.result_tensor_access:
+            raise ScorchAssertionError(
+                "result tensor access is None", code="cin_lowering_state_missing"
+            )
         is_workspace = self.result_tensor_access.is_workspace()
         result_access_metadata = (
             self._tensor_access_metadata(
@@ -791,9 +892,10 @@ class CINLowerer:
         )
         index_vars = self.result_tensor_access.get_index_vars()
         sorted_index_vars = self.result_tensor_access.get_sorted_index_vars()
-        # If index_vars is None (empty), that means we have a scalar workspace
-        # Then just do <tensor> += <rhs_llir>
-        if not index_vars:
+        # An access with no index is a scalar workspace or a rank-0 result.  A
+        # scalar workspace is a local: just do <tensor> += <rhs_llir>.  A rank-0
+        # result is written below like any other result, at position 0.
+        if is_workspace and not index_vars:
             wksp_name = self.result_tensor_var.get_name()
             assign_stmt = llir.Assign(
                 var=llir.Var(name=f"{wksp_name}", type=llir.DataType.NO_TYPE),
@@ -801,10 +903,18 @@ class CINLowerer:
                 op=AssignOp.ADD_ASSIGN,
             )
             llir_stmts.append(assign_stmt)
+            # The producer reached the accumulation: its consumer keeps this entry
+            # whatever the sum is (scalar_workspace_visit.py).
+            flag = self._scalar_workspace_visit_flags.get(wksp_name)
+            if flag is not None:
+                llir_stmts.append(visit_flag_set(flag))
         else:
             # if index_vars are all in defined_index_vars, then we can emit the compute code
             if all(index_var in self.defined_index_vars for index_var in index_vars):
-                assert self.result_tensor_var, "result tensor var is None"
+                if not self.result_tensor_var:
+                    raise ScorchAssertionError(
+                        "result tensor var is None", code="cin_lowering_state_missing"
+                    )
 
                 values_llir_name = self.result_tensor_var.name
                 if not is_workspace:
@@ -820,18 +930,27 @@ class CINLowerer:
                         tensor_access=result_access_metadata,
                     )
                 else:
-                    level = self.result_tensor_access.level_of_index_var(
-                        sorted_index_vars[-1]
+                    # The value's position is the result's position at its last
+                    # level.  A rank-0 result has no level: its one value is at
+                    # position 0, the root of its (empty) level tree, and every
+                    # loop around this statement sums into it.
+                    value_position: llir.Expr = llir.Literal(
+                        value=0, data_type=llir.DataType.INT64
                     )
+                    if sorted_index_vars:
+                        level = self.result_tensor_access.level_of_index_var(
+                            sorted_index_vars[-1]
+                        )
+                        value_position = llir.Var(
+                            name=f"p{self.result_tensor_var.name}{level}",
+                            type=llir.DataType.INT64,
+                        )
                     tensor_access_llir = llir.ArrayAccess(
                         array=llir.Var(
                             name=values_llir_name,
                             type=llir.DataType.NO_TYPE,
                         ),
-                        index=llir.Var(
-                            name=f"p{self.result_tensor_var.name}{level}",
-                            type=llir.DataType.INT64,
-                        ),
+                        index=value_position,
                         tensor_access=result_access_metadata,
                     )
                     # tensor_access_llir = llir.Var(
@@ -841,7 +960,11 @@ class CINLowerer:
                     # )
 
                 if is_workspace:
-                    assert isinstance(self.result_tensor_access, WorkspaceAccess)
+                    if not isinstance(self.result_tensor_access, WorkspaceAccess):
+                        raise ScorchAssertionError(
+                            "isinstance(self.result_tensor_access, WorkspaceAccess)",
+                            code="cin_lowering_state_missing",
+                        )
                     wksp_access: WorkspaceAccess = self.result_tensor_access
                     wksp_index_vars = wksp_access.get_index_vars()
                     sorted_wksp_index_vars = [
@@ -850,9 +973,11 @@ class CINLowerer:
 
                     if wksp_access.is_dense():
                         # <workspace name>[<C++ array of indices>] += <rhs_llir>;
-                        assert (
-                            len(sorted_wksp_index_vars) == 1
-                        ), "dense workspace has more than 1 index var"
+                        if len(sorted_wksp_index_vars) != 1:
+                            raise ScorchAssertionError(
+                                "dense workspace has more than 1 index var",
+                                code="cin_lowering_state_missing",
+                            )
                         wksp_index_var = sorted_wksp_index_vars[0]
                         llir_stmts.append(
                             llir.Assign(
@@ -952,8 +1077,8 @@ class CINLowerer:
                             )
                         )
             # If the last _level of the result tensor var is sparse, then we need to set
-            # the coordinates
-            if not self.result_tensor_access.is_workspace():
+            # the coordinates (a rank-0 result has no level, so it has none to set)
+            if not self.result_tensor_access.is_workspace() and index_vars:
                 last_ivar = self.defined_index_vars[-1]
                 last_level_type = self.result_tensor_access.level_types()[-1]
                 if last_level_type in [LevelType.COMPRESSED, LevelType.COORDINATE]:
@@ -1260,7 +1385,10 @@ class CINLowerer:
         workspace_free_stmts: List[llir.Stmt] = []
         workspace_memset_stmts: List[llir.Stmt] = []
         for wksp in workspaces:
-            assert isinstance(wksp, Workspace), "workspace is not a Workspace"
+            if not isinstance(wksp, Workspace):
+                raise ScorchAssertionError(
+                    "workspace is not a Workspace", code="cin_lowering_state_missing"
+                )
             # coo_workspace<tensor's ctype> <tensor's name> = coo_workspace<tensor's ctype>(<tensor's dim>);
             wksp_ctype = dtype_to_c_datatype(wksp.dtype)
             wksp_ctype_ptr = DataType.ptr_type(wksp_ctype)
@@ -1276,6 +1404,12 @@ class CINLowerer:
                         value=llir.Literal(0),
                     )
                 )
+                if self._scalar_workspace_appends(stmt.consumer, wksp):
+                    flag = visit_flag(wksp.get_name())
+                    workspace_init_stmts.append(
+                        llir.VarInit(var=flag, value=llir.Literal(False))
+                    )
+                    self._scalar_workspace_visit_flags[wksp.get_name()] = flag
                 continue
 
             if wksp.dim == 1:
@@ -1483,7 +1617,16 @@ class CINLowerer:
             self._unplaced_workspace_clusters.append(self._parallel_workspace_cluster)
 
         producer_stmts = self.lower_ProducerIndexStmt(stmt.producer)
+        flags = [
+            self._scalar_workspace_visit_flags[wksp.get_name()]
+            for wksp in workspaces
+            if wksp.get_name() in self._scalar_workspace_visit_flags
+        ]
+        for flag in flags:
+            producer_stmts = place_visit_flag(producer_stmts, flag)
         consumer_stmts = self.lower_ConsumerIndexStmt(stmt.consumer)
+        for wksp in workspaces:
+            self._scalar_workspace_visit_flags.pop(wksp.get_name(), None)
         self._where_producer_stmts = producer_stmts
         self._where_consumer_stmts = consumer_stmts
         return [
@@ -1930,6 +2073,10 @@ class CINLowerer:
             llir.BlankLine(),
             wksp_sort_stmt,
             loop_stmt,
+            # The conversion below reads T back with `int` positions
+            # (`int pT0_end = T0_crd_tensor.size(0)`): hold the drained count to the
+            # 32-bit position bound first (csrc/header.h, scorch_check_drained_entries).
+            drained_entries_check(intermediate_tensor_iterator),
             llir.BlankLine(),
             *assembly_stmts,
             llir.BlankLine(),
@@ -1962,7 +2109,11 @@ class CINLowerer:
         block's first dense level pads and appends once for all of them.
         """
 
-        assert parent_index_var is not None and parent_level_type is not None
+        if not (parent_index_var is not None and parent_level_type is not None):
+            raise ScorchAssertionError(
+                "parent_index_var is not None and parent_level_type is not None",
+                code="cin_lowering_state_missing",
+            )
         result_name = result_tensor_access.get_tensor().get_name()
         values_name = f"{result_name}_values"
         scalar_type = dtype_to_c_datatype(wksp.dtype)
@@ -1997,7 +2148,21 @@ class CINLowerer:
                     result_tensor_access, (RESULT_VALUES, None, STORAGE_READ)
                 ),
             )
+        # Below the compressed level the row is the whole block, opened here;
+        # below a dense level the block opened before the loop over its first
+        # level, where the commit is.
+        block_opens: List[llir.Stmt] = []
+        if parent_level_type == LevelType.COMPRESSED:
+            block_opens.append(
+                dense_block_check(
+                    self.result_levels_bounded_in_kernel,
+                    result_name,
+                    result_tensor_access.level_types(),
+                    level,
+                )
+            )
         body: List[llir.Stmt] = [
+            *block_opens,
             grow,
             llir.FunctionCallStmt(
                 name="memcpy",
@@ -2209,6 +2374,41 @@ class CINLowerer:
             diagnostics=(diagnostic,),
         )
 
+    def _scalar_workspace_appends(self, consumer: IndexStmt, wksp: Workspace) -> bool:
+        """Whether ``consumer`` appends the scalar workspace ``wksp`` to a compressed or
+        coordinate result level: the conditions under which lower_ConsumerIndexStmt's
+        scalar-workspace branch appends rather than stores or refuses.  Such a consumer
+        appends when the producer visited (scalar_workspace_visit.py)."""
+
+        if consumer.parent == self.outermost_stmt:
+            return False
+        workspaces = consumer.get_workspaces()
+        if not workspaces or workspaces[0] is not wksp:
+            return False
+        if consumer.get_workspace_accesses()[0].get_index_vars():
+            return False
+        results = consumer.get_result_tensor_accesses()
+        if not results or not results[0].get_sorted_index_vars():
+            return False
+        access = results[0]
+        level_type = access.level_type_of_index_var(access.get_sorted_index_vars()[-1])
+        sparse = (LevelType.COMPRESSED, LevelType.COORDINATE)
+        return level_type in sparse and not self._reductions_around_consumer(access)
+
+    def _scalar_workspace_visit_flag(self, wksp: Workspace) -> llir.Var:
+        """The visit flag lower_Where declared for ``wksp``.  Its absence means the
+        two compute different conditions for one consumer: an invariant, not a
+        program to compile."""
+
+        flag = self._scalar_workspace_visit_flags.get(wksp.get_name())
+        if flag is None:
+            raise CompilerInvariantError(
+                f"the consumer appends the scalar workspace {wksp.get_name()!r} to a "
+                "sparse result level, but its Where declared no visit flag",
+                code="scalar_workspace_visit_flag_missing",
+            )
+        return flag
+
     def lower_ConsumerIndexStmt(self, stmt: IndexStmt) -> List[llir.Stmt]:
         """
         Lower a ConsumerIndexStmt to LLIR
@@ -2248,7 +2448,8 @@ class CINLowerer:
                 type=llir.DataType.NO_TYPE,
             )
 
-            # Guard assignment: if wksp != 0
+            # A dense result skips a zero sum: its cell already holds 0.  A sparse
+            # result appends when the producer visited (the branches below).
             if level_type == LevelType.DENSE:
                 stmts.append(
                     llir.IfThenElse(
@@ -2294,13 +2495,11 @@ class CINLowerer:
                     f"level {level}",
                 )
             elif level_type == LevelType.COMPRESSED:
+                # Kept when the producer visited, whatever the sum: a test of the
+                # sum against zero would drop a visited entry whose sum is 0.
                 stmts.append(
                     llir.IfThenElse(
-                        cond=llir.BinOp(
-                            op="!=",
-                            left=wksp_var,
-                            right=llir.Literal(value=0),
-                        ),
+                        cond=self._scalar_workspace_visit_flag(wksp),
                         then_body=[
                             llir.FunctionCallStmt(
                                 name=f"{result_tensor_name}{level}_crd.push_back",
@@ -2364,19 +2563,17 @@ class CINLowerer:
                         ),
                     )
                 )
+                # Kept when the producer visited, as the compressed branch above.
                 stmts.append(
                     llir.IfThenElse(
-                        cond=llir.BinOp(
-                            op="!=",
-                            left=wksp_var,
-                            right=llir.Literal(value=0),
-                        ),
+                        cond=self._scalar_workspace_visit_flag(wksp),
                         then_body=push_stmts,
                     )
                 )
             else:
-                raise NotImplementedError(
-                    f"TODO: need to handle assembly of workspace with {level_type} level"
+                raise ScorchNotImplementedError(
+                    f"TODO: need to handle assembly of workspace with {level_type} level",
+                    code="workspace_assembly_level_unsupported",
                 )
             return [
                 llir.BlankLine(),
@@ -2399,7 +2596,11 @@ class CINLowerer:
         parent_level_type = None
         if level > 0:
             parent_index_var = result_tensor_access.get_parent_index_var(curr_index_var)
-            assert parent_index_var is not None, "parent_index_var should not be None"
+            if parent_index_var is None:
+                raise ScorchAssertionError(
+                    "parent_index_var should not be None",
+                    code="cin_lowering_state_missing",
+                )
             parent_level_type = result_tensor_access.level_type_of_index_var(
                 parent_index_var
             )
@@ -2422,9 +2623,11 @@ class CINLowerer:
         # When the result level is dense and contiguous, use memcpy
         # (pure store, avoids cold read-modify-write on large output).
         if wksp_access.is_dense():
-            assert (
-                len(wksp_index_vars) == 1
-            ), "dense workspace has more than 1 index var"
+            if len(wksp_index_vars) != 1:
+                raise ScorchAssertionError(
+                    "dense workspace has more than 1 index var",
+                    code="cin_lowering_state_missing",
+                )
             wksp_index_var = wksp_index_vars[0]
 
             if not wksp_index_var.tile_size_var:
@@ -2601,9 +2804,11 @@ class CINLowerer:
                     for_loop,
                 ]
 
-            assert (
-                wksp_index_var.tile_size_var and wksp_index_var.is_inner
-            ), "Dense accumulator used not for tiling"
+            if not (wksp_index_var.tile_size_var and wksp_index_var.is_inner):
+                raise ScorchAssertionError(
+                    "Dense accumulator used not for tiling",
+                    code="cin_lowering_state_missing",
+                )
 
             # For loop
             # for (int <wksp index var> = 0; <wksp index var> < <wksp index var bound>; <wksp index var>++) {
@@ -2727,7 +2932,8 @@ class CINLowerer:
                 "stage=CIN lowering: a sparse workspace is drained into result "
                 f"level {level} of {result_tensor_name!r}, which is "
                 f"{level_type.name.lower()}; the drain assembles a compressed or "
-                "coordinate level"
+                "coordinate level",
+                code="unsupported_workspace_result_level",
             )
 
         # For loop
@@ -3165,7 +3371,10 @@ class CINLowerer:
                     if changed is None
                     else llir.BinOp(op="||", left=changed, right=differs)
                 )
-            assert changed is not None
+            if changed is None:
+                raise ScorchAssertionError(
+                    "changed is not None", code="cin_lowering_state_missing"
+                )
             loop_body.append(
                 llir.IfThenElse(cond=changed, then_body=close_segment(level))
             )
@@ -3231,7 +3440,11 @@ class CINLowerer:
             closing.extend(close_segment(level))
 
         parent_index_var = result_tensor_access.get_parent_index_var(key[0])
-        assert parent_index_var is not None, "a nested drain has an enclosing level"
+        if parent_index_var is None:
+            raise ScorchAssertionError(
+                "a nested drain has an enclosing level",
+                code="cin_lowering_state_missing",
+            )
         return [
             llir.BlankLine(),
             llir.Comment("Lower consumer CIN"),
@@ -3450,8 +3663,24 @@ class CINLowerer:
         )
         loop_body.append(llir.BlankLine())
 
-        # Close, deepest first, every subtree whose own prefix changed.
+        # Close, deepest first, every subtree whose own prefix changed.  A
+        # compressed level over a dense block opens the next coordinate's block
+        # as it closes the last one, so the block's check follows its commit,
+        # before the positions below are resolved.
         for level, stmts in closes:
+            if (
+                level_types[level] == LevelType.COMPRESSED
+                and level_types[level + 1] == LevelType.DENSE
+            ):
+                stmts = [
+                    *stmts,
+                    dense_block_check(
+                        self.result_levels_bounded_in_kernel,
+                        result_tensor_name,
+                        level_types,
+                        level + 1,
+                    ),
+                ]
             changed: Optional[llir.Expr] = None
             for key_position in range(level - first_level + 1):
                 differs = llir.BinOp(
@@ -3464,7 +3693,10 @@ class CINLowerer:
                     if changed is None
                     else llir.BinOp(op="||", left=changed, right=differs)
                 )
-            assert changed is not None
+            if changed is None:
+                raise ScorchAssertionError(
+                    "changed is not None", code="cin_lowering_state_missing"
+                )
             loop_body.append(llir.IfThenElse(cond=changed, then_body=list(stmts)))
         for key_position in range(tracked):
             loop_body.append(
@@ -3479,7 +3711,11 @@ class CINLowerer:
             if level_types[level] != LevelType.DENSE:
                 continue
             resolve = result_tensor_access.get_level_iterator_resolve_stmts(level=level)
-            assert resolve, "a dense level below another level resolves its position"
+            if not resolve:
+                raise ScorchAssertionError(
+                    "a dense level below another level resolves its position",
+                    code="cin_lowering_state_missing",
+                )
             loop_body.extend(resolve)
             if level < leaf_level and level_types[level + 1] == LevelType.COMPRESSED:
                 loop_body.extend(
@@ -3550,9 +3786,16 @@ class CINLowerer:
 
         # The outermost key level, against the loop that encloses the drain.
         parent_index_var = result_tensor_access.get_parent_index_var(key[0])
-        assert parent_index_var is not None, "a mixed drain has an enclosing level"
+        if parent_index_var is None:
+            raise ScorchAssertionError(
+                "a mixed drain has an enclosing level",
+                code="cin_lowering_state_missing",
+            )
         parent_level_type = level_types[first_level - 1]
         outer: List[llir.Stmt]
+        # A drain whose first key level opens a dense block under the enclosing
+        # loop's coordinate: the block is checked once, before the drain.
+        block_opens: List[llir.Stmt] = []
         if level_types[first_level] == LevelType.COMPRESSED:
             outer = self._drained_segment_assembly(
                 result_tensor_access,
@@ -3568,6 +3811,15 @@ class CINLowerer:
                 first_level,
                 llir.Var(name=parent_index_var.name, type=llir.DataType.INT),
             )
+            if outer:
+                block_opens.append(
+                    dense_block_check(
+                        self.result_levels_bounded_in_kernel,
+                        result_tensor_name,
+                        level_types,
+                        first_level,
+                    )
+                )
         else:
             # Dense levels all the way up to the enclosing loop, so the drain
             # itself closes nothing here.  A compressed level below the run
@@ -3596,6 +3848,7 @@ class CINLowerer:
                 llir.VarInit(var=previous(key_position), value=llir.Literal(-1))
                 for key_position in range(tracked)
             ],
+            *block_opens,
             llir.ForLoopAuto(
                 var=loop_var,
                 array=llir.Var(name=wksp_name, type=llir.DataType.AUTO),
@@ -3635,7 +3888,10 @@ class CINLowerer:
             # if _level is > 0 and parent _level is also sparse, we need to set
             # the parent _level's crd
             if level > 0:
-                assert parent_index_var is not None, "Parent index var is None"
+                if parent_index_var is None:
+                    raise ScorchAssertionError(
+                        "Parent index var is None", code="cin_lowering_state_missing"
+                    )
                 if parent_level_type == LevelType.COMPRESSED:
                     # The enclosing loop over the parent's variable closes the
                     # parent's level with ``if ({R}{L-1}_pos.back() < p{R}{L-1})``
@@ -3715,7 +3971,10 @@ class CINLowerer:
             # - Compressed parent: A1_pos[A0_crd.size()] = A1_crd.size()
             assembled_pos_array = False
             if level > 0:
-                assert parent_index_var is not None, "Parent index var is None"
+                if parent_index_var is None:
+                    raise ScorchAssertionError(
+                        "Parent index var is None", code="cin_lowering_state_missing"
+                    )
                 if parent_level_type == LevelType.COMPRESSED:
                     # A1_pos[A0_crd.size()] = A1_crd.size()
                     assembly_stmts.append(
@@ -3817,13 +4076,17 @@ class CINLowerer:
     ) -> IndexStmt:
         scheduled_input = type(stmt) is ScheduledCIN
         if not scheduled_input and not _is_index_stmt_instance(stmt):
-            raise TypeError("CIN lowering expects an IndexStmt or exact ScheduledCIN")
+            raise ScorchTypeError(
+                "CIN lowering expects an IndexStmt or exact ScheduledCIN",
+                code="internal_argument_type_invalid",
+            )
         plain_cin_input = not scheduled_input
         if recurse or self._active_lowerings > 0:
             if scheduled_input:
                 raise CompilerInvariantError(
                     "stage=CIN lowering: ScheduledCIN is valid only at the "
-                    "outer scheduling boundary"
+                    "outer scheduling boundary",
+                    code="scheduled_cin_misplaced",
                 )
             plain_stmt = cast(IndexStmt, stmt)
             self._validate_index_stmt(plain_stmt)
@@ -3870,8 +4133,9 @@ class CINLowerer:
                 prepared_stmt
             )
         self._validate_index_stmt(prepared_stmt)
-        self._validate_tensor_ranks(prepared_stmt)
+        self._validate_loop_nest(prepared_stmt)
         self._validate_coordinate_hierarchies(prepared_stmt)
+        self._validate_update_operators(prepared_stmt)
         verify_cin_enabled = self.compile_options.verification.verify_cin
         if legacy_schedule_aliases and verify_cin_enabled and not ownership_transferred:
             # A caller-owned legacy auto-schedule is a derived compatibility
@@ -3939,7 +4203,8 @@ class CINLowerer:
             statements = lowered if isinstance(lowered, list) else [lowered]
             return _LoweredOuterBody(statements)
         raise CompilerInvariantError(
-            "stage=CIN lowering: outer function body must be ForAll or Where"
+            "stage=CIN lowering: outer function body must be ForAll or Where",
+            code="cin_outer_body_invalid",
         )
 
     def lower_IndexStmt(
@@ -4146,11 +4411,17 @@ class CINLowerer:
                 return self.lower_Where(stmt)
 
         result_contract = self.final_result_tensor_var or self.result_tensor_var
-        assert result_contract is not None, "No result tensor ABI contract"
+        if result_contract is None:
+            raise ScorchAssertionError(
+                "No result tensor ABI contract", code="cin_lowering_state_missing"
+            )
+        # The dense blocks the body bounds are known once the body is built; until
+        # then the ABI refuses only what no body could address.
         kernel_abi = _torch_cpp_kernel_abi(
             result_contract,
             rhs_tensor_vars,
             self.post_ops,
+            result_levels_bounded_in_kernel=None,
         )
         # The ABI snapshot is the fail-closed dtype/rank boundary.  Do not
         # index the raw dtype mapping before it has validated every input.
@@ -4338,10 +4609,6 @@ class CINLowerer:
 
         # Finally, return function that computes the result
         if stmt == self.outermost_stmt:
-            # Validate public by-value arguments before any nested mode-index
-            # access or data_ptr call. Validation may replace only these local
-            # handles with checked int32 copies; caller-owned tensors stay intact.
-            abi_validation_stmts = kernel_abi.emit_validation()
             postop_ptr_stmts = kernel_abi.emit_extra_tensor_prologue()
 
             # The former ``lower_IndexStmt(..., recurse=True)`` path repeated
@@ -4349,6 +4616,16 @@ class CINLowerer:
             # instance state stable while returning pass ownership explicitly.
             self.need_compute.extend(result_tensor_vars)
             recurse_result = self._lower_outer_body(stmt)
+
+            # Validate public by-value arguments before any nested mode-index
+            # access or data_ptr call. Validation may replace only these local
+            # handles with checked int32 copies; caller-owned tensors stay intact.
+            # Its result check declares the dense blocks the body just built
+            # bounds itself.
+            kernel_abi = kernel_abi.with_levels_bounded_in_kernel(
+                self.result_levels_bounded_in_kernel
+            )
+            abi_validation_stmts = kernel_abi.emit_validation()
 
             def assemble_body(
                 transformed_body: LLIRStatementListArtifact,
@@ -4469,9 +4746,10 @@ class CINLowerer:
                         ]
                     )
 
-                    assert (
-                        self.final_result_tensor_var is not None
-                    ), "No final result tensor"
+                    if self.final_result_tensor_var is None:
+                        raise ScorchAssertionError(
+                            "No final result tensor", code="cin_lowering_state_missing"
+                        )
                     final_assembler = _result_tensor_abi_assembler(
                         self.final_result_tensor_var,
                         known_nnz_var=self._known_nnz_var,
@@ -4516,7 +4794,9 @@ class CINLowerer:
                 raise failure.failure from None
             self._record_llir_pass_runs(pipeline_result.run_records)
             body_stmts = pipeline_result.artifact.value
-            return kernel_abi.assemble_function(body_stmts)
+            function = kernel_abi.assemble_function(body_stmts)
+            kernel_abi.require_bounded_levels_checked(function)
+            return function
 
         return []
 
@@ -4556,6 +4836,90 @@ class CINLowerer:
             "stage=legacy CIN lowering: "
             f"{UNSUPPORTED_ACCUMULATOR_STRUCTURE} at plan/accumulator",
             diagnostics=(diagnostic,),
+        )
+
+    @staticmethod
+    def _apply_vector_loops(
+        scheduled: Union[llir.Stmt, List[llir.Stmt]],
+        requested: Optional[Tuple[str, ...]],
+    ) -> None:
+        """Keep the vector marks a plan's ``vector_loops`` names, refuse the rest.
+
+        ``None`` keeps every mark the shared rule placed during lowering.  A
+        name that matches no marked loop is a loop the rule did not find safe to
+        mark, refused with a structured code rather than ignored.
+        """
+
+        body = scheduled.body if isinstance(scheduled, llir.Function) else scheduled
+        statements = body if isinstance(body, list) else [body]
+        unmarkable = select_vector_marks(statements, requested)
+        if not unmarkable:
+            return
+        from .loop_plan_legality import LoopPlanDiagnostic
+
+        reason = (
+            f"{', '.join(map(repr, unmarkable))} carries no vector mark in this "
+            "kernel: a mark is placed only on a loop of a sum kept in a register, "
+            "not parallel or unrolled, with no early exit and no loop over a "
+            "compressed level's positions in its body"
+        )
+        raise UnsupportedFeature(
+            "stage=schedule lowering: unsupported_vector_loop at "
+            f"schedule/vector_loops: {reason}",
+            diagnostics=(
+                LoopPlanDiagnostic(
+                    code="unsupported_vector_loop",
+                    message=reason,
+                    path=("schedule", "vector_loops"),
+                    stage="schedule lowering",
+                    pass_name="select_vector_marks",
+                ),
+            ),
+        )
+
+    def _require_entries_of(self, requested: Optional[str]) -> None:
+        """Accept a plan's ``entries_of`` only where this lowering stores them.
+
+        Scalar accumulation into a sparse result stores one result entry for
+        every stored entry of the input its loops walk
+        (:meth:`_require_scalar_accumulation_driver`), an entry whose inner sum
+        ran zero times included; a request naming that input is what this
+        lowering already emits, so the kernel text does not change.  Any other
+        request names a structure this lowering does not build and is refused
+        with a structured code rather than ignored.
+        """
+
+        if requested is None:
+            return
+        driver = self._scalar_accum_driver
+        result = self.final_result_tensor_var
+        if (
+            self._used_scalar_accum
+            and result is not None
+            and not result.is_dense()
+            and driver is not None
+            and driver.get_name() == requested
+        ):
+            return
+        from .loop_plan_legality import LoopPlanDiagnostic
+
+        reason = (
+            f"the result stores the entries of input {requested!r} only under "
+            "scalar accumulation whose loops walk that input's stored entries; "
+            "this kernel does not accumulate that way"
+        )
+        raise UnsupportedFeature(
+            "stage=schedule lowering: unsupported_entries_of at "
+            f"schedule/entries_of: {reason}",
+            diagnostics=(
+                LoopPlanDiagnostic(
+                    code="unsupported_entries_of",
+                    message=reason,
+                    path=("schedule", "entries_of"),
+                    stage="schedule lowering",
+                    pass_name="require_entries_of",
+                ),
+            ),
         )
 
     def _apply_schedule_lowering(
@@ -4599,6 +4963,8 @@ class CINLowerer:
                 relayout_plan,
                 result_tile_plan,
             )
+            self._apply_vector_loops(scheduled, legacy_schedule.vector_loops)
+            self._require_entries_of(legacy_schedule.entries_of)
         except Exception:
             if schedule_lowering_token is not None and compilation_context is not None:
                 compilation_context.fail_stage(schedule_lowering_token)
@@ -5028,7 +5394,8 @@ class CINLowerer:
             raise CompilerInvariantError(
                 "stage=CIN lowering pass=workspace placement: a dense workspace "
                 "was placed by no parallel loop in a kernel that has a parallel "
-                "region or no outermost loop"
+                "region or no outermost loop",
+                code="workspace_placement_failed",
             )
         before: List[llir.Stmt] = []
         after: List[llir.Stmt] = []
@@ -5049,7 +5416,8 @@ class CINLowerer:
                 return
         raise CompilerInvariantError(
             "stage=CIN lowering pass=workspace placement: the outermost loop "
-            "is not in the lowered function"
+            "is not in the lowered function",
+            code="workspace_placement_failed",
         )
 
     @staticmethod
@@ -5140,8 +5508,9 @@ class CINLowerer:
 
         loop = self._find_tagged_for_loop(function.body, loop_name)
         if loop is None:
-            raise ValueError(
-                f"Cannot find generated loop {loop_name!r} selected for parallelism"
+            raise ScorchValueError(
+                f"Cannot find generated loop {loop_name!r} selected for parallelism",
+                code="parallel_loop_not_generated",
             )
         if not loop.omp_parallel_for and not getattr(
             loop, "_use_atomic_scheduling", False
@@ -5155,74 +5524,6 @@ class CINLowerer:
     # generated kernel so the macro resolves. Defaults to 1500 there — larger than the
     # A_nnz default (500) because flop is ~avg_B_row bigger; validated on redwood.
     _CG_FLOP_GRAIN = "SCORCH_GRAIN_CODEGEN_SPGEMM"
-
-    @staticmethod
-    def _parse_pos(pos_name: str):
-        """Split a sparse pos array name into (operand_prefix, level) per the codegen
-        naming convention: 'A1_pos' -> ('A', 1), 'B0_pos' -> ('B', 0). None if it
-        doesn't parse. A pos array exists only for a COMPRESSED level, so a level-0 pos
-        (e.g. 'B0_pos') signals a compressed outer level (no materialised <op>0_size).
-        """
-        import re
-
-        m = re.match(r"([A-Za-z_]\w*?)(\d+)_pos$", pos_name)
-        return (m.group(1), int(m.group(2))) if m else None
-
-    def _find_all_sparse_pos_arrays(self, body) -> List[str]:
-        """All distinct sparse pos array names (e.g. ['A1_pos', 'B1_pos']) referenced
-        anywhere in `body`, in deterministic structural pre-order. Generalises
-        the parallel-marking pass's find_sparse_pos_array to nested loop
-        headers while retaining only the explicit RawStmt compatibility
-        escape hatch."""
-
-        return collect_mode_position_arrays(
-            list(body),
-            _SPARSE_POSITION_DISCOVERY_CONTEXT,
-        )
-
-    def _spgemm_flop_work_expr(self, body, bound) -> Optional[str]:
-        """True SpGEMM-flop work estimate for the thread cap: A_nnz * avg_B_row, the
-        same estimate the prebuilt spmspm_csr kernel uses. A_nnz is the outer (A-side)
-        operand's nnz; avg_B_row is the second (B-side) operand's mean row length
-        (B_nnz/B0_size + 1). Returns None (caller falls back to the A_nnz-only estimate)
-        unless BOTH operands are CSR-like with a DENSE outer level, because only then
-        are <op>0_size (the outer dim) and <op><leaf>_pos[<op>0_size] (total nnz) real
-        declared vars. In particular a compressed-outer B (format 'ss', 'oo', ...) has
-        no <B>0_size var, so we must NOT reference it — that would be undeclared-id.
-        """
-        # Levels that have a pos array, grouped by operand prefix. A pos array exists
-        # only for a compressed level, so `0 in levels[op]` == compressed outer level.
-        levels: Dict[str, set] = {}
-        for p in self._find_all_sparse_pos_arrays(body):
-            parsed = self._parse_pos(p)
-            if parsed:
-                levels.setdefault(parsed[0], set()).add(parsed[1])
-
-        # A-side prefix from the loop bound (`<A>0_size`). If A had a compressed outer
-        # level the loop bound wouldn't be a plain size var, so this already implies A
-        # is dense-outer (its <A>0_size is declared).
-        if not bound.endswith("0_size"):
-            return None
-        a_prefix = bound[: -len("0_size")]
-        if a_prefix not in levels or 0 in levels[a_prefix]:
-            return None
-
-        # B-side: a DIFFERENT operand that is also dense-outer (no level-0 pos), so
-        # <B>0_size is a materialised shape var and <B><leaf>_pos[<B>0_size] = B_nnz.
-        b_prefix = next(
-            (pref for pref, lv in levels.items() if pref != a_prefix and 0 not in lv),
-            None,
-        )
-        if b_prefix is None:
-            return None
-
-        a_nnz = f"(long){a_prefix}{max(levels[a_prefix])}_pos[{bound}]"
-        b_outer = f"{b_prefix}0_size"
-        b_nnz = f"{b_prefix}{max(levels[b_prefix])}_pos[{b_outer}]"
-        # (long) forces 64-bit multiply so a big flop can't overflow int (the prebuilt
-        # kernel likewise holds A_nnz/flop_est as long). avg_B_row guards B0_size==0
-        # (empty contraction dim), matching the prebuilt's `B0_size>0?(B_nnz/B0_size)+1:1`.
-        return f"{a_nnz} * ({b_outer} > 0 ? ({b_nnz} / {b_outer}) + 1 : 1)"
 
     @classmethod
     def _collect_output_arrays(
@@ -5261,9 +5562,10 @@ class CINLowerer:
         """Clone one whole-object receiver admitted by the COO resize seam."""
 
         if type(array_var) is not llir.Var:
-            raise TypeError(
+            raise ScorchTypeError(
                 "COO preallocation receiver must be an exact metadata-free "
-                "std::vector Var"
+                "std::vector Var",
+                code="coo_preallocation_invalid",
             )
         fields = vars(array_var)
         required_fields = {
@@ -5287,9 +5589,10 @@ class CINLowerer:
             or fields["is_restrict"] is not False
             or fields["tensor_access"] is not None
         ):
-            raise TypeError(
+            raise ScorchTypeError(
                 "COO preallocation receiver must be an exact metadata-free "
-                "std::vector Var"
+                "std::vector Var",
+                code="coo_preallocation_invalid",
             )
         return llir.Var(
             name=cast(str, array_name),
@@ -5298,15 +5601,45 @@ class CINLowerer:
             is_restrict=False,
         )
 
+    @staticmethod
+    def _tensor_position_pattern(tensor_names: Iterable[str]) -> Pattern[str]:
+        """Match the position variable of one of the named tensors, ``p<name><level>``;
+        group 1 is the tensor's name.
+
+        The names are the program's own, so a name of any length is recognised: einsum
+        names a 27th tensor ``AA``. A pattern that guessed one capital letter left
+        ``pAA1`` shared between the threads of the loop this transform makes parallel.
+        """
+        import re
+
+        names = sorted(
+            {re.escape(name) for name in tensor_names}, key=len, reverse=True
+        )
+        if not names:
+            return re.compile(r"(?!)")
+        return re.compile(r"^p(" + "|".join(names) + r")\d+$")
+
+    @staticmethod
+    def _is_array_of_tensor(array_name: str, tensor_name: str) -> bool:
+        """Whether ``array_name`` is one of ``tensor_name``'s arrays: the tensor's name,
+        then nothing, a level digit or an underscore (``D1_crd``, ``D_values``). With
+        tensors ``A`` and ``AA``, ``AA1_crd`` is not one of ``A``'s."""
+        if not array_name.startswith(tensor_name):
+            return False
+        rest = array_name[len(tensor_name) :]
+        return rest == "" or rest[0].isdigit() or rest[0] == "_"
+
     @classmethod
     def _replace_output_pos_with_input_pos(
-        cls, stmts: List[llir.Stmt], input_iter_var: str
+        cls,
+        stmts: List[llir.Stmt],
+        input_iter_var: str,
+        tensor_position: Pattern[str],
     ) -> None:
         """Replace shared output position variable (pD1) with input iterator position
         for thread-safe parallel output. Finds inner ForLoop over pA1..pA1_end and
-        replaces pD<N> references with pA1 in the loop body."""
-        import re
-
+        replaces pD<N> references with pA1 in the loop body. ``tensor_position`` is
+        ``_tensor_position_pattern`` of the program's tensors."""
         for stmt in stmts:
             if isinstance(stmt, llir.ForLoop):
                 # Find the sparse inner loop iterating pA1
@@ -5316,29 +5649,36 @@ class CINLowerer:
                     and stmt.init.var.name.startswith("p")
                 ):
                     inner_pos_var = stmt.init.var.name  # e.g. "pA1"
-                    cls._rewrite_output_pos_vars(stmt.body, inner_pos_var)
+                    cls._rewrite_output_pos_vars(
+                        stmt.body, inner_pos_var, tensor_position
+                    )
                 else:
-                    cls._replace_output_pos_with_input_pos(stmt.body, input_iter_var)
+                    cls._replace_output_pos_with_input_pos(
+                        stmt.body, input_iter_var, tensor_position
+                    )
             elif isinstance(stmt, llir.WhileLoop):
-                cls._replace_output_pos_with_input_pos(stmt.body, input_iter_var)
+                cls._replace_output_pos_with_input_pos(
+                    stmt.body, input_iter_var, tensor_position
+                )
             elif isinstance(stmt, llir.IfThenElse):
                 if stmt.then_body:
                     cls._replace_output_pos_with_input_pos(
-                        stmt.then_body, input_iter_var
+                        stmt.then_body, input_iter_var, tensor_position
                     )
                 if stmt.else_body:
                     cls._replace_output_pos_with_input_pos(
-                        stmt.else_body, input_iter_var
+                        stmt.else_body, input_iter_var, tensor_position
                     )
 
     @classmethod
     def _rewrite_output_pos_vars(
-        cls, stmts: List[llir.Stmt], input_pos_var: str
+        cls,
+        stmts: List[llir.Stmt],
+        input_pos_var: str,
+        tensor_position: Pattern[str],
     ) -> None:
         """Replace output position variables (pD1, pD0) in Assign/Increment stmts
         with the input position variable for thread-safe writes."""
-        import re
-
         to_remove = []
         for i, stmt in enumerate(stmts):
             if isinstance(stmt, llir.Assign) and type(stmt.var) is llir.ArrayAccess:
@@ -5347,8 +5687,8 @@ class CINLowerer:
                 if type(target.array) is llir.Var and type(target.index) is llir.Var:
                     array = cast(llir.Var, target.array)
                     index = cast(llir.Var, target.index)
-                    match = re.match(r"^p([A-Z])\d+$", index.name)
-                    if match and array.name.startswith(match.group(1)):
+                    match = tensor_position.match(index.name)
+                    if match and cls._is_array_of_tensor(array.name, match.group(1)):
                         stmt.var = llir.ArrayAccess(
                             array=array,
                             index=llir.Var(
@@ -5362,14 +5702,14 @@ class CINLowerer:
                         )
             elif isinstance(stmt, llir.Increment) and isinstance(stmt.var, llir.Var):
                 # Remove pD1++ (no longer needed, position is input-derived)
-                if re.match(r"^p[A-Z]\d+$", stmt.var.name):
+                if tensor_position.match(stmt.var.name):
                     # Check it's an output pos var, not an input one
                     if stmt.var.name != input_pos_var:
                         to_remove.append(i)
             elif isinstance(stmt, llir.ForLoop):
-                cls._rewrite_output_pos_vars(stmt.body, input_pos_var)
+                cls._rewrite_output_pos_vars(stmt.body, input_pos_var, tensor_position)
             elif isinstance(stmt, llir.WhileLoop):
-                cls._rewrite_output_pos_vars(stmt.body, input_pos_var)
+                cls._rewrite_output_pos_vars(stmt.body, input_pos_var, tensor_position)
         for i in reversed(to_remove):
             stmts.pop(i)
 
@@ -5392,14 +5732,19 @@ class CINLowerer:
         # levels runs its nested loops serially.
         return len(level_types) <= 2
 
-    def _transform_coo_loop_for_openmp(self, stmts: List[llir.Stmt]) -> List[llir.Stmt]:
+    def _transform_coo_loop_for_openmp(
+        self, stmts: List[llir.Stmt], tensor_names: Iterable[str]
+    ) -> List[llir.Stmt]:
         """Transform the outer COO WhileLoop into a group-indexed ForLoop
         with OpenMP parallelism.
 
         Finds the outermost WhileLoop that iterates over COO coordinate
         levels (identified by the pA0 = pA1_end update pattern) and replaces
-        it with a pre-scan + parallel for over row groups.
+        it with a pre-scan + parallel for over row groups. ``tensor_names`` are
+        the names of the statement's tensors: they say which variables are tensor
+        positions (``_tensor_position_pattern``).
         """
+        tensor_position = self._tensor_position_pattern(tensor_names)
         result: List[llir.Stmt] = []
         transformed = False
 
@@ -5534,7 +5879,9 @@ class CINLowerer:
             # Thread-safety for output position: use input position pA1
             # as output position since nnz_out == nnz_in for SDDMM-like
             # kernels (no filtering). Replace pD1 references in the body.
-            CINLowerer._replace_output_pos_with_input_pos(inner_body_filtered, iter_var)
+            CINLowerer._replace_output_pos_with_input_pos(
+                inner_body_filtered, iter_var, tensor_position
+            )
 
             # Collect output array roots that need pre-allocation
             output_arrays: Dict[str, llir.Var] = {}
@@ -5716,9 +6063,10 @@ class CINLowerer:
                     or bound_fields["is_restrict"] is not False
                     or bound_fields["tensor_access"] is not None
                 ):
-                    raise TypeError(
+                    raise ScorchTypeError(
                         "COO preallocation extent must be an exact metadata-free "
-                        "integral Var"
+                        "integral Var",
+                        code="coo_preallocation_invalid",
                     )
                 return [
                     llir.MemberCallStmt(
@@ -5907,7 +6255,11 @@ class CINLowerer:
                     )
                 ]
             ):
-                assert self.result_tensor_var, "Result tensor variable not set"
+                if not self.result_tensor_var:
+                    raise ScorchAssertionError(
+                        "Result tensor variable not set",
+                        code="cin_lowering_state_missing",
+                    )
 
         self._enclosing_forall_vars.append(index_var)
         try:
@@ -5943,7 +6295,15 @@ class CINLowerer:
             and self._should_parallelize_coo_outer(index_var)
         ):
             self._kernel_has_parallel_region = True
-            stmts = self._transform_coo_loop_for_openmp(stmts)
+            stmts = self._transform_coo_loop_for_openmp(
+                stmts,
+                [
+                    tensor.name
+                    for tensor in (
+                        stmt.get_result_tensor_vars() + stmt.get_rhs_tensor_vars()
+                    )
+                ],
+            )
         elif (
             is_outermost_forall
             and not self.has_explicit_parallel_loop
@@ -5963,7 +6323,8 @@ class CINLowerer:
             ):
                 raise CompilerInvariantError(
                     "stage=CIN lowering pass=compressed Where/OpenMP: "
-                    "parallelization gate did not establish result/workspace metadata"
+                    "parallelization gate did not establish result/workspace metadata",
+                    code="parallel_gate_unestablished",
                 )
             compressed_levels = tuple(
                 level

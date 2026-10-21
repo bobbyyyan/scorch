@@ -55,6 +55,7 @@ from scorch.compiler.compile_options import (  # type: ignore[import-untyped]
 from scorch.compiler.diagnostics import (  # type: ignore[import-untyped]
     CompileOptionsDiagnostic,
     CompileOptionsError,
+    ScheduleNotThreadedThroughSpMVError,
     VerificationError,
 )
 from scorch.compiler.llir_pass_manager import (  # type: ignore[import-untyped]
@@ -766,9 +767,10 @@ def test_default_explicit_options_preserve_csr_dense_generated_cpp_anchor() -> N
     options = _default_options()
     _, _, _, cpp = _compile_spmm(_build_spmm_source(), options)
 
-    assert len(cpp) == 2505
+    # The result check names the level kinds, {0, 0}, where it named the rank (0038).
+    assert len(cpp) == 2510
     assert hashlib.sha256(cpp.encode()).hexdigest() == (
-        "36a8599c59f06b2cb060e27af26b7c9196716be88f666282d83b1ec2dc9d6151"
+        "058ed102cbd95a123af90dde7d6d10362b7dabc2262236b3880c13dea6b27714"
     )
 
 
@@ -957,9 +959,10 @@ def test_production_lowering_delegates_once_to_each_snapshotted_manager_pipeline
     assert first_result.artifact is not second_result.artifact
     assert first_result.artifact.value is not second_result.artifact.value
     assert production_cpp == debug_cpp
-    assert len(production_cpp) == 2505
+    # The result check names the level kinds, {0, 0}, where it named the rank (0038).
+    assert len(production_cpp) == 2510
     assert hashlib.sha256(production_cpp.encode()).hexdigest() == (
-        "36a8599c59f06b2cb060e27af26b7c9196716be88f666282d83b1ec2dc9d6151"
+        "058ed102cbd95a123af90dde7d6d10362b7dabc2262236b3880c13dea6b27714"
     )
 
 
@@ -1461,11 +1464,13 @@ def test_compile_entry_without_schedule_support_fails_closed() -> None:
     requested = Schedule(loop_order=("i", "k", "j"))
     options = replace(_default_options(), requested_schedule=requested)
 
+    # The SpMV path's own refusal (patch 0050): still a CompileOptionsError.
     with pytest.raises(CompileOptionsError) as error:
         ops.spmv(None, None, _compile_options=options)  # type: ignore[arg-type]
+    assert type(error.value) is ScheduleNotThreadedThroughSpMVError
     _assert_compile_options_error(
         error,
-        code="unsupported_requested_schedule",
+        code="schedule_not_threaded_through_spmv",
         field="requested_schedule",
     )
 

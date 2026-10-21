@@ -14,6 +14,7 @@
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
+#include <initializer_list>
 #include <limits>
 #include <memory>
 #include <mutex>
@@ -1314,14 +1315,92 @@ enum class BinaryContract {
   CsrDenseMatmulInt64Elements,
 };
 
+// A result's levels as its entry check sees them. DenseBoundedInKernel is a dense level below a
+// sparse one whose block the kernel itself holds to the position bound where the block opens
+// (scorch_check_dense_block, header.h), so the entry check does not count the sparse levels
+// above it by their extents (check_result_positions).
 enum class LevelKind : int {
   Dense = 0,
   Compressed = 1,
   Coordinate = 2,
+  DenseBoundedInKernel = 3,
 };
 
 inline std::string argument_name(const char* op, const char* argument) {
   return std::string(op) + ": " + argument;
+}
+
+// The 32-bit position bound.
+//
+// Every kernel declares a level's positions, its loop variables and its coordinates as `int`.
+// What a tensor may hold is therefore bounded per storage level, by the positions that level
+// stores, and not by the tensor's logical element count: a 64,000 x 64,000 CSR matrix stores
+// 64,001 row offsets and its nonzeros, and no kernel forms rows x columns for it. The bound
+// on a logical element count belongs to the kernels that address a dense array with `int`
+// offsets, and to no others.
+//
+// Every refusal under this bound ends with the code below. scorch.exceptions
+// .raise_if_native_coded turns a text that carries it into IndexCapacityError at every
+// Python call site of a kernel, so the code's spelling is a contract: change both or neither.
+#define SCORCH_INDEX_CAPACITY_CODE " [index_position_exceeds_int32]"
+
+constexpr int64_t kMaxIndexPosition = std::numeric_limits<int>::max();
+
+#if defined(__GNUC__) || defined(__clang__)
+#define SCORCH_COLD_NOINLINE __attribute__((noinline, cold))
+#define SCORCH_NOINLINE __attribute__((noinline))
+#else
+#define SCORCH_COLD_NOINLINE
+#define SCORCH_NOINLINE
+#endif
+
+// The refusal a kernel's own growth raises (header.h): kept out of line and cold so that the
+// append it guards carries one compare and no message.
+[[noreturn]] SCORCH_COLD_NOINLINE inline void refuse_index_capacity(const char* what,
+                                                                   int64_t count) {
+  TORCH_CHECK(false, what, " would hold ", count, " entries; a 32-bit position addresses ",
+              "at most ", kMaxIndexPosition, SCORCH_INDEX_CAPACITY_CODE);
+  std::abort();  // not reached: TORCH_CHECK(false) throws
+}
+
+// The refusal of a result's dense block that would pass the bound where it opens
+// (scorch_check_dense_block, header.h): out of line and cold, as above.
+[[noreturn]] SCORCH_COLD_NOINLINE inline void refuse_dense_block_positions(
+    int64_t parent_position, int64_t block, bool compressed_below, int first_level,
+    int last_level) {
+  TORCH_CHECK(false, "result dense levels ", first_level, " to ", last_level,
+              ": the block of ", block, " cells under position ", parent_position,
+              " of compressed level ", first_level - 1, " would end at position ",
+              (parent_position + 1) * block,
+              compressed_below ? ", and compressed level " : "",
+              compressed_below ? std::to_string(last_level + 1) : std::string(),
+              compressed_below ? " below it would have one position entry more" : "",
+              "; a 32-bit position addresses at most ", kMaxIndexPosition, " entries",
+              SCORCH_INDEX_CAPACITY_CODE);
+  std::abort();  // not reached: TORCH_CHECK(false) throws
+}
+
+// The refusal of a compressed level that the two-pass assembly counted past the bound
+// (scorch_check_level_total, header.h): out of line and cold, as above.
+[[noreturn]] SCORCH_COLD_NOINLINE inline void refuse_level_total(int64_t total,
+                                                                bool compressed_below,
+                                                                int level) {
+  TORCH_CHECK(false, "result compressed level ", level, " would hold ", total, " entries",
+              compressed_below ? ", and compressed level " : "",
+              compressed_below ? std::to_string(level + 1) : std::string(),
+              compressed_below ? " below it one position entry more" : "",
+              "; a 32-bit position addresses at most ", kMaxIndexPosition, " entries",
+              SCORCH_INDEX_CAPACITY_CODE);
+  std::abort();  // not reached: TORCH_CHECK(false) throws
+}
+
+// The refusal of a sparse workspace drained into more entries than the kernel can address
+// when it reads them back (scorch_check_drained_entries, header.h): out of line and cold.
+[[noreturn]] SCORCH_COLD_NOINLINE inline void refuse_drained_entries(int64_t entries) {
+  TORCH_CHECK(false, "a sparse workspace drained ", entries, " entries, which the kernel ",
+              "reads back with 32-bit positions; a 32-bit position addresses at most ",
+              kMaxIndexPosition, " entries", SCORCH_INDEX_CAPACITY_CODE);
+  std::abort();  // not reached: TORCH_CHECK(false) throws
 }
 
 inline std::string shape_string(const std::vector<int64_t>& shape) {
@@ -1350,7 +1429,8 @@ inline std::vector<int64_t> checked_shape(const std::vector<Dim>& shape,
                 dim, " at mode ", i);
     TORCH_CHECK(dim <= std::numeric_limits<int>::max(),
                 argument_name(op, argument), " dimension ", i,
-                " exceeds the current native int32 loop bound: ", dim);
+                " exceeds the current native int32 loop bound: ", dim,
+                SCORCH_INDEX_CAPACITY_CODE);
     result.push_back(dim);
   }
   return result;
@@ -1366,7 +1446,8 @@ inline std::vector<int> narrow_legacy_shape(const std::vector<Dim>& shape,
     const int64_t extent = static_cast<int64_t>(shape[mode]);
     TORCH_CHECK(extent >= 0 && extent <= std::numeric_limits<int>::max(),
                 argument_name(op, argument), " extent ", extent, " at mode ",
-                mode, " cannot be represented by the legacy int32 kernel ABI");
+                mode, " cannot be represented by the legacy int32 kernel ABI",
+                SCORCH_INDEX_CAPACITY_CODE);
     result.push_back(static_cast<int>(extent));
   }
   return result;
@@ -1387,9 +1468,27 @@ inline int64_t checked_product(const std::vector<int64_t>& shape,
   if (require_legacy_int_capacity) {
     TORCH_CHECK(product <= std::numeric_limits<int>::max(),
                 argument_name(op, argument), " element count ", product,
-                " exceeds the current native int32 allocation bound");
+                " exceeds the current native int32 allocation bound",
+                SCORCH_INDEX_CAPACITY_CODE);
   }
   return product;
+}
+
+// A shape a kernel was compiled for, or any shape of the kernel's rank when it was compiled
+// for none. Every extent is held to `int` (checked_shape); the element count is not looked
+// at, which is what a tensor with a sparse level needs: its logical size bounds nothing.
+template <typename Dim>
+inline std::vector<int64_t> checked_compiled_shape(
+    const std::vector<Dim>& shape, const std::vector<int64_t>& expected,
+    int64_t rank, const char* op, const char* argument) {
+  if (expected.empty() && rank > 0) {
+    return checked_shape(shape, rank, op, argument);
+  }
+  const auto actual = checked_shape(shape, static_cast<int64_t>(expected.size()),
+                                    op, argument);
+  TORCH_CHECK(actual == expected, argument_name(op, argument), " must equal ",
+              shape_string(expected), ", got ", shape_string(actual));
+  return actual;
 }
 
 template <typename Dim>
@@ -1397,12 +1496,31 @@ inline std::vector<int64_t> checked_expected_shape(
     const std::vector<Dim>& shape, const std::vector<int64_t>& expected,
     const char* op, const char* argument,
     bool require_legacy_int_capacity = false) {
-  const auto actual = checked_shape(shape, static_cast<int64_t>(expected.size()),
-                                    op, argument);
-  TORCH_CHECK(actual == expected, argument_name(op, argument), " must equal ",
-              shape_string(expected), ", got ", shape_string(actual));
+  const auto actual = checked_compiled_shape(shape, expected, 0, op, argument);
   checked_product(actual, op, argument, require_legacy_int_capacity);
   return actual;
+}
+
+// The positions a kernel can form at a dense level of `extent` whose parent level has
+// `parent_positions` of them: parent position x extent + coordinate, for every parent
+// position and every coordinate. All of them must fit `int`, and so must the count itself,
+// which a kernel forms as the end of the last parent's block.
+//
+// `parent_positions` is 1 at the root, the product so far under dense levels, and the
+// stored entries + 1 under a compressed or coordinate level. The + 1 is the level's end
+// position: a kernel that merges two operands leaves a finished operand's cursor there and
+// may still compute the dense position below it (never reading through it), so that
+// product must not overflow either.
+inline int64_t checked_dense_positions(int64_t parent_positions, int64_t extent,
+                                       size_t level, const char* op,
+                                       const char* argument) {
+  TORCH_CHECK(extent == 0 || parent_positions <= kMaxIndexPosition / extent,
+              argument_name(op, argument), " dense level ", level, " of extent ",
+              extent, " under ", parent_positions,
+              " parent positions needs more than ", kMaxIndexPosition,
+              " positions, the most a 32-bit position addresses",
+              SCORCH_INDEX_CAPACITY_CODE);
+  return parent_positions * extent;
 }
 
 inline void check_tensor_common(const torch::Tensor& tensor,
@@ -1465,7 +1583,8 @@ inline torch::Tensor checked_index_tensor(torch::Tensor index,
               op, ": ", argument, " must have dtype int32 or int64, got ",
               c10::toString(index.scalar_type()));
   TORCH_CHECK(index.numel() <= std::numeric_limits<int>::max(), op, ": ",
-              argument, " length exceeds the current int32 native bound");
+              argument, " length exceeds the current int32 native bound",
+              SCORCH_INDEX_CAPACITY_CODE);
 
   if (index.scalar_type() == torch::kInt64) {
     // Already narrowed this array? Then both the scan and the allocate-and-fill below
@@ -1758,7 +1877,8 @@ inline CsrInputView checked_csr_view(
   const int64_t cols = logical_shape[1];
   const int64_t nnz = values.numel();
   TORCH_CHECK(nnz <= std::numeric_limits<int>::max(), argument_name(op, argument),
-              " nnz exceeds the current int32 native bound");
+              " nnz exceeds the current int32 native bound",
+              SCORCH_INDEX_CAPACITY_CODE);
   TORCH_CHECK(coordinates.numel() == nnz, argument_name(op, argument),
               " coordinate/value nnz mismatch: ", coordinates.numel(), " vs ",
               nnz);
@@ -1816,7 +1936,7 @@ inline CsrInputView checked_csr_view(
 // The serial check behind abi_screen_lex: run only when the screen says "go and look", so
 // that the first violation by position is the one reported, as it always was. A descent and
 // a repeat are reported apart. A repeat's text is parsed back into a structured
-// RepeatedCoordinateError by scorch.exceptions.raise_if_native_repeat at every Python call
+// RepeatedCoordinateError by scorch.exceptions.raise_if_native_coded at every Python call
 // site of a kernel, so its wording is a contract: change both or neither.
 inline void check_coo_strictly_ascending(const std::vector<const int32_t*>& levels,
                                          int64_t n, const char* op,
@@ -1860,7 +1980,8 @@ inline CooInputView checked_coo_view(
                       (std::string(argument) + " values").c_str(), 1);
   const int64_t nnz = values.numel();
   TORCH_CHECK(nnz <= std::numeric_limits<int>::max(), argument_name(op, argument),
-              " nnz exceeds the current int32 native bound");
+              " nnz exceeds the current int32 native bound",
+              SCORCH_INDEX_CAPACITY_CODE);
 
   std::vector<torch::Tensor> coordinates;
   coordinates.reserve(logical_shape.size());
@@ -1920,6 +2041,218 @@ inline CooInputView checked_coo_view(
   return CooInputView(logical_shape, coordinates, values);
 }
 
+// The result's bound that is known before the kernel runs. `result_shape` holds the extents
+// by storage level, as an operand's shape does, and `level_kinds` the result's layout.
+//
+// A kernel addresses a dense level of the result as parent position x extent + coordinate,
+// so what must fit `int` is the product of the extents down to the result's deepest dense
+// level. For a dense prefix (ds, dss, dds) that is the prefix; a result with no dense level
+// (ss, oo) has no bound here at all; and an all-dense result keeps its element count, the
+// only case in which the logical size is what a kernel forms. Levels below the deepest
+// dense one store what the kernel appends, which is bounded while it runs
+// (scorch_vector_set, the chunk merges) and when it returns (the result wrapper, stensor.py).
+//
+// For a dense level BELOW a sparse one (sd, sdd, dsd) the kernel grows the dense block by
+// `resize` and narrows the position that follows to `int`. A kernel that holds each block to
+// the bound where it opens (scorch_check_dense_block, header.h) declares the block's levels
+// DenseBoundedInKernel: they bound nothing here, and what is left to check is that one block
+// fits at all, which the kernel's first stored coordinate needs. A kernel that does not
+// declares them Dense, and the product then counts the sparse levels above by their extents,
+// as if every coordinate were stored: more than the kernel can form, and the only bound on
+// what it could store that holds before it starts.
+//
+// A compressed level under those extents has one position entry more than it has parents,
+// and the kernel that fills it counts parents with `for (int p = 1; p <= parents; p++)`,
+// which does not end at INT32_MAX parents: one less is the bound there, for a block too.
+//
+// refuse_result_positions is the rule with its refusals worded. result_positions_fit is the
+// same rule as a yes or no, decided without building a vector or a message, and
+// check_result_positions asks it first: this runs once per kernel call, and a call whose
+// result fits pays for no allocation. The two are held to one table and one sweep of shapes
+// by tests/test_scorch/test_index_position_bound.py.
+// Whether a DenseBoundedInKernel level at `level` sits where a kernel's block can: below a
+// compressed level or another level of the same block, and above a compressed level, another
+// level of the same block, or nothing. Any other place is a malformed contract.
+inline bool bounded_in_kernel_level_in_place(const int* level_kinds, size_t level_count,
+                                             size_t level) noexcept {
+  if (level == 0) return false;
+  const auto above = static_cast<LevelKind>(level_kinds[level - 1]);
+  if (above != LevelKind::Compressed && above != LevelKind::DenseBoundedInKernel) {
+    return false;
+  }
+  if (level + 1 == level_count) return true;
+  const auto below = static_cast<LevelKind>(level_kinds[level + 1]);
+  return below == LevelKind::Compressed || below == LevelKind::DenseBoundedInKernel;
+}
+
+template <typename Dim>
+inline void refuse_result_positions(
+    const std::vector<Dim>& result_shape,
+    const std::vector<int64_t>& expected_shape,
+    const int* level_kinds, size_t level_count, const char* op) {
+  const auto shape = checked_compiled_shape(
+      result_shape, expected_shape, static_cast<int64_t>(level_count), op,
+      "result_shape");
+  TORCH_CHECK(level_count == shape.size(), argument_name(op, "result_shape"),
+              " level contract rank mismatch");
+  size_t bounded_levels = 0;  // one past the deepest dense level the entry check bounds
+  for (size_t level = 0; level < level_count; ++level) {
+    const auto kind = static_cast<LevelKind>(level_kinds[level]);
+    TORCH_CHECK(kind == LevelKind::Dense || kind == LevelKind::Compressed ||
+                    kind == LevelKind::Coordinate ||
+                    (kind == LevelKind::DenseBoundedInKernel &&
+                     bounded_in_kernel_level_in_place(level_kinds, level_count, level)),
+                argument_name(op, "result_shape"), " unsupported level kind at ", level);
+    if (kind == LevelKind::Dense) bounded_levels = level + 1;
+  }
+  int64_t positions = 1;
+  for (size_t level = 0; level < level_count && level <= bounded_levels; ++level) {
+    if (static_cast<LevelKind>(level_kinds[level]) == LevelKind::Compressed) {
+      TORCH_CHECK(positions < kMaxIndexPosition, argument_name(op, "result_shape"), " ",
+                  shape_string(shape), ": compressed level ", level, " would have ",
+                  positions, " parents and one position entry more than that; a 32-bit ",
+                  "position addresses at most ", kMaxIndexPosition, " entries",
+                  SCORCH_INDEX_CAPACITY_CODE);
+    }
+    if (level == bounded_levels) break;
+    const int64_t extent = shape[level];
+    TORCH_CHECK(extent == 0 || positions <= kMaxIndexPosition / extent,
+                argument_name(op, "result_shape"), " ", shape_string(shape),
+                ": the extents of levels 0 to ", level, " multiply to more than ",
+                kMaxIndexPosition, ", the most positions a 32-bit position addresses, ",
+                "and level ", bounded_levels - 1, " of the result is dense",
+                SCORCH_INDEX_CAPACITY_CODE);
+    positions *= extent;
+  }
+  // Each block the kernel bounds itself (DenseBoundedInKernel levels, a run below a compressed
+  // level): the first coordinate stored above it needs one block. The product runs left to
+  // right, as the kernel forms the block's positions, so no product the kernel forms from these
+  // extents passes int64 either.
+  size_t first = 0;
+  while (first < level_count) {
+    if (static_cast<LevelKind>(level_kinds[first]) != LevelKind::DenseBoundedInKernel) {
+      ++first;
+      continue;
+    }
+    size_t end = first;
+    int64_t block = 1;
+    while (end < level_count &&
+           static_cast<LevelKind>(level_kinds[end]) == LevelKind::DenseBoundedInKernel) {
+      const int64_t extent = shape[end];
+      TORCH_CHECK(extent == 0 || block <= kMaxIndexPosition / extent,
+                  argument_name(op, "result_shape"), " ", shape_string(shape),
+                  ": the extents of dense levels ", first, " to ", end,
+                  " multiply to more than ", kMaxIndexPosition, ", the most positions a ",
+                  "32-bit position addresses, and each coordinate stored at level ",
+                  first - 1, " owns one block of them", SCORCH_INDEX_CAPACITY_CODE);
+      block *= extent;
+      ++end;
+    }
+    TORCH_CHECK(end == level_count || block < kMaxIndexPosition,
+                argument_name(op, "result_shape"), " ", shape_string(shape),
+                ": the extents of dense levels ", first, " to ", end - 1, " multiply to ",
+                kMaxIndexPosition, ", and compressed level ", end, " below them has one ",
+                "position entry more than that; a 32-bit position addresses at most ",
+                kMaxIndexPosition, " entries", SCORCH_INDEX_CAPACITY_CODE);
+    first = end;
+  }
+}
+
+// True exactly when refuse_result_positions raises nothing for the same arguments.
+// `expected` is the shape the kernel was compiled for, or nothing (`expected_count` 0) when
+// it was compiled for a rank only: what checked_compiled_shape decides from.
+template <typename Dim>
+inline bool result_positions_fit(
+    const std::vector<Dim>& result_shape, const int64_t* expected,
+    size_t expected_count, const int* level_kinds, size_t level_count) noexcept {
+  const size_t rank = result_shape.size();
+  const bool rank_only = expected_count == 0 && level_count > 0;
+  if (rank != (rank_only ? level_count : expected_count)) return false;
+  if (rank != level_count) return false;
+  size_t bounded_levels = 0;  // one past the deepest dense level the entry check bounds
+  bool blocks = false;        // whether any level is DenseBoundedInKernel
+  for (size_t level = 0; level < rank; ++level) {
+    const int64_t extent = static_cast<int64_t>(result_shape[level]);
+    if (extent < 0 || extent > std::numeric_limits<int>::max()) return false;
+    if (!rank_only && extent != expected[level]) return false;
+    const auto kind = static_cast<LevelKind>(level_kinds[level]);
+    if (kind == LevelKind::Dense) {
+      bounded_levels = level + 1;
+    } else if (kind == LevelKind::DenseBoundedInKernel) {
+      if (!bounded_in_kernel_level_in_place(level_kinds, level_count, level)) return false;
+      blocks = true;
+    } else if (kind != LevelKind::Compressed && kind != LevelKind::Coordinate) {
+      return false;
+    }
+  }
+  int64_t positions = 1;
+  for (size_t level = 0; level < rank && level <= bounded_levels; ++level) {
+    if (static_cast<LevelKind>(level_kinds[level]) == LevelKind::Compressed &&
+        positions >= kMaxIndexPosition) {
+      return false;
+    }
+    if (level == bounded_levels) break;
+    // `positions` and the extent are each at most INT32_MAX here, so their product is
+    // exact in int64, and comparing it is the division refuse_result_positions writes.
+    positions *= static_cast<int64_t>(result_shape[level]);
+    if (positions > kMaxIndexPosition) return false;
+  }
+  if (!blocks) return true;
+  // Each block the kernel bounds itself, as refuse_result_positions checks it. `block` is at
+  // most INT32_MAX before each product, so the product is exact in int64.
+  int64_t block = 1;
+  for (size_t level = 0; level < rank; ++level) {
+    if (static_cast<LevelKind>(level_kinds[level]) != LevelKind::DenseBoundedInKernel) {
+      block = 1;
+      continue;
+    }
+    block *= static_cast<int64_t>(result_shape[level]);
+    if (block > kMaxIndexPosition) return false;
+    // The level below, if any, is compressed or in the same block (checked above).
+    if (level + 1 < rank &&
+        static_cast<LevelKind>(level_kinds[level + 1]) == LevelKind::Compressed &&
+        block >= kMaxIndexPosition) {
+      return false;
+    }
+  }
+  return true;
+}
+
+template <typename Dim>
+inline void check_result_positions(
+    const std::vector<Dim>& result_shape, const int64_t* expected,
+    size_t expected_count, const int* level_kinds, size_t level_count,
+    const char* op) {
+  if (result_positions_fit(result_shape, expected, expected_count, level_kinds,
+                           level_count)) {
+    return;
+  }
+  refuse_result_positions(
+      result_shape, std::vector<int64_t>(expected, expected + expected_count),
+      level_kinds, level_count, op);
+}
+
+// The compiled shape and the level kinds as braced lists, the form every caller in this
+// file and every generated kernel writes. Braced lists bind here without constructing a
+// std::vector.
+template <typename Dim>
+inline void check_result_positions(
+    const std::vector<Dim>& result_shape,
+    std::initializer_list<int64_t> expected_shape,
+    std::initializer_list<int> level_kinds, const char* op) {
+  check_result_positions(result_shape, expected_shape.begin(), expected_shape.size(),
+                         level_kinds.begin(), level_kinds.size(), op);
+}
+
+template <typename Dim>
+inline void check_result_positions(
+    const std::vector<Dim>& result_shape,
+    const std::vector<int64_t>& expected_shape,
+    const std::vector<int>& level_kinds, const char* op) {
+  check_result_positions(result_shape, expected_shape.data(), expected_shape.size(),
+                         level_kinds.data(), level_kinds.size(), op);
+}
+
 template <typename Dim>
 inline void check_legacy_output_shape(const std::vector<Dim>& result_shape,
                                       int64_t expected_rank, const char* op) {
@@ -1962,8 +2295,10 @@ inline void validate_binary_inputs(
                 op, ": result_shape must equal [A.rows, B.cols]");
     return;
   }
-  check_legacy_output_shape(result_shape, 2, op);
+  // The logical size of the result bounds only the kernels that address a dense result
+  // with `int` offsets. A sparse result is bounded by what its levels store.
   if (contract == BinaryContract::CsrDenseMatmul) {
+    check_legacy_output_shape(result_shape, 2, op);
     const auto a = checked_csr_view(a_shape, a_mode_indices, a_values, dtype, op, "A");
     const auto b = checked_dense_view(b_shape, b_mode_indices, b_values, dtype, 2,
                                       op, "B");
@@ -1976,6 +2311,12 @@ inline void validate_binary_inputs(
     return;
   }
   if (contract == BinaryContract::CsrCsrMatmul) {
+    // A CSR result: rows + 1 row offsets, and the entries spmspm_csr counts before it
+    // allocates them (it refuses a count past INT32_MAX itself).
+    check_result_positions(
+        result_shape, {},
+        {static_cast<int>(LevelKind::Dense), static_cast<int>(LevelKind::Compressed)},
+        op);
     const auto a = checked_csr_view(a_shape, a_mode_indices, a_values, dtype, op, "A");
     const auto b = checked_csr_view(b_shape, b_mode_indices, b_values, dtype, op, "B");
     TORCH_CHECK(a.shape[1] == b.shape[0], op,
@@ -1987,6 +2328,7 @@ inline void validate_binary_inputs(
     return;
   }
   if (contract == BinaryContract::CooDenseMatmul) {
+    check_legacy_output_shape(result_shape, 2, op);
     const auto a = checked_coo_view(a_shape, a_mode_indices, a_values, dtype, 2,
                                     op, "A");
     const auto b = checked_dense_view(b_shape, b_mode_indices, b_values, dtype, 2,
@@ -1999,6 +2341,12 @@ inline void validate_binary_inputs(
                 op, ": result_shape must equal [A.rows, B.cols]");
     return;
   }
+  // CooCooMatmul. A COO result: coordinate and value vectors that grow by one entry at a
+  // time; the result wrapper refuses more entries than a 32-bit position addresses.
+  check_result_positions(
+      result_shape, {},
+      {static_cast<int>(LevelKind::Coordinate), static_cast<int>(LevelKind::Coordinate)},
+      op);
   const auto a = checked_coo_view(a_shape, a_mode_indices, a_values, dtype, 2,
                                   op, "A");
   const auto b = checked_coo_view(b_shape, b_mode_indices, b_values, dtype, 2,
@@ -2046,11 +2394,19 @@ inline void validate_sddmm_inputs(
     const torch::Tensor& b_values) {
   const auto s = checked_coo_view(s_shape, s_mode_indices, s_values,
                                   torch::kFloat32, 2, op, "S");
+  // The kernel reads row i of A and row j of B at (size_t)i * K, so neither array's element
+  // count is held to int32. Its result is S's stored pattern with new values, one per stored
+  // entry of S, whatever rows x columns is.
   const auto a = checked_dense_view(a_shape, a_mode_indices, a_values,
-                                    torch::kFloat32, 2, op, "A");
+                                    torch::kFloat32, 2, op, "A",
+                                    /*int32_elements=*/false);
   const auto b = checked_dense_view(b_shape, b_mode_indices, b_values,
-                                    torch::kFloat32, 2, op, "B");
-  check_legacy_output_shape(result_shape, 2, op);
+                                    torch::kFloat32, 2, op, "B",
+                                    /*int32_elements=*/false);
+  check_result_positions(
+      result_shape, {},
+      {static_cast<int>(LevelKind::Coordinate), static_cast<int>(LevelKind::Coordinate)},
+      op);
   TORCH_CHECK(result_shape[0] == s.shape[0] && result_shape[1] == s.shape[1],
               op, ": result_shape must equal S.shape");
   TORCH_CHECK(a.shape[0] == s.shape[0], op,
@@ -2069,7 +2425,8 @@ inline void validate_csr_segments(
               ": crow_indices must contain at least the initial zero");
   const int64_t nnz = values.numel();
   TORCH_CHECK(nnz <= std::numeric_limits<int>::max(), op,
-              ": values nnz exceeds the current int32 native bound");
+              ": values nnz exceeds the current int32 native bound",
+              SCORCH_INDEX_CAPACITY_CODE);
   const int32_t* pos = positions.data_ptr<int32_t>();
   TORCH_CHECK(pos[0] == 0, op, ": crow_indices[0] must be 0, got ", pos[0]);
   AbiStructEntry memo;
@@ -2111,7 +2468,8 @@ inline void validate_attention_inputs(
               ": crow_indices length must be S + 1 (", sequence + 1,
               "), got ", positions.numel());
   TORCH_CHECK(coordinates.numel() <= std::numeric_limits<int>::max(), op,
-              ": mask nnz exceeds the current int32 native bound");
+              ": mask nnz exceeds the current int32 native bound",
+              SCORCH_INDEX_CAPACITY_CODE);
   const int32_t* pos = positions.data_ptr<int32_t>();
   const int32_t* crd = coordinates.data_ptr<int32_t>();
   TORCH_CHECK(pos[0] == 0, op, ": crow_indices[0] must be 0, got ", pos[0]);
@@ -2155,15 +2513,11 @@ inline void validate_jit_tensor(
     const torch::Tensor& values, torch::ScalarType expected_dtype,
     const std::vector<int>& level_kinds, const std::vector<int>& mode_order,
     const std::vector<int64_t>& expected_shape) {
-  const auto logical_shape = expected_shape.empty() && !level_kinds.empty()
-                                 ? checked_shape(
-                                       shape,
-                                       static_cast<int64_t>(level_kinds.size()),
-                                       op, argument)
-                                 : checked_expected_shape(
-                                       shape, expected_shape, op, argument,
-                                       true);
-  checked_product(logical_shape, op, argument, true);
+  // The operand is bounded level by level below, by the positions each level stores. Its
+  // logical element count is not looked at: for a tensor with a sparse level it bounds
+  // nothing a kernel forms, and for an all-dense one the last level's count is that product.
+  const auto logical_shape = checked_compiled_shape(
+      shape, expected_shape, static_cast<int64_t>(level_kinds.size()), op, argument);
   TORCH_CHECK(level_kinds.size() == logical_shape.size(),
               argument_name(op, argument), " level contract rank mismatch");
   TORCH_CHECK(mode_order.size() == logical_shape.size(),
@@ -2185,6 +2539,9 @@ inline void validate_jit_tensor(
   }
 
   int64_t storage_count = 1;
+  // The positions a kernel can form at the level above, an end position included: what
+  // checked_dense_positions holds a dense level to.
+  int64_t parent_positions = 1;
   int64_t coordinate_count = -1;
   bool has_index_dtype = false;
   torch::ScalarType index_dtype = torch::kInt32;
@@ -2204,10 +2561,9 @@ inline void validate_jit_tensor(
     if (kind == LevelKind::Dense) {
       TORCH_CHECK(mode_indices[level].empty(), argument_name(op, argument),
                   " dense level ", level, " must not contain index tensors");
-      TORCH_CHECK(extent == 0 ||
-                      storage_count <= std::numeric_limits<int64_t>::max() / extent,
-                  argument_name(op, argument), " storage size overflows at level ",
-                  level);
+      parent_positions =
+          checked_dense_positions(parent_positions, extent, level, op, argument);
+      // Within the bound just checked: storage_count <= parent_positions at every level.
       storage_count *= extent;
       continue;
     }
@@ -2231,6 +2587,7 @@ inline void validate_jit_tensor(
         TORCH_CHECK(count == coordinate_count, argument_name(op, argument),
                     " coordinate levels have inconsistent nnz");
       }
+      parent_positions = storage_count + 1;
       const int32_t* crd = mode_indices[level][0].data_ptr<int32_t>();
       AbiStructEntry level_memo;
       level_memo.add(mode_indices[level][0]);
@@ -2317,6 +2674,7 @@ inline void validate_jit_tensor(
     // by the terminal-position check above is never cached as valid.
     if (!level_known) abi_struct_store(std::move(level_memo));
     storage_count = coordinates.numel();
+    parent_positions = storage_count + 1;
   }
   AbiStructEntry lex_memo;
   bool lex_known = true;  // nothing to record unless the check below actually runs
@@ -2340,18 +2698,32 @@ inline void validate_jit_tensor(
   if (!lex_known) abi_struct_store(std::move(lex_memo));
 }
 
-inline void validate_jit_result_shape(
+// The result bound of a generated kernel (check_result_positions), emitted at the
+// beginning of every JIT evaluate() before the operands are validated. A generated kernel
+// writes the shape it was compiled for and the level kinds as braced lists,
+// `{5, 3}, {0, 1}`, which select the first form and construct no std::vector; the second
+// form takes them held in vectors.
+//
+// Both forms are out of line. Inlined into evaluate(), the check changed the register
+// allocation of loops it never touches: in the elementwise-product kernel built on mkt1
+// (gcc 13.3, -O3 -march=native), it moved the second operand's merge cursor into a stack
+// slot, a store and a reload on every merge step, and that kernel ran 1.18x to 1.28x
+// slower on two different patterns. Called out of line, the steps are the base's
+// instructions again; the call costs one call per kernel call.
+SCORCH_NOINLINE inline void validate_jit_result_shape(
     const std::vector<int64_t>& result_shape,
-    const std::vector<int64_t>& expected_shape, int64_t expected_rank,
-    const char* op) {
-  if (expected_shape.empty() && expected_rank > 0) {
-    const auto shape =
-        checked_shape(result_shape, expected_rank, op, "result_shape");
-    checked_product(shape, op, "result_shape", true);
-  } else {
-    checked_expected_shape(result_shape, expected_shape, op, "result_shape",
-                           true);
-  }
+    std::initializer_list<int64_t> expected_shape,
+    std::initializer_list<int> level_kinds, const char* op) {
+  check_result_positions(result_shape, expected_shape.begin(), expected_shape.size(),
+                         level_kinds.begin(), level_kinds.size(), op);
+}
+
+SCORCH_NOINLINE inline void validate_jit_result_shape(
+    const std::vector<int64_t>& result_shape,
+    const std::vector<int64_t>& expected_shape,
+    const std::vector<int>& level_kinds, const char* op) {
+  check_result_positions(result_shape, expected_shape.data(), expected_shape.size(),
+                         level_kinds.data(), level_kinds.size(), op);
 }
 
 inline void validate_jit_extra_tensor(const torch::Tensor& tensor,
@@ -2360,7 +2732,8 @@ inline void validate_jit_extra_tensor(const torch::Tensor& tensor,
   check_tensor_common(tensor, expected_dtype, op, argument);
   TORCH_CHECK(tensor.numel() <= std::numeric_limits<int>::max(),
               argument_name(op, argument),
-              " element count exceeds the current native int32 bound");
+              " element count exceeds the current native int32 bound",
+              SCORCH_INDEX_CAPACITY_CODE);
 }
 
 }  // namespace scorch_native

@@ -150,8 +150,9 @@ def test_operand_term_that_repeats_an_index_is_refused(monkeypatch, case, blocki
 
 @pytest.mark.parametrize("dtype", [torch.float32, torch.float64, torch.int64])
 def test_torch_operands_are_refused_the_same_way(monkeypatch, dtype):
-    """A dense ``torch.Tensor`` is wrapped before the labels are checked; the trace,
-    whose result has no index, is refused for its empty result term first, as before."""
+    """A dense ``torch.Tensor`` is wrapped before the labels are checked.  The trace
+    ``"ii->"`` is refused for its repeated index like the diagonal: its empty result term
+    is a rank-0 result, which einsum computes (``test_einsum_scalar_result.py``)."""
 
     square = torch.arange(16, dtype=dtype).reshape(4, 4)
     nothing_past_the_label_check(monkeypatch)
@@ -160,9 +161,10 @@ def test_torch_operands_are_refused_the_same_way(monkeypatch, dtype):
             scorch.einsum("ii->i", square, format="d")
         with pytest.raises(EinsumRepeatedIndexError):
             scorch.einsum("ij,jj->i", square, square, format="d")
-        with pytest.raises(CompileSpecError, match="result labels must be non-empty"):
+        with pytest.raises(EinsumRepeatedIndexError) as trace:
             scorch.einsum("ii->", square)
     assert (raised.value.operand, raised.value.index) == (0, "i")
+    assert (trace.value.operand, trace.value.index) == (0, "i")
     # What the refused call asked for, so the reference of the feature is on record.
     assert torch.equal(torch.einsum("ii->i", square), torch.diagonal(square))
 

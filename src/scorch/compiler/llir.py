@@ -7,6 +7,7 @@ from typing import List, Optional, Any, Union, TypeVar, Sequence, Tuple, cast
 import torch
 
 from .identity import AccessId, IndexId, SymbolId
+from ..exceptions import ScorchNotImplementedError, ScorchTypeError
 
 """
 TODO: maybe need this, maybe not
@@ -284,7 +285,10 @@ class DataType(Enum):
         text cannot silently become a typed declaration.
         """
         if type(element_spelling) is not str:
-            raise TypeError("linked-list workspace element spelling must be a string")
+            raise ScorchTypeError(
+                "linked-list workspace element spelling must be a string",
+                code="internal_argument_type_invalid",
+            )
         return DataType(f"std::vector<linked_list_workspace_1d<{element_spelling}>>")
 
     @classmethod
@@ -296,7 +300,10 @@ class DataType(Enum):
         legacy C type text cannot silently become a typed declaration.
         """
         if type(element_spelling) is not str:
-            raise TypeError("const-pointer element spelling must be a string")
+            raise ScorchTypeError(
+                "const-pointer element spelling must be a string",
+                code="internal_argument_type_invalid",
+            )
         return DataType(f"const {element_spelling}*")
 
     @classmethod
@@ -340,7 +347,9 @@ class DataType(Enum):
         elif dtype == torch.uint8:
             return cls.UINT8
         else:
-            raise NotImplementedError(f"Unsupported dtype: {dtype}")
+            raise ScorchNotImplementedError(
+                f"Unsupported dtype: {dtype}", code="dtype_unsupported"
+            )
 
     @classmethod
     def from_python_type(cls, py_type):
@@ -353,7 +362,9 @@ class DataType(Enum):
         elif py_type == str:
             return cls.STRING
         else:
-            raise NotImplementedError(f"Unsupported type: {py_type}")
+            raise ScorchNotImplementedError(
+                f"Unsupported type: {py_type}", code="llir_python_type_unknown"
+            )
 
 
 _DIRECT_INIT_DATA_TYPES = frozenset(
@@ -395,17 +406,27 @@ class TensorAccessMetadata:
 
     def __post_init__(self) -> None:
         if type(self.access_id) is not AccessId:
-            raise TypeError("TensorAccessMetadata.access_id must be an AccessId")
+            raise ScorchTypeError(
+                "TensorAccessMetadata.access_id must be an AccessId",
+                code="invalid_tensor_access_metadata",
+            )
         if type(self.tensor_id) is not SymbolId:
-            raise TypeError("TensorAccessMetadata.tensor_id must be a SymbolId")
+            raise ScorchTypeError(
+                "TensorAccessMetadata.tensor_id must be a SymbolId",
+                code="invalid_tensor_access_metadata",
+            )
         if type(self.index_ids) is not tuple or any(
             type(index_id) is not IndexId for index_id in self.index_ids
         ):
-            raise TypeError(
-                "TensorAccessMetadata.index_ids must be a tuple of IndexId values"
+            raise ScorchTypeError(
+                "TensorAccessMetadata.index_ids must be a tuple of IndexId values",
+                code="invalid_tensor_access_metadata",
             )
         if type(self.role) is not TensorAccessRole:
-            raise TypeError("TensorAccessMetadata.role must be a TensorAccessRole")
+            raise ScorchTypeError(
+                "TensorAccessMetadata.role must be a TensorAccessRole",
+                code="invalid_tensor_access_metadata",
+            )
 
 
 class ResultStorageArray(Enum):
@@ -465,20 +486,26 @@ class ResultStorageReference:
 
     def __post_init__(self) -> None:
         if type(self.array) is not ResultStorageArray:
-            raise TypeError("ResultStorageReference.array must be a ResultStorageArray")
+            raise ScorchTypeError(
+                "ResultStorageReference.array must be a ResultStorageArray",
+                code="invalid_result_storage_metadata",
+            )
         if type(self.direction) is not ResultStorageDirection:
-            raise TypeError(
-                "ResultStorageReference.direction must be a ResultStorageDirection"
+            raise ScorchTypeError(
+                "ResultStorageReference.direction must be a ResultStorageDirection",
+                code="invalid_result_storage_metadata",
             )
         if self.array is ResultStorageArray.VALUES:
             if self.level is not None:
-                raise TypeError(
-                    "ResultStorageReference.level must be None for the value vector"
+                raise ScorchTypeError(
+                    "ResultStorageReference.level must be None for the value vector",
+                    code="invalid_result_storage_metadata",
                 )
         elif type(self.level) is not int or self.level < 0:
-            raise TypeError(
+            raise ScorchTypeError(
                 "ResultStorageReference.level must be a non-negative exact int "
-                "for a position or coordinate vector"
+                "for a position or coordinate vector",
+                code="invalid_result_storage_metadata",
             )
 
 
@@ -510,22 +537,28 @@ class ResultStorageMetadata:
 
     def __post_init__(self) -> None:
         if type(self.tensor_id) is not SymbolId:
-            raise TypeError("ResultStorageMetadata.tensor_id must be a SymbolId")
+            raise ScorchTypeError(
+                "ResultStorageMetadata.tensor_id must be a SymbolId",
+                code="invalid_result_storage_metadata",
+            )
         if type(self.references) is not tuple or not self.references:
-            raise TypeError(
-                "ResultStorageMetadata.references must be a non-empty tuple"
+            raise ScorchTypeError(
+                "ResultStorageMetadata.references must be a non-empty tuple",
+                code="invalid_result_storage_metadata",
             )
         if any(
             type(reference) is not ResultStorageReference
             for reference in self.references
         ):
-            raise TypeError(
+            raise ScorchTypeError(
                 "ResultStorageMetadata.references must contain only exact "
-                "ResultStorageReference values"
+                "ResultStorageReference values",
+                code="invalid_result_storage_metadata",
             )
         if len(set(self.references)) != len(self.references):
-            raise TypeError(
-                "ResultStorageMetadata.references must not repeat a reference"
+            raise ScorchTypeError(
+                "ResultStorageMetadata.references must not repeat a reference",
+                code="invalid_result_storage_metadata",
             )
 
     def writes(self) -> bool:
@@ -545,7 +578,10 @@ def _validated_result_storage(
     if metadata is None:
         return None
     if type(metadata) is not ResultStorageMetadata:
-        raise TypeError(f"{owner}.result_storage must be ResultStorageMetadata or None")
+        raise ScorchTypeError(
+            f"{owner}.result_storage must be ResultStorageMetadata or None",
+            code="invalid_result_storage_metadata",
+        )
     return metadata
 
 
@@ -590,11 +626,17 @@ class BinOp(Expr):
 
     def __post_init__(self) -> None:
         if type(self.op) is not str or not self.op:
-            raise TypeError("BinOp.op must be a non-empty string")
+            raise ScorchTypeError(
+                "BinOp.op must be a non-empty string", code="invalid_bin_op_op"
+            )
         if not isinstance(self.left, Expr):
-            raise TypeError("BinOp.left must be an LLIR Expr")
+            raise ScorchTypeError(
+                "BinOp.left must be an LLIR Expr", code="invalid_bin_op_left"
+            )
         if not isinstance(self.right, Expr):
-            raise TypeError("BinOp.right must be an LLIR Expr")
+            raise ScorchTypeError(
+                "BinOp.right must be an LLIR Expr", code="invalid_bin_op_right"
+            )
 
 
 @dataclass(frozen=True, repr=False, init=False)
@@ -624,13 +666,16 @@ def rebuild_binary_expression(
         return BinOp(expression.op, left, right)
     if type(expression) is Add:
         if expression.op != "+":
-            raise TypeError("Add.op must remain '+'")
+            raise ScorchTypeError("Add.op must remain '+'", code="invalid_add_op")
         return Add(left, right)
     if type(expression) is Mul:
         if expression.op != "*":
-            raise TypeError("Mul.op must remain '*'")
+            raise ScorchTypeError("Mul.op must remain '*'", code="invalid_mul_op")
         return Mul(left, right)
-    raise TypeError("binary expression must be an exact BinOp, Add, or Mul instance")
+    raise ScorchTypeError(
+        "binary expression must be an exact BinOp, Add, or Mul instance",
+        code="llir_node_invalid",
+    )
 
 
 @dataclass(frozen=True)
@@ -642,7 +687,10 @@ class Literal(Expr):
 
     def __post_init__(self) -> None:
         if type(self.value) not in (bool, int, float, str):
-            raise TypeError("Literal.value must be a bool, int, float, or string")
+            raise ScorchTypeError(
+                "Literal.value must be a bool, int, float, or string",
+                code="invalid_literal_value",
+            )
         if self.data_type is None:
             object.__setattr__(
                 self,
@@ -650,7 +698,10 @@ class Literal(Expr):
                 DataType.from_python_type(type(self.value)),
             )
         elif type(self.data_type) is not DataType:
-            raise TypeError("Literal.data_type must be a DataType or None")
+            raise ScorchTypeError(
+                "Literal.data_type must be a DataType or None",
+                code="invalid_literal_data_type",
+            )
 
 
 @dataclass(frozen=True, repr=False)
@@ -663,11 +714,20 @@ class QualifiedName(Expr):
 
     def __post_init__(self) -> None:
         if type(self.namespace) is not str or not self.namespace.isidentifier():
-            raise TypeError("QualifiedName.namespace must be a non-empty identifier")
+            raise ScorchTypeError(
+                "QualifiedName.namespace must be a non-empty identifier",
+                code="invalid_qualified_name_namespace",
+            )
         if type(self.name) is not str or not self.name.isidentifier():
-            raise TypeError("QualifiedName.name must be a non-empty identifier")
+            raise ScorchTypeError(
+                "QualifiedName.name must be a non-empty identifier",
+                code="invalid_qualified_name_name",
+            )
         if type(self.data_type) is not DataType:
-            raise TypeError("QualifiedName.data_type must be a DataType")
+            raise ScorchTypeError(
+                "QualifiedName.data_type must be a DataType",
+                code="invalid_qualified_name_data_type",
+            )
 
 
 """
@@ -683,7 +743,9 @@ class Increment(Stmt):
 
     def __post_init__(self) -> None:
         if type(self.var) is not Var:
-            raise TypeError("Increment.var must be an exact LLIR Var")
+            raise ScorchTypeError(
+                "Increment.var must be an exact LLIR Var", code="invalid_increment_var"
+            )
 
 
 class Return(Stmt):
@@ -739,25 +801,46 @@ class DirectInit(Stmt):
 
     def __init__(self, var: Var, args: Sequence[Expr]) -> None:
         if type(var) is not Var:
-            raise TypeError("DirectInit.var must be an exact LLIR Var")
+            raise ScorchTypeError(
+                "DirectInit.var must be an exact LLIR Var",
+                code="invalid_direct_init_var",
+            )
         if type(var.name) is not str or not var.name.isidentifier():
-            raise TypeError("DirectInit.var.name must be a non-empty identifier")
+            raise ScorchTypeError(
+                "DirectInit.var.name must be a non-empty identifier",
+                code="llir_node_invalid",
+            )
         if type(var.type) is not DataType or var.type not in _DIRECT_INIT_DATA_TYPES:
-            raise TypeError(
-                "DirectInit.var.type must be a supported standard-vector DataType"
+            raise ScorchTypeError(
+                "DirectInit.var.type must be a supported standard-vector DataType",
+                code="llir_node_invalid",
             )
         if var.is_ptr is not False:
-            raise TypeError("DirectInit.var.is_ptr must be False")
+            raise ScorchTypeError(
+                "DirectInit.var.is_ptr must be False", code="llir_node_invalid"
+            )
         if var.is_restrict is not False:
-            raise TypeError("DirectInit.var.is_restrict must be False")
+            raise ScorchTypeError(
+                "DirectInit.var.is_restrict must be False", code="llir_node_invalid"
+            )
         if var.tensor_access is not None:
-            raise TypeError("DirectInit.var.tensor_access must be None")
+            raise ScorchTypeError(
+                "DirectInit.var.tensor_access must be None", code="llir_node_invalid"
+            )
         if type(args) is not list and type(args) is not tuple:
-            raise TypeError("DirectInit.args must be a list or tuple")
+            raise ScorchTypeError(
+                "DirectInit.args must be a list or tuple",
+                code="invalid_direct_init_args",
+            )
         if not args:
-            raise TypeError("DirectInit.args must be non-empty")
+            raise ScorchTypeError(
+                "DirectInit.args must be non-empty", code="invalid_direct_init_args"
+            )
         if any(not isinstance(argument, Expr) for argument in args):
-            raise TypeError("DirectInit.args must contain only LLIR expressions")
+            raise ScorchTypeError(
+                "DirectInit.args must contain only LLIR expressions",
+                code="invalid_direct_init_args",
+            )
         object.__setattr__(self, "var", var)
         object.__setattr__(self, "args", tuple(args))
 
@@ -780,14 +863,22 @@ class Assign(Stmt):
         _validated_result_storage(self.result_storage, "Assign")
         _validate_assignment_target(self.var)
         if not isinstance(self.value, Expr):
-            raise TypeError("Assign.value must be an LLIR Expr")
+            raise ScorchTypeError(
+                "Assign.value must be an LLIR Expr", code="invalid_assign_value"
+            )
         if type(self.op) is not AssignOp:
-            raise TypeError("Assign.op must be an AssignOp")
+            raise ScorchTypeError(
+                "Assign.op must be an AssignOp", code="invalid_assign_op"
+            )
         if type(self.cast) is not bool:
-            raise TypeError("Assign.cast must be a bool")
+            raise ScorchTypeError(
+                "Assign.cast must be a bool", code="invalid_assign_cast"
+            )
         if self.cast:
             if type(self.var) is not Var:
-                raise TypeError("Assign.cast requires an exact Var target")
+                raise ScorchTypeError(
+                    "Assign.cast requires an exact Var target", code="llir_node_invalid"
+                )
             self.value = Cast(self.value, self.var.type)
 
 
@@ -856,9 +947,14 @@ def _normalized_call_template_args(
     if template_args is None:
         return ()
     if type(template_args) is not list and type(template_args) is not tuple:
-        raise TypeError(f"{owner}.template_args must be a list or tuple")
+        raise ScorchTypeError(
+            f"{owner}.template_args must be a list or tuple", code="llir_node_invalid"
+        )
     if any(type(argument) is not DataType for argument in template_args):
-        raise TypeError(f"{owner}.template_args must contain only DataType values")
+        raise ScorchTypeError(
+            f"{owner}.template_args must contain only DataType values",
+            code="llir_node_invalid",
+        )
     return tuple(template_args)
 
 
@@ -882,7 +978,10 @@ class FunctionCall(Expr):
         template_args: Optional[Sequence[DataType]] = None,
     ) -> None:
         if type(name) is not str or not name.strip():
-            raise TypeError("FunctionCall.name must be a non-empty string")
+            raise ScorchTypeError(
+                "FunctionCall.name must be a non-empty string",
+                code="invalid_function_call_name",
+            )
         normalized_template_args = _normalized_call_template_args(
             template_args, owner="FunctionCall"
         )
@@ -890,9 +989,15 @@ class FunctionCall(Expr):
             normalized_args: Tuple[Expr, ...] = ()
         else:
             if type(args) is not list and type(args) is not tuple:
-                raise TypeError("FunctionCall.args must be a list or tuple")
+                raise ScorchTypeError(
+                    "FunctionCall.args must be a list or tuple",
+                    code="invalid_function_call_args",
+                )
             if any(not isinstance(argument, Expr) for argument in args):
-                raise TypeError("FunctionCall.args must contain only LLIR expressions")
+                raise ScorchTypeError(
+                    "FunctionCall.args must contain only LLIR expressions",
+                    code="invalid_function_call_args",
+                )
             normalized_args = tuple(args)
         object.__setattr__(self, "name", name)
         object.__setattr__(self, "template_args", normalized_template_args)
@@ -920,7 +1025,10 @@ class FunctionCallStmt(Stmt):
         result_storage: Optional[ResultStorageMetadata] = None,
     ) -> None:
         if type(name) is not str or not name.strip():
-            raise TypeError("FunctionCallStmt.name must be a non-empty string")
+            raise ScorchTypeError(
+                "FunctionCallStmt.name must be a non-empty string",
+                code="invalid_function_call_stmt_name",
+            )
         normalized_template_args = _normalized_call_template_args(
             template_args, owner="FunctionCallStmt"
         )
@@ -928,10 +1036,14 @@ class FunctionCallStmt(Stmt):
             normalized_args: Tuple[Expr, ...] = ()
         else:
             if type(args) is not list and type(args) is not tuple:
-                raise TypeError("FunctionCallStmt.args must be a list or tuple")
+                raise ScorchTypeError(
+                    "FunctionCallStmt.args must be a list or tuple",
+                    code="invalid_function_call_stmt_args",
+                )
             if any(not isinstance(argument, Expr) for argument in args):
-                raise TypeError(
-                    "FunctionCallStmt.args must contain only LLIR expressions"
+                raise ScorchTypeError(
+                    "FunctionCallStmt.args must contain only LLIR expressions",
+                    code="invalid_function_call_stmt_args",
                 )
             normalized_args = tuple(args)
         object.__setattr__(self, "name", name)
@@ -953,11 +1065,18 @@ class Array(Expr):
 
     def __init__(self, values: Sequence[Expr], data_type: DataType) -> None:
         if type(values) is not list and type(values) is not tuple:
-            raise TypeError("Array.values must be a list or tuple")
+            raise ScorchTypeError(
+                "Array.values must be a list or tuple", code="invalid_array_values"
+            )
         if any(not isinstance(value, Expr) for value in values):
-            raise TypeError("Array.values must contain only LLIR expressions")
+            raise ScorchTypeError(
+                "Array.values must contain only LLIR expressions",
+                code="invalid_array_values",
+            )
         if type(data_type) is not DataType:
-            raise TypeError("Array.data_type must be a DataType")
+            raise ScorchTypeError(
+                "Array.data_type must be a DataType", code="invalid_array_data_type"
+            )
         object.__setattr__(self, "values", tuple(values))
         object.__setattr__(self, "data_type", data_type)
 
@@ -1023,29 +1142,44 @@ class FixedStackArrayDecl(Stmt):
 
     def __post_init__(self) -> None:
         if type(self.name) is not str or not self.name.isidentifier():
-            raise TypeError("FixedStackArrayDecl.name must be a non-empty identifier")
+            raise ScorchTypeError(
+                "FixedStackArrayDecl.name must be a non-empty identifier",
+                code="invalid_fixed_stack_array_decl_name",
+            )
         if (
             type(self.element_type) is not DataType
             or self.element_type not in _FIXED_STACK_ARRAY_ELEMENT_TYPES
         ):
-            raise TypeError(
+            raise ScorchTypeError(
                 "FixedStackArrayDecl.element_type must be a supported scalar "
-                "DataType"
+                "DataType",
+                code="invalid_fixed_stack_array_decl_element_type",
             )
         if not _is_fixed_stack_array_extent(self.extent):
-            raise TypeError(
+            raise ScorchTypeError(
                 "FixedStackArrayDecl.extent must be an exact metadata-free "
-                "constexpr Var or positive integral Literal"
+                "constexpr Var or positive integral Literal",
+                code="invalid_fixed_stack_array_decl_extent",
             )
         if type(self.initializer) is not Array:
-            raise TypeError("FixedStackArrayDecl.initializer must be an exact Array")
+            raise ScorchTypeError(
+                "FixedStackArrayDecl.initializer must be an exact Array",
+                code="invalid_fixed_stack_array_decl_initializer",
+            )
         if type(self.initializer.values) is not tuple:
-            raise TypeError("FixedStackArrayDecl.initializer values must be a tuple")
+            raise ScorchTypeError(
+                "FixedStackArrayDecl.initializer values must be a tuple",
+                code="llir_node_invalid",
+            )
         if self.initializer.values:
-            raise TypeError("FixedStackArrayDecl.initializer must be empty")
+            raise ScorchTypeError(
+                "FixedStackArrayDecl.initializer must be empty",
+                code="invalid_fixed_stack_array_decl_initializer",
+            )
         if self.initializer.data_type is not self.element_type:
-            raise TypeError(
-                "FixedStackArrayDecl.initializer type must match element_type"
+            raise ScorchTypeError(
+                "FixedStackArrayDecl.initializer type must match element_type",
+                code="llir_node_invalid",
             )
 
 
@@ -1058,9 +1192,15 @@ class MemberAccess(Expr):
 
     def __post_init__(self) -> None:
         if not isinstance(self.base, Expr):
-            raise TypeError("MemberAccess.base must be an LLIR Expr")
+            raise ScorchTypeError(
+                "MemberAccess.base must be an LLIR Expr",
+                code="invalid_member_access_base",
+            )
         if type(self.member) is not str or not self.member.isidentifier():
-            raise TypeError("MemberAccess.member must be a non-empty identifier")
+            raise ScorchTypeError(
+                "MemberAccess.member must be a non-empty identifier",
+                code="invalid_member_access_member",
+            )
 
 
 @dataclass(frozen=True, init=False, repr=False)
@@ -1080,26 +1220,41 @@ class MemberCall(Expr):
         args: Optional[Sequence[Expr]] = None,
     ) -> None:
         if not isinstance(base, Expr):
-            raise TypeError("MemberCall.base must be an LLIR Expr")
+            raise ScorchTypeError(
+                "MemberCall.base must be an LLIR Expr", code="invalid_member_call_base"
+            )
         if type(member) is not str or not member.isidentifier():
-            raise TypeError("MemberCall.member must be a non-empty identifier")
+            raise ScorchTypeError(
+                "MemberCall.member must be a non-empty identifier",
+                code="invalid_member_call_member",
+            )
         if template_args is None:
             normalized_template_args: Tuple[DataType, ...] = ()
         else:
             if type(template_args) is not list and type(template_args) is not tuple:
-                raise TypeError("MemberCall.template_args must be a list or tuple")
+                raise ScorchTypeError(
+                    "MemberCall.template_args must be a list or tuple",
+                    code="invalid_member_call_template_args",
+                )
             if any(type(argument) is not DataType for argument in template_args):
-                raise TypeError(
-                    "MemberCall.template_args must contain only DataType values"
+                raise ScorchTypeError(
+                    "MemberCall.template_args must contain only DataType values",
+                    code="invalid_member_call_template_args",
                 )
             normalized_template_args = tuple(template_args)
         if args is None:
             normalized_args: Tuple[Expr, ...] = ()
         else:
             if type(args) is not list and type(args) is not tuple:
-                raise TypeError("MemberCall.args must be a list or tuple")
+                raise ScorchTypeError(
+                    "MemberCall.args must be a list or tuple",
+                    code="invalid_member_call_args",
+                )
             if any(not isinstance(argument, Expr) for argument in args):
-                raise TypeError("MemberCall.args must contain only LLIR expressions")
+                raise ScorchTypeError(
+                    "MemberCall.args must contain only LLIR expressions",
+                    code="invalid_member_call_args",
+                )
             normalized_args = tuple(args)
         object.__setattr__(self, "base", base)
         object.__setattr__(self, "member", member)
@@ -1135,27 +1290,41 @@ class MemberCallStmt(Stmt):
         result_storage: Optional[ResultStorageMetadata] = None,
     ) -> None:
         if not isinstance(base, Expr):
-            raise TypeError("MemberCallStmt.base must be an LLIR Expr")
+            raise ScorchTypeError(
+                "MemberCallStmt.base must be an LLIR Expr",
+                code="invalid_member_call_stmt_base",
+            )
         if type(member) is not str or not member.isidentifier():
-            raise TypeError("MemberCallStmt.member must be a non-empty identifier")
+            raise ScorchTypeError(
+                "MemberCallStmt.member must be a non-empty identifier",
+                code="invalid_member_call_stmt_member",
+            )
         if template_args is None:
             normalized_template_args: Tuple[DataType, ...] = ()
         else:
             if type(template_args) is not list and type(template_args) is not tuple:
-                raise TypeError("MemberCallStmt.template_args must be a list or tuple")
+                raise ScorchTypeError(
+                    "MemberCallStmt.template_args must be a list or tuple",
+                    code="invalid_member_call_stmt_template_args",
+                )
             if any(type(argument) is not DataType for argument in template_args):
-                raise TypeError(
-                    "MemberCallStmt.template_args must contain only DataType values"
+                raise ScorchTypeError(
+                    "MemberCallStmt.template_args must contain only DataType values",
+                    code="invalid_member_call_stmt_template_args",
                 )
             normalized_template_args = tuple(template_args)
         if args is None:
             normalized_args: Tuple[Expr, ...] = ()
         else:
             if type(args) is not list and type(args) is not tuple:
-                raise TypeError("MemberCallStmt.args must be a list or tuple")
+                raise ScorchTypeError(
+                    "MemberCallStmt.args must be a list or tuple",
+                    code="invalid_member_call_stmt_args",
+                )
             if any(not isinstance(argument, Expr) for argument in args):
-                raise TypeError(
-                    "MemberCallStmt.args must contain only LLIR expressions"
+                raise ScorchTypeError(
+                    "MemberCallStmt.args must contain only LLIR expressions",
+                    code="invalid_member_call_stmt_args",
                 )
             normalized_args = tuple(args)
         object.__setattr__(self, "base", base)
@@ -1188,15 +1357,22 @@ class ArrayAccess(Expr):
 
     def __post_init__(self) -> None:
         if not isinstance(self.array, Expr):
-            raise TypeError("ArrayAccess.array must be an LLIR Expr")
+            raise ScorchTypeError(
+                "ArrayAccess.array must be an LLIR Expr",
+                code="invalid_array_access_array",
+            )
         if not isinstance(self.index, Expr):
-            raise TypeError("ArrayAccess.index must be an LLIR Expr")
+            raise ScorchTypeError(
+                "ArrayAccess.index must be an LLIR Expr",
+                code="invalid_array_access_index",
+            )
         if (
             self.tensor_access is not None
             and type(self.tensor_access) is not TensorAccessMetadata
         ):
-            raise TypeError(
-                "ArrayAccess.tensor_access must be TensorAccessMetadata or None"
+            raise ScorchTypeError(
+                "ArrayAccess.tensor_access must be TensorAccessMetadata or None",
+                code="invalid_array_access_tensor_access",
             )
 
 
@@ -1222,20 +1398,35 @@ def _validate_assignment_metadata(
     owner: str,
 ) -> None:
     if type(metadata) is not TensorAccessMetadata:
-        raise TypeError(f"{owner} metadata must be TensorAccessMetadata")
+        raise ScorchTypeError(
+            f"{owner} metadata must be TensorAccessMetadata",
+            code="invalid_tensor_access_metadata",
+        )
     missing = _MISSING_ADDRESS_OF_FIELD
     fields = _stored_instance_fields(metadata)
     if fields.get("role", missing) is not expected_role:
-        raise TypeError(f"{owner} metadata must have the {expected_role.name} role")
+        raise ScorchTypeError(
+            f"{owner} metadata must have the {expected_role.name} role",
+            code="invalid_tensor_access_metadata",
+        )
     if type(fields.get("access_id", missing)) is not AccessId:
-        raise TypeError(f"{owner} metadata access_id must be an AccessId")
+        raise ScorchTypeError(
+            f"{owner} metadata access_id must be an AccessId",
+            code="invalid_tensor_access_metadata",
+        )
     if type(fields.get("tensor_id", missing)) is not SymbolId:
-        raise TypeError(f"{owner} metadata tensor_id must be a SymbolId")
+        raise ScorchTypeError(
+            f"{owner} metadata tensor_id must be a SymbolId",
+            code="invalid_tensor_access_metadata",
+        )
     index_ids = fields.get("index_ids", missing)
     if type(index_ids) is not tuple or any(
         type(index_id) is not IndexId for index_id in index_ids
     ):
-        raise TypeError(f"{owner} metadata index_ids must be a tuple of IndexId values")
+        raise ScorchTypeError(
+            f"{owner} metadata index_ids must be a tuple of IndexId values",
+            code="invalid_tensor_access_metadata",
+        )
 
 
 def _assignment_index_fast_ok(expression: object, budget: int) -> int:
@@ -1330,16 +1521,28 @@ def _validate_assignment_target(target: object) -> None:
     if type(target) is Var:
         fields = _stored_instance_fields(target)
         if not _is_assignment_name(fields.get("name", missing), allow_member=True):
-            raise TypeError("assignment Var.name must be an identifier or member path")
+            raise ScorchTypeError(
+                "assignment Var.name must be an identifier or member path",
+                code="invalid_assignment_target",
+            )
         if type(fields.get("type", missing)) is not DataType:
-            raise TypeError("assignment Var.type must be a DataType")
+            raise ScorchTypeError(
+                "assignment Var.type must be a DataType",
+                code="invalid_assignment_target",
+            )
         if type(fields.get("is_ptr", missing)) is not bool:
-            raise TypeError("assignment Var.is_ptr must be a bool")
+            raise ScorchTypeError(
+                "assignment Var.is_ptr must be a bool", code="invalid_assignment_target"
+            )
         if type(fields.get("is_restrict", missing)) is not bool:
-            raise TypeError("assignment Var.is_restrict must be a bool")
+            raise ScorchTypeError(
+                "assignment Var.is_restrict must be a bool",
+                code="invalid_assignment_target",
+            )
         if fields.get("tensor_access", missing) is not None:
-            raise TypeError(
-                "scalar/member Assign targets cannot carry tensor access metadata"
+            raise ScorchTypeError(
+                "scalar/member Assign targets cannot carry tensor access metadata",
+                code="invalid_assignment_target",
             )
         return
     if type(target) is ArrayAccess:
@@ -1379,55 +1582,92 @@ def _validate_assignment_target(target: object) -> None:
         while type(base) is MemberAccess:
             member = cast(MemberAccess, base)
             if id(member) in visited_members:
-                raise TypeError("assignment MemberAccess chain must be acyclic")
+                raise ScorchTypeError(
+                    "assignment MemberAccess chain must be acyclic",
+                    code="invalid_assignment_target",
+                )
             visited_members.add(id(member))
             member_fields = _stored_instance_fields(member)
             member_name = member_fields.get("member", missing)
             if type(member_name) is not str or not member_name.isidentifier():
-                raise TypeError("assignment MemberAccess members must be identifiers")
+                raise ScorchTypeError(
+                    "assignment MemberAccess members must be identifiers",
+                    code="invalid_assignment_target",
+                )
             base = member_fields.get("base", missing)
         if type(base) is not Var:
-            raise TypeError(
+            raise ScorchTypeError(
                 "assignment MemberAccess must have an exact Var root through exact "
-                "MemberAccess bases"
+                "MemberAccess bases",
+                code="invalid_assignment_target",
             )
         root_fields = _stored_instance_fields(base)
         if not _is_assignment_name(
             root_fields.get("name", missing), allow_member=False
         ):
-            raise TypeError("assignment MemberAccess root name must be an identifier")
+            raise ScorchTypeError(
+                "assignment MemberAccess root name must be an identifier",
+                code="invalid_assignment_target",
+            )
         if type(root_fields.get("type", missing)) is not DataType:
-            raise TypeError("assignment MemberAccess root type must be a DataType")
+            raise ScorchTypeError(
+                "assignment MemberAccess root type must be a DataType",
+                code="invalid_assignment_target",
+            )
         if type(root_fields.get("is_ptr", missing)) is not bool:
-            raise TypeError("assignment MemberAccess root is_ptr must be a bool")
+            raise ScorchTypeError(
+                "assignment MemberAccess root is_ptr must be a bool",
+                code="invalid_assignment_target",
+            )
         if type(root_fields.get("is_restrict", missing)) is not bool:
-            raise TypeError("assignment MemberAccess root is_restrict must be a bool")
+            raise ScorchTypeError(
+                "assignment MemberAccess root is_restrict must be a bool",
+                code="invalid_assignment_target",
+            )
         if root_fields.get("tensor_access", missing) is not None:
-            raise TypeError(
-                "assignment MemberAccess root cannot carry tensor access metadata"
+            raise ScorchTypeError(
+                "assignment MemberAccess root cannot carry tensor access metadata",
+                code="invalid_assignment_target",
             )
         return
     if type(target) is not ArrayAccess:
-        raise TypeError("Assign.var must be an exact Var, MemberAccess, or ArrayAccess")
+        raise ScorchTypeError(
+            "Assign.var must be an exact Var, MemberAccess, or ArrayAccess",
+            code="invalid_assignment_target",
+        )
 
     access_fields = _stored_instance_fields(target)
     array = access_fields.get("array", missing)
     if type(array) is not Var:
-        raise TypeError("assignment ArrayAccess.array must be an exact Var")
+        raise ScorchTypeError(
+            "assignment ArrayAccess.array must be an exact Var",
+            code="invalid_assignment_target",
+        )
     array_fields = _stored_instance_fields(array)
     if not _is_assignment_name(array_fields.get("name", missing), allow_member=True):
-        raise TypeError(
-            "assignment ArrayAccess.array name must be an identifier or member path"
+        raise ScorchTypeError(
+            "assignment ArrayAccess.array name must be an identifier or member path",
+            code="invalid_assignment_target",
         )
     if type(array_fields.get("type", missing)) is not DataType:
-        raise TypeError("assignment ArrayAccess.array type must be a DataType")
+        raise ScorchTypeError(
+            "assignment ArrayAccess.array type must be a DataType",
+            code="invalid_assignment_target",
+        )
     if type(array_fields.get("is_ptr", missing)) is not bool:
-        raise TypeError("assignment ArrayAccess.array is_ptr must be a bool")
+        raise ScorchTypeError(
+            "assignment ArrayAccess.array is_ptr must be a bool",
+            code="invalid_assignment_target",
+        )
     if type(array_fields.get("is_restrict", missing)) is not bool:
-        raise TypeError("assignment ArrayAccess.array is_restrict must be a bool")
+        raise ScorchTypeError(
+            "assignment ArrayAccess.array is_restrict must be a bool",
+            code="invalid_assignment_target",
+        )
     if array_fields.get("tensor_access", missing) is not None:
-        raise TypeError(
-            "assignment ArrayAccess.array cannot carry tensor access metadata"
+        raise ScorchTypeError(
+            "assignment ArrayAccess.array cannot carry tensor access metadata",
+            code="invalid_assignment_target",
         )
     _validate_assignment_index(access_fields.get("index", missing))
     metadata = access_fields.get("tensor_access", missing)
@@ -1558,9 +1798,13 @@ class Cast(Expr):
 
     def __post_init__(self) -> None:
         if not isinstance(self.expr, Expr):
-            raise TypeError("Cast.expr must be an LLIR Expr")
+            raise ScorchTypeError(
+                "Cast.expr must be an LLIR Expr", code="invalid_cast_expr"
+            )
         if type(self.data_type) is not DataType:
-            raise TypeError("Cast.data_type must be a DataType")
+            raise ScorchTypeError(
+                "Cast.data_type must be a DataType", code="invalid_cast_data_type"
+            )
 
 
 @dataclass(frozen=True)
@@ -1578,11 +1822,18 @@ class Select(Expr):
 
     def __post_init__(self) -> None:
         if not isinstance(self.cond, Expr):
-            raise TypeError("Select.cond must be an LLIR Expr")
+            raise ScorchTypeError(
+                "Select.cond must be an LLIR Expr", code="invalid_select_cond"
+            )
         if not isinstance(self.when_true, Expr):
-            raise TypeError("Select.when_true must be an LLIR Expr")
+            raise ScorchTypeError(
+                "Select.when_true must be an LLIR Expr", code="invalid_select_when_true"
+            )
         if not isinstance(self.when_false, Expr):
-            raise TypeError("Select.when_false must be an LLIR Expr")
+            raise ScorchTypeError(
+                "Select.when_false must be an LLIR Expr",
+                code="invalid_select_when_false",
+            )
 
 
 @dataclass(frozen=True)
@@ -1593,7 +1844,9 @@ class Sizeof(Expr):
 
     def __post_init__(self) -> None:
         if type(self.data_type) is not DataType:
-            raise TypeError("Sizeof.data_type must be a DataType")
+            raise ScorchTypeError(
+                "Sizeof.data_type must be a DataType", code="invalid_sizeof_data_type"
+            )
 
 
 _MISSING_ADDRESS_OF_FIELD = object()
@@ -1611,9 +1864,19 @@ _EMPTY_INSTANCE_FIELDS: dict = {}
 class _AddressOfValidationError(TypeError):
     """A typed lvalue-boundary failure with an operand-relative field path."""
 
-    def __init__(self, message: str, field_path: Tuple[str, ...] = ()) -> None:
+    code: Optional[str] = None
+
+    def __init__(
+        self,
+        message: str,
+        field_path: Tuple[str, ...] = (),
+        *,
+        code: Optional[str] = None,
+    ) -> None:
         super().__init__(message)
         self.field_path = field_path
+        if code is not None:
+            self.code = code
 
 
 def _address_of_instance_field(owner: object, name: str) -> object:
@@ -1646,17 +1909,20 @@ def _validate_address_of_metadata(
         raise _AddressOfValidationError(
             f"{owner} metadata must be TensorAccessMetadata or None",
             path,
+            code="invalid_address_of_operand",
         )
     typed_metadata = cast(TensorAccessMetadata, metadata)
     if type(_address_of_instance_field(typed_metadata, "access_id")) is not AccessId:
         raise _AddressOfValidationError(
             f"{owner} metadata access_id must be an AccessId",
             path + ("access_id",),
+            code="invalid_address_of_operand",
         )
     if type(_address_of_instance_field(typed_metadata, "tensor_id")) is not SymbolId:
         raise _AddressOfValidationError(
             f"{owner} metadata tensor_id must be a SymbolId",
             path + ("tensor_id",),
+            code="invalid_address_of_operand",
         )
     index_ids = _address_of_instance_field(typed_metadata, "index_ids")
     if type(index_ids) is not tuple or any(
@@ -1665,11 +1931,13 @@ def _validate_address_of_metadata(
         raise _AddressOfValidationError(
             f"{owner} metadata index_ids must be a tuple of IndexId values",
             path + ("index_ids",),
+            code="invalid_address_of_operand",
         )
     if type(_address_of_instance_field(typed_metadata, "role")) is not TensorAccessRole:
         raise _AddressOfValidationError(
             f"{owner} metadata role must be a TensorAccessRole",
             path + ("role",),
+            code="invalid_address_of_operand",
         )
 
 
@@ -1683,6 +1951,7 @@ def _validate_address_of_root_var(
         raise _AddressOfValidationError(
             f"AddressOf.operand {owner} must be an exact Var",
             path,
+            code="invalid_address_of_operand",
         )
     variable = cast(Var, value)
     name = _address_of_instance_field(variable, "name")
@@ -1690,26 +1959,31 @@ def _validate_address_of_root_var(
         raise _AddressOfValidationError(
             f"AddressOf.operand {owner} name must be a non-empty identifier",
             path + ("name",),
+            code="invalid_address_of_operand",
         )
     if type(_address_of_instance_field(variable, "type")) is not DataType:
         raise _AddressOfValidationError(
             f"AddressOf.operand {owner} type must be a DataType",
             path + ("type",),
+            code="invalid_address_of_operand",
         )
     if type(_address_of_instance_field(variable, "is_ptr")) is not bool:
         raise _AddressOfValidationError(
             f"AddressOf.operand {owner} is_ptr must be a bool",
             path + ("is_ptr",),
+            code="invalid_address_of_operand",
         )
     if type(_address_of_instance_field(variable, "is_restrict")) is not bool:
         raise _AddressOfValidationError(
             f"AddressOf.operand {owner} is_restrict must be a bool",
             path + ("is_restrict",),
+            code="invalid_address_of_operand",
         )
     if _address_of_instance_field(variable, "tensor_access") is not None:
         raise _AddressOfValidationError(
             f"AddressOf.operand {owner} cannot carry tensor access metadata",
             path + ("tensor_access",),
+            code="invalid_address_of_operand",
         )
 
 
@@ -1753,26 +2027,31 @@ def _validate_address_of_index_impl(
             raise _AddressOfValidationError(
                 f"{owner} Var name must be an identifier or member path",
                 path + ("name",),
+                code="invalid_address_of_operand",
             )
         if type(fields.get("type", missing)) is not DataType:
             raise _AddressOfValidationError(
                 f"{owner} Var type must be a DataType",
                 path + ("type",),
+                code="invalid_address_of_operand",
             )
         if type(fields.get("is_ptr", missing)) is not bool:
             raise _AddressOfValidationError(
                 f"{owner} Var is_ptr must be a bool",
                 path + ("is_ptr",),
+                code="invalid_address_of_operand",
             )
         if type(fields.get("is_restrict", missing)) is not bool:
             raise _AddressOfValidationError(
                 f"{owner} Var is_restrict must be a bool",
                 path + ("is_restrict",),
+                code="invalid_address_of_operand",
             )
         if fields.get("tensor_access", missing) is not None:
             raise _AddressOfValidationError(
                 f"{owner} Var cannot carry tensor access metadata",
                 path + ("tensor_access",),
+                code="invalid_address_of_operand",
             )
         return
 
@@ -1781,11 +2060,13 @@ def _validate_address_of_index_impl(
             raise _AddressOfValidationError(
                 f"{owner} Literal value must be an int",
                 path + ("value",),
+                code="invalid_address_of_operand",
             )
         if type(fields.get("data_type", missing)) is not DataType:
             raise _AddressOfValidationError(
                 f"{owner} Literal data_type must be a DataType",
                 path + ("data_type",),
+                code="invalid_address_of_operand",
             )
         return
 
@@ -1794,6 +2075,7 @@ def _validate_address_of_index_impl(
             raise _AddressOfValidationError(
                 f"{owner} Sizeof data_type must be a DataType",
                 path + ("data_type",),
+                code="invalid_address_of_operand",
             )
         return
 
@@ -1802,11 +2084,13 @@ def _validate_address_of_index_impl(
         raise _AddressOfValidationError(
             f"{owner} must be acyclic",
             path,
+            code="invalid_address_of_operand",
         )
     if len(active) >= _MAX_VALIDATED_EXPRESSION_DEPTH:
         raise _AddressOfValidationError(
             f"{owner} exceeds the maximum supported nesting depth",
             path,
+            code="invalid_address_of_operand",
         )
 
     if expression_type in (BinOp, Add, Mul):
@@ -1820,6 +2104,7 @@ def _validate_address_of_index_impl(
             raise _AddressOfValidationError(
                 f"{owner} BinOp op must be a supported arithmetic operator",
                 path + ("op",),
+                code="invalid_address_of_operand",
             )
         active.add(expression_id)
         try:
@@ -1847,6 +2132,7 @@ def _validate_address_of_index_impl(
             raise _AddressOfValidationError(
                 f"{owner} UnaryOp op must be '+' or '-'",
                 path + ("op",),
+                code="invalid_address_of_operand",
             )
         active.add(expression_id)
         try:
@@ -1866,6 +2152,7 @@ def _validate_address_of_index_impl(
             raise _AddressOfValidationError(
                 f"{owner} Cast data_type must be a DataType",
                 path + ("data_type",),
+                code="invalid_address_of_operand",
             )
         active.add(expression_id)
         try:
@@ -1885,6 +2172,7 @@ def _validate_address_of_index_impl(
             raise _AddressOfValidationError(
                 f"{owner} FunctionCall name must be an identifier or member path",
                 path + ("name",),
+                code="invalid_address_of_operand",
             )
         template_arguments = fields.get("template_args", missing)
         if type(template_arguments) is not tuple or any(
@@ -1894,12 +2182,14 @@ def _validate_address_of_index_impl(
                 f"{owner} FunctionCall template_args must be a tuple of "
                 "DataType values",
                 path + ("template_args",),
+                code="invalid_address_of_operand",
             )
         arguments = fields.get("args", missing)
         if type(arguments) is not tuple:
             raise _AddressOfValidationError(
                 f"{owner} FunctionCall args must be a tuple",
                 path + ("args",),
+                code="invalid_address_of_operand",
             )
         active.add(expression_id)
         try:
@@ -1930,6 +2220,7 @@ def _validate_address_of_index_impl(
                 raise _AddressOfValidationError(
                     f"{owner} metadata must have the INPUT_READ role",
                     path + ("tensor_access", "role"),
+                    code="invalid_address_of_operand",
                 )
         active.add(expression_id)
         try:
@@ -1954,6 +2245,7 @@ def _validate_address_of_index_impl(
     raise _AddressOfValidationError(
         f"{owner} contains an unsupported LLIR expression",
         path,
+        code="invalid_address_of_operand",
     )
 
 
@@ -1973,6 +2265,7 @@ def _validate_address_of_operand(operand: object) -> None:
                 raise _AddressOfValidationError(
                     "AddressOf.operand MemberAccess chain must be acyclic",
                     member_path,
+                    code="invalid_address_of_operand",
                 )
             visited_members.add(id(member_access))
             member = _address_of_instance_field(member_access, "member")
@@ -1980,6 +2273,7 @@ def _validate_address_of_operand(operand: object) -> None:
                 raise _AddressOfValidationError(
                     "AddressOf.operand MemberAccess members must be identifiers",
                     member_path + ("member",),
+                    code="invalid_address_of_operand",
                 )
             base = _address_of_instance_field(member_access, "base")
             if type(base) is MemberAccess:
@@ -2010,6 +2304,7 @@ def _validate_address_of_operand(operand: object) -> None:
 
     raise _AddressOfValidationError(
         "AddressOf.operand must be an exact Var, MemberAccess, or ArrayAccess",
+        code="invalid_address_of_operand",
     )
 
 
@@ -2029,9 +2324,19 @@ _GUARDED_CALL_COMPARISON_OPS = frozenset({"<", "<=", ">", ">=", "==", "!="})
 class _GuardedCallValidationError(TypeError):
     """A guarded-call boundary failure with a node-relative field path."""
 
-    def __init__(self, message: str, field_path: Tuple[str, ...] = ()) -> None:
+    code: Optional[str] = None
+
+    def __init__(
+        self,
+        message: str,
+        field_path: Tuple[str, ...] = (),
+        *,
+        code: Optional[str] = None,
+    ) -> None:
         super().__init__(message)
         self.field_path = field_path
+        if code is not None:
+            self.code = code
 
 
 def _validate_guarded_call_condition(
@@ -2047,11 +2352,13 @@ def _validate_guarded_call_condition(
         raise _GuardedCallValidationError(
             "GuardedCallStmt.cond must be acyclic",
             path,
+            code="invalid_guarded_call_stmt",
         )
     if len(active) >= _MAX_VALIDATED_EXPRESSION_DEPTH:
         raise _GuardedCallValidationError(
             "GuardedCallStmt.cond exceeds the maximum supported nesting depth",
             path,
+            code="invalid_guarded_call_stmt",
         )
     active.add(value_id)
     try:
@@ -2060,12 +2367,14 @@ def _validate_guarded_call_condition(
                 "GuardedCallStmt.cond must be an exact comparison or '&&' "
                 "conjunction BinOp",
                 path,
+                code="invalid_guarded_call_stmt",
             )
         op = _address_of_instance_field(value, "op")
         if type(op) is not str:
             raise _GuardedCallValidationError(
                 "GuardedCallStmt.cond operator must be an exact string",
                 path + ("op",),
+                code="invalid_guarded_call_stmt",
             )
         if op == "&&":
             _validate_guarded_call_condition(
@@ -2084,6 +2393,7 @@ def _validate_guarded_call_condition(
                 "GuardedCallStmt.cond comparisons must use one supported "
                 "comparison operator",
                 path + ("op",),
+                code="invalid_guarded_call_stmt",
             )
         for side in ("left", "right"):
             try:
@@ -2098,6 +2408,7 @@ def _validate_guarded_call_condition(
                 raise _GuardedCallValidationError(
                     str(error),
                     error.field_path,
+                    code="invalid_guarded_call_stmt",
                 ) from error
     finally:
         active.remove(value_id)
@@ -2110,12 +2421,14 @@ def _validate_guarded_call_callee(call: object, *, path: Tuple[str, ...]) -> Non
         raise _GuardedCallValidationError(
             "GuardedCallStmt.call must be an exact FunctionCallStmt",
             path,
+            code="invalid_guarded_call_stmt",
         )
     name = _address_of_instance_field(call, "name")
     if not _is_assignment_name(name, allow_member=True):
         raise _GuardedCallValidationError(
             "GuardedCallStmt.call name must be an identifier or member path",
             path + ("name",),
+            code="invalid_guarded_call_stmt",
         )
     template_args = _address_of_instance_field(call, "template_args")
     if type(template_args) is not tuple or any(
@@ -2124,12 +2437,14 @@ def _validate_guarded_call_callee(call: object, *, path: Tuple[str, ...]) -> Non
         raise _GuardedCallValidationError(
             "GuardedCallStmt.call template_args must be a tuple of DataType values",
             path + ("template_args",),
+            code="invalid_guarded_call_stmt",
         )
     args = _address_of_instance_field(call, "args")
     if type(args) is not tuple:
         raise _GuardedCallValidationError(
             "GuardedCallStmt.call args must be a tuple",
             path + ("args",),
+            code="invalid_guarded_call_stmt",
         )
     for index, argument in enumerate(args):
         argument_path = path + ("args", f"[{index}]")
@@ -2142,6 +2457,7 @@ def _validate_guarded_call_callee(call: object, *, path: Tuple[str, ...]) -> Non
                 raise _GuardedCallValidationError(
                     str(error),
                     argument_path + ("operand",) + error.field_path,
+                    code="invalid_guarded_call_stmt",
                 ) from error
             continue
         try:
@@ -2156,6 +2472,7 @@ def _validate_guarded_call_callee(call: object, *, path: Tuple[str, ...]) -> Non
             raise _GuardedCallValidationError(
                 str(error),
                 error.field_path,
+                code="invalid_guarded_call_stmt",
             ) from error
 
 

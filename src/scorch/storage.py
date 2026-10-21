@@ -132,7 +132,9 @@ def _expected_level_arity(level_type: LevelType) -> int:
         return 2
     if level_type in (LevelType.COORDINATE, LevelType.SINGLETON):
         return 1
-    raise TensorIndexError(f"unsupported level type {level_type}")
+    raise TensorIndexError(
+        f"unsupported level type {level_type}", code="level_type_unknown"
+    )
 
 
 def _normalize_mode_indices(
@@ -147,11 +149,15 @@ def _normalize_mode_indices(
     ``TensorIndex.__init__``'s ``_adopt`` for when that is allowed.
     """
     if isinstance(mode_indices, (str, bytes)) or not isinstance(mode_indices, Sequence):
-        raise TensorTypeError("mode_indices must be a sequence with one entry per mode")
+        raise TensorTypeError(
+            "mode_indices must be a sequence with one entry per mode",
+            code="mode_indices_type_invalid",
+        )
     if len(mode_indices) != tensor_format.get_order():
         raise TensorIndexError(
             f"mode_indices has rank {len(mode_indices)}, expected "
-            f"{tensor_format.get_order()} for format {tensor_format}"
+            f"{tensor_format.get_order()} for format {tensor_format}",
+            code="mode_indices_rank_mismatch",
         )
 
     normalized = []
@@ -159,12 +165,16 @@ def _normalize_mode_indices(
         zip(mode_indices, tensor_format.level_types)
     ):
         if isinstance(arrays, (str, bytes)) or not isinstance(arrays, Sequence):
-            raise TensorTypeError(f"mode_indices[{mode}] must be a sequence")
+            raise TensorTypeError(
+                f"mode_indices[{mode}] must be a sequence",
+                code="mode_indices_type_invalid",
+            )
         expected = _expected_level_arity(level_type)
         if len(arrays) != expected:
             raise TensorIndexError(
                 f"mode {mode} ({level_type.name.lower()}) requires {expected} "
-                f"index arrays, got {len(arrays)}"
+                f"index arrays, got {len(arrays)}",
+                code="mode_indices_arity_mismatch",
             )
         normalized_arrays = []
         for slot, index in enumerate(arrays):
@@ -183,40 +193,51 @@ def _normalize_mode_indices(
                     mro = type.__getattribute__(index_type, "__mro__")
                 except Exception as error:
                     raise TensorTypeError(
-                        f"mode_indices[{mode}][{slot}] must be a torch.Tensor"
+                        f"mode_indices[{mode}][{slot}] must be a torch.Tensor",
+                        code="mode_indices_type_invalid",
                     ) from error
                 if not any(base is torch.Tensor for base in mro):
                     raise TensorTypeError(
-                        f"mode_indices[{mode}][{slot}] must be a torch.Tensor"
+                        f"mode_indices[{mode}][{slot}] must be a torch.Tensor",
+                        code="mode_indices_type_invalid",
                     )
                 try:
                     base = torch.Tensor.as_subclass(index, torch.Tensor)
                 except Exception as error:
                     raise TensorIndexError(
-                        f"mode_indices[{mode}][{slot}] is malformed"
+                        f"mode_indices[{mode}][{slot}] is malformed",
+                        code="index_array_malformed",
                     ) from error
                 if type(base) is not torch.Tensor:
-                    raise TensorIndexError(f"mode_indices[{mode}][{slot}] is malformed")
+                    raise TensorIndexError(
+                        f"mode_indices[{mode}][{slot}] is malformed",
+                        code="index_array_malformed",
+                    )
             if base.layout != torch.strided:
                 raise TensorIndexError(
-                    f"mode_indices[{mode}][{slot}] must use strided storage"
+                    f"mode_indices[{mode}][{slot}] must use strided storage",
+                    code="index_array_layout_invalid",
                 )
             if base.device.type != "cpu":
                 raise TensorDeviceError(
-                    f"mode_indices[{mode}][{slot}] must be on CPU, got {base.device}"
+                    f"mode_indices[{mode}][{slot}] must be on CPU, got {base.device}",
+                    code="device_not_cpu_unsupported",
                 )
             if base.dtype not in _INDEX_DTYPES:
                 raise TensorIndexError(
                     f"mode_indices[{mode}][{slot}] must use int32 or int64, "
-                    f"got {base.dtype}"
+                    f"got {base.dtype}",
+                    code="index_dtype_invalid",
                 )
             if torch.Tensor.dim(base) != 1:
                 raise TensorIndexError(
-                    f"mode_indices[{mode}][{slot}] must be one-dimensional"
+                    f"mode_indices[{mode}][{slot}] must be one-dimensional",
+                    code="index_array_layout_invalid",
                 )
             if not torch.Tensor.is_contiguous(base):
                 raise TensorIndexError(
-                    f"mode_indices[{mode}][{slot}] must be contiguous"
+                    f"mode_indices[{mode}][{slot}] must be contiguous",
+                    code="index_array_layout_invalid",
                 )
             # Index coordinates are structural data. Own an independent copy so
             # caller mutation cannot invalidate a previously validated object -- unless
@@ -226,10 +247,14 @@ def _normalize_mode_indices(
                 owned = torch.Tensor.clone(detached) if copy else detached
             except Exception as error:
                 raise TensorIndexError(
-                    f"mode_indices[{mode}][{slot}] is malformed"
+                    f"mode_indices[{mode}][{slot}] is malformed",
+                    code="index_array_malformed",
                 ) from error
             if type(owned) is not torch.Tensor:
-                raise TensorIndexError(f"mode_indices[{mode}][{slot}] is malformed")
+                raise TensorIndexError(
+                    f"mode_indices[{mode}][{slot}] is malformed",
+                    code="index_array_malformed",
+                )
             normalized_arrays.append(owned)
         normalized.append(tuple(normalized_arrays))
     return tuple(normalized)
@@ -292,7 +317,8 @@ def _index_components(
     """
     if tensor_format is None:
         raise TensorIndexError(
-            "tensor_format is required; use TensorFormat() for a scalar"
+            "tensor_format is required; use TensorFormat() for a scalar",
+            code="tensor_format_missing",
         )
     # Direct index construction retains the format through
     # ``format.owned_format``: an exact format is kept as it is (it cannot
@@ -305,25 +331,32 @@ def _index_components(
         order = tuple(range(tensor_format.get_order()))
     else:
         if isinstance(mode_order, (str, bytes)) or not isinstance(mode_order, Sequence):
-            raise TensorTypeError("mode_order must be a sequence of integers")
+            raise TensorTypeError(
+                "mode_order must be a sequence of integers",
+                code="mode_order_type_invalid",
+            )
         supplied_order = tuple(mode_order)
         if any(
             type(mode) is bool or not issubclass(type(mode), int)
             for mode in supplied_order
         ):
-            raise TensorTypeError("mode_order entries must be integers")
+            raise TensorTypeError(
+                "mode_order entries must be integers", code="mode_order_type_invalid"
+            )
         order = tuple(int.__int__(mode) for mode in supplied_order)
     if len(order) != tensor_format.get_order() or sorted(order) != list(
         range(tensor_format.get_order())
     ):
         raise TensorIndexError(
-            f"mode_order must be a permutation of range({tensor_format.get_order()})"
+            f"mode_order must be a permutation of range({tensor_format.get_order()})",
+            code="mode_order_not_permutation",
         )
 
     observed_dtypes = {index.dtype for arrays in normalized for index in arrays}
     if len(observed_dtypes) > 1:
         raise TensorIndexError(
-            "all sparse index arrays must use one common index dtype"
+            "all sparse index arrays must use one common index dtype",
+            code="index_dtype_mixed",
         )
     observed = next(iter(observed_dtypes), None)
     declared = (
@@ -334,15 +367,18 @@ def _index_components(
     if type(declared) is not torch.dtype:
         raise TensorIndexError(
             "index_dtype must be torch.int32 or torch.int64, got "
-            f"{type(declared).__name__}"
+            f"{type(declared).__name__}",
+            code="index_dtype_invalid",
         )
     if declared not in _INDEX_DTYPES:
         raise TensorIndexError(
-            f"index_dtype must be torch.int32 or torch.int64, got {declared}"
+            f"index_dtype must be torch.int32 or torch.int64, got {declared}",
+            code="index_dtype_invalid",
         )
     if observed is not None and observed != declared:
         raise TensorIndexError(
-            f"declared index dtype {declared} does not match arrays of dtype {observed}"
+            f"declared index dtype {declared} does not match arrays of dtype {observed}",
+            code="index_dtype_mismatch",
         )
     return tensor_format, normalized, order, declared
 
@@ -508,11 +544,15 @@ class TensorIndex:
 
     def get_level_type(self, mode: int) -> LevelType:
         if mode < 0:
-            raise TensorIndexError(f"mode {mode} is outside tensor rank")
+            raise TensorIndexError(
+                f"mode {mode} is outside tensor rank", code="mode_out_of_range"
+            )
         try:
             return self._format.get_level_types()[mode]
         except IndexError as error:
-            raise TensorIndexError(f"mode {mode} is outside tensor rank") from error
+            raise TensorIndexError(
+                f"mode {mode} is outside tensor rank", code="mode_out_of_range"
+            ) from error
 
     def get_level_types(self) -> List[LevelType]:
         return self._format.get_level_types()
@@ -553,13 +593,17 @@ def _owned_tensor_index_components(
     try:
         mro = type.__getattribute__(index_type, "__mro__")
     except Exception as error:
-        raise TensorTypeError("index must be a TensorIndex") from error
+        raise TensorTypeError(
+            "index must be a TensorIndex", code="index_type_invalid"
+        ) from error
     if not any(base is TensorIndex for base in mro):
-        raise TensorTypeError("index must be a TensorIndex")
+        raise TensorTypeError("index must be a TensorIndex", code="index_type_invalid")
     try:
         state = TensorIndex.__dict__["__dict__"].__get__(index, TensorIndex)
     except Exception as error:
-        raise TensorIndexError("index has malformed stored state") from error
+        raise TensorIndexError(
+            "index has malformed stored state", code="value_object_state_corrupt"
+        ) from error
     expected = {"_format", "_mode_indices", "_mode_order", "_index_dtype"}
     if (
         type(state) is not dict
@@ -569,18 +613,24 @@ def _owned_tensor_index_components(
         or any(type(arrays) is not tuple for arrays in state["_mode_indices"])
         or type(state["_mode_order"]) is not tuple
     ):
-        raise TensorIndexError("index has malformed stored state")
+        raise TensorIndexError(
+            "index has malformed stored state", code="value_object_state_corrupt"
+        )
 
     tensor_format = owned_format(state["_format"])
     supplied_order = state["_mode_order"]
     if any(
         type(mode) is bool or not issubclass(type(mode), int) for mode in supplied_order
     ):
-        raise TensorIndexError("index has malformed stored state")
+        raise TensorIndexError(
+            "index has malformed stored state", code="value_object_state_corrupt"
+        )
     order = tuple(int.__int__(mode) for mode in supplied_order)
     index_dtype = state["_index_dtype"]
     if type(index_dtype) is not torch.dtype:
-        raise TensorIndexError("index has malformed stored state")
+        raise TensorIndexError(
+            "index has malformed stored state", code="value_object_state_corrupt"
+        )
     normalized = (
         _normalize_mode_indices(state["_mode_indices"], tensor_format)
         if own_arrays
@@ -601,7 +651,8 @@ def _check_coordinate_bounds(coordinate: torch.Tensor, extent: int, label: str) 
     maximum = int(coordinate.max().item())
     if minimum < 0 or maximum >= extent:
         raise TensorIndexError(
-            f"{label} contains coordinate range [{minimum}, {maximum}] outside [0, {extent})"
+            f"{label} contains coordinate range [{minimum}, {maximum}] outside [0, {extent})",
+            code="coordinate_out_of_bounds",
         )
 
 
@@ -758,11 +809,13 @@ def _validate_index_storage(
             if index.dtype != layout.index_dtype:
                 raise TensorIndexError(
                     f"mode_indices[{mode}][{slot}] has dtype {index.dtype}, "
-                    f"expected layout index dtype {layout.index_dtype}"
+                    f"expected layout index dtype {layout.index_dtype}",
+                    code="index_dtype_mismatch",
                 )
             if index.device != values.device:
                 raise TensorDeviceError(
-                    f"mode_indices[{mode}][{slot}] and values must share a device"
+                    f"mode_indices[{mode}][{slot}] and values must share a device",
+                    code="index_values_device_mismatch",
                 )
 
     if all(level_type == LevelType.DENSE for level_type in level_types):
@@ -770,7 +823,8 @@ def _validate_index_storage(
         if nnz != expected:
             raise TensorStorageError(
                 f"dense values contain {nnz} elements, expected {expected} for shape "
-                f"{layout.physical_shape}"
+                f"{layout.physical_shape}",
+                code="values_count_mismatch",
             )
         return False
 
@@ -783,7 +837,8 @@ def _validate_index_storage(
             if coordinate.numel() != nnz:
                 raise TensorStorageError(
                     f"COO mode {mode} has {coordinate.numel()} coordinates, "
-                    f"but values has {nnz} elements"
+                    f"but values has {nnz} elements",
+                    code="values_count_mismatch",
                 )
             _check_coordinate_bounds(
                 coordinate, layout.physical_shape[mode], f"COO mode {mode}"
@@ -796,7 +851,10 @@ def _validate_index_storage(
             return True
         position, repeated = defect
         if not repeated:
-            raise TensorIndexError("COO coordinates must be lexicographically ordered")
+            raise TensorIndexError(
+                "COO coordinates must be lexicographically ordered",
+                code="coo_coordinates_unordered",
+            )
         # A COO tensor is never repaired, unlike an unordered compressed level: Scorch
         # refuses a stored repeat and the caller sums it (RepeatedCoordinateError).
         repeat = tuple(int(c[position].item()) for c in coordinates_per_mode)
@@ -821,7 +879,8 @@ def _validate_index_storage(
             if positions.numel() != expected_positions:
                 raise TensorIndexError(
                     f"compressed mode {mode} position array has {positions.numel()} "
-                    f"elements, expected {expected_positions}"
+                    f"elements, expected {expected_positions}",
+                    code="compressed_positions_length_invalid",
                 )
             # One native pass stands in for every check below -- the first position
             # is zero, positions nondecreasing, the last position equals the
@@ -836,21 +895,24 @@ def _validate_index_storage(
             suspect = _screen_compressed_level(positions, coordinates, extent)
             if suspect and (positions.numel() == 0 or int(positions[0].item()) != 0):
                 raise TensorIndexError(
-                    f"compressed mode {mode} position array must start at zero"
+                    f"compressed mode {mode} position array must start at zero",
+                    code="compressed_positions_start_nonzero",
                 )
             if suspect and (
                 positions.numel() > 1
                 and bool(torch.any(positions[1:] < positions[:-1]).item())
             ):
                 raise TensorIndexError(
-                    f"compressed mode {mode} position array must be nondecreasing"
+                    f"compressed mode {mode} position array must be nondecreasing",
+                    code="compressed_positions_decreasing",
                 )
             if suspect:
                 terminal = int(positions[-1].item())
                 if terminal != coordinates.numel():
                     raise TensorIndexError(
                         f"compressed mode {mode} terminal position {terminal} does "
-                        f"not match coordinate count {coordinates.numel()}"
+                        f"not match coordinate count {coordinates.numel()}",
+                        code="compressed_positions_terminal_mismatch",
                     )
             if suspect:
                 _check_coordinate_bounds(coordinates, extent, f"compressed mode {mode}")
@@ -867,7 +929,8 @@ def _validate_index_storage(
                 ):
                     raise TensorIndexError(
                         f"compressed mode {mode} coordinates must be strictly "
-                        f"increasing within parent {parent}"
+                        f"increasing within parent {parent}",
+                        code="compressed_coordinates_unordered",
                     )
                 unordered = unordered or parent is not None
             parent_positions = coordinates.numel()
@@ -876,18 +939,21 @@ def _validate_index_storage(
         _check_coordinate_bounds(coordinate, extent, f"mode {mode}")
         if level_type == LevelType.SINGLETON and coordinate.numel() != parent_positions:
             raise TensorIndexError(
-                f"singleton mode {mode} must contain one coordinate per parent"
+                f"singleton mode {mode} must contain one coordinate per parent",
+                code="singleton_coordinates_count_mismatch",
             )
         if level_type == LevelType.COORDINATE and coordinate.numel() != nnz:
             raise TensorStorageError(
                 f"coordinate mode {mode} has {coordinate.numel()} entries, "
-                f"but values has {nnz} elements"
+                f"but values has {nnz} elements",
+                code="values_count_mismatch",
             )
         parent_positions = coordinate.numel()
 
     if parent_positions != nnz:
         raise TensorStorageError(
-            f"layout describes {parent_positions} stored positions, but values has {nnz} elements"
+            f"layout describes {parent_positions} stored positions, but values has {nnz} elements",
+            code="values_count_mismatch",
         )
     return unordered
 
@@ -1191,7 +1257,9 @@ class SparseStorage:
         # rebuilt, because the caller's metadata names the object it handed over.
         if _audited_index is not None:
             if type(layout) is not TensorLayout:
-                raise TensorTypeError("layout must be a TensorLayout")
+                raise TensorTypeError(
+                    "layout must be a TensorLayout", code="layout_type_invalid"
+                )
         elif not _trusted_index:
             layout = owned_layout(layout)
         value_type = type(value)
@@ -1205,29 +1273,46 @@ class SparseStorage:
                 value_mro = type.__getattribute__(value_type, "__mro__")
             except Exception as error:
                 raise TensorTypeError(
-                    "SparseStorage value must be a torch.Tensor"
+                    "SparseStorage value must be a torch.Tensor",
+                    code="values_type_invalid",
                 ) from error
             if not any(base is torch.Tensor for base in value_mro):
-                raise TensorTypeError("SparseStorage value must be a torch.Tensor")
+                raise TensorTypeError(
+                    "SparseStorage value must be a torch.Tensor",
+                    code="values_type_invalid",
+                )
             try:
                 base_value = torch.Tensor.as_subclass(value, torch.Tensor)
             except Exception as error:
-                raise TensorStorageError("values tensor is malformed") from error
+                raise TensorStorageError(
+                    "values tensor is malformed", code="values_malformed"
+                ) from error
             if type(base_value) is not torch.Tensor:
-                raise TensorStorageError("values tensor is malformed")
+                raise TensorStorageError(
+                    "values tensor is malformed", code="values_malformed"
+                )
         if base_value.layout != torch.strided:
-            raise TensorStorageError("values must use strided storage")
+            raise TensorStorageError(
+                "values must use strided storage", code="values_layout_invalid"
+            )
         if base_value.device.type != "cpu":
             raise TensorDeviceError(
-                f"Scorch values must be on CPU, got {base_value.device}"
+                f"Scorch values must be on CPU, got {base_value.device}",
+                code="device_not_cpu_unsupported",
             )
         if torch.Tensor.dim(base_value) != 1:
-            raise TensorStorageError("values must be a flat one-dimensional tensor")
+            raise TensorStorageError(
+                "values must be a flat one-dimensional tensor",
+                code="values_shape_invalid",
+            )
         if not torch.Tensor.is_contiguous(base_value):
-            raise TensorStorageError("values must be contiguous")
+            raise TensorStorageError(
+                "values must be contiguous", code="values_layout_invalid"
+            )
         if torch.Tensor.is_neg(base_value) or torch.Tensor.is_conj(base_value):
             raise TensorStorageError(
-                "values must resolve lazy negative and conjugate view bits"
+                "values must resolve lazy negative and conjugate view bits",
+                code="values_layout_invalid",
             )
         validate_runtime_contract(layout.format, base_value.dtype)
         if (
@@ -1236,7 +1321,8 @@ class SparseStorage:
             + (_audited_index is not None)
         ) != 1:
             raise TensorStorageError(
-                "provide exactly one of mode_indices or a TensorIndex"
+                "provide exactly one of mode_indices or a TensorIndex",
+                code="storage_arguments_conflict",
             )
         if _audited_index is not None:
             index_format, normalized, index_order, index_dtype = _audited_index
@@ -1267,16 +1353,27 @@ class SparseStorage:
             # construction inside Scorch builds its layout from the format its arrays
             # were audited against, which is then the same object or an equal one.
             if index_format is not layout.format and index_format != layout.format:
-                raise TensorIndexError("index format does not match storage layout")
+                raise TensorIndexError(
+                    "index format does not match storage layout",
+                    code="index_layout_mismatch",
+                )
             if index_order != layout.permutation:
-                raise TensorIndexError("index mode_order does not match storage layout")
+                raise TensorIndexError(
+                    "index mode_order does not match storage layout",
+                    code="index_layout_mismatch",
+                )
             if index_dtype != layout.index_dtype:
-                raise TensorIndexError("index dtype does not match storage layout")
+                raise TensorIndexError(
+                    "index dtype does not match storage layout",
+                    code="index_layout_mismatch",
+                )
         # Keep tensor metadata independent from the caller while retaining normal
         # tensor payload aliasing semantics for element updates.
         owned_value = torch.Tensor.detach(base_value)
         if type(owned_value) is not torch.Tensor:
-            raise TensorStorageError("values tensor is malformed")
+            raise TensorStorageError(
+                "values tensor is malformed", code="values_malformed"
+            )
         # The cheap per-array checks -- dtype, rank, contiguity, device, one array per
         # level -- have already run inside `_normalize_mode_indices` for every caller,
         # trusted or not. They are O(1) each and adopting a kernel's arrays depends on
@@ -1468,13 +1565,19 @@ def _owned_sparse_storage(storage: object) -> SparseStorage:
     try:
         mro = type.__getattribute__(storage_type, "__mro__")
     except Exception as error:
-        raise TensorTypeError("storage must be a SparseStorage") from error
+        raise TensorTypeError(
+            "storage must be a SparseStorage", code="storage_type_invalid"
+        ) from error
     if not any(base is SparseStorage for base in mro):
-        raise TensorTypeError("storage must be a SparseStorage")
+        raise TensorTypeError(
+            "storage must be a SparseStorage", code="storage_type_invalid"
+        )
     try:
         state = SparseStorage.__dict__["__dict__"].__get__(storage, SparseStorage)
     except Exception as error:
-        raise TensorStorageError("storage has malformed stored state") from error
+        raise TensorStorageError(
+            "storage has malformed stored state", code="value_object_state_corrupt"
+        ) from error
     expected = {"_layout", "_mode_indices", "_value"}
     if (
         type(state) is not dict
@@ -1483,7 +1586,9 @@ def _owned_sparse_storage(storage: object) -> SparseStorage:
         or type(state["_mode_indices"]) is not tuple
         or any(type(arrays) is not tuple for arrays in state["_mode_indices"])
     ):
-        raise TensorStorageError("storage has malformed stored state")
+        raise TensorStorageError(
+            "storage has malformed stored state", code="value_object_state_corrupt"
+        )
     return SparseStorage(
         state["_layout"],
         state["_value"],

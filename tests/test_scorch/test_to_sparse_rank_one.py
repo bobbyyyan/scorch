@@ -24,6 +24,7 @@ output is built.
 import pytest
 import torch
 
+import scorch.stensor as stensor_module  # type: ignore[import-untyped]
 from scorch.compiler.compilation_context import CompilationContext
 from scorch.compiler.compile_options import CompileOptions
 from scorch.exceptions import TensorFormatError, TensorStorageError, TensorTypeError
@@ -314,15 +315,32 @@ def test_context_owned_by_foreign_options_is_rejected():
     assert str(tensor.format) == "d"
 
 
-def test_sparse_source_densification_uses_the_supplied_context():
-    """A sparse receiver's densification is recorded by the caller's owner."""
+def test_sparse_source_densification_uses_the_supplied_context(monkeypatch):
+    """A sparse receiver's densification is recorded by the caller's owner when it
+    compiles, and records nothing when the kept kernel serves it."""
 
+    # A densification the generated-kernel cache serves lowers nothing and records no
+    # stage, in the caller's context or any other.  A kernel an earlier test in this
+    # process kept for the same call (stensor._GENERATED_KERNELS) would serve this one.
+    monkeypatch.setattr(stensor_module, "_GENERATED_KERNELS", {})
     options = CompileOptions.from_environment()
     context = CompilationContext(options)
     tensor = STensor.from_torch(torch.tensor(VECTOR), "A").to_sparse("s")
     tensor.to_sparse("s", _compile_options=options, _compilation_context=context)
     assert coordinates(tensor) == [1, 4]
     assert context.stage_run_records
+
+    # Warm: the same densification under another supplied context runs the kept kernel,
+    # keeps nothing new and records nothing (the cache's design, stensor.py).
+    warm = STensor.from_torch(torch.tensor(VECTOR), "A").to_sparse("s")
+    kept = dict(stensor_module._GENERATED_KERNELS)
+    assert kept
+    warm_context = CompilationContext(options)
+    warm.to_sparse("s", _compile_options=options, _compilation_context=warm_context)
+    assert coordinates(warm) == [1, 4]
+    assert stensor_module._GENERATED_KERNELS.keys() == kept.keys()
+    assert all(stensor_module._GENERATED_KERNELS[key] is kept[key] for key in kept)
+    assert warm_context.stage_run_records == ()
 
 
 def test_conversion_is_exception_atomic(monkeypatch):

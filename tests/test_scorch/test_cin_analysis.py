@@ -47,6 +47,7 @@ from scorch.compiler.diagnostics import CompilerInvariantError, VerificationErro
 from scorch.compiler.identity import AccessId, IndexId, NodeId, SymbolId
 from scorch.compiler.legacy_cin_adapter import legacy_cin_working_copy
 from scorch.compiler.scheduler import Schedule, Scheduler
+from scorch.exceptions import ScorchKeyError, ScorchTypeError, defect_code
 from scorch.format import LevelFormat, LevelType, TensorFormat
 
 
@@ -329,6 +330,29 @@ def test_analysis_result_is_deeply_immutable() -> None:
         mutable_analysis.root_id = NodeId(-1)
     with pytest.raises(TypeError):
         mutable_parents[NodeId(-1)] = None
+
+
+def test_a_missing_analysis_key_is_refused_by_code_and_get_still_works() -> None:
+    program, _ = _reduction_program()
+    parents = analyze_cin(program).parents
+
+    with pytest.raises(KeyError) as raised:
+        parents[NodeId(-1)]
+    assert type(raised.value) is ScorchKeyError
+    assert defect_code(raised.value) == "cin_analysis_key_unknown"
+    # Mapping.get and ``in`` read a miss from the KeyError, so they still work.
+    assert parents.get(NodeId(-1)) is None
+    assert NodeId(-1) not in parents
+    present = next(iter(parents))
+    assert present in parents
+    assert parents.get(present) == parents[present]
+
+
+def test_analysis_of_a_value_that_is_no_statement_is_refused_by_code() -> None:
+    with pytest.raises(TypeError) as raised:
+        analyze_cin(object())  # type: ignore[arg-type]
+    assert type(raised.value) is ScorchTypeError
+    assert defect_code(raised.value) == "internal_argument_type_invalid"
 
 
 def test_analysis_tracks_typed_nondefault_storage_layout() -> None:

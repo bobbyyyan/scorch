@@ -34,6 +34,7 @@ from .cin import (
 from .diagnostics import VerificationError
 from .identity import AccessId, IndexId, SymbolId
 from ..format import TensorFormat
+from ..exceptions import ScorchTypeError
 
 if TYPE_CHECKING:
     from .compile_options import CompileOptions
@@ -93,7 +94,10 @@ def _prepare_legacy_cin(
         if compile_options is None:
             compile_options = CompileOptions.from_environment()
         elif type(compile_options) is not CompileOptions:
-            raise TypeError("compile_options must be a CompileOptions instance")
+            raise ScorchTypeError(
+                "compile_options must be a CompileOptions instance",
+                code="internal_argument_type_invalid",
+            )
 
         if plan.provenance == "auto":
             working = Scheduler._replay_auto_plan_owned(
@@ -370,7 +374,8 @@ def _copy_legacy_cin_forward(cin: IndexStmt) -> IndexStmt:
             finish_no_tile_list(expression, unary_clone)
             return unary_clone
         raise VerificationError(
-            "stage=legacy CIN adapter: unsupported expression in forward copy"
+            "stage=legacy CIN adapter: unsupported expression in forward copy",
+            code="legacy_cin_adapter_invalid",
         )
 
     def clone_stmt(statement: IndexStmt) -> IndexStmt:
@@ -432,7 +437,8 @@ def _copy_legacy_cin_forward(cin: IndexStmt) -> IndexStmt:
             finish_no_tile_list(statement, assignment_clone)
             return assignment_clone
         raise VerificationError(
-            "stage=legacy CIN adapter: unsupported statement in forward copy"
+            "stage=legacy CIN adapter: unsupported statement in forward copy",
+            code="legacy_cin_adapter_invalid",
         )
 
     return clone_stmt(cin)
@@ -447,7 +453,8 @@ def validate_legacy_cin_display_names(cin: IndexStmt) -> None:
         if previous_index is not None and previous_index != index_var.index_id:
             raise VerificationError(
                 "stage=legacy CIN adapter: display name "
-                f"{index_var.name!r} refers to distinct IndexId values"
+                f"{index_var.name!r} refers to distinct IndexId values",
+                code="legacy_cin_adapter_invalid",
             )
         index_names[index_var.name] = index_var.index_id
 
@@ -459,7 +466,8 @@ def validate_legacy_cin_display_names(cin: IndexStmt) -> None:
         if previous_symbol is not None and previous_symbol != access.tensor.symbol_id:
             raise VerificationError(
                 "stage=legacy CIN adapter: display name "
-                f"{name!r} refers to distinct SymbolId values"
+                f"{name!r} refers to distinct SymbolId values",
+                code="legacy_cin_adapter_invalid",
             )
         symbol_names[name] = access.tensor.symbol_id
 
@@ -532,7 +540,8 @@ def _canonicalize_legacy_entities(cin: IndexStmt) -> None:
         if canonical is None:
             raise VerificationError(
                 "stage=legacy CIN adapter: "
-                f"{relation} references an index outside the working tree"
+                f"{relation} references an index outside the working tree",
+                code="legacy_cin_adapter_invalid",
             )
         return canonical
 

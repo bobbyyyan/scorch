@@ -232,7 +232,11 @@ Tensor spmspm_csr(
     const int count = C1_pos_data[i + 1];
     max_row_nnz = std::max(max_row_nnz, count);
     if (count > std::numeric_limits<int>::max() - C1_pos_data[i]) {
-      throw std::length_error("CSR SpGEMM output exceeds int32 index capacity");
+      // Coded, and a c10::Error like the boundary's own refusals: a std::length_error
+      // reached Python as a ValueError that no caller could tell from a bad argument.
+      scorch_native::refuse_index_capacity(
+          "spmspm_csr: the result's column coordinates",
+          static_cast<int64_t>(C1_pos_data[i]) + count);
     }
     C1_pos_data[i + 1] = C1_pos_data[i] + count;
   }
@@ -699,14 +703,18 @@ Tensor sddmm_coo_float_prebuilt(
 
   const int nthreads = omp_get_max_threads();
   const int chunk = std::max(16, std::min(256, nnz / (nthreads * 128)));
-  std::atomic<int> next_p{0};
+  // 64-bit: every worker adds `chunk` once more after the last entry is taken, so the
+  // cursor ends past nnz by up to nthreads * chunk. With nnz within that distance of
+  // INT32_MAX an int cursor wraps, and the next worker starts at a negative position.
+  std::atomic<int64_t> next_p{0};
 
   #pragma omp parallel
   {
     while (true) {
-      const int start = next_p.fetch_add(chunk, std::memory_order_relaxed);
-      if (start >= nnz) break;
-      const int end = std::min(start + chunk, nnz);
+      const int64_t claimed = next_p.fetch_add(chunk, std::memory_order_relaxed);
+      if (claimed >= nnz) break;
+      const int start = static_cast<int>(claimed);
+      const int end = static_cast<int>(std::min<int64_t>(claimed + chunk, nnz));
 
       for (int p = start; p < end; p++) {
         const int i = S_row[p];

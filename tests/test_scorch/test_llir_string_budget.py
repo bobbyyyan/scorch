@@ -156,7 +156,10 @@ def test_direct_string_encoded_var_expression_budget_is_explicit() -> None:
         # computed in one place.  Both are position counters under plain
         # identifiers, and both sums below are unchanged.
         "cin_lowerer.py": 203,
-        "compressed_where_openmp_pass.py": 32,
+        # 31 after the SpGEMM work estimate reads each operand's stored count in
+        # bounds: the chain helper's one position-array Var per level replaces the
+        # estimate's two fixed ones, under the same plain identifiers.
+        "compressed_where_openmp_pass.py": 31,
         "dense_pointer_hoist_pass.py": 7,
         "dynamic_vector_access_pass.py": 1,
         # 45 after the same change: the dense position under a compressed
@@ -170,18 +173,27 @@ def test_direct_string_encoded_var_expression_budget_is_explicit() -> None:
         # parallel loop used to place.
         "parallel_marking_pass.py": 15,
         "result_write_pass.py": 3,
+        # 1: the flag that records whether a scalar workspace's producer loop ran
+        # (``<workspace>_visited``, a bool), named by an f-string over the
+        # workspace's plain name: no string-encoded expression.
+        "scalar_workspace_visit.py": 1,
         "schedule_lowerer.py": 106,
         "single_iteration_loop_pass.py": 1,
         "sparse_prefetch_pass.py": 1,
         # 85: ``emit_position_tail_close`` (the cell count, the position
-        # cursor and the position array of an append-built level).
-        "torch_cpp_abi.py": 85,
+        # cursor and the position array of an append-built level).  87:
+        # ``dense_block_check`` (a level's extent and the pending position of
+        # the compressed level above a dense block), both plain identifiers.  89:
+        # ``level_total_check`` and ``drained_entries_check`` (each a copy of the
+        # int64 count it checks), plain identifiers.
+        "torch_cpp_abi.py": 89,
     }
-    assert sum(constructor_counts.values()) == 534
+    assert sum(constructor_counts.values()) == 538
     assert unclassified_counts == {
         "cin.py": 9,
         "cin_lowerer.py": 195,
-        "compressed_where_openmp_pass.py": 32,
+        # 31: the work estimate's chain helper, as in constructor_counts above.
+        "compressed_where_openmp_pass.py": 31,
         "dense_pointer_hoist_pass.py": 7,
         "dynamic_vector_access_pass.py": 1,
         "iter_lattice.py": 44,
@@ -190,12 +202,13 @@ def test_direct_string_encoded_var_expression_budget_is_explicit() -> None:
         "loop_invariant_factor_pass.py": 3,
         "parallel_marking_pass.py": 15,
         "result_write_pass.py": 3,
+        "scalar_workspace_visit.py": 1,
         "schedule_lowerer.py": 106,
         "single_iteration_loop_pass.py": 1,
         "sparse_prefetch_pass.py": 1,
-        "torch_cpp_abi.py": 85,
+        "torch_cpp_abi.py": 89,
     }
-    assert sum(unclassified_counts.values()) == 524
+    assert sum(unclassified_counts.values()) == 528
     assert known_indirect == {
         ("cin_lowerer.py", "actual_size"): 2,
         ("cin_lowerer.py", "expr.name.replace(old, new)"): 1,
@@ -208,6 +221,8 @@ def test_direct_string_encoded_var_expression_budget_is_explicit() -> None:
         ("compressed_where_openmp_pass.py", "bound.name"): 3,
         ("compressed_where_openmp_pass.py", "loop_bound"): 1,
         ("compressed_where_openmp_pass.py", "loop_var.name"): 1,
+        # The work estimate's chain helper: one position array per level, by name.
+        ("compressed_where_openmp_pass.py", "name"): 1,
         ("compressed_where_openmp_pass.py", "sparse_pos"): 1,
         ("parallel_marking_pass.py", "bound_name"): 4,
         ("parallel_marking_pass.py", "sparse_pos"): 2,
@@ -230,7 +245,7 @@ def test_direct_string_encoded_var_expression_budget_is_explicit() -> None:
         ("torch_cpp_abi.py", "pointer_name"): 4,
         ("torch_cpp_abi.py", "bound_name"): 1,
     }
-    assert sum(known_indirect.values()) == 51
+    assert sum(known_indirect.values()) == 52
 
     assert totals == {
         "subscript": 9,

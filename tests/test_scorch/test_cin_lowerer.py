@@ -1,5 +1,5 @@
 from dataclasses import FrozenInstanceError
-from typing import cast
+from typing import Iterable, cast
 
 import pytest
 import torch
@@ -126,13 +126,19 @@ def _build_all_coo_transform_loop() -> llir.ForLoop:
     )
 
 
+# The tensors the loops built here belong to: the transform is told the statement's
+# tensor names and recognises a position variable (pMask0, pSampled1) by them.
+_ALL_COO_TENSOR_NAMES = ("Sampled", "Mask")
+
+
 def _all_coo_transform_coordinate_read(
     *, scalar_accumulator: bool, source: llir.ForLoop | None = None
 ) -> tuple[llir.ForLoop, llir.VarInit, llir.ArrayAccess]:
     lowerer = CINLowerer()
     lowerer._used_scalar_accum = scalar_accumulator
     transformed = lowerer._transform_coo_loop_for_openmp(
-        [source if source is not None else _build_all_coo_transform_loop()]
+        [source if source is not None else _build_all_coo_transform_loop()],
+        _ALL_COO_TENSOR_NAMES,
     )
     parallel_loop = next(
         cast(llir.ForLoop, statement)
@@ -180,7 +186,8 @@ def _all_coo_transform_end_bound(
     lowerer = CINLowerer()
     lowerer._used_scalar_accum = True
     transformed = lowerer._transform_coo_loop_for_openmp(
-        [source if source is not None else _build_all_coo_transform_loop()]
+        [source if source is not None else _build_all_coo_transform_loop()],
+        _ALL_COO_TENSOR_NAMES,
     )
     parallel_loop = next(
         cast(llir.ForLoop, statement)
@@ -614,7 +621,7 @@ def test_kernel_abi_contracts_reject_malformed_and_forged_fields() -> None:
     tensor = KernelTensorABI(**valid_tensor)
     valid_kernel = {
         "result_shape": (3, 5),
-        "result_rank": 2,
+        "result_level_types": (LevelType.DENSE, LevelType.DENSE),
         "input_tensors": (tensor,),
     }
     for function_name in ("", "scorch.evaluate", 1):
@@ -628,20 +635,32 @@ def test_kernel_abi_contracts_reject_malformed_and_forged_fields() -> None:
             TorchCppKernelABI(  # type: ignore[arg-type]
                 **{**valid_kernel, "result_shape": result_shape}
             )
-    for result_rank in (-1, True, 2.0):
-        with pytest.raises(TypeError, match="kernel result rank"):
+    for result_level_types in (
+        [LevelType.DENSE, LevelType.DENSE],
+        (LevelType.DENSE, "dense"),
+        (0, 1),
+        2,
+    ):
+        with pytest.raises(TypeError, match="kernel result levels"):
             TorchCppKernelABI(  # type: ignore[arg-type]
-                **{**valid_kernel, "result_rank": result_rank}
+                **{**valid_kernel, "result_level_types": result_level_types}
             )
-    for result_rank in (65, 1 << 63, 10**5000):
-        with pytest.raises(ValueError, match="kernel result rank must not exceed 64"):
-            TorchCppKernelABI(
-                **{
-                    **valid_kernel,
-                    "result_shape": (),
-                    "result_rank": result_rank,
-                }
-            )
+    with pytest.raises(ValueError, match="unsupported JIT level type"):
+        TorchCppKernelABI(
+            **{
+                **valid_kernel,
+                "result_level_types": (LevelType.DENSE, LevelType.SINGLETON),
+            }
+        )
+    with pytest.raises(ValueError, match="kernel result rank must not exceed 64"):
+        TorchCppKernelABI(
+            **{
+                **valid_kernel,
+                "result_shape": (),
+                "result_level_types": (LevelType.DENSE,) * 65,
+            }
+        )
+    assert TorchCppKernelABI(**valid_kernel).result_rank == 2
     with pytest.raises(ValueError, match="shape must match the result rank"):
         TorchCppKernelABI(**{**valid_kernel, "result_shape": (3,)})
     with pytest.raises(ValueError, match="extents must be non-negative"):
@@ -697,7 +716,7 @@ def test_kernel_abi_contracts_reject_malformed_and_forged_fields() -> None:
     with pytest.raises(ValueError, match="argument names must be unique"):
         TorchCppKernelABI(
             result_shape=(),
-            result_rank=1,
+            result_level_types=(LevelType.DENSE,),
             input_tensors=(result_name_collision,),
         )
 
@@ -734,7 +753,7 @@ def test_kernel_abi_owns_one_frozen_semantic_snapshot() -> None:
     abi = _torch_cpp_kernel_abi(result, [left, mask], post_ops)
     equal = TorchCppKernelABI(
         result_shape=(5, 3),
-        result_rank=2,
+        result_level_types=(LevelType.DENSE, LevelType.DENSE),
         input_tensors=(
             KernelTensorABI(
                 "Left",
@@ -785,6 +804,8 @@ def test_kernel_abi_owns_one_frozen_semantic_snapshot() -> None:
     ) == LLIRLowerer().lower_llir(equal.emit_extra_tensor_prologue())
 
     with pytest.raises(FrozenInstanceError):
+        abi.result_level_types = ()
+    with pytest.raises(FrozenInstanceError):
         abi.result_rank = 3
     with pytest.raises(FrozenInstanceError):
         abi.input_tensors = ()
@@ -797,7 +818,7 @@ def test_kernel_abi_arguments_validation_and_function_are_fresh_and_byte_exact()
 ):
     abi = TorchCppKernelABI(
         result_shape=(5, 3),
-        result_rank=2,
+        result_level_types=(LevelType.DENSE, LevelType.DENSE),
         input_tensors=(
             KernelTensorABI(
                 "Left",
@@ -845,7 +866,7 @@ def test_kernel_abi_arguments_validation_and_function_are_fresh_and_byte_exact()
     first_validation = abi.emit_validation()
     second_validation = abi.emit_validation()
     expected_validation = (
-        "scorch_native::validate_jit_result_shape(result_shape, {5, 3}, 2, "
+        "scorch_native::validate_jit_result_shape(result_shape, {5, 3}, {0, 0}, "
         '"evaluate")',
         'scorch_native::validate_jit_tensor("evaluate", "Left", Left_shape, '
         "Left_mode_indices, Left_values, torch::kFloat64, {0, 1}, {1, 0}, {3, 5})",
@@ -956,7 +977,7 @@ def test_kernel_abi_arguments_validation_and_function_are_fresh_and_byte_exact()
 def test_kernel_abi_validation_calls_are_structured_frozen_and_byte_exact() -> None:
     abi = TorchCppKernelABI(
         result_shape=(5, 3),
-        result_rank=2,
+        result_level_types=(LevelType.DENSE, LevelType.DENSE),
         input_tensors=(
             KernelTensorABI(
                 "Left",
@@ -994,7 +1015,7 @@ def test_kernel_abi_validation_calls_are_structured_frozen_and_byte_exact() -> N
     assert [type(argument) for argument in result_call.args] == [
         llir.Var,
         llir.Array,
-        llir.Literal,
+        llir.Array,
         llir.Literal,
     ]
     result_vector = cast(llir.Var, result_call.args[0])
@@ -1009,9 +1030,13 @@ def test_kernel_abi_validation_calls_are_structured_frozen_and_byte_exact() -> N
         ),
         data_type=llir.DataType.INT64,
     )
-    result_rank = cast(llir.Literal, result_call.args[2])
-    assert type(result_rank.value) is int
-    assert result_rank == llir.Literal(value=2, data_type=llir.DataType.INT64)
+    assert result_call.args[2] == llir.Array(
+        values=(
+            llir.Literal(value=0, data_type=llir.DataType.INT),
+            llir.Literal(value=0, data_type=llir.DataType.INT),
+        ),
+        data_type=llir.DataType.INT,
+    )
     assert result_call.args[3] == llir.Literal(
         value="evaluate", data_type=llir.DataType.STRING
     )
@@ -1113,7 +1138,7 @@ def test_kernel_abi_validation_calls_are_structured_frozen_and_byte_exact() -> N
         first[0].name = "forged"  # type: ignore[misc]
 
     expected_lines = [
-        "scorch_native::validate_jit_result_shape(result_shape, {5, 3}, 2, "
+        "scorch_native::validate_jit_result_shape(result_shape, {5, 3}, {0, 0}, "
         '"evaluate");',
         'scorch_native::validate_jit_tensor("evaluate", "Left", Left_shape, '
         "Left_mode_indices, Left_values, torch::kFloat64, {0, 1}, {1, 0}, {3, 5});",
@@ -1160,7 +1185,7 @@ def test_kernel_abi_validation_calls_are_structured_frozen_and_byte_exact() -> N
 def test_kernel_abi_validation_handles_empty_shapes_and_unknown_extents() -> None:
     abi = TorchCppKernelABI(
         result_shape=(),
-        result_rank=1,
+        result_level_types=(LevelType.COMPRESSED,),
         input_tensors=(
             KernelTensorABI(
                 "Input",
@@ -1185,7 +1210,7 @@ def test_kernel_abi_validation_handles_empty_shapes_and_unknown_extents() -> Non
     )
     assert LLIRLowerer().lower_llir(statements) == "\n".join(
         [
-            "scorch_native::validate_jit_result_shape(result_shape, {}, 1, "
+            "scorch_native::validate_jit_result_shape(result_shape, {}, {1}, "
             '"evaluate");',
             'scorch_native::validate_jit_tensor("evaluate", "Input", Input_shape, '
             "Input_mode_indices, Input_values, torch::kFloat32, {1}, {0}, {});",
@@ -1196,7 +1221,7 @@ def test_kernel_abi_validation_handles_empty_shapes_and_unknown_extents() -> Non
 def test_kernel_abi_validation_preserves_unicode_identifiers() -> None:
     abi = TorchCppKernelABI(
         result_shape=(2,),
-        result_rank=1,
+        result_level_types=(LevelType.DENSE,),
         input_tensors=(
             KernelTensorABI(
                 "Δ",
@@ -1212,7 +1237,7 @@ def test_kernel_abi_validation_preserves_unicode_identifiers() -> None:
     )
     assert LLIRLowerer().lower_llir(abi.emit_validation()) == "\n".join(
         [
-            "scorch_native::validate_jit_result_shape(result_shape, {2}, 1, "
+            "scorch_native::validate_jit_result_shape(result_shape, {2}, {0}, "
             '"\\303\\251valuate");',
             'scorch_native::validate_jit_tensor("\\303\\251valuate", '
             '"\\316\\224", Δ_shape, Δ_mode_indices, Δ_values, torch::kFloat32, '
@@ -1401,7 +1426,7 @@ def test_post_op_extra_tensor_data_ptr_is_live_typed_and_fresh() -> None:
     assert all(type(node) is llir.FunctionCallStmt for node in validation)
     assert not any(type(node) is llir.RawStmt for node in validation)
     assert [LLIRLowerer().lower_llir(node) for node in validation] == [
-        'scorch_native::validate_jit_result_shape(result_shape, {}, 1, "evaluate");',
+        'scorch_native::validate_jit_result_shape(result_shape, {}, {0}, "evaluate");',
         'scorch_native::validate_jit_tensor("evaluate", "Input", Input_shape, '
         "Input_mode_indices, Input_values, torch::kFloat32, {0}, {0}, {});",
         "scorch_native::validate_jit_extra_tensor(bias_values, torch::kFloat32, "
@@ -5346,11 +5371,13 @@ def test_all_coo_grouped_preallocation_is_structured_typed_owned_and_byte_exact(
     first_source_bound = cast(llir.Var, first_source.cond.right)
     first_lowerer = CINLowerer()
     first_lowerer._used_scalar_accum = False
-    first_stmts = first_lowerer._transform_coo_loop_for_openmp([first_source])
+    first_stmts = first_lowerer._transform_coo_loop_for_openmp(
+        [first_source], _ALL_COO_TENSOR_NAMES
+    )
     second_lowerer = CINLowerer()
     second_lowerer._used_scalar_accum = False
     second_stmts = second_lowerer._transform_coo_loop_for_openmp(
-        [_build_all_coo_transform_loop_with_output_write()]
+        [_build_all_coo_transform_loop_with_output_write()], _ALL_COO_TENSOR_NAMES
     )
 
     first_resizes = _grouped_route_resize_statements(first_stmts)
@@ -5435,7 +5462,7 @@ def test_all_coo_preallocation_rejects_known_non_vector_receivers(
         TypeError,
         match="exact metadata-free std::vector Var",
     ):
-        lowerer._transform_coo_loop_for_openmp([source])
+        lowerer._transform_coo_loop_for_openmp([source], _ALL_COO_TENSOR_NAMES)
 
 
 def test_all_coo_preallocation_rejects_provenance_bearing_receiver() -> None:
@@ -5457,7 +5484,7 @@ def test_all_coo_preallocation_rejects_provenance_bearing_receiver() -> None:
         TypeError,
         match="exact metadata-free std::vector Var",
     ):
-        lowerer._transform_coo_loop_for_openmp([source])
+        lowerer._transform_coo_loop_for_openmp([source], _ALL_COO_TENSOR_NAMES)
 
 
 @pytest.mark.parametrize(
@@ -5491,7 +5518,7 @@ def test_all_coo_preallocation_rejects_invalid_extent_metadata(
         TypeError,
         match="exact metadata-free integral Var",
     ):
-        lowerer._transform_coo_loop_for_openmp([source])
+        lowerer._transform_coo_loop_for_openmp([source], _ALL_COO_TENSOR_NAMES)
 
 
 def test_all_coo_preallocation_rejects_provenance_bearing_extent() -> None:
@@ -5512,7 +5539,7 @@ def test_all_coo_preallocation_rejects_provenance_bearing_extent() -> None:
         TypeError,
         match="exact metadata-free integral Var",
     ):
-        lowerer._transform_coo_loop_for_openmp([source])
+        lowerer._transform_coo_loop_for_openmp([source], _ALL_COO_TENSOR_NAMES)
 
 
 def test_all_coo_flat_preallocation_is_discarded_on_the_known_nnz_route() -> None:
@@ -5525,7 +5552,8 @@ def test_all_coo_flat_preallocation_is_discarded_on_the_known_nnz_route() -> Non
                 output_type=llir.DataType.PTR_FLOAT32,
                 is_ptr=True,
             )
-        ]
+        ],
+        _ALL_COO_TENSOR_NAMES,
     )
 
     assert lowerer._known_nnz_var == "_known_nnz"
@@ -5574,8 +5602,9 @@ def test_production_all_coo_end_bound_activates_then_is_suppressed(
     def record_end_bound(
         self: CINLowerer,
         statements: list[llir.Stmt],
+        tensor_names: Iterable[str],
     ) -> list[llir.Stmt]:
-        transformed = original_transform(self, statements)
+        transformed = original_transform(self, statements, tensor_names)
 
         def collect(value: object) -> None:
             if type(value) is llir.VarInit:

@@ -1,13 +1,29 @@
 """Structured Torch/C++ ABI construction shared by compiler lowering stages."""
 
-from dataclasses import dataclass
-from typing import List, Optional, Sequence, Tuple, cast
+import math
+from dataclasses import dataclass, replace
+from typing import FrozenSet, Iterable, List, Optional, Sequence, Set, Tuple, cast
 
 import torch
 
 from . import llir
+from .diagnostics import CompilerInvariantError
 from .identity import SymbolId
-from ..format import LevelType
+from .llir_traversal import (
+    LLIRPath,
+    LLIRTraversalContext,
+    LLIRValue,
+    LLIRWalker,
+)
+from ..exceptions import (
+    IndexCapacityError,
+    ScorchAssertionError,
+    ScorchTypeError,
+    ScorchValueError,
+    ShapeCapacityKernelError,
+    shape_capacity_error,
+)
+from ..format import MAX_INDEX_POSITION, LevelType
 from ..utils import (
     dtype_to_c_datatype,
     get_pytorch_c_dtype_name,
@@ -23,27 +39,367 @@ _SUPPORTED_KERNEL_DTYPES = (
     torch.int8,
     torch.uint8,
 )
+#: csrc/native_abi.h, ``LevelKind``: the level kinds a kernel's entry checks know.
+_LEVEL_KIND_CODE = {
+    LevelType.DENSE: 0,
+    LevelType.COMPRESSED: 1,
+    LevelType.COORDINATE: 2,
+}
+#: ``LevelKind::DenseBoundedInKernel``: the code a dense level has in the entry check when
+#: the kernel body holds its block to the position bound itself (:func:`dense_block_check`).
+_DENSE_BOUNDED_IN_KERNEL_CODE = 3
+
+#: csrc/header.h: the call that holds one dense block of the result to the position bound.
+DENSE_BLOCK_CHECK = "scorch_check_dense_block"
+#: csrc/header.h: the call that holds a compressed level the two-pass assembly counted to
+#: the position bound, before the level is allocated (:func:`level_total_check`).
+LEVEL_TOTAL_CHECK = "scorch_check_level_total"
+#: csrc/header.h: the call that holds a drained sparse workspace to the position bound
+#: before the kernel reads it back (:func:`drained_entries_check`).
+DRAINED_ENTRIES_CHECK = "scorch_check_drained_entries"
+
+
+def level_total_check(
+    total: llir.Var, level: int, compressed_below: bool
+) -> llir.FunctionCallStmt:
+    """The check that holds compressed result level ``level``'s entry count to the bound.
+
+    The two-pass assembly emits it once per compressed level, after the prefix sum that
+    reads out ``total`` (``_total{level}``, int64_t) and before the level's arrays are
+    allocated: the fill pass stores every prefix-sum entry, and every position it fills,
+    as ``int``.  ``compressed_below`` is whether a compressed level follows, whose
+    position array has one entry more.  The call refuses with
+    ``index_position_exceeds_int32`` (csrc/header.h, ``scorch_check_level_total``).  Both
+    compilers emit it from here: the shipped two-pass pass
+    (compressed_where_openmp_pass.py) and the new compiler's reconstruction of the same
+    function (``_ParallelSparseWorkspaceLowering`` in its lower_llir.py).
+    """
+
+    if type(total) is not llir.Var or total.type is not llir.DataType.INT64:
+        raise ScorchTypeError(
+            "a level total check needs the level's int64 total",
+            code="internal_argument_type_invalid",
+        )
+    if type(level) is not int or level < 1:
+        raise ScorchValueError(
+            "a level total check names a compressed level below level 0",
+            code="level_total_check_level_invalid",
+        )
+    return llir.FunctionCallStmt(
+        name=LEVEL_TOTAL_CHECK,
+        args=[
+            llir.Var(name=total.name, type=total.type),
+            llir.Literal(bool(compressed_below), llir.DataType.BOOL),
+            llir.Literal(level, llir.DataType.INT),
+        ],
+    )
+
+
+def drained_entries_check(entries: llir.Var) -> llir.FunctionCallStmt:
+    """The check that holds a drained sparse workspace's entry count to the bound.
+
+    Emitted after a drain that fills a coordinate tensor's arrays through the int64_t
+    counter ``entries``, before the kernel reads that tensor back with ``int`` positions
+    (``int pT0_end = T0_crd_tensor.size(0)``).  The call refuses with
+    ``index_position_exceeds_int32`` (csrc/header.h, ``scorch_check_drained_entries``).
+    """
+
+    if type(entries) is not llir.Var or entries.type is not llir.DataType.INT64:
+        raise ScorchTypeError(
+            "a drained entries check needs the drain's int64 counter",
+            code="internal_argument_type_invalid",
+        )
+    return llir.FunctionCallStmt(
+        name=DRAINED_ENTRIES_CHECK,
+        args=[llir.Var(name=entries.name, type=entries.type)],
+    )
+
+
+def dense_blocks(level_types: Sequence[LevelType]) -> Tuple[Tuple[int, int], ...]:
+    """The result's dense blocks, each as its first and last level.
+
+    A dense block is a run of dense levels directly below a compressed level, and directly
+    above a compressed level or nothing.  Each coordinate the compressed level above stores
+    owns one block of cells, the product of the run's extents, at consecutive positions
+    from the coordinate's position times that product.  These are the levels a kernel can
+    hold to the position bound itself, where a block opens (:func:`dense_block_check`).
+    """
+
+    blocks: List[Tuple[int, int]] = []
+    level = 1
+    while level < len(level_types):
+        if (
+            level_types[level] is not LevelType.DENSE
+            or level_types[level - 1] is not LevelType.COMPRESSED
+        ):
+            level += 1
+            continue
+        end = level
+        while end < len(level_types) and level_types[end] is LevelType.DENSE:
+            end += 1
+        if end == len(level_types) or level_types[end] is LevelType.COMPRESSED:
+            blocks.append((level, end - 1))
+        level = end
+    return tuple(blocks)
+
+
+def dense_block_check(
+    bounded_levels: Optional[Set[int]],
+    result_name: str,
+    level_types: Sequence[LevelType],
+    first_level: int,
+    parent_position: Optional[llir.Expr] = None,
+) -> llir.FunctionCallStmt:
+    """The check that holds the result's dense block at ``first_level`` to the bound.
+
+    Emitted where the block opens, under the coordinate of compressed level
+    ``first_level - 1`` and before the loops that form the block's positions: those are
+    multiplied from that coordinate's position -- ``parent_position``, by default its
+    pending position ``p<result><first_level - 1>`` -- and narrowed to ``int`` as they
+    are formed, before anything is stored.  The call refuses, with
+    ``index_position_exceeds_int32``, a block whose end would pass the bound
+    (csrc/header.h, ``scorch_check_dense_block``).
+
+    Every site that grows a dense block calls this, and nothing else emits the call.  The
+    shipped lowering keeps a record of the levels its body bounds and passes it as
+    ``bounded_levels``, to which the block's levels are added; its kernel's ABI declares
+    them from that record (:meth:`TorchCppKernelABI.with_levels_bounded_in_kernel`).  The
+    new compiler's targets are sealed after construction and keep no record
+    (``bounded_levels`` is None): each target class declares the levels it bounds
+    (``_TargetLowering._levels_bounded_in_kernel`` in its lower_llir.py).  Either way the
+    declaration is checked against the finished body
+    (:meth:`TorchCppKernelABI.require_bounded_levels_checked`), in both directions.
+    """
+
+    block = next(
+        (block for block in dense_blocks(level_types) if block[0] == first_level), None
+    )
+    if block is None:
+        raise ScorchValueError(
+            f"level {first_level} does not open a dense block of the result",
+            code="dense_block_check_mismatch",
+        )
+    first, last = block
+
+    def extent(level: int) -> llir.Var:
+        return llir.Var(name=f"{result_name}{level}_size", type=llir.DataType.INT64)
+
+    cells: llir.Expr = extent(first)
+    for level in range(first + 1, last + 1):
+        cells = llir.Mul(left=cells, right=extent(level))
+    if bounded_levels is not None:
+        bounded_levels.update(range(first, last + 1))
+    return llir.FunctionCallStmt(
+        name=DENSE_BLOCK_CHECK,
+        args=[
+            (
+                parent_position
+                if parent_position is not None
+                else llir.Var(
+                    name=f"p{result_name}{first - 1}", type=llir.DataType.INT64
+                )
+            ),
+            cells,
+            llir.Literal(last + 1 < len(level_types), llir.DataType.BOOL),
+            llir.Literal(first, llir.DataType.INT),
+            llir.Literal(last, llir.DataType.INT),
+        ],
+    )
+
+
+class DenseBlockCheckError(CompilerInvariantError):
+    """A kernel's entry check and its body disagree on the dense blocks it bounds.
+
+    The entry check declares a level ``DenseBoundedInKernel`` only because the body checks
+    its block where the block opens.  A declared level without the check would let the
+    kernel narrow a position past the bound; a check without the declaration would have the
+    entry check refuse what the body handles.  ``code`` names the defect.
+    """
+
+    code = "dense_block_check_mismatch"
+
+
+_DENSE_BLOCK_CHECK_CONTEXT = LLIRTraversalContext(
+    stage="kernel_abi", pass_name="dense_block_checks"
+)
+
+
+class _DenseBlockChecks(LLIRWalker):
+    """The dense blocks a kernel body checks: the levels its check calls name."""
+
+    def __init__(self) -> None:
+        super().__init__(_DENSE_BLOCK_CHECK_CONTEXT)
+        self.blocks: List[Tuple[int, int]] = []
+
+    def enter_node(self, node: llir.Node, path: LLIRPath) -> None:
+        if type(node) is not llir.FunctionCallStmt:
+            return
+        call = cast(llir.FunctionCallStmt, node)
+        if call.name != DENSE_BLOCK_CHECK:
+            return
+        levels = call.args[3:]
+        if len(call.args) != 5 or any(
+            type(level) is not llir.Literal
+            or type(cast(llir.Literal, level).value) is not int
+            for level in levels
+        ):
+            raise DenseBlockCheckError(
+                f"{DENSE_BLOCK_CHECK} at {'/'.join(path)} does not name its levels "
+                "as two integer literals"
+            )
+        first, last = (cast(int, cast(llir.Literal, level).value) for level in levels)
+        self.blocks.append((first, last))
+
+
+def levels_bounded_by_checks(body: LLIRValue) -> FrozenSet[int]:
+    """The result levels whose dense blocks ``body`` checks where they open."""
+
+    walker = _DenseBlockChecks()
+    walker.walk(body)
+    return frozenset(
+        level for first, last in walker.blocks for level in range(first, last + 1)
+    )
 
 
 def _validate_known_shape_range(shape: Tuple[int, ...], owner: str) -> None:
     """Reject extents that cannot be represented or safely multiplied."""
 
-    product = 1
-    for extent in shape:
+    for mode, extent in enumerate(shape):
         if extent > _MAX_INT64:
-            raise ValueError(f"known {owner} extents must fit signed int64")
-        if extent and product > _MAX_INT64 // extent:
-            raise ValueError(f"known {owner} element count must fit signed int64")
-        product *= extent
+            raise shape_capacity_error(
+                ShapeCapacityKernelError,
+                f"known {owner} extents must fit signed int64",
+                owner,
+                shape,
+                mode,
+                extent,
+            )
+    # A zero extent holds no element whatever the extents before it multiply to.
+    if 0 not in shape:
+        count = math.prod(shape)
+        if count > _MAX_INT64:
+            raise shape_capacity_error(
+                ShapeCapacityKernelError,
+                f"known {owner} element count must fit signed int64",
+                owner,
+                shape,
+                None,
+                count,
+            )
+
+
+# The two functions below refuse, before a kernel is built, a known shape that the
+# kernel's own entry checks would refuse on every call (csrc/native_abi.h,
+# ``check_result_positions`` and ``checked_dense_positions``).  The rule lives there, and
+# its reasons with it; these repeat the part of it that shapes and layouts decide, with
+# the native texts, so that the refusal reads the same whichever side raises it.
+# ``tests/test_scorch/test_index_position_bound.py`` holds the two sides to one table.
+
+
+def _refuse_unaddressable_result(
+    shape: Tuple[int, ...],
+    level_types: Tuple[LevelType, ...],
+    op: str,
+    bounded_in_kernel: FrozenSet[int] = frozenset(),
+) -> None:
+    """Refuse a result whose extents down to its deepest dense level pass ``int``.
+
+    The levels in ``bounded_in_kernel`` are dense blocks the kernel holds to the bound
+    itself where each block opens; they bound nothing here except that one block must fit,
+    which the first coordinate stored above the block needs.
+    """
+
+    bounded_levels = max(
+        (
+            level + 1
+            for level, level_type in enumerate(level_types)
+            if level_type is LevelType.DENSE and level not in bounded_in_kernel
+        ),
+        default=0,
+    )
+    positions = 1
+    for level, level_type in enumerate(level_types[: bounded_levels + 1]):
+        if level_type is LevelType.COMPRESSED and positions >= MAX_INDEX_POSITION:
+            raise IndexCapacityError(
+                f"{op}: result_shape {list(shape)}: compressed level {level} would "
+                f"have {positions} parents and one position entry more than that; a "
+                f"32-bit position addresses at most {MAX_INDEX_POSITION} entries"
+            )
+        if level == bounded_levels:
+            break
+        positions *= shape[level]
+        if positions > MAX_INDEX_POSITION:
+            raise IndexCapacityError(
+                f"{op}: result_shape {list(shape)}: the extents of levels 0 to "
+                f"{level} multiply to more than {MAX_INDEX_POSITION}, the most "
+                f"positions a 32-bit position addresses, and level "
+                f"{bounded_levels - 1} of the result is dense"
+            )
+    level = 0
+    while level < len(level_types):
+        if level not in bounded_in_kernel:
+            level += 1
+            continue
+        first = level
+        block = 1
+        while level < len(level_types) and level in bounded_in_kernel:
+            # Left to right, as the kernel forms the block's positions.
+            block *= shape[level]
+            if block > MAX_INDEX_POSITION:
+                raise IndexCapacityError(
+                    f"{op}: result_shape {list(shape)}: the extents of dense levels "
+                    f"{first} to {level} multiply to more than {MAX_INDEX_POSITION}, "
+                    "the most positions a 32-bit position addresses, and each "
+                    f"coordinate stored at level {first - 1} owns one block of them"
+                )
+            level += 1
+        if level < len(level_types) and block >= MAX_INDEX_POSITION:
+            raise IndexCapacityError(
+                f"{op}: result_shape {list(shape)}: the extents of dense levels "
+                f"{first} to {level - 1} multiply to {MAX_INDEX_POSITION}, and "
+                f"compressed level {level} below them has one position entry more "
+                f"than that; a 32-bit position addresses at most {MAX_INDEX_POSITION} "
+                "entries"
+            )
+
+
+def _refuse_unaddressable_dense_prefix(
+    name: str, shape: Tuple[int, ...], level_types: Tuple[LevelType, ...], op: str
+) -> None:
+    """Refuse an operand whose leading dense levels pass ``int`` positions.
+
+    What a compressed or coordinate level stores is known only when the kernel runs,
+    so the levels from the first sparse one on are left to the kernel's entry check.
+    """
+
+    positions = 1
+    for level, level_type in enumerate(level_types):
+        if level_type is not LevelType.DENSE:
+            return
+        extent = shape[level]
+        if positions * extent > MAX_INDEX_POSITION:
+            raise IndexCapacityError(
+                f"{op}: {name} dense level {level} of extent {extent} under "
+                f"{positions} parent positions needs more than "
+                f"{MAX_INDEX_POSITION} positions, the most a 32-bit position "
+                "addresses"
+            )
+        positions *= extent
 
 
 def tensor_storage_member(tensor_name: str, *members: str) -> llir.MemberAccess:
     """Build a fresh nested member path rooted at one generated ``Tensor``."""
 
     if type(tensor_name) is not str or not tensor_name.isidentifier():
-        raise TypeError("tensor storage root must be a non-empty identifier")
+        raise ScorchTypeError(
+            "tensor storage root must be a non-empty identifier",
+            code="kernel_identifier_invalid",
+        )
     if not members:
-        raise TypeError("tensor storage member path cannot be empty")
+        raise ScorchTypeError(
+            "tensor storage member path cannot be empty",
+            code="internal_argument_type_invalid",
+        )
     expression: llir.Expr = llir.Var(
         name=tensor_name,
         type=llir.DataType.TACO_TENSOR,
@@ -57,11 +413,20 @@ def mode_index_tensor(tensor_name: str, level: int, slot: int) -> llir.ArrayAcce
     """Build a fresh access to one Torch tensor in the mode-index ABI argument."""
 
     if type(tensor_name) is not str or not tensor_name.isidentifier():
-        raise TypeError("mode-index tensor root must be a non-empty identifier")
+        raise ScorchTypeError(
+            "mode-index tensor root must be a non-empty identifier",
+            code="kernel_identifier_invalid",
+        )
     if type(level) is not int or level < 0:
-        raise TypeError("mode-index level must be a non-negative int")
+        raise ScorchTypeError(
+            "mode-index level must be a non-negative int",
+            code="internal_argument_type_invalid",
+        )
     if type(slot) is not int or slot < 0:
-        raise TypeError("mode-index slot must be a non-negative int")
+        raise ScorchTypeError(
+            "mode-index slot must be a non-negative int",
+            code="internal_argument_type_invalid",
+        )
     return llir.ArrayAccess(
         array=llir.ArrayAccess(
             array=llir.Var(
@@ -78,9 +443,15 @@ def tensor_data_ptr(receiver: llir.Expr, data_type: llir.DataType) -> llir.Membe
     """Build a typed ``receiver.data_ptr<T>()`` expression."""
 
     if not isinstance(receiver, llir.Expr):
-        raise TypeError("tensor data_ptr receiver must be an LLIR Expr")
+        raise ScorchTypeError(
+            "tensor data_ptr receiver must be an LLIR Expr",
+            code="internal_argument_type_invalid",
+        )
     if type(data_type) is not llir.DataType:
-        raise TypeError("tensor data_ptr template argument must be a DataType")
+        raise ScorchTypeError(
+            "tensor data_ptr template argument must be a DataType",
+            code="internal_argument_type_invalid",
+        )
     return llir.MemberCall(
         base=receiver,
         member="data_ptr",
@@ -103,13 +474,22 @@ class KernelTensorABI:
 
     def _validate(self) -> None:
         if type(self.name) is not str or not self.name.isidentifier():
-            raise TypeError("kernel tensor name must be a non-empty identifier")
+            raise ScorchTypeError(
+                "kernel tensor name must be a non-empty identifier",
+                code="kernel_identifier_invalid",
+            )
         if type(self.level_types) is not tuple or any(
             type(level_type) is not LevelType for level_type in self.level_types
         ):
-            raise TypeError("kernel tensor levels must be an immutable LevelType tuple")
+            raise ScorchTypeError(
+                "kernel tensor levels must be an immutable LevelType tuple",
+                code="internal_argument_type_invalid",
+            )
         if len(self.level_types) > _MAX_KERNEL_RANK:
-            raise ValueError(f"kernel tensor rank must not exceed {_MAX_KERNEL_RANK}")
+            raise ScorchValueError(
+                f"kernel tensor rank must not exceed {_MAX_KERNEL_RANK}",
+                code="kernel_rank_exceeds_limit",
+            )
         supported_levels = (
             LevelType.DENSE,
             LevelType.COMPRESSED,
@@ -124,40 +504,55 @@ class KernelTensorABI:
             None,
         )
         if unsupported_level is not None:
-            raise ValueError(
-                f"unsupported JIT level type {unsupported_level} for ABI validation"
+            raise ScorchValueError(
+                f"unsupported JIT level type {unsupported_level} for ABI validation",
+                code="level_type_unknown",
             )
         if type(self.mode_order) is not tuple or any(
             type(level) is not int for level in self.mode_order
         ):
-            raise TypeError("kernel tensor mode order must be an immutable int tuple")
+            raise ScorchTypeError(
+                "kernel tensor mode order must be an immutable int tuple",
+                code="internal_argument_type_invalid",
+            )
         rank = len(self.level_types)
         if len(self.mode_order) != rank or set(self.mode_order) != set(range(rank)):
-            raise ValueError(
-                "kernel tensor mode order must be a rank-sized permutation"
+            raise ScorchValueError(
+                "kernel tensor mode order must be a rank-sized permutation",
+                code="kernel_abi_shape_invalid",
             )
         if type(self.shape) is not tuple or any(
             type(extent) is not int for extent in self.shape
         ):
-            raise TypeError("kernel tensor shape must be an immutable int tuple")
+            raise ScorchTypeError(
+                "kernel tensor shape must be an immutable int tuple",
+                code="internal_argument_type_invalid",
+            )
         if self.shape and len(self.shape) != rank:
-            raise ValueError("known kernel tensor shape must match the level rank")
+            raise ScorchValueError(
+                "known kernel tensor shape must match the level rank",
+                code="kernel_abi_shape_invalid",
+            )
         if any(extent < 0 for extent in self.shape):
-            raise ValueError("known kernel tensor extents must be non-negative")
+            raise ScorchValueError(
+                "known kernel tensor extents must be non-negative",
+                code="kernel_abi_shape_invalid",
+            )
         _validate_known_shape_range(self.shape, "kernel tensor")
         if type(self.dtype) is not torch.dtype:
-            raise TypeError("kernel tensor dtype must be an exact torch.dtype")
+            raise ScorchTypeError(
+                "kernel tensor dtype must be an exact torch.dtype",
+                code="internal_argument_type_invalid",
+            )
         if self.dtype not in _SUPPORTED_KERNEL_DTYPES:
-            raise ValueError(f"unsupported kernel tensor dtype {self.dtype}")
+            raise ScorchValueError(
+                f"unsupported kernel tensor dtype {self.dtype}",
+                code="dtype_unsupported",
+            )
 
     def _level_kind_codes(self) -> Tuple[int, ...]:
         self._validate()
-        level_kind_code = {
-            LevelType.DENSE: 0,
-            LevelType.COMPRESSED: 1,
-            LevelType.COORDINATE: 2,
-        }
-        return tuple(level_kind_code[level] for level in self.level_types)
+        return tuple(_LEVEL_KIND_CODE[level] for level in self.level_types)
 
     def emit_level_array_bindings(self) -> List[llir.Stmt]:
         """Build fresh dense extents and sparse mode-index pointer bindings."""
@@ -264,9 +659,15 @@ def _int_initializer_list(
     """Build one typed initializer list from validated ABI integer metadata."""
 
     if type(values) is not tuple or any(type(value) is not int for value in values):
-        raise TypeError("initializer-list values must be an immutable int tuple")
+        raise ScorchTypeError(
+            "initializer-list values must be an immutable int tuple",
+            code="internal_argument_type_invalid",
+        )
     if type(element_type) is not llir.DataType:
-        raise TypeError("initializer-list element type must be a DataType")
+        raise ScorchTypeError(
+            "initializer-list element type must be a DataType",
+            code="internal_argument_type_invalid",
+        )
     return llir.Array(
         values=tuple(
             llir.Literal(value=value, data_type=element_type) for value in values
@@ -280,36 +681,186 @@ class TorchCppKernelABI:
     """Own one frozen public ``evaluate`` signature and input ABI contract."""
 
     result_shape: Tuple[int, ...]
-    result_rank: int
+    result_level_types: Tuple[LevelType, ...]
     input_tensors: Tuple[KernelTensorABI, ...]
     extra_tensor_names: Tuple[str, ...] = ()
     extra_tensor_dtype: Optional[torch.dtype] = None
     function_name: str = "evaluate"
+    #: The result levels the kernel body holds to the position bound itself, whole dense
+    #: blocks (:func:`dense_block_check`); the entry check gives them the kind
+    #: ``DenseBoundedInKernel``.  ``None`` while the body is being built: construction then
+    #: refuses only what no body could address, with every dense block counted as bounded,
+    #: and the entry checks cannot be emitted until the body's record is known
+    #: (:meth:`with_levels_bounded_in_kernel`).
+    result_levels_bounded_in_kernel: Optional[Tuple[int, ...]] = ()
 
     def __post_init__(self) -> None:
         self._validate()
+        self._refuse_unaddressable_shapes()
+
+    @property
+    def result_rank(self) -> int:
+        return len(self.result_level_types)
+
+    def _bounded_in_kernel(self) -> FrozenSet[int]:
+        """The levels the refusals count as bounded in the kernel."""
+
+        if self.result_levels_bounded_in_kernel is None:
+            return frozenset(
+                level
+                for first, last in dense_blocks(self.result_level_types)
+                for level in range(first, last + 1)
+            )
+        return frozenset(self.result_levels_bounded_in_kernel)
+
+    def _require_body_record(self, what: str) -> Tuple[int, ...]:
+        if self.result_levels_bounded_in_kernel is None:
+            raise ScorchValueError(
+                f"{what} needs the dense blocks the kernel body bounds, which are not "
+                "known until the body is built (with_levels_bounded_in_kernel)",
+                code="abi_body_record_missing",
+            )
+        return self.result_levels_bounded_in_kernel
+
+    def with_levels_bounded_in_kernel(
+        self, levels: Iterable[int]
+    ) -> "TorchCppKernelABI":
+        """This ABI once the body is built: ``levels`` are the ones its checks bound.
+
+        Construction runs again, so the refusals now count only those levels as bounded.
+        """
+
+        return replace(self, result_levels_bounded_in_kernel=tuple(sorted(set(levels))))
+
+    def require_bounded_levels_checked(self, body: LLIRValue) -> None:
+        """Refuse a kernel whose entry check and finished body disagree on its blocks.
+
+        Read from the body's LLIR (the check calls :func:`dense_block_check` builds), after
+        every pass, so a pass that dropped or copied a check cannot go unnoticed.
+        """
+
+        declared = frozenset(self._require_body_record("checking the body"))
+        checked = levels_bounded_by_checks(body)
+        if declared != checked:
+            raise DenseBlockCheckError(
+                f"{self.function_name}: the entry check declares result levels "
+                f"{sorted(declared)} bounded in the kernel, and the body checks the "
+                f"blocks of levels {sorted(checked)}"
+            )
+
+    def _result_level_kinds(self) -> Tuple[int, ...]:
+        bounded = self._require_body_record("the entry check")
+        return tuple(
+            (
+                _DENSE_BOUNDED_IN_KERNEL_CODE
+                if level in bounded
+                else _LEVEL_KIND_CODE[level_type]
+            )
+            for level, level_type in enumerate(self.result_level_types)
+        )
+
+    def _refuse_unaddressable_shapes(self) -> None:
+        """Refuse known shapes no kernel of this ABI could address, before one is built.
+
+        At construction: the fields are frozen, so the answer cannot change.
+        """
+
+        if self.result_shape:
+            _refuse_unaddressable_result(
+                self.result_shape,
+                self.result_level_types,
+                self.function_name,
+                self._bounded_in_kernel(),
+            )
+        for tensor in self.input_tensors:
+            if tensor.shape:
+                _refuse_unaddressable_dense_prefix(
+                    tensor.name, tensor.shape, tensor.level_types, self.function_name
+                )
 
     def _validate(self) -> None:
         if type(self.function_name) is not str or not self.function_name.isidentifier():
-            raise TypeError("kernel function name must be a non-empty identifier")
+            raise ScorchTypeError(
+                "kernel function name must be a non-empty identifier",
+                code="kernel_identifier_invalid",
+            )
         if type(self.result_shape) is not tuple or any(
             type(extent) is not int for extent in self.result_shape
         ):
-            raise TypeError("kernel result shape must be an immutable int tuple")
-        if type(self.result_rank) is not int or self.result_rank < 0:
-            raise TypeError("kernel result rank must be a non-negative exact int")
+            raise ScorchTypeError(
+                "kernel result shape must be an immutable int tuple",
+                code="internal_argument_type_invalid",
+            )
+        if type(self.result_level_types) is not tuple or any(
+            type(level_type) is not LevelType for level_type in self.result_level_types
+        ):
+            raise ScorchTypeError(
+                "kernel result levels must be an immutable LevelType tuple",
+                code="internal_argument_type_invalid",
+            )
         if self.result_rank > _MAX_KERNEL_RANK:
-            raise ValueError(f"kernel result rank must not exceed {_MAX_KERNEL_RANK}")
+            raise ScorchValueError(
+                f"kernel result rank must not exceed {_MAX_KERNEL_RANK}",
+                code="kernel_rank_exceeds_limit",
+            )
+        unsupported_level = next(
+            (
+                level_type
+                for level_type in self.result_level_types
+                if level_type not in _LEVEL_KIND_CODE
+            ),
+            None,
+        )
+        if unsupported_level is not None:
+            raise ScorchValueError(
+                f"unsupported JIT level type {unsupported_level} for ABI validation",
+                code="level_type_unknown",
+            )
         if self.result_shape and len(self.result_shape) != self.result_rank:
-            raise ValueError("known kernel result shape must match the result rank")
+            raise ScorchValueError(
+                "known kernel result shape must match the result rank",
+                code="kernel_abi_shape_invalid",
+            )
+        bounded = self.result_levels_bounded_in_kernel
+        if bounded is not None:
+            if (
+                type(bounded) is not tuple
+                or any(type(level) is not int for level in bounded)
+                or list(bounded) != sorted(set(bounded))
+            ):
+                raise ScorchTypeError(
+                    "result levels bounded in the kernel must be a sorted tuple of "
+                    "distinct ints",
+                    code="internal_argument_type_invalid",
+                )
+            unplaced = set(bounded)
+            for first, last in dense_blocks(self.result_level_types):
+                block = set(range(first, last + 1))
+                if block & unplaced and not block <= unplaced:
+                    raise ScorchValueError(
+                        f"result levels {first} to {last} form one dense block, which "
+                        "the kernel bounds whole or not at all",
+                        code="dense_block_check_mismatch",
+                    )
+                unplaced -= block
+            if unplaced:
+                raise ScorchValueError(
+                    f"result levels {sorted(unplaced)} are declared bounded in the "
+                    "kernel but are not in a dense block below a compressed level",
+                    code="dense_block_check_mismatch",
+                )
         if any(extent < 0 for extent in self.result_shape):
-            raise ValueError("known kernel result extents must be non-negative")
+            raise ScorchValueError(
+                "known kernel result extents must be non-negative",
+                code="kernel_abi_shape_invalid",
+            )
         _validate_known_shape_range(self.result_shape, "kernel result")
         if type(self.input_tensors) is not tuple or any(
             type(tensor) is not KernelTensorABI for tensor in self.input_tensors
         ):
-            raise TypeError(
-                "kernel inputs must be an immutable exact KernelTensorABI tuple"
+            raise ScorchTypeError(
+                "kernel inputs must be an immutable exact KernelTensorABI tuple",
+                code="internal_argument_type_invalid",
             )
         for tensor in self.input_tensors:
             tensor._validate()
@@ -317,18 +868,26 @@ class TorchCppKernelABI:
             type(name) is not str or not name.isidentifier()
             for name in self.extra_tensor_names
         ):
-            raise TypeError("extra tensor names must be an immutable identifier tuple")
+            raise ScorchTypeError(
+                "extra tensor names must be an immutable identifier tuple",
+                code="internal_argument_type_invalid",
+            )
         if self.extra_tensor_names:
             if type(self.extra_tensor_dtype) is not torch.dtype:
-                raise TypeError(
-                    "extra tensor dtype must be an exact torch.dtype when present"
+                raise ScorchTypeError(
+                    "extra tensor dtype must be an exact torch.dtype when present",
+                    code="internal_argument_type_invalid",
                 )
             if self.extra_tensor_dtype not in _SUPPORTED_KERNEL_DTYPES:
-                raise ValueError(
-                    f"unsupported extra tensor dtype {self.extra_tensor_dtype}"
+                raise ScorchValueError(
+                    f"unsupported extra tensor dtype {self.extra_tensor_dtype}",
+                    code="dtype_unsupported",
                 )
         elif self.extra_tensor_dtype is not None:
-            raise TypeError("extra tensor dtype must be None without extra tensors")
+            raise ScorchTypeError(
+                "extra tensor dtype must be None without extra tensors",
+                code="internal_argument_type_invalid",
+            )
         argument_names = ["result_shape"]
         for tensor in self.input_tensors:
             argument_names.extend(
@@ -340,7 +899,10 @@ class TorchCppKernelABI:
             )
         argument_names.extend(f"{name}_values" for name in self.extra_tensor_names)
         if len(argument_names) != len(set(argument_names)):
-            raise ValueError("kernel ABI argument names must be unique")
+            raise ScorchValueError(
+                "kernel ABI argument names must be unique",
+                code="kernel_identifier_invalid",
+            )
 
     def emit_arguments(self) -> List[llir.Var]:
         """Build a fresh ordered public function-argument list."""
@@ -394,9 +956,12 @@ class TorchCppKernelABI:
                         self.result_shape,
                         llir.DataType.INT64,
                     ),
-                    llir.Literal(
-                        value=self.result_rank,
-                        data_type=llir.DataType.INT64,
+                    # The result's layout: its bound depends on which levels are dense,
+                    # and on which dense blocks the body bounds itself
+                    # (csrc/native_abi.h, check_result_positions).
+                    _int_initializer_list(
+                        self._result_level_kinds(),
+                        llir.DataType.INT,
                     ),
                     llir.Literal(
                         value=self.function_name,
@@ -451,7 +1016,11 @@ class TorchCppKernelABI:
                 )
             )
         if self.extra_tensor_names:
-            assert self.extra_tensor_dtype is not None
+            if self.extra_tensor_dtype is None:
+                raise ScorchAssertionError(
+                    "self.extra_tensor_dtype is not None",
+                    code="extra_tensor_dtype_missing",
+                )
             for name in self.extra_tensor_names:
                 validation.append(
                     llir.FunctionCallStmt(
@@ -497,7 +1066,10 @@ class TorchCppKernelABI:
         self._validate()
         if not self.extra_tensor_names:
             return []
-        assert self.extra_tensor_dtype is not None
+        if self.extra_tensor_dtype is None:
+            raise ScorchAssertionError(
+                "self.extra_tensor_dtype is not None", code="extra_tensor_dtype_missing"
+            )
         c_dtype = dtype_to_c_datatype(self.extra_tensor_dtype)
         ptr_type = llir.DataType.ptr_type(self.extra_tensor_dtype)
         return [
@@ -543,7 +1115,10 @@ class TorchCppKernelABI:
 
         return_type, name, args = self.signature()
         if type(body) is not list:
-            raise TypeError("kernel function body must be an exact LLIR list")
+            raise ScorchTypeError(
+                "kernel function body must be an exact LLIR list",
+                code="internal_argument_type_invalid",
+            )
         return llir.Function(
             return_type=return_type,
             name=name,
@@ -584,30 +1159,56 @@ class ResultTensorAssembler:
         """Validate the frozen result-ABI metadata snapshot."""
 
         if type(self.name) is not str or not self.name.isidentifier():
-            raise TypeError("result tensor name must be a non-empty identifier")
+            raise ScorchTypeError(
+                "result tensor name must be a non-empty identifier",
+                code="kernel_identifier_invalid",
+            )
         if type(self.level_types) is not tuple or any(
             type(level_type) is not LevelType for level_type in self.level_types
         ):
-            raise TypeError("result level types must be an immutable LevelType tuple")
+            raise ScorchTypeError(
+                "result level types must be an immutable LevelType tuple",
+                code="internal_argument_type_invalid",
+            )
         if len(self.level_types) > _MAX_KERNEL_RANK:
-            raise ValueError(f"result rank must not exceed {_MAX_KERNEL_RANK}")
+            raise ScorchValueError(
+                f"result rank must not exceed {_MAX_KERNEL_RANK}",
+                code="kernel_rank_exceeds_limit",
+            )
         if type(self.dtype) is not torch.dtype:
-            raise TypeError("result dtype must be an exact torch.dtype")
+            raise ScorchTypeError(
+                "result dtype must be an exact torch.dtype",
+                code="internal_argument_type_invalid",
+            )
         if self.dtype not in _SUPPORTED_KERNEL_DTYPES:
-            raise ValueError(f"unsupported result dtype {self.dtype}")
+            raise ScorchValueError(
+                f"unsupported result dtype {self.dtype}", code="dtype_unsupported"
+            )
         if self.known_nnz_var is not None and (
             type(self.known_nnz_var) is not str or not self.known_nnz_var.isidentifier()
         ):
-            raise TypeError("known nnz variable must be an identifier or None")
+            raise ScorchTypeError(
+                "known nnz variable must be an identifier or None",
+                code="internal_argument_type_invalid",
+            )
         if type(self.exact_dense_parent_positions) is not bool:
-            raise TypeError("exact dense parent positions must be a bool")
+            raise ScorchTypeError(
+                "exact dense parent positions must be a bool",
+                code="internal_argument_type_invalid",
+            )
         if self.reserve_hint_var is not None and (
             type(self.reserve_hint_var) is not str
             or not self.reserve_hint_var.isidentifier()
         ):
-            raise TypeError("reserve hint variable must be an identifier or None")
+            raise ScorchTypeError(
+                "reserve hint variable must be an identifier or None",
+                code="internal_argument_type_invalid",
+            )
         if self.result_id is not None and type(self.result_id) is not SymbolId:
-            raise TypeError("result identity must be an exact SymbolId or None")
+            raise ScorchTypeError(
+                "result identity must be an exact SymbolId or None",
+                code="internal_argument_type_invalid",
+            )
 
     def result_storage_marker(
         self,
@@ -683,9 +1284,10 @@ class ResultTensorAssembler:
         """Build and initialize first-level position storage from exact offsets."""
 
         if type(self) is not ResultTensorAssembler:
-            raise TypeError(
+            raise ScorchTypeError(
                 "first compressed position allocation requires an exact "
-                "ResultTensorAssembler"
+                "ResultTensorAssembler",
+                code="internal_argument_type_invalid",
             )
         self.validate()
         if (
@@ -696,13 +1298,17 @@ class ResultTensorAssembler:
                 for level_type in self.level_types[1:]
             )
         ):
-            raise ValueError(
+            raise ScorchValueError(
                 "first compressed position allocation requires one dense level "
-                "followed by one or more compressed levels"
+                "followed by one or more compressed levels",
+                code="result_assembly_allocation_mismatch",
             )
 
         if type(loop_bound) is not llir.Var:
-            raise TypeError("first compressed position bound must be an exact LLIR Var")
+            raise ScorchTypeError(
+                "first compressed position bound must be an exact LLIR Var",
+                code="internal_argument_type_invalid",
+            )
         if set(vars(loop_bound)) != {
             "name",
             "type",
@@ -710,8 +1316,9 @@ class ResultTensorAssembler:
             "is_restrict",
             "tensor_access",
         }:
-            raise TypeError(
-                "first compressed position bound must be a complete LLIR Var"
+            raise ScorchTypeError(
+                "first compressed position bound must be a complete LLIR Var",
+                code="internal_argument_type_invalid",
             )
         try:
             bound_name = loop_bound.name
@@ -720,27 +1327,40 @@ class ResultTensorAssembler:
             bound_is_restrict = loop_bound.is_restrict
             bound_access = loop_bound.tensor_access
         except AttributeError as failure:
-            raise TypeError(
-                "first compressed position bound must be a complete LLIR Var"
+            raise ScorchTypeError(
+                "first compressed position bound must be a complete LLIR Var",
+                code="internal_argument_type_invalid",
             ) from failure
         if type(bound_name) is not str or not bound_name.isidentifier():
-            raise ValueError("first compressed position bound must be an identifier")
+            raise ScorchValueError(
+                "first compressed position bound must be an identifier",
+                code="result_assembly_allocation_mismatch",
+            )
         if bound_type not in (llir.DataType.INT, llir.DataType.INT64):
-            raise TypeError("first compressed position bound must be INT or INT64")
+            raise ScorchTypeError(
+                "first compressed position bound must be INT or INT64",
+                code="internal_argument_type_invalid",
+            )
         if bound_is_ptr is not False:
-            raise TypeError("first compressed position bound cannot be a pointer")
+            raise ScorchTypeError(
+                "first compressed position bound cannot be a pointer",
+                code="internal_argument_type_invalid",
+            )
         if bound_is_restrict is not False:
-            raise TypeError(
-                "first compressed position bound cannot be restrict-qualified"
+            raise ScorchTypeError(
+                "first compressed position bound cannot be restrict-qualified",
+                code="internal_argument_type_invalid",
             )
         if bound_access is not None:
-            raise TypeError(
-                "first compressed position bound cannot carry tensor provenance"
+            raise ScorchTypeError(
+                "first compressed position bound cannot carry tensor provenance",
+                code="internal_argument_type_invalid",
             )
 
         if type(offsets) is not llir.Var:
-            raise TypeError(
-                "first compressed position offsets must be an exact LLIR Var"
+            raise ScorchTypeError(
+                "first compressed position offsets must be an exact LLIR Var",
+                code="internal_argument_type_invalid",
             )
         if set(vars(offsets)) != {
             "name",
@@ -749,8 +1369,9 @@ class ResultTensorAssembler:
             "is_restrict",
             "tensor_access",
         }:
-            raise TypeError(
-                "first compressed position offsets must be a complete LLIR Var"
+            raise ScorchTypeError(
+                "first compressed position offsets must be a complete LLIR Var",
+                code="internal_argument_type_invalid",
             )
         try:
             offsets_name = offsets.name
@@ -759,24 +1380,34 @@ class ResultTensorAssembler:
             offsets_is_restrict = offsets.is_restrict
             offsets_access = offsets.tensor_access
         except AttributeError as failure:
-            raise TypeError(
-                "first compressed position offsets must be a complete LLIR Var"
+            raise ScorchTypeError(
+                "first compressed position offsets must be a complete LLIR Var",
+                code="internal_argument_type_invalid",
             ) from failure
         if offsets_name != "_offset1":
-            raise ValueError("first compressed position offsets must be named _offset1")
+            raise ScorchValueError(
+                "first compressed position offsets must be named _offset1",
+                code="result_assembly_allocation_mismatch",
+            )
         if offsets_type is not llir.DataType.STD_VECTOR_INT:
-            raise TypeError(
-                "first compressed position offsets must have STD_VECTOR_INT type"
+            raise ScorchTypeError(
+                "first compressed position offsets must have STD_VECTOR_INT type",
+                code="internal_argument_type_invalid",
             )
         if offsets_is_ptr is not False:
-            raise TypeError("first compressed position offsets cannot be a pointer")
+            raise ScorchTypeError(
+                "first compressed position offsets cannot be a pointer",
+                code="internal_argument_type_invalid",
+            )
         if offsets_is_restrict is not False:
-            raise TypeError(
-                "first compressed position offsets cannot be restrict-qualified"
+            raise ScorchTypeError(
+                "first compressed position offsets cannot be restrict-qualified",
+                code="internal_argument_type_invalid",
             )
         if offsets_access is not None:
-            raise TypeError(
-                "first compressed position offsets cannot carry tensor provenance"
+            raise ScorchTypeError(
+                "first compressed position offsets cannot carry tensor provenance",
+                code="internal_argument_type_invalid",
             )
 
         owner_name = f"{self.name}1_pos_torch"
@@ -866,9 +1497,10 @@ class ResultTensorAssembler:
         """Build coordinate buffers from exact typed compressed cardinalities."""
 
         if type(self) is not ResultTensorAssembler:
-            raise TypeError(
+            raise ScorchTypeError(
                 "compressed coordinate allocations require an exact "
-                "ResultTensorAssembler"
+                "ResultTensorAssembler",
+                code="internal_argument_type_invalid",
             )
         self.validate()
         if (
@@ -879,24 +1511,28 @@ class ResultTensorAssembler:
                 for level_type in self.level_types[1:]
             )
         ):
-            raise ValueError(
+            raise ScorchValueError(
                 "compressed coordinate allocations require one dense level "
-                "followed by one or more compressed levels"
+                "followed by one or more compressed levels",
+                code="result_assembly_allocation_mismatch",
             )
         if type(total_vars) is not tuple:
-            raise TypeError(
-                "compressed coordinate totals must be an immutable Var tuple"
+            raise ScorchTypeError(
+                "compressed coordinate totals must be an immutable Var tuple",
+                code="internal_argument_type_invalid",
             )
         if len(total_vars) != self.levels - 1:
-            raise ValueError(
-                "compressed coordinate totals must match the compressed levels"
+            raise ScorchValueError(
+                "compressed coordinate totals must match the compressed levels",
+                code="result_assembly_allocation_mismatch",
             )
 
         statements: List[llir.Stmt] = []
         for level, total_var in zip(range(1, self.levels), total_vars):
             if type(total_var) is not llir.Var:
-                raise TypeError(
-                    "compressed coordinate totals must contain exact LLIR Vars"
+                raise ScorchTypeError(
+                    "compressed coordinate totals must contain exact LLIR Vars",
+                    code="internal_argument_type_invalid",
                 )
             try:
                 total_name = total_var.name
@@ -905,24 +1541,34 @@ class ResultTensorAssembler:
                 total_is_restrict = total_var.is_restrict
                 total_access = total_var.tensor_access
             except AttributeError as failure:
-                raise TypeError(
-                    "compressed coordinate totals must contain complete LLIR Vars"
+                raise ScorchTypeError(
+                    "compressed coordinate totals must contain complete LLIR Vars",
+                    code="internal_argument_type_invalid",
                 ) from failure
             if total_name != f"_total{level}":
-                raise ValueError(
-                    "compressed coordinate total name must match its result level"
+                raise ScorchValueError(
+                    "compressed coordinate total name must match its result level",
+                    code="result_assembly_allocation_mismatch",
                 )
             if total_type is not llir.DataType.INT64:
-                raise TypeError("compressed coordinate totals must have INT64 type")
+                raise ScorchTypeError(
+                    "compressed coordinate totals must have INT64 type",
+                    code="internal_argument_type_invalid",
+                )
             if total_is_ptr is not False:
-                raise TypeError("compressed coordinate totals cannot be pointers")
+                raise ScorchTypeError(
+                    "compressed coordinate totals cannot be pointers",
+                    code="internal_argument_type_invalid",
+                )
             if total_is_restrict is not False:
-                raise TypeError(
-                    "compressed coordinate totals cannot be restrict-qualified"
+                raise ScorchTypeError(
+                    "compressed coordinate totals cannot be restrict-qualified",
+                    code="internal_argument_type_invalid",
                 )
             if total_access is not None:
-                raise TypeError(
-                    "compressed coordinate totals cannot carry tensor provenance"
+                raise ScorchTypeError(
+                    "compressed coordinate totals cannot carry tensor provenance",
+                    code="internal_argument_type_invalid",
                 )
 
             owner_name = f"{self.name}{level}_crd_torch"
@@ -977,9 +1623,10 @@ class ResultTensorAssembler:
         """Build deeper position buffers from exact parent cardinalities."""
 
         if type(self) is not ResultTensorAssembler:
-            raise TypeError(
+            raise ScorchTypeError(
                 "deeper compressed position allocations require an exact "
-                "ResultTensorAssembler"
+                "ResultTensorAssembler",
+                code="internal_argument_type_invalid",
             )
         self.validate()
         if (
@@ -990,23 +1637,27 @@ class ResultTensorAssembler:
                 for level_type in self.level_types[1:]
             )
         ):
-            raise ValueError(
+            raise ScorchValueError(
                 "deeper compressed position allocations require one dense level "
-                "followed by two or more compressed levels"
+                "followed by two or more compressed levels",
+                code="result_assembly_allocation_mismatch",
             )
         if type(total_vars) is not tuple:
-            raise TypeError(
-                "deeper compressed position totals must be an immutable Var tuple"
+            raise ScorchTypeError(
+                "deeper compressed position totals must be an immutable Var tuple",
+                code="internal_argument_type_invalid",
             )
         if len(total_vars) != self.levels - 1:
-            raise ValueError(
-                "deeper compressed position totals must match the compressed levels"
+            raise ScorchValueError(
+                "deeper compressed position totals must match the compressed levels",
+                code="result_assembly_allocation_mismatch",
             )
 
         for level, total_var in zip(range(1, self.levels), total_vars):
             if type(total_var) is not llir.Var:
-                raise TypeError(
-                    "deeper compressed position totals must contain exact LLIR Vars"
+                raise ScorchTypeError(
+                    "deeper compressed position totals must contain exact LLIR Vars",
+                    code="internal_argument_type_invalid",
                 )
             if set(vars(total_var)) != {
                 "name",
@@ -1015,8 +1666,9 @@ class ResultTensorAssembler:
                 "is_restrict",
                 "tensor_access",
             }:
-                raise TypeError(
-                    "deeper compressed position totals must contain complete LLIR Vars"
+                raise ScorchTypeError(
+                    "deeper compressed position totals must contain complete LLIR Vars",
+                    code="internal_argument_type_invalid",
                 )
             try:
                 total_name = total_var.name
@@ -1025,26 +1677,34 @@ class ResultTensorAssembler:
                 total_is_restrict = total_var.is_restrict
                 total_access = total_var.tensor_access
             except AttributeError as failure:
-                raise TypeError(
-                    "deeper compressed position totals must contain complete LLIR Vars"
+                raise ScorchTypeError(
+                    "deeper compressed position totals must contain complete LLIR Vars",
+                    code="internal_argument_type_invalid",
                 ) from failure
             if total_name != f"_total{level}":
-                raise ValueError(
-                    "deeper compressed position total name must match its result level"
+                raise ScorchValueError(
+                    "deeper compressed position total name must match its result level",
+                    code="result_assembly_allocation_mismatch",
                 )
             if total_type is not llir.DataType.INT64:
-                raise TypeError(
-                    "deeper compressed position totals must have INT64 type"
+                raise ScorchTypeError(
+                    "deeper compressed position totals must have INT64 type",
+                    code="internal_argument_type_invalid",
                 )
             if total_is_ptr is not False:
-                raise TypeError("deeper compressed position totals cannot be pointers")
+                raise ScorchTypeError(
+                    "deeper compressed position totals cannot be pointers",
+                    code="internal_argument_type_invalid",
+                )
             if total_is_restrict is not False:
-                raise TypeError(
-                    "deeper compressed position totals cannot be restrict-qualified"
+                raise ScorchTypeError(
+                    "deeper compressed position totals cannot be restrict-qualified",
+                    code="internal_argument_type_invalid",
                 )
             if total_access is not None:
-                raise TypeError(
-                    "deeper compressed position totals cannot carry tensor provenance"
+                raise ScorchTypeError(
+                    "deeper compressed position totals cannot carry tensor provenance",
+                    code="internal_argument_type_invalid",
                 )
 
         statements: List[llir.Stmt] = []
@@ -1115,8 +1775,10 @@ class ResultTensorAssembler:
         """Build Torch-owned values from one exact compressed cardinality."""
 
         if type(self) is not ResultTensorAssembler:
-            raise TypeError(
-                "compressed value allocation requires an exact " "ResultTensorAssembler"
+            raise ScorchTypeError(
+                "compressed value allocation requires an exact "
+                "ResultTensorAssembler",
+                code="internal_argument_type_invalid",
             )
         self.validate()
         if (
@@ -1127,12 +1789,16 @@ class ResultTensorAssembler:
                 for level_type in self.level_types[1:]
             )
         ):
-            raise ValueError(
+            raise ScorchValueError(
                 "compressed value allocation requires one dense level followed "
-                "by one or more compressed levels"
+                "by one or more compressed levels",
+                code="result_assembly_allocation_mismatch",
             )
         if type(total_var) is not llir.Var:
-            raise TypeError("compressed value total must be an exact LLIR Var")
+            raise ScorchTypeError(
+                "compressed value total must be an exact LLIR Var",
+                code="internal_argument_type_invalid",
+            )
         if set(vars(total_var)) != {
             "name",
             "type",
@@ -1140,7 +1806,10 @@ class ResultTensorAssembler:
             "is_restrict",
             "tensor_access",
         }:
-            raise TypeError("compressed value total must be a complete LLIR Var")
+            raise ScorchTypeError(
+                "compressed value total must be a complete LLIR Var",
+                code="internal_argument_type_invalid",
+            )
         try:
             total_name = total_var.name
             total_type = total_var.type
@@ -1148,30 +1817,45 @@ class ResultTensorAssembler:
             total_is_restrict = total_var.is_restrict
             total_access = total_var.tensor_access
         except AttributeError as failure:
-            raise TypeError(
-                "compressed value total must be a complete LLIR Var"
+            raise ScorchTypeError(
+                "compressed value total must be a complete LLIR Var",
+                code="internal_argument_type_invalid",
             ) from failure
         expected_total_name = f"_total{self.levels - 1}"
         if type(total_name) is not str or total_name != expected_total_name:
-            raise ValueError(
-                "compressed value total name must match the leaf result level"
+            raise ScorchValueError(
+                "compressed value total name must match the leaf result level",
+                code="result_assembly_allocation_mismatch",
             )
         if total_type is not llir.DataType.INT64:
-            raise TypeError("compressed value total must have INT64 type")
+            raise ScorchTypeError(
+                "compressed value total must have INT64 type",
+                code="internal_argument_type_invalid",
+            )
         if total_is_ptr is not False:
-            raise TypeError("compressed value total cannot be a pointer")
+            raise ScorchTypeError(
+                "compressed value total cannot be a pointer",
+                code="internal_argument_type_invalid",
+            )
         if total_is_restrict is not False:
-            raise TypeError("compressed value total cannot be restrict-qualified")
+            raise ScorchTypeError(
+                "compressed value total cannot be restrict-qualified",
+                code="internal_argument_type_invalid",
+            )
         if total_access is not None:
-            raise TypeError("compressed value total cannot carry tensor provenance")
+            raise ScorchTypeError(
+                "compressed value total cannot carry tensor provenance",
+                code="internal_argument_type_invalid",
+            )
 
         try:
             c_datatype = dtype_to_c_datatype(self.dtype)
             dtype_name = get_pytorch_c_dtype_name(self.dtype)
             pointer_type = llir.DataType.ptr_type(c_datatype)
         except (KeyError, ValueError) as failure:
-            raise ValueError(
-                "compressed value allocation requires a supported result dtype"
+            raise ScorchValueError(
+                "compressed value allocation requires a supported result dtype",
+                code="dtype_unsupported",
             ) from failure
 
         owner_name = f"{self.name}_values_torch"
@@ -1210,16 +1894,22 @@ class ResultTensorAssembler:
     def emit_value_array_init(self) -> List[llir.Stmt]:
         """Emit Torch-owned known-size storage or a dynamic ``std::vector``."""
         if type(self) is not ResultTensorAssembler:
-            raise TypeError(
-                "value array initialization requires an exact " "ResultTensorAssembler"
+            raise ScorchTypeError(
+                "value array initialization requires an exact " "ResultTensorAssembler",
+                code="internal_argument_type_invalid",
             )
         self.validate()
         stmts: List[llir.Stmt] = []
         if self.is_dense:
-            # capacity = product of all dimension sizes
-            res_capacity_expr: llir.Expr = llir.Var(
-                name=f"{self.name}0_size",
-                type=llir.DataType.INT64,
+            # capacity = product of all dimension sizes; a rank-0 result has no
+            # dimension and holds one value (the empty product).
+            res_capacity_expr: llir.Expr = (
+                llir.Var(
+                    name=f"{self.name}0_size",
+                    type=llir.DataType.INT64,
+                )
+                if self.levels
+                else llir.Literal(value=1, data_type=llir.DataType.INT64)
             )
             for i in range(1, self.levels):
                 res_capacity_expr = llir.BinOp(
@@ -1404,8 +2094,9 @@ class ResultTensorAssembler:
     def emit_level_indices_init(self) -> List[llir.Stmt]:
         """Emit per-level index array initialization for COMPRESSED/COORDINATE levels."""
         if type(self) is not ResultTensorAssembler:
-            raise TypeError(
-                "level-index initialization requires an exact " "ResultTensorAssembler"
+            raise ScorchTypeError(
+                "level-index initialization requires an exact " "ResultTensorAssembler",
+                code="internal_argument_type_invalid",
             )
         self.validate()
         stmts: List[llir.Stmt] = []
@@ -1627,7 +2318,9 @@ class ResultTensorAssembler:
                 ),
             )
         else:
-            raise ValueError(f"unsupported result level type {level_type}")
+            raise ScorchValueError(
+                f"unsupported result level type {level_type}", code="level_type_unknown"
+            )
         return llir.Array(
             values=values,
             data_type=llir.DataType.STD_VECTOR_TORCH_TENSOR,
@@ -1637,8 +2330,9 @@ class ResultTensorAssembler:
         """Declare one fresh ABI result owner from this frozen snapshot."""
 
         if type(self) is not ResultTensorAssembler:
-            raise TypeError(
-                "result declaration requires an exact ResultTensorAssembler"
+            raise ScorchTypeError(
+                "result declaration requires an exact ResultTensorAssembler",
+                code="internal_argument_type_invalid",
             )
         self.validate()
         return llir.VarDecl(
@@ -1652,7 +2346,10 @@ class ResultTensorAssembler:
         """Assign result storage and return without moving dynamic buffers."""
 
         if type(self) is not ResultTensorAssembler:
-            raise TypeError("storage epilogue requires an exact ResultTensorAssembler")
+            raise ScorchTypeError(
+                "storage epilogue requires an exact ResultTensorAssembler",
+                code="internal_argument_type_invalid",
+            )
         self.validate()
         return [
             llir.Assign(
@@ -1688,7 +2385,10 @@ class ResultTensorAssembler:
     def emit_final_assembly(self) -> List[llir.Stmt]:
         """Move dynamic buffers to Torch, assign indices/values, and return."""
         if type(self) is not ResultTensorAssembler:
-            raise TypeError("final assembly requires an exact ResultTensorAssembler")
+            raise ScorchTypeError(
+                "final assembly requires an exact ResultTensorAssembler",
+                code="internal_argument_type_invalid",
+            )
         self.validate()
         stmts: List[llir.Stmt] = []
 
@@ -1822,8 +2522,9 @@ class ResultTensorAssembler:
         """
 
         if type(self) is not ResultTensorAssembler:
-            raise TypeError(
-                "position tail close requires an exact ResultTensorAssembler"
+            raise ScorchTypeError(
+                "position tail close requires an exact ResultTensorAssembler",
+                code="internal_argument_type_invalid",
             )
         self.validate()
         level = next(
@@ -1848,9 +2549,10 @@ class ResultTensorAssembler:
                 type(name) is not str or not name.isidentifier()
                 for name in extent_names[:level]
             ):
-                raise TypeError(
+                raise ScorchTypeError(
                     "position tail close extent names must be one identifier "
-                    "per dense level above the compressed level"
+                    "per dense level above the compressed level",
+                    code="internal_argument_type_invalid",
                 )
             names = list(extent_names[:level])
         cells: llir.Expr = llir.Var(name=names[0], type=llir.DataType.INT64)

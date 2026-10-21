@@ -262,9 +262,9 @@ def test_validated_labels_memo_returns_fresh_lists():
 @pytest.mark.parametrize(
     ("expression", "groups", "result", "message"),
     [
-        ("i&,kj->ij", ["i&", "kj"], "ij", "input labels must be non-empty"),
-        (",kj->ij", ["", "kj"], "ij", "input labels must be non-empty"),
-        ("ik,kj->i&", ["ik", "kj"], "i&", "result labels must be non-empty"),
+        ("i&,kj->ij", ["i&", "kj"], "ij", "input labels must be ASCII letters"),
+        ("->", [""], "", "has no index"),
+        ("ik,kj->i&", ["ik", "kj"], "i&", "result labels must be ASCII letters"),
         ("ik,kj->ii", ["ik", "kj"], "ii", "result labels must be unique"),
         ("ik,kj->iz", ["ik", "kj"], "iz", "must appear in an input"),
     ],
@@ -326,7 +326,12 @@ def test_logical_index_sizes_survive_relayout():
 
 @pytest.fixture
 def copy_arms(monkeypatch):
-    """Set the two levers explicitly per test, and start from an empty memo."""
+    """Set the two levers explicitly per test, and start from an empty memo.
+
+    "Empty" includes the withdrawal counter. It is process-wide and only a hit resets
+    it, so without this a worker whose earlier tests left eight stale misses in a row
+    runs every later memo test with the memo withdrawn.
+    """
 
     def select(*, memo, native):
         monkeypatch.setattr(stensor_module, "_MEMO_OPERAND_COPY", [memo])
@@ -336,6 +341,11 @@ def copy_arms(monkeypatch):
             stensor_module._NATIVE_TRANSPOSE if native else None,
         )
         monkeypatch.setattr(stensor_module, "_OPERAND_COPY_CACHE", {})
+        monkeypatch.setattr(
+            stensor_module,
+            "_OPERAND_COPY_STATE",
+            [0, stensor_module._OPERAND_COPY_CACHE_MAX],
+        )
 
     return select
 
@@ -398,6 +408,27 @@ def test_memo_serves_one_copy_for_a_repeated_operand(copy_arms):
     second = STensor.from_torch(base.T)
     assert first.values.data_ptr() == second.values.data_ptr()
     torch.testing.assert_close(first.values, base.T.reshape(-1), atol=0, rtol=0)
+
+
+def test_copy_arms_starts_from_a_memo_that_has_not_withdrawn(monkeypatch, copy_arms):
+    """A withdrawal left by an earlier test must not reach the next one.
+
+    The counter is set as eight stale misses in a row would leave it; after the fixture
+    the memo has to serve one copy again. Before the fixture reset the counter,
+    test_memo_serves_one_copy_for_a_repeated_operand failed this way when it ran
+    after 36 other tests in one process, and passed alone.
+    """
+    monkeypatch.setattr(
+        stensor_module,
+        "_OPERAND_COPY_STATE",
+        [stensor_module._OPERAND_COPY_GIVE_UP, stensor_module._OPERAND_COPY_CACHE_MAX],
+    )
+    copy_arms(memo=True, native=True)
+    torch.manual_seed(0)
+    base = torch.rand(32, 8)
+    first = STensor.from_torch(base.T)
+    second = STensor.from_torch(base.T)
+    assert first.values.data_ptr() == second.values.data_ptr()
 
 
 def test_memo_is_not_consulted_when_it_is_off(copy_arms):

@@ -52,7 +52,11 @@ from .llir_pass_manager import (
     LLIRRewriteArtifact,
     ResultWritePassSpec,
 )
-from .result_write_pass import ResultWriteContext
+from .result_write_pass import (
+    ResultWriteContext,
+    phase_count_vector_type,
+    phase_state_type,
+)
 from .iterator import collect_mode_position_arrays, match_mode_position_access
 from .sparse_accumulator import (
     CHAINED_ACCUMULATOR_STRUCTURE,
@@ -61,7 +65,7 @@ from .sparse_accumulator import (
     UNSUPPORTED_ACCUMULATOR_STRUCTURE,
     is_accumulator_structure,
 )
-from .torch_cpp_abi import ResultTensorAssembler
+from .torch_cpp_abi import ResultTensorAssembler, level_total_check
 from ..format import LevelType
 from ..utils import dtype_to_c_datatype
 
@@ -1084,6 +1088,41 @@ def _parse_pos(pos_name: str) -> Optional[Tuple[str, int]]:
     return match.group(1), int(match.group(2))
 
 
+def _stored_count_chain(
+    prefix: str, levels: set[int], outer: llir.Var
+) -> Optional[Tuple[str, llir.Expr]]:
+    """The stored count at an operand's deepest compressed level, read in bounds.
+
+    ``outer`` is the operand's dense level-0 extent.  Level ``l``'s position array has
+    one entry per stored position of level ``l - 1``, plus one, so when the compressed
+    levels are exactly ``1..L`` the chain ``X{L}_pos[...X2_pos[X1_pos[X0_size]]]``
+    reads every array inside its length and yields the stored count at level ``L``
+    (and at any singleton level below it).  For two-level CSR it is ``X1_pos[X0_size]``.
+
+    Reading ``X{L}_pos[X0_size]`` for ``L > 1``, as this estimate did, indexes level
+    ``L``'s array by the level-0 extent: past its end when fewer positions are stored
+    above it (``ijkl,ijkl->il`` with ``A`` in ``dssd``, dennis, region scan 82815), and
+    a wrong count otherwise.  The estimate sizes the team (``num_threads``), the
+    per-thread workspace count and the chunk, each from its own read, so a read past
+    the end can give them different values.  Any other set of levels (a dense level
+    between compressed ones) has no such chain in the kernel's names, and ``None``
+    sends the caller to the guarded estimate (``_sparse_pos_work_estimate``).
+    """
+
+    deepest = max(levels)
+    if levels != set(range(1, deepest + 1)):
+        return None
+    text = outer.name
+    expr: llir.Expr = outer
+    for level in range(1, deepest + 1):
+        name = f"{prefix}{level}_pos"
+        text = f"{name}[{text}]"
+        expr = llir.ArrayAccess(
+            array=llir.Var(name=name, type=llir.DataType.NO_TYPE), index=expr
+        )
+    return text, expr
+
+
 def _spgemm_flop_work_estimate(
     body: Sequence[llir.Stmt],
     bound: llir.Var,
@@ -1111,24 +1150,32 @@ def _spgemm_flop_work_estimate(
     if right_prefix is None:
         return None
 
-    left_pos = f"{left_prefix}{max(levels[left_prefix])}_pos"
     right_outer = f"{right_prefix}0_size"
-    right_pos = f"{right_prefix}{max(levels[right_prefix])}_pos"
 
     def _right_outer_reference() -> llir.Var:
         return llir.Var(name=right_outer, type=llir.DataType.INT64)
 
+    left = _stored_count_chain(
+        left_prefix,
+        levels[left_prefix],
+        llir.Var(name=bound.name, type=bound.type),
+    )
+    right = _stored_count_chain(
+        right_prefix, levels[right_prefix], _right_outer_reference()
+    )
+    if left is None or right is None:
+        return None
+    left_text, left_count = left
+    right_text, right_count = right
+
     return _PolicyExpression(
         text=(
-            f"(long){left_pos}[{bound.name}] * ({right_outer} > 0 ? "
-            f"{right_pos}[{right_outer}] / {right_outer} + 1 : 1)"
+            f"(long){left_text} * ({right_outer} > 0 ? "
+            f"{right_text} / {right_outer} + 1 : 1)"
         ),
         expr=llir.Mul(
             llir.Cast(
-                expr=llir.ArrayAccess(
-                    array=llir.Var(name=left_pos, type=llir.DataType.NO_TYPE),
-                    index=llir.Var(name=bound.name, type=bound.type),
-                ),
+                expr=left_count,
                 data_type=llir.DataType.LONG,
             ),
             llir.Select(
@@ -1140,13 +1187,7 @@ def _spgemm_flop_work_estimate(
                 when_true=llir.Add(
                     llir.BinOp(
                         "/",
-                        llir.ArrayAccess(
-                            array=llir.Var(
-                                name=right_pos,
-                                type=llir.DataType.NO_TYPE,
-                            ),
-                            index=_right_outer_reference(),
-                        ),
+                        right_count,
                         _right_outer_reference(),
                     ),
                     llir.Literal(1, llir.DataType.INT),
@@ -1300,14 +1341,14 @@ def _build_count_body(
     levels = context.compressed_levels
     body: List[llir.Stmt] = [
         llir.VarInit(
-            var=llir.Var(name=f"_cnt{level}", type=llir.DataType.INT),
+            var=llir.Var(name=f"_cnt{level}", type=phase_state_type(level)),
             value=llir.Literal(0, llir.DataType.INT),
         )
         for level in levels
     ]
     body.extend(
         llir.VarInit(
-            var=llir.Var(name=f"_prev{level}", type=llir.DataType.INT),
+            var=llir.Var(name=f"_prev{level}", type=phase_state_type(level)),
             value=llir.Literal(0, llir.DataType.INT),
         )
         for level in levels[1:]
@@ -1332,11 +1373,11 @@ def _build_count_body(
             var=llir.ArrayAccess(
                 array=llir.Var(
                     name=f"_count{level}",
-                    type=llir.DataType.STD_VECTOR_C_INT,
+                    type=phase_count_vector_type(level),
                 ),
                 index=_cell_index_expression(context, cell_index),
             ),
-            value=llir.Var(name=f"_cnt{level}", type=llir.DataType.INT),
+            value=llir.Var(name=f"_cnt{level}", type=phase_state_type(level)),
         )
         for level in levels
     )
@@ -1372,14 +1413,14 @@ def _build_fill_body(
                     ),
                 ),
                 llir.VarInit(
-                    var=llir.Var(name=f"_pos{level}", type=llir.DataType.INT),
+                    var=llir.Var(name=f"_pos{level}", type=phase_state_type(level)),
                     value=llir.Literal(0, llir.DataType.INT),
                 ),
             ]
         )
     body.extend(
         llir.VarInit(
-            var=llir.Var(name=f"_prev{level}", type=llir.DataType.INT),
+            var=llir.Var(name=f"_prev{level}", type=phase_state_type(level)),
             value=llir.Literal(0, llir.DataType.INT),
         )
         for level in levels[1:]
@@ -1658,7 +1699,7 @@ def _cell_index_expression(
 
 
 def _count_reference(level: int) -> llir.Var:
-    return llir.Var(name=f"_count{level}", type=llir.DataType.STD_VECTOR_C_INT)
+    return llir.Var(name=f"_count{level}", type=phase_count_vector_type(level))
 
 
 def _offset_reference(level: int) -> llir.Var:
@@ -1774,6 +1815,26 @@ def _prefix_sum_statements(
         for level in context.compressed_levels
     )
     return statements
+
+
+def _level_total_checks(context: CompressedWhereOpenMPContext) -> List[llir.Stmt]:
+    """Hold every compressed level's ``_total{L}`` to the 32-bit position bound.
+
+    Between the prefix sum and the first allocation: the fill pass stores each
+    ``_offset{L}`` entry, and each position it fills, as ``int``, so a total past the
+    bound is refused with ``index_position_exceeds_int32`` before anything is allocated
+    or written (csrc/header.h, ``scorch_check_level_total``).
+    """
+
+    levels = context.compressed_levels
+    return [
+        level_total_check(
+            _total_reference(level),
+            level,
+            compressed_below=index + 1 < len(levels),
+        )
+        for index, level in enumerate(levels)
+    ]
 
 
 def _position_and_coordinate_allocations(
@@ -1913,6 +1974,7 @@ def _build_transformed_statements(
         result.extend(count_phase.preamble)
         result.append(count_phase.loop)
         result.extend(_prefix_sum_statements(context, cell_count))
+        result.extend(_level_total_checks(context))
         result.extend(_position_and_coordinate_allocations(context, cell_count))
         result.extend(_value_allocation(context))
         result.append(fill_phase.loop)

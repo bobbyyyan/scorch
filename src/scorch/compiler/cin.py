@@ -19,6 +19,12 @@ from .identity import (
 )
 from ..format import TensorFormat, LevelType
 from ..utils import parse_format
+from ..exceptions import (
+    ScorchAssertionError,
+    ScorchError,
+    ScorchNotImplementedError,
+    ScorchTypeError,
+)
 
 # Type aliases for type hints
 _UnaryOp = Callable[[Any], Any]
@@ -375,7 +381,10 @@ class IndexVar(IndexExpr):
 
     @property
     def name(self) -> str:
-        assert self._name is not None, "IndexVar name is None"
+        if self._name is None:
+            raise ScorchAssertionError(
+                "IndexVar name is None", code="cin_node_state_missing"
+            )
         return self._name
 
     @property
@@ -400,7 +409,10 @@ class IndexVar(IndexExpr):
                     ),
                 )
             ]
-        raise NotImplementedError(f"Resolve LLIR stmts for {self.expr} not implemented")
+        raise ScorchNotImplementedError(
+            f"Resolve LLIR stmts for {self.expr} not implemented",
+            code="index_expression_resolution_unsupported",
+        )
 
     @property
     def parent(self) -> IndexVar:
@@ -429,7 +441,10 @@ class IndexVar(IndexExpr):
             self.is_inner = is_inner
 
     def add_tensor_access(self, tensor_access: TensorAccess) -> None:
-        assert self in tensor_access.indices, f"{self} not in {tensor_access}"
+        if self not in tensor_access.indices:
+            raise ScorchAssertionError(
+                f"{self} not in {tensor_access}", code="cin_node_state_missing"
+            )
         if tensor_access not in self.tensor_accesses:
             self.tensor_accesses.append(tensor_access)
 
@@ -448,7 +463,10 @@ class IndexVar(IndexExpr):
         dense_tensor_accesses = [
             ta for ta in self.tensor_accesses if ta.is_dense() and self in ta.indices
         ]
-        assert len(dense_tensor_accesses) > 0, "No dense tensor accesses"
+        if not (len(dense_tensor_accesses) > 0):
+            raise ScorchAssertionError(
+                "No dense tensor accesses", code="cin_node_state_missing"
+            )
         # Pick one
         tensor_access = dense_tensor_accesses[0]
         level = tensor_access.level_of_index_var(self)
@@ -535,7 +553,7 @@ class IndexVarExpr(IndexExpr):
     """
 
     def set_parent(self, parent: IndexVar) -> None:
-        raise NotImplementedError
+        raise ScorchNotImplementedError(code="cin_node_method_abstract")
 
 
 class IndexVarAdd(IndexVarExpr):
@@ -643,12 +661,18 @@ class TensorVar(IndexExpr):
         self._name = name
 
     def get_name(self) -> str:
-        assert self.name is not None, "TensorVar name is None"
+        if self.name is None:
+            raise ScorchAssertionError(
+                "TensorVar name is None", code="cin_node_state_missing"
+            )
         return self.name
 
     def get_format(self) -> TensorFormat:
         tensor_format = self.format
-        assert tensor_format is not None, "TensorVar format is None"
+        if tensor_format is None:
+            raise ScorchAssertionError(
+                "TensorVar format is None", code="cin_node_state_missing"
+            )
         return tensor_format
 
     def get_mode_order(self) -> Optional[List[int]]:
@@ -721,8 +745,9 @@ class Workspace(TensorVar):
         mode_order: Optional[List[int]] = None,
     ):
         if type(dtype) is not torch.dtype:
-            raise TypeError(
-                f"Workspace dtype must be a torch.dtype, got {type(dtype).__name__}"
+            raise ScorchTypeError(
+                f"Workspace dtype must be a torch.dtype, got {type(dtype).__name__}",
+                code="internal_argument_type_invalid",
             )
         # dim and dense must be set before super().__init__() because
         # TensorVar derives default mode_order from format, which for
@@ -756,7 +781,10 @@ class Workspace(TensorVar):
 
     @property
     def size_llir_var(self) -> llir.Var:
-        assert len(self.workspace_accesses) > 0, "No workspace accesses"
+        if not (len(self.workspace_accesses) > 0):
+            raise ScorchAssertionError(
+                "No workspace accesses", code="cin_node_state_missing"
+            )
         wksp_accesses = [
             wa for wa in self.workspace_accesses if wa.indices and len(wa.indices) == 1
         ]
@@ -885,9 +913,11 @@ class TensorAccess(IndexExpr):
         level: Optional[int] = None,
         index_var: Optional[IndexVar] = None,
     ) -> List[llir.Stmt]:
-        assert (
-            level is not None or index_var is not None
-        ), "Either level or index_var must be specified"
+        if not (level is not None or index_var is not None):
+            raise ScorchAssertionError(
+                "Either level or index_var must be specified",
+                code="cin_node_state_missing",
+            )
         if index_var:
             level = self.level_of_index_var(index_var)
         elif level is not None:
@@ -1243,7 +1273,10 @@ class CINVisitor:
         visitor(node)
 
     def generic_visit(self, node: CIN) -> None:
-        raise Exception(f"No visit_{node.__class__.__name__} method")
+        raise ScorchError(
+            f"No visit_{node.__class__.__name__} method",
+            code="cin_visitor_method_missing",
+        )
 
 
 class CINVisitorAccept(CINVisitor):

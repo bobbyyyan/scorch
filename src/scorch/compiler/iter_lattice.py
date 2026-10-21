@@ -15,6 +15,8 @@ from typing import (
 )
 
 from . import llir
+from .llir_traversal import LLIRPath, LLIRTraversalContext, LLIRWalker
+from .torch_cpp_abi import dense_block_check
 from ..utils import dtype_to_c_datatype, flatten_2d_list
 
 if TYPE_CHECKING:
@@ -37,6 +39,7 @@ from ..format import LevelType
 from .cin_analysis import CINDiagnostic
 from .diagnostics import UnsupportedFeature
 from .iterator import ModeIterator
+from ..exceptions import ScorchAssertionError, ScorchNotImplementedError
 
 # Short names for the statement-level result-storage marker's vocabulary.  Spelled
 # from ``llir`` rather than imported from ``cin_lowerer``, which imports this
@@ -311,11 +314,17 @@ class LatticePoint:
         )
 
     def get_index_var(self) -> IndexVar:
-        assert self.index_var is not None, "Index var not set"
+        if self.index_var is None:
+            raise ScorchAssertionError(
+                "Index var not set", code="iteration_lattice_state_missing"
+            )
         return self.index_var
 
     def get_index_var_llir(self):
-        assert self.index_var_llir is not None, "Index var LLIR not set"
+        if self.index_var_llir is None:
+            raise ScorchAssertionError(
+                "Index var LLIR not set", code="iteration_lattice_state_missing"
+            )
         return self.index_var_llir
 
     @property
@@ -384,15 +393,21 @@ class LatticePoint:
 
         # if domain is dense
         if lattice.dense_index_var_llir:
-            assert (
-                lattice.dense_index_var_end_var_llir is not None
-            ), "Dense index var upper bound not set"
+            if lattice.dense_index_var_end_var_llir is None:
+                raise ScorchAssertionError(
+                    "Dense index var upper bound not set",
+                    code="iteration_lattice_state_missing",
+                )
             condition = llir.BinOp(
                 op="<",
                 left=lattice.dense_index_var_llir,
                 right=lattice.dense_index_var_end_var_llir,
             )
-        assert condition is not None, "Failed to generate while condition"
+        if condition is None:
+            raise ScorchAssertionError(
+                "Failed to generate while condition",
+                code="iteration_lattice_state_missing",
+            )
         return condition
 
     def get_while_condition(self, lattice: IterationLattice) -> llir.Expr:
@@ -411,24 +426,34 @@ class LatticePoint:
 
         # if domain is dense
         if lattice.dense_index_var_llir:
-            assert (
-                lattice.dense_index_var_end_var_llir is not None
-            ), "Dense index var upper bound not set"
+            if lattice.dense_index_var_end_var_llir is None:
+                raise ScorchAssertionError(
+                    "Dense index var upper bound not set",
+                    code="iteration_lattice_state_missing",
+                )
             condition = llir.BinOp(
                 op="<",
                 left=lattice.dense_index_var_llir,
                 right=lattice.dense_index_var_end_var_llir,
             )
-        assert condition is not None, "Failed to generate while condition"
+        if condition is None:
+            raise ScorchAssertionError(
+                "Failed to generate while condition",
+                code="iteration_lattice_state_missing",
+            )
         return condition
 
     def get_single_iterator_advance_stmt(
         self, lattice: IterationLattice
     ) -> Union[llir.Increment, llir.Assign]:
         iterators = self.get_iterators()
-        assert len(iterators) == 1 or (
-            len(iterators) == 0 and lattice.dense_index_var_llir
-        ), "Expected only one iterator"
+        if not (
+            len(iterators) == 1
+            or (len(iterators) == 0 and lattice.dense_index_var_llir)
+        ):
+            raise ScorchAssertionError(
+                "Expected only one iterator", code="iteration_lattice_state_missing"
+            )
 
         if lattice.dense_index_var_llir:
             lattice_ivar = lattice.index_var
@@ -566,7 +591,10 @@ class LatticePoint:
             iterator: ModeIterator = iterators[0]
             next_level = iterator.level + 1
             tensor_var = iterator.tensor_var
-            assert tensor_var is not None, "Tensor var not set"
+            if tensor_var is None:
+                raise ScorchAssertionError(
+                    "Tensor var not set", code="iteration_lattice_state_missing"
+                )
 
             if (
                 next_level < tensor_var.levels
@@ -594,15 +622,24 @@ class LatticePoint:
         return stmts
 
     def get_iterators(self) -> Sequence[ModeIterator]:
-        assert self.iterators is not None, "Iterators not set"
+        if self.iterators is None:
+            raise ScorchAssertionError(
+                "Iterators not set", code="iteration_lattice_state_missing"
+            )
         return self.iterators
 
     def get_sparse_tensor_accesses(self) -> List[TensorAccess]:
-        assert self.sparse_tensor_accesses is not None, "Sparse tensor accesses not set"
+        if self.sparse_tensor_accesses is None:
+            raise ScorchAssertionError(
+                "Sparse tensor accesses not set", code="iteration_lattice_state_missing"
+            )
         return self.sparse_tensor_accesses
 
     def get_dense_tensor_accesses(self) -> List[TensorAccess]:
-        assert self.dense_tensor_accesses is not None, "Dense tensor accesses not set"
+        if self.dense_tensor_accesses is None:
+            raise ScorchAssertionError(
+                "Dense tensor accesses not set", code="iteration_lattice_state_missing"
+            )
         return self.dense_tensor_accesses
 
     def get_simplified_cin(self, cin: CIN) -> Optional[CIN]:
@@ -625,9 +662,13 @@ class LatticePoint:
                 return None
 
             if left_new and right_new:
-                assert isinstance(left_new, IndexExpr) and isinstance(
-                    right_new, IndexExpr
-                ), "Expected IndexExpr for left and right"
+                if not (
+                    isinstance(left_new, IndexExpr) and isinstance(right_new, IndexExpr)
+                ):
+                    raise ScorchAssertionError(
+                        "Expected IndexExpr for left and right",
+                        code="iteration_lattice_state_missing",
+                    )
                 return BinaryOp(
                     op=cin.op,
                     left=left_new,
@@ -643,9 +684,11 @@ class LatticePoint:
 
         elif isinstance(cin, ForAll):
             rewritten_inner_stmt = self.get_simplified_cin(cin.stmt)
-            assert isinstance(
-                rewritten_inner_stmt, IndexStmt
-            ), "Rewritten inner stmt is not an index stmt"
+            if not (isinstance(rewritten_inner_stmt, IndexStmt)):
+                raise ScorchAssertionError(
+                    "Rewritten inner stmt is not an index stmt",
+                    code="iteration_lattice_state_missing",
+                )
             return ForAll(
                 index_var=cin.index_var,
                 stmt=rewritten_inner_stmt,
@@ -654,9 +697,14 @@ class LatticePoint:
         elif isinstance(cin, Where):
             producer_rewritten = self.get_simplified_cin(cin.producer)
             consumer_rewritten = self.get_simplified_cin(cin.consumer)
-            assert isinstance(producer_rewritten, IndexStmt) and isinstance(
-                consumer_rewritten, IndexStmt
-            ), "Rewritten producer and consumer are not index stmts"
+            if not (
+                isinstance(producer_rewritten, IndexStmt)
+                and isinstance(consumer_rewritten, IndexStmt)
+            ):
+                raise ScorchAssertionError(
+                    "Rewritten producer and consumer are not index stmts",
+                    code="iteration_lattice_state_missing",
+                )
             return Where(
                 producer=producer_rewritten,
                 consumer=consumer_rewritten,
@@ -679,9 +727,11 @@ class LatticePoint:
                 rewritten_rhs = cin.rhs
             # print("RHS: ", cin.rhs)
             # print("Rewritten RHS: ", rewritten_rhs)
-            assert isinstance(
-                rewritten_rhs, IndexExpr
-            ), "Rewritten RHS is not an IndexExpr"
+            if not (isinstance(rewritten_rhs, IndexExpr)):
+                raise ScorchAssertionError(
+                    "Rewritten RHS is not an IndexExpr",
+                    code="iteration_lattice_state_missing",
+                )
 
             return TensorAssign(
                 lhs=cin.lhs,
@@ -689,7 +739,9 @@ class LatticePoint:
                 op=Operation.ADD if has_reduction else None,
             )
 
-        raise NotImplementedError(f"Unhandled CIN type {type(cin)}")
+        raise ScorchNotImplementedError(
+            f"Unhandled CIN type {type(cin)}", code="iteration_lattice_cin_unsupported"
+        )
 
     def get_child_subregion_loops(
         self, cin_lowerer: CINLowerer, cin: IndexStmt, lattice: "IterationLattice"
@@ -711,10 +763,15 @@ class LatticePoint:
             lattice_point: LatticePoint, cin: IndexStmt, lst: List[llir.Stmt]
         ):
             simplified_cin = lattice_point.get_simplified_cin(cin)
-            assert simplified_cin is not None, "Simplified CIN is None"
-            assert isinstance(
-                simplified_cin, IndexStmt
-            ), "Simplified CIN is not an index stmt"
+            if simplified_cin is None:
+                raise ScorchAssertionError(
+                    "Simplified CIN is None", code="iteration_lattice_state_missing"
+                )
+            if not (isinstance(simplified_cin, IndexStmt)):
+                raise ScorchAssertionError(
+                    "Simplified CIN is not an index stmt",
+                    code="iteration_lattice_state_missing",
+                )
             cin_lowered = cin_lowerer.lower_IndexStmt(simplified_cin)
             if isinstance(cin_lowered, llir.Stmt):
                 lst.append(cin_lowered)
@@ -773,7 +830,11 @@ class LatticePoint:
                     lower_cin_and_add_to_list(child_lp, cin, else_body)
                 else:
                     lower_cin_and_add_to_list(child_lp, cin, then_body)
-                    assert if_condition is not None, "if_condition cannot be None"
+                    if if_condition is None:
+                        raise ScorchAssertionError(
+                            "if_condition cannot be None",
+                            code="iteration_lattice_state_missing",
+                        )
                     if_conditions.append(if_condition)
                     then_body_list.append(then_body)
 
@@ -934,12 +995,16 @@ class LatticePoint:
                         type=llir.DataType.INT,
                     )
 
-                    assert (
-                        next_level_iterator_end_llir is not None
-                    ), "next_level_iterator_end_llir cannot be None"
-                    assert (
-                        it.iterator_var_llir is not None
-                    ), "it.iterator_var_llir cannot be None"
+                    if next_level_iterator_end_llir is None:
+                        raise ScorchAssertionError(
+                            "next_level_iterator_end_llir cannot be None",
+                            code="iteration_lattice_state_missing",
+                        )
+                    if it.iterator_var_llir is None:
+                        raise ScorchAssertionError(
+                            "it.iterator_var_llir cannot be None",
+                            code="iteration_lattice_state_missing",
+                        )
                     coordinate_level_iterator_end_resolution_stmts.append(
                         llir.Assign(
                             var=next_level_iterator_end_llir,
@@ -951,9 +1016,11 @@ class LatticePoint:
                         )
                     )
 
-                    assert (
-                        it.iterator_var_end_var_llir is not None
-                    ), "it.iterator_var_end_var_llir cannot be None"
+                    if it.iterator_var_end_var_llir is None:
+                        raise ScorchAssertionError(
+                            "it.iterator_var_end_var_llir cannot be None",
+                            code="iteration_lattice_state_missing",
+                        )
 
                     coordinate_level_iterator_end_resolution_stmts.append(
                         llir.WhileLoop(
@@ -992,7 +1059,10 @@ class LatticePoint:
             stmts.extend(coordinate_level_iterator_end_resolution_stmts)
 
         cin_lowerer = lattice.cin_lowerer
-        assert cin_lowerer is not None, "CIN lowerer is None"
+        if cin_lowerer is None:
+            raise ScorchAssertionError(
+                "CIN lowerer is None", code="iteration_lattice_state_missing"
+            )
 
         dense_iterators_resolve_stmts: List[llir.Stmt] = []
         d = cin_lowerer.dense_coord_resolve_stmt_to_dep_index_vars
@@ -1034,6 +1104,93 @@ class LatticePoint:
         return set(self.get_sparse_tensor_accesses()).issubset(
             set(other.get_sparse_tensor_accesses())
         )
+
+
+def mark_simd_on_reduction_loops(stmts: Sequence[llir.Stmt]) -> None:
+    """Mark the loops of a sum kept in a register for vector instructions.
+
+    ``stmts`` is the statement list that accumulates one result entry into a
+    scalar (the scalar-accumulation subregion of this lowering, the reduction
+    sub-nest of the new compiler's bound-prefix family).  A ``for`` loop directly
+    in it is marked ``#pragma omp simd`` when its body holds no loop over a
+    compressed level's positions, it is not parallel or unrolled, and nothing in
+    it breaks out.  One definition, read by both compilers, so the two mark the
+    same loops.
+    """
+
+    from .parallel_marking_pass import has_sparse_inner_loop
+
+    def contains_break(body: Sequence[llir.Stmt]) -> bool:
+        for child in body:
+            if isinstance(child, llir.Break):
+                return True
+            if isinstance(child, (llir.ForLoop, llir.WhileLoop)):
+                if contains_break(child.body):
+                    return True
+            elif isinstance(child, llir.IfThenElse):
+                branches = [child.then_body, child.else_body]
+                branches.extend(child.then_body_list or [])
+                if any(branch and contains_break(branch) for branch in branches):
+                    return True
+        return False
+
+    for stmt in stmts:
+        if isinstance(stmt, llir.ForLoop):
+            if (
+                not has_sparse_inner_loop(stmt.body)
+                and not stmt.omp_parallel_for
+                and not stmt.unroll
+                and not contains_break(stmt.body)
+            ):
+                stmt.simd = True
+
+
+class _VectorMarkedLoops(LLIRWalker):
+    """Every ``for`` loop carrying a vector mark, in emission order."""
+
+    def __init__(self) -> None:
+        super().__init__(
+            LLIRTraversalContext(
+                stage="schedule lowering", pass_name="select_vector_marks"
+            )
+        )
+        self.loops: List[llir.ForLoop] = []
+
+    def enter_node(self, node: llir.Node, path: LLIRPath) -> None:
+        if type(node) is llir.ForLoop and node.simd:
+            self.loops.append(node)
+
+
+def select_vector_marks(
+    stmts: Sequence[llir.Stmt], requested: Optional[Sequence[str]]
+) -> Tuple[str, ...]:
+    """Keep a vector mark only on the loops a schedule names.
+
+    ``requested`` names loops by their logical-loop identity
+    (``ForLoop.scorch_index_var``: an index name, or ``{name}_out`` and
+    ``{name}_in`` for the two loops of an affine split).  ``None`` requests
+    nothing and keeps every mark :func:`mark_simd_on_reduction_loops` placed.
+    Otherwise a marked loop whose identity is not requested loses its mark, and
+    the requested names that match no marked loop are returned, in request
+    order, for the caller to refuse: a schedule keeps or drops the marks the
+    rule places, and cannot mark a loop the rule does not find safe to mark.
+    Both compilers call this on their lowered kernel, so one request leaves the
+    same loops marked in both.
+    """
+
+    if requested is None:
+        return ()
+    collector = _VectorMarkedLoops()
+    collector.walk(list(stmts))
+    wanted = set(requested)
+    matched: Set[str] = set()
+    for loop in collector.loops:
+        identity = loop.scorch_index_var
+        if identity is not None and identity in wanted:
+            matched.add(identity)
+        else:
+            loop.simd = False
+    return tuple(name for name in requested if name not in matched)
 
 
 def _names_read(expr: object) -> List[str]:
@@ -1245,7 +1402,9 @@ class IterationLattice:
                 ):
                     return [LatticePoint(dense_tensor_accesses=[cin])]
                 return [LatticePoint(sparse_tensor_accesses=[cin])]
-            raise NotImplementedError(f"Unsupported CIN: {cin}")
+            raise ScorchNotImplementedError(
+                f"Unsupported CIN: {cin}", code="iteration_lattice_cin_unsupported"
+            )
 
         lattice_points: List[LatticePoint] = get_lattice_points_from_cin(
             self.for_all_stmt
@@ -1291,7 +1450,10 @@ class IterationLattice:
         # If any of the lattice points have no iterators, then the iteration domain is the universe
         if any([not lp.sparse_tensor_accesses for lp in lattice_points]):
             self.dense_index_var = curr_index_var
-            assert self.cin_lowerer, "cin_lowerer must be set"
+            if not self.cin_lowerer:
+                raise ScorchAssertionError(
+                    "cin_lowerer must be set", code="iteration_lattice_state_missing"
+                )
             self.dense_index_var_llir = self.cin_lowerer.lower_IndexVar(curr_index_var)
             # first get the lattice point with no iterators
             dense_lattice_point = next(
@@ -1321,7 +1483,10 @@ class IterationLattice:
         return lattice_points
 
     def get_lattice_points(self) -> Sequence[LatticePoint]:
-        assert self.lattice_points is not None, "Lattice points not generated"
+        if self.lattice_points is None:
+            raise ScorchAssertionError(
+                "Lattice points not generated", code="iteration_lattice_state_missing"
+            )
         return self.lattice_points
 
     def gen_parent_to_children_lattice_points(
@@ -1366,7 +1531,10 @@ class IterationLattice:
         # DONE: handle dense iterators
         iterator_init_stmts: List[llir.Stmt] = []
         lattice_points = self.get_lattice_points()
-        assert len(lattice_points) > 0, "No lattice points generated"
+        if not (len(lattice_points) > 0):
+            raise ScorchAssertionError(
+                "No lattice points generated", code="iteration_lattice_state_missing"
+            )
         all_mode_iterators = lattice_points[0].get_iterators()
 
         # if self.dense_index_var_llir:
@@ -1404,7 +1572,10 @@ class IterationLattice:
         return iterator_init_stmts
 
     def get_dense_iterator_init_stmt(self) -> llir.VarInit:
-        assert self.dense_index_var_llir is not None, "Dense index var not set"
+        if self.dense_index_var_llir is None:
+            raise ScorchAssertionError(
+                "Dense index var not set", code="iteration_lattice_state_missing"
+            )
         return llir.VarInit(
             var=self.dense_index_var_llir,
             value=llir.Literal(value=0, data_type=llir.DataType.INT),
@@ -1413,7 +1584,10 @@ class IterationLattice:
     def _tile_bound_var(self, parent_index_var: IndexVar) -> str | None:
         """Return the dimension-size variable name that bounds *parent_index_var*
         in the first dense tensor access that contains it, or None."""
-        assert self.cin_lowerer is not None
+        if self.cin_lowerer is None:
+            raise ScorchAssertionError(
+                "self.cin_lowerer is not None", code="iteration_lattice_state_missing"
+            )
         lattice_points = self.get_lattice_points()
         for lp in lattice_points:
             for ta in lp.get_dense_tensor_accesses():
@@ -1425,7 +1599,10 @@ class IterationLattice:
 
     def _should_use_scalar_accum(self, index_var: IndexVar) -> bool:
         """Check if this ForAll should use scalar accumulation for child reduction."""
-        assert self.cin_lowerer is not None
+        if self.cin_lowerer is None:
+            raise ScorchAssertionError(
+                "self.cin_lowerer is not None", code="iteration_lattice_state_missing"
+            )
         result_tensor_access = self.cin_lowerer.result_tensor_access
         result_tensor_var = self.cin_lowerer.result_tensor_var
         if result_tensor_access is None or result_tensor_var is None:
@@ -1458,13 +1635,20 @@ class IterationLattice:
         self, lattice_point: "LatticePoint", index_var: IndexVar
     ) -> list:
         """Get child subregion loops, wrapping with scalar accumulation if needed."""
-        assert self.cin_lowerer is not None
+        if self.cin_lowerer is None:
+            raise ScorchAssertionError(
+                "self.cin_lowerer is not None", code="iteration_lattice_state_missing"
+            )
         result_tensor_access = self.cin_lowerer.result_tensor_access
         result_tensor_var = self.cin_lowerer.result_tensor_var
 
         use_scalar_accum = self._should_use_scalar_accum(index_var)
         if use_scalar_accum:
-            assert result_tensor_access is not None
+            if result_tensor_access is None:
+                raise ScorchAssertionError(
+                    "result_tensor_access is not None",
+                    code="iteration_lattice_state_missing",
+                )
             self.cin_lowerer._require_scalar_accumulation_driver(
                 result_tensor_access, self.for_all_stmt
             )
@@ -1479,8 +1663,16 @@ class IterationLattice:
         if use_scalar_accum:
             self.cin_lowerer._scalar_accum_mode = False
             self.cin_lowerer._used_scalar_accum = True
-            assert result_tensor_var is not None
-            assert result_tensor_access is not None
+            if result_tensor_var is None:
+                raise ScorchAssertionError(
+                    "result_tensor_var is not None",
+                    code="iteration_lattice_state_missing",
+                )
+            if result_tensor_access is None:
+                raise ScorchAssertionError(
+                    "result_tensor_access is not None",
+                    code="iteration_lattice_state_missing",
+                )
             result_name = result_tensor_var.name
             n_levels = result_tensor_var.levels
             pos_var = f"p{result_name}{n_levels - 1}"
@@ -1566,31 +1758,7 @@ class IterationLattice:
     @staticmethod
     def _mark_simd_on_reduction_loops(stmts: list) -> None:
         """Mark dense reduction loops inside scalar accumulation for SIMD."""
-        from .parallel_marking_pass import has_sparse_inner_loop
-
-        def contains_break(body: list) -> bool:
-            for child in body:
-                if isinstance(child, llir.Break):
-                    return True
-                if isinstance(child, (llir.ForLoop, llir.WhileLoop)):
-                    if contains_break(child.body):
-                        return True
-                elif isinstance(child, llir.IfThenElse):
-                    branches = [child.then_body, child.else_body]
-                    branches.extend(child.then_body_list or [])
-                    if any(branch and contains_break(branch) for branch in branches):
-                        return True
-            return False
-
-        for stmt in stmts:
-            if isinstance(stmt, llir.ForLoop):
-                if (
-                    not has_sparse_inner_loop(stmt.body)
-                    and not stmt.omp_parallel_for
-                    and not stmt.unroll
-                    and not contains_break(stmt.body)
-                ):
-                    stmt.simd = True
+        mark_simd_on_reduction_loops(stmts)
 
     def _dense_result_levels_resolved_at(
         self, result_tensor_access: TensorAccess, level: int
@@ -1624,7 +1792,10 @@ class IterationLattice:
         for a variable an inner loop binds.
         """
 
-        assert self.cin_lowerer is not None, "cin_lowerer must be set"
+        if self.cin_lowerer is None:
+            raise ScorchAssertionError(
+                "cin_lowerer must be set", code="iteration_lattice_state_missing"
+            )
         bound = [
             enclosing.parent if enclosing.has_parent else enclosing
             for enclosing in self.cin_lowerer._enclosing_forall_vars
@@ -1661,7 +1832,10 @@ class IterationLattice:
         resolve assigns.
         """
 
-        assert self.cin_lowerer is not None, "cin_lowerer must be set"
+        if self.cin_lowerer is None:
+            raise ScorchAssertionError(
+                "cin_lowerer must be set", code="iteration_lattice_state_missing"
+            )
         result_name = result_tensor_access.get_tensor().get_name()
         level_vars = result_tensor_access.get_sorted_index_vars()
         coordinate = llir.Var(name=level_vars[level].name, type=llir.DataType.INT)
@@ -1712,7 +1886,10 @@ class IterationLattice:
         below a compressed one; see :func:`dense_block_commit`.
         """
 
-        assert self.cin_lowerer is not None, "cin_lowerer must be set"
+        if self.cin_lowerer is None:
+            raise ScorchAssertionError(
+                "cin_lowerer must be set", code="iteration_lattice_state_missing"
+            )
         if level == 0:
             return []
         parent_index_var = result_tensor_access.get_parent_index_var(index_var)
@@ -1730,7 +1907,10 @@ class IterationLattice:
         Generate the outermost loops, one for each lattice point.
 
         """
-        assert self.cin_lowerer is not None, "cin_lowerer must be set"
+        if self.cin_lowerer is None:
+            raise ScorchAssertionError(
+                "cin_lowerer must be set", code="iteration_lattice_state_missing"
+            )
 
         stmts: List[llir.Stmt] = []
 
@@ -1738,23 +1918,42 @@ class IterationLattice:
         lattice_point = lattice_points[0]
 
         result_tensor_var = self.cin_lowerer.result_tensor_var
-        assert result_tensor_var is not None, "Result tensor var not set"
+        if result_tensor_var is None:
+            raise ScorchAssertionError(
+                "Result tensor var not set", code="iteration_lattice_state_missing"
+            )
         result_tensor_name = result_tensor_var.name
         result_tensor_access = self.cin_lowerer.result_tensor_access
-        assert result_tensor_access is not None, "Result tensor access not set"
+        if result_tensor_access is None:
+            raise ScorchAssertionError(
+                "Result tensor access not set", code="iteration_lattice_state_missing"
+            )
 
         current_index_var = lattice_point.get_index_var()
 
+        # Before the loops over the first level of a dense block below a
+        # compressed level: the check that the block the pending coordinate
+        # opens ends within the position bound, before the loops form and
+        # narrow its positions.  Emitted exactly where the block's commit is.
+        block_opens: List[llir.Stmt] = []
         if result_tensor_access.has_index_var(current_index_var):
             level = result_tensor_access.level_of_index_var(current_index_var)
             level_type = result_tensor_access.level_type_of_index_var(current_index_var)
 
             if level_type == LevelType.DENSE:
-                stmts.extend(
-                    self._dense_block_commit_stmts(
-                        result_tensor_access, current_index_var, level
-                    )
+                commit = self._dense_block_commit_stmts(
+                    result_tensor_access, current_index_var, level
                 )
+                if commit:
+                    block_opens.append(
+                        dense_block_check(
+                            self.cin_lowerer.result_levels_bounded_in_kernel,
+                            result_tensor_name,
+                            result_tensor_access.level_types(),
+                            level,
+                        )
+                    )
+                stmts.extend(commit)
             if level_type == LevelType.COMPRESSED:
                 stmts.extend(
                     [
@@ -1769,7 +1968,11 @@ class IterationLattice:
                     parent_index_var = result_tensor_access.get_parent_index_var(
                         current_index_var
                     )
-                    assert parent_index_var is not None, "Parent index var is None"
+                    if parent_index_var is None:
+                        raise ScorchAssertionError(
+                            "Parent index var is None",
+                            code="iteration_lattice_state_missing",
+                        )
                     parent_level_type = result_tensor_access.level_type_of_index_var(
                         parent_index_var
                     )
@@ -1833,7 +2036,11 @@ class IterationLattice:
                     parent_index_var = result_tensor_access.get_parent_index_var(
                         lattice_point.get_index_var()
                     )
-                    assert parent_index_var is not None, "Parent index var is None"
+                    if parent_index_var is None:
+                        raise ScorchAssertionError(
+                            "Parent index var is None",
+                            code="iteration_lattice_state_missing",
+                        )
                     if (
                         result_tensor_access.level_type_of_index_var(parent_index_var)
                         == LevelType.COMPRESSED
@@ -1898,11 +2105,19 @@ class IterationLattice:
                     )
 
         def gen_single_lattice_loop(lattice_point: LatticePoint) -> List[llir.Stmt]:
-            assert self.cin_lowerer, "CINLowerer not set"
-            assert result_tensor_var is not None, "Result tensor var is None"
-            assert isinstance(
-                result_tensor_access, TensorAccess
-            ), "Result tensor access is None"
+            if not self.cin_lowerer:
+                raise ScorchAssertionError(
+                    "CINLowerer not set", code="iteration_lattice_state_missing"
+                )
+            if result_tensor_var is None:
+                raise ScorchAssertionError(
+                    "Result tensor var is None", code="iteration_lattice_state_missing"
+                )
+            if not (isinstance(result_tensor_access, TensorAccess)):
+                raise ScorchAssertionError(
+                    "Result tensor access is None",
+                    code="iteration_lattice_state_missing",
+                )
 
             stmts: List[llir.Stmt] = []
 
@@ -2175,7 +2390,8 @@ class IterationLattice:
         )
 
         return (
-            flatten_2d_list(
+            block_opens
+            + flatten_2d_list(
                 [
                     [
                         *gen_single_lattice_loop(p),

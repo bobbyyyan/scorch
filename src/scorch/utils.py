@@ -7,9 +7,10 @@ import pickle
 import shutil
 import subprocess
 import sys
+import tempfile
 import time
 from collections import defaultdict, deque
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from importlib import resources
 from itertools import chain
 from typing import (
@@ -26,7 +27,15 @@ from typing import (
 
 import torch
 from .compiler.llir import DataType
-from .exceptions import EinsumLoopOrderError
+from .exceptions import (
+    EinsumLoopOrderError,
+    ScorchImportError,
+    ScorchOSError,
+    ScorchRuntimeError,
+    ScorchTypeError,
+    ScorchValueError,
+    defect_code,
+)
 from .format import parse_format  # noqa: F401 - compatibility re-export
 
 if TYPE_CHECKING:
@@ -38,7 +47,10 @@ _NATIVE_RESOURCES = resources.files("scorch").joinpath("csrc")
 def native_resource_text(filename: str) -> str:
     """Read a packaged native source or header as UTF-8 text."""
     if filename in {"", ".", ".."} or "/" in filename or "\\" in filename:
-        raise ValueError("filename must name a file directly under scorch/csrc")
+        raise ScorchValueError(
+            "filename must name a file directly under scorch/csrc",
+            code="internal_argument_type_invalid",
+        )
     return _NATIVE_RESOURCES.joinpath(filename).read_text(encoding="utf-8")
 
 
@@ -50,6 +62,68 @@ def _policy_header_text() -> str:
     return tuned_text + base
 
 
+# The files ``jit_preamble_text`` joins.  The last one is the optional local tuning
+# header, which usually does not exist.
+_PREAMBLE_RESOURCE_NAMES = (
+    "header.h",
+    "native_abi.h",
+    "scorch_policy.h",
+    "scorch_policy_tuned.h",
+)
+# (resource root, paths of the files above under it), so the paths are built once.
+_preamble_paths_memo: Optional[Tuple[Any, Optional[Tuple[str, ...]]]] = None
+# (file identity, preamble text): the text last joined and the files it was joined from.
+_preamble_text_memo: Optional[Tuple[Tuple[object, ...], str]] = None
+
+
+def _preamble_resource_paths() -> Optional[Tuple[str, ...]]:
+    """Paths of the preamble's files, or None when the package is not plain files."""
+    global _preamble_paths_memo
+    root = _NATIVE_RESOURCES
+    memo = _preamble_paths_memo
+    if memo is not None and memo[0] is root:
+        return memo[1]
+    paths: Optional[Tuple[str, ...]] = None
+    if isinstance(root, os.PathLike):
+        directory = os.fspath(root)
+        paths = tuple(
+            os.path.join(directory, name) for name in _PREAMBLE_RESOURCE_NAMES
+        )
+    _preamble_paths_memo = (root, paths)
+    return paths
+
+
+def jit_preamble_file_identity() -> Optional[Tuple[object, ...]]:
+    """Identify the files behind ``jit_preamble_text`` without reading them.
+
+    Each file contributes its path, size, modification time in nanoseconds and inode
+    number, or its path alone when it does not exist.  The preamble text is a function
+    of these files, so a caller may reuse anything it derived from the text for as long
+    as this value compares equal.  The cost is one ``stat`` per file.
+
+    Returns None when the package is not stored as plain files (a zip archive, for
+    example): nothing short of reading the text identifies it then.
+    """
+    paths = _preamble_resource_paths()
+    if paths is None:
+        return None
+    identity: List[Tuple[object, ...]] = []
+    optional = len(paths) - 1
+    for position, path in enumerate(paths):
+        # The tuning header is usually absent.  Asking first keeps every public call
+        # from raising and catching an exception for it.
+        if position == optional and not os.access(path, os.F_OK):
+            identity.append((path,))
+            continue
+        try:
+            status = os.stat(path)
+        except OSError:
+            identity.append((path,))
+        else:
+            identity.append((path, status.st_size, status.st_mtime_ns, status.st_ino))
+    return tuple(identity)
+
+
 def jit_preamble_text() -> str:
     """Return the complete packaged C++ preamble used by generated kernels.
 
@@ -58,16 +132,41 @@ def jit_preamble_text() -> str:
     Expanding the packaged policy header into the template keeps each generated
     translation unit self-contained and also works for non-filesystem resource
     loaders.
+
+    The files are read and joined again only when ``jit_preamble_file_identity``
+    changes; otherwise the same ``str`` object is returned.  Without a file identity
+    the text is read on every call, as it was before the text was kept.
     """
+    global _preamble_text_memo
+    identity = jit_preamble_file_identity()
+    memo = _preamble_text_memo
+    if identity is not None and memo is not None and memo[0] == identity:
+        return memo[1]
+    text = _read_jit_preamble_text()
+    # Keep the text only if no file changed while it was being read: otherwise the
+    # text could be newer than the identity it would be stored under.
+    if identity is not None and identity == jit_preamble_file_identity():
+        _preamble_text_memo = (identity, text)
+    return text
+
+
+def _read_jit_preamble_text() -> str:
+    """Read and join the packaged preamble files."""
     template = native_resource_text("header.h")
     abi_include = '#include "native_abi.h"'
     if template.count(abi_include) != 1:
-        raise RuntimeError("packaged header.h must include native_abi.h once")
+        raise ScorchRuntimeError(
+            "packaged header.h must include native_abi.h once",
+            code="packaged_header_invalid",
+        )
     template = template.replace(abi_include, native_resource_text("native_abi.h"), 1)
 
     include = '#include "scorch_policy.h"'
     if template.count(include) != 1:
-        raise RuntimeError("packaged header.h must include scorch_policy.h once")
+        raise ScorchRuntimeError(
+            "packaged header.h must include scorch_policy.h once",
+            code="packaged_header_invalid",
+        )
     return template.replace(include, _policy_header_text(), 1)
 
 
@@ -81,7 +180,10 @@ def _resolve_compile_options(
     if compile_options is None:
         return CompileOptions.from_environment()
     if type(compile_options) is not CompileOptions:
-        raise TypeError("compile_options must be a CompileOptions instance")
+        raise ScorchTypeError(
+            "compile_options must be a CompileOptions instance",
+            code="internal_argument_type_invalid",
+        )
     return compile_options
 
 
@@ -133,18 +235,27 @@ def _validate_prepared_jit_build(prepared: object) -> _PreparedJITBuild:
     """Validate that one pre-native carrier has a coherent frozen identity."""
 
     if type(prepared) is not _PreparedJITBuild:
-        raise TypeError("prepared JIT build must be an exact _PreparedJITBuild")
+        raise ScorchTypeError(
+            "prepared JIT build must be an exact _PreparedJITBuild",
+            code="jit_build_request_invalid",
+        )
     typed_prepared = prepared
     request = _validate_jit_build_request(typed_prepared.request)
     expected_cache_key = (request.name, _request_cache_key(request))
     if typed_prepared.cache_key != expected_cache_key:
-        raise ValueError("prepared JIT cache key disagrees with its build request")
+        raise ScorchValueError(
+            "prepared JIT cache key disagrees with its build request",
+            code="jit_build_request_invalid",
+        )
     expected_so_path = os.path.join(
         request.build_directory,
         f"{request.name}.so",
     )
     if typed_prepared.so_path != expected_so_path:
-        raise ValueError("prepared JIT path disagrees with its build request")
+        raise ScorchValueError(
+            "prepared JIT path disagrees with its build request",
+            code="jit_build_request_invalid",
+        )
     return typed_prepared
 
 
@@ -152,17 +263,26 @@ def _validate_jit_build_request(request: object) -> _JITBuildRequest:
     from .compiler.compile_options import KernelBuildOptions
 
     if type(request) is not _JITBuildRequest:
-        raise TypeError("JIT build payload must be an exact _JITBuildRequest")
+        raise ScorchTypeError(
+            "JIT build payload must be an exact _JITBuildRequest",
+            code="jit_build_request_invalid",
+        )
     typed_request = request
     if type(typed_request.build_options) is not KernelBuildOptions:
-        raise TypeError("JIT build payload must own exact KernelBuildOptions")
+        raise ScorchTypeError(
+            "JIT build payload must own exact KernelBuildOptions",
+            code="jit_build_request_invalid",
+        )
     string_fields = (
         ("name", typed_request.name),
         ("build_directory", typed_request.build_directory),
     )
     for field_name, string_value in string_fields:
         if type(string_value) is not str or not string_value:
-            raise TypeError(f"JIT build {field_name} must be a non-empty string")
+            raise ScorchTypeError(
+                f"JIT build {field_name} must be a non-empty string",
+                code="jit_build_request_invalid",
+            )
     sequence_fields = (
         ("cpp_sources", typed_request.cpp_sources),
         ("functions", typed_request.functions),
@@ -173,18 +293,32 @@ def _validate_jit_build_request(request: object) -> _JITBuildRequest:
         if type(sequence_value) is not tuple or any(
             type(item) is not str or not item for item in sequence_value
         ):
-            raise TypeError(f"JIT build {field_name} must be an exact tuple of strings")
+            raise ScorchTypeError(
+                f"JIT build {field_name} must be an exact tuple of strings",
+                code="jit_build_request_invalid",
+            )
     if not typed_request.cpp_sources or not typed_request.functions:
-        raise ValueError("JIT build sources and functions must be non-empty")
+        raise ScorchValueError(
+            "JIT build sources and functions must be non-empty",
+            code="jit_build_request_invalid",
+        )
     if typed_request.extra_cflags not in (
         typed_request.build_options.extra_cflags,
         typed_request.build_options.special_kernel_cflags,
     ):
-        raise ValueError("JIT build compiler flags disagree with KernelBuildOptions")
+        raise ScorchValueError(
+            "JIT build compiler flags disagree with KernelBuildOptions",
+            code="jit_build_request_invalid",
+        )
     if typed_request.extra_ldflags != typed_request.build_options.extra_ldflags:
-        raise ValueError("JIT build linker flags disagree with KernelBuildOptions")
+        raise ScorchValueError(
+            "JIT build linker flags disagree with KernelBuildOptions",
+            code="jit_build_request_invalid",
+        )
     if not os.path.isabs(typed_request.build_directory):
-        raise ValueError("JIT build directory must be absolute")
+        raise ScorchValueError(
+            "JIT build directory must be absolute", code="jit_build_request_invalid"
+        )
     return typed_request
 
 
@@ -256,9 +390,10 @@ def _verify_snapshotted_build_runtime(request: _JITBuildRequest) -> None:
         if observed_wrapper_path != options.compiler_wrapper_path:
             mismatches.append("compiler_wrapper_path")
     if mismatches:
-        raise RuntimeError(
+        raise ScorchRuntimeError(
             "JIT build runtime differs from CompileOptions snapshot: "
-            + ", ".join(mismatches)
+            + ", ".join(mismatches),
+            code="jit_build_runtime_mismatch",
         )
 
 
@@ -267,9 +402,18 @@ def _verify_snapshotted_build_runtime(request: _JITBuildRequest) -> None:
 _JIT_BUILD_ERROR_MARKER = "@@scorch-jit-build-error@@\n"
 # Exception types the parent re-raises as themselves; any other becomes a
 # RuntimeError with the same message.
+# The type a build child reported, by name, and the Scorch variant the parent raises:
+# the same built-in, carrying the child's code.
 _JIT_BUILD_CHILD_ERRORS = {
-    error_type.__name__: error_type
-    for error_type in (RuntimeError, ImportError, OSError, ValueError, TypeError)
+    name: variant
+    for builtin, variant in (
+        (RuntimeError, ScorchRuntimeError),
+        (ImportError, ScorchImportError),
+        (OSError, ScorchOSError),
+        (ValueError, ScorchValueError),
+        (TypeError, ScorchTypeError),
+    )
+    for name in (builtin.__name__, variant.__name__)
 }
 
 
@@ -298,16 +442,29 @@ def _run_jit_build_request() -> None:
     except Exception as error:
         sys.stderr.write(
             _JIT_BUILD_ERROR_MARKER
-            + json.dumps({"type": type(error).__name__, "message": str(error)})
+            + json.dumps(
+                {
+                    "type": type(error).__name__,
+                    "message": str(error),
+                    "code": defect_code(error),
+                }
+            )
         )
         sys.stderr.flush()
         raise SystemExit(1)
 
 
 def _raise_for_jit_build_child(
-    name: str, completed: "subprocess.CompletedProcess[bytes]"
+    name: str,
+    completed: "subprocess.CompletedProcess[bytes]",
+    *,
+    where: str = "",
 ) -> None:
-    """Forward the build child's stderr and re-raise the error that stopped it."""
+    """Forward the build child's stderr and re-raise the error that stopped it.
+
+    ``where`` is added to the error's message: the sentence ``_keep_failed_build``
+    returns, saying where a failed build's files are kept.
+    """
 
     stderr = (completed.stderr or b"").decode("utf-8", errors="replace")
     log, marker, payload = stderr.partition(_JIT_BUILD_ERROR_MARKER)
@@ -318,11 +475,14 @@ def _raise_for_jit_build_child(
         return
     if marker:
         error = json.loads(payload)
-        error_type = _JIT_BUILD_CHILD_ERRORS.get(error["type"], RuntimeError)
-        raise error_type(error["message"])
-    raise RuntimeError(
+        error_type = _JIT_BUILD_CHILD_ERRORS.get(error["type"], ScorchRuntimeError)
+        raise error_type(
+            error["message"] + where, code=error.get("code") or "jit_build_failed"
+        )
+    raise ScorchRuntimeError(
         f"JIT build child for {name!r} exited with status "
-        f"{completed.returncode} before reporting an error:\n{log}"
+        f"{completed.returncode} before reporting an error:\n{log}{where}",
+        code="jit_build_failed",
     )
 
 
@@ -363,39 +523,214 @@ def _build_identity_digest(
 def _load_extension_file(name: str, so_path: str) -> Any:
     spec = importlib.util.spec_from_file_location(name, so_path)
     if spec is None or spec.loader is None:
-        raise RuntimeError(f"could not load compiled extension {so_path}")
+        raise ScorchRuntimeError(
+            f"could not load compiled extension {so_path}",
+            code="jit_extension_load_failed",
+        )
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
     return module
 
 
+# A build's private directory is made inside the build directory, so that it is on the
+# same filesystem as the final path; the lock file lets one process at a time build there.
+# A builder that holds the lock builds in _JIT_STAGING_NAME, so every build of a kernel
+# writes the same paths (into build.ninja and the compiler's messages); without the lock
+# each builder makes a directory of its own, whose 8-character random suffix is never
+# "build".  Both names start with _JIT_STAGING_PREFIX.
+_JIT_STAGING_PREFIX = ".scorch-staging-"
+_JIT_STAGING_NAME = _JIT_STAGING_PREFIX + "build"
+_JIT_BUILD_LOCK_NAME = ".scorch-build.lock"
+
+
+def _lock_jit_build_directory(build_directory: str) -> Tuple[Optional[int], bool]:
+    """Wait for the build directory's lock; return its descriptor and whether it is held.
+
+    ``flock`` is advisory and belongs to the open file, so the kernel releases it when
+    the process holding it dies: a killed builder never leaves a lock behind, as torch's
+    build lock (a file created with ``O_EXCL``) does. Where there is no ``flock`` the
+    lock is not held and builds may overlap; publishing stays atomic either way.
+    """
+
+    try:
+        import fcntl
+    except ImportError:  # no fcntl on this platform
+        return None, False
+    descriptor = os.open(
+        os.path.join(build_directory, _JIT_BUILD_LOCK_NAME),
+        os.O_RDWR | os.O_CREAT,
+        0o644,
+    )
+    try:
+        fcntl.flock(descriptor, fcntl.LOCK_EX)
+    except OSError:  # the filesystem has no flock
+        return descriptor, False
+    return descriptor, True
+
+
+def _publish_staged_build(staging: str, build_directory: str, name: str) -> None:
+    """Move a finished build's files into the build directory, the ``.so`` last.
+
+    ``os.replace`` is atomic on one filesystem, so ``<name>.so`` appears on its final
+    path whole or not at all. The sources and the ninja file come first, so the build
+    directory holds what an in-place build left there (``main.cpp``, ``build.ninja``).
+    """
+
+    library = f"{name}.so"
+    for entry in os.scandir(staging):
+        if entry.name not in (library, "lock") and entry.is_file(follow_symlinks=False):
+            os.replace(entry.path, os.path.join(build_directory, entry.name))
+    staged_library = os.path.join(staging, library)
+    if os.path.isfile(staged_library):
+        os.replace(staged_library, os.path.join(build_directory, library))
+
+
+def _keep_failed_build(staging: str, build_directory: str, name: str) -> str:
+    """Leave a failed build's files where they can be read; say where they are.
+
+    The staging directory stays, so the paths in the compiler's messages name files
+    that exist, and its files are also copied into the build directory, where an
+    in-place build left them before 0064 (``main.cpp`` above all). The ``.so`` is
+    never copied: a failed link can leave part of one. The next build of the kernel
+    removes the staging directory and replaces the copies.
+
+    Returns the sentence the build's error adds, or ``""`` when the build left no
+    file (the child stopped before writing one, as on a runtime-snapshot mismatch);
+    the caller then removes the empty directory and the error is unchanged.
+    """
+
+    library = f"{name}.so"
+    left = [
+        entry
+        for entry in os.scandir(staging)
+        if entry.name != "lock" and entry.is_file(follow_symlinks=False)
+    ]
+    if not left:
+        return ""
+    copied = []
+    for entry in left:
+        if entry.name == library:
+            continue
+        try:
+            shutil.copy2(entry.path, os.path.join(build_directory, entry.name))
+            copied.append(entry.name)
+        except OSError:  # the build's own error, raised next, matters more
+            pass
+    also = f" (main.cpp also in {build_directory})" if "main.cpp" in copied else ""
+    return (
+        f"\nThe failed build's files are kept in {staging}{also}; the next build of "
+        "this kernel replaces them."
+    )
+
+
+def _new_staging_directory(build_directory: str, held: bool) -> str:
+    """Make the empty directory a build runs in.
+
+    With the lock held, the earlier builds' directories were just removed, and
+    ``_JIT_STAGING_NAME`` is made afresh. When one of them could not be removed (so
+    ``os.mkdir`` finds it), or the lock is not held, a new directory with a random name
+    is made instead. No directory is ever built in twice, so nothing an earlier build
+    left there can be published.
+    """
+
+    if held:
+        staging = os.path.join(build_directory, _JIT_STAGING_NAME)
+        try:
+            os.mkdir(staging)
+            return staging
+        except FileExistsError:
+            pass
+    return tempfile.mkdtemp(prefix=_JIT_STAGING_PREFIX, dir=build_directory)
+
+
+def _run_jit_build_child_privately(
+    request: _JITBuildRequest, *, toolchain_directory: Optional[str]
+) -> "subprocess.CompletedProcess[bytes]":
+    """Run the build child in a private directory and publish what it builds.
+
+    ``_load_validated_prepared_kernel`` imports any ``<name>.so`` it finds without a
+    lock, and torch's build lock is taken only by builders, so a child that linked the
+    ``.so`` in place let other processes import a file still being written ("file too
+    short"). The child now builds in a directory of its own inside the build directory
+    (``_new_staging_directory``) and the finished files are published with
+    ``_publish_staged_build``; a builder killed before that leaves nothing on the final
+    path. One process at a time builds in a build directory: one that waited for the
+    lock finds the published ``.so`` and runs no child, and with the lock held, the
+    directories that killed or failed builds left behind are removed first. A failed
+    build keeps its files (``_keep_failed_build``), and the error it raises names them.
+    """
+
+    build_directory = request.build_directory
+    so_path = os.path.join(build_directory, f"{request.name}.so")
+    descriptor, held = _lock_jit_build_directory(build_directory)
+    try:
+        if os.path.isfile(so_path):  # published while this process waited
+            return subprocess.CompletedProcess([], 0, None, b"")
+        if held:
+            for entry in os.scandir(build_directory):
+                if entry.name.startswith(_JIT_STAGING_PREFIX) and entry.is_dir(
+                    follow_symlinks=False
+                ):
+                    shutil.rmtree(entry.path, ignore_errors=True)
+        staging = _new_staging_directory(build_directory, held)
+        failed, where = False, ""
+        try:
+            completed = subprocess.run(
+                [
+                    request.build_options.python_executable,
+                    "-P",
+                    "-c",
+                    "from scorch.utils import _run_jit_build_request; "
+                    "_run_jit_build_request()",
+                ],
+                input=pickle.dumps(replace(request, build_directory=staging)),
+                env=_jit_build_environment_from_request(
+                    request,
+                    toolchain_directory=toolchain_directory,
+                ),
+                stderr=subprocess.PIPE,
+                check=False,
+            )
+            # A failure as _raise_for_jit_build_child reads one: a nonzero exit, or an
+            # error the child reported (it exits 1 after reporting, so both hold).
+            reported = _JIT_BUILD_ERROR_MARKER.encode() in (completed.stderr or b"")
+            if completed.returncode == 0 and not reported:
+                _publish_staged_build(staging, build_directory, request.name)
+            else:
+                failed = True
+                where = _keep_failed_build(staging, build_directory, request.name)
+        finally:
+            if not where:  # published, empty, or abandoned before the child finished
+                shutil.rmtree(staging, ignore_errors=True)
+        if failed:
+            _raise_for_jit_build_child(request.name, completed, where=where)
+        return completed
+    finally:
+        if descriptor is not None:
+            os.close(descriptor)  # releases the lock
+
+
 def _build_and_load_extension(request: _JITBuildRequest) -> Any:
-    """Compile in a child with frozen process state, then import the result."""
+    """Compile in a child with frozen process state, then import the result.
+
+    The child builds privately and its ``.so`` is published atomically
+    (``_run_jit_build_child_privately``), so the ``.so`` is never seen half written.
+    """
 
     request = _validate_jit_build_request(request)
     os.makedirs(request.build_directory, exist_ok=True)
     toolchain_directory = _prepare_compiler_toolchain(request)
     so_path = os.path.join(request.build_directory, f"{request.name}.so")
     if not os.path.isfile(so_path):
-        completed = subprocess.run(
-            [
-                request.build_options.python_executable,
-                "-P",
-                "-c",
-                "from scorch.utils import _run_jit_build_request; "
-                "_run_jit_build_request()",
-            ],
-            input=pickle.dumps(request),
-            env=_jit_build_environment_from_request(
-                request,
-                toolchain_directory=toolchain_directory,
-            ),
-            stderr=subprocess.PIPE,
-            check=False,
+        completed = _run_jit_build_child_privately(
+            request, toolchain_directory=toolchain_directory
         )
         _raise_for_jit_build_child(request.name, completed)
     if not os.path.isfile(so_path):
-        raise RuntimeError(f"JIT build did not produce expected extension {so_path}")
+        raise ScorchRuntimeError(
+            f"JIT build did not produce expected extension {so_path}",
+            code="jit_build_output_missing",
+        )
     return _load_extension_file(request.name, so_path)
 
 
@@ -420,8 +755,9 @@ def _prepare_compiler_toolchain(request: _JITBuildRequest) -> Optional[str]:
     if not os.path.islink(launcher) or os.readlink(launcher) != (
         build_options.cxx_compiler_path
     ):
-        raise RuntimeError(
-            "JIT compiler launcher conflicts with the CompileOptions snapshot"
+        raise ScorchRuntimeError(
+            "JIT compiler launcher conflicts with the CompileOptions snapshot",
+            code="jit_build_request_invalid",
         )
     return toolchain_directory
 
@@ -473,9 +809,15 @@ def _prepare_jit_build(
     cflags_snapshot = tuple(extra_cflags)
     ldflags_snapshot = tuple(extra_ldflags)
     if cflags_snapshot != options.build.extra_cflags:
-        raise ValueError("extra_cflags must match the CompileOptions snapshot")
+        raise ScorchValueError(
+            "extra_cflags must match the CompileOptions snapshot",
+            code="jit_build_request_invalid",
+        )
     if ldflags_snapshot != options.build.extra_ldflags:
-        raise ValueError("extra_ldflags must match the CompileOptions snapshot")
+        raise ScorchValueError(
+            "extra_ldflags must match the CompileOptions snapshot",
+            code="jit_build_request_invalid",
+        )
 
     from torch.utils.cpp_extension import _get_build_directory
 
