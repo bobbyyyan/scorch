@@ -19,8 +19,12 @@ unmasked one, everywhere, as torch gives a sparse operand of torch.matmul (Bobby
 raises scorch gives the unmasked gradient). It is dense and strided when every other
 operand is dense, which is torch's layout for a sparse times a dense product, and is
 otherwise in ``X_k``'s own layout, computed as a sparse program: torch's layout for a
-product of two sparse operands of one layout, and the operand's where torch raises. The
-operand itself is the recorded input, so the gradient reaches it in that layout;
+product of two sparse operands of one layout, and the operand's where torch raises. A CSC
+operand's gradient is dense and strided in every product: torch's autograd engine accepts no
+CSC-layout gradient for a CSC leaf (torch 2.13 and 2.14: AccumulateGrad raises "Sparse CSC
+tensors do not have is_contiguous", and torch's own sparse product with a CSC operand raises
+in its backward), and dense is torch's layout for a CSC operand of a sparse times a dense
+product. The operand itself is the recorded input, so the gradient reaches it in that layout;
 ``torch.sparse.mm``, which scorch does not define, keeps torch's stored-entries gradient.
 
 ``G`` is an STensor over ``C``'s index arrays (a torch tensor when ``C`` is dense): the
@@ -111,10 +115,10 @@ def _tangent_of(tensor: torch.Tensor) -> bool:
 
 def _sparse_keywords(layout: torch.layout, term: str) -> Dict[str, Any]:
     """The keywords under which the compiler stores a gradient of ``term``'s rank the way
-    ``layout`` stores it: a matrix as CSR (``"ds"`` in mode order ``[0, 1]``), CSC
-    (``"ds"`` in mode order ``[1, 0]``, its columns outermost) or, for COO, CSR too -- its
-    stored coordinates are COO's, row-major and each once -- and any other rank as
-    coordinates in their own order.
+    ``layout`` stores it: a matrix as CSR (``"ds"`` in mode order ``[0, 1]``) or, for COO,
+    CSR too -- its stored coordinates are COO's, row-major and each once -- and any other
+    rank as coordinates in their own order. A CSC operand never comes here: its gradient is
+    dense (see the module's note).
 
     The mode order is always given: without one, einsum stores the result in the order
     its schedule finds (``temp_mode_order``), which follows the factors' -- so the
@@ -123,8 +127,6 @@ def _sparse_keywords(layout: torch.layout, term: str) -> Dict[str, Any]:
     ``[1, 0]``, which ``_to_torch_layout`` refuses (chk21v3 85360)."""
 
     if len(term) == 2:
-        if layout is torch.sparse_csc:
-            return {"format": "ds", "output_mode_order": [1, 0]}
         return {"format": "ds", "output_mode_order": [0, 1]}
     return {"format": "o" * len(term), "output_mode_order": list(range(len(term)))}
 
@@ -144,8 +146,6 @@ def _to_torch_layout(gradient: STensor, layout: torch.layout) -> torch.Tensor:
     indices = gradient._native_mode_indices()
     if levels == (LevelType.DENSE, LevelType.COMPRESSED):
         positions, coordinates = indices[1]
-        if layout is torch.sparse_csc and order == [1, 0]:
-            return torch.sparse_csc_tensor(positions, coordinates, values, shape)
         if order == [0, 1]:
             if layout is torch.sparse_csr:
                 return torch.sparse_csr_tensor(positions, coordinates, values, shape)
@@ -175,13 +175,17 @@ def _to_torch_layout(gradient: STensor, layout: torch.layout) -> torch.Tensor:
 
 
 def _dense_to_layout(dense: torch.Tensor, layout: torch.layout) -> torch.Tensor:
-    """A dense gradient in a torch sparse ``layout``, by torch's own conversion."""
+    """A dense gradient in a torch sparse ``layout``, CSR or COO, by torch's own conversion.
+    A CSC operand never comes here: its gradient is dense (see the module's note)."""
 
     if layout is torch.sparse_csr:
         return dense.to_sparse_csr()
-    if layout is torch.sparse_csc:
-        return dense.to_sparse_csc()
-    return dense.to_sparse_coo()
+    if layout is torch.sparse_coo:
+        return dense.to_sparse_coo()
+    raise ScorchAssertionError(
+        f"a {layout} gradient laid out from a dense one",
+        code="einsum_grad_torch_layout_unexpected",
+    )
 
 
 class _Program:
@@ -401,7 +405,8 @@ class _Program:
         """``dL/dX_k`` for a torch sparse ``X_k`` of ``layout``: unmasked, as torch gives a
         sparse operand its gradient (see the module's note).
 
-        Dense and strided when every other operand is dense. Otherwise in ``layout``,
+        Dense and strided when every other operand is dense, and for a CSC operand in every
+        product (see the module's note). Otherwise in ``layout``,
         computed by the compiler as a sparse program over the factors -- ``G`` and the
         other operands -- so it stores the coordinates their structures imply, as torch's
         sparse product does, and never materializes the dense gradient. A gradient that is
@@ -409,7 +414,7 @@ class _Program:
         dense and then laid out, since it is nonzero at every coordinate along that label.
         """
 
-        if all(_is_dense(x) for _, x in others):
+        if layout is torch.sparse_csc or all(_is_dense(x) for _, x in others):
             return self._dense_gradient(k, term, grad_output, others, logical=True)
         named = set(self.output)
         for other, _ in others:
@@ -536,7 +541,7 @@ def _over_torch_result(result: torch.Tensor) -> Optional[STensor]:
     """The STensor over a torch sparse matrix the forward returned, sharing its index
     arrays and its values in their order; None for any other torch sparse result.
 
-    ``scorch.matmul`` returns the product of two torch CSR operands in torch's type
+    ``scorch.matmul`` returns the product of two torch compressed operands in torch's type
     (ops._torch_csr_spgemm, ops._as_torch_compressed): a CSR tensor, or a CSC one when
     ``output_mode_order=[1, 0]`` stores its columns outermost. Each row's (column's)
     coordinates are sorted and distinct, so the STensor adopts the arrays as they are. A
@@ -597,7 +602,7 @@ def recorded(
     """``compute(expression, *tensors, **kwargs)`` -- the compiler's einsum, for a call
     through which a gradient is wanted -- computed without autograd on detached
     operands, and its result's values recorded as ``_EinsumValues``. A torch sparse
-    result (``scorch.matmul``'s for two torch CSR operands) is returned as a torch
+    result (``scorch.matmul``'s for two torch compressed operands) is returned as a torch
     tensor of its layout over the same arrays, whose values carry the record.
 
     ``refuse(result, why)`` records a result whose derivative this module does not
@@ -622,7 +627,7 @@ def recorded(
 
     with torch.no_grad():
         result = compute(expression, *(detached(x) for x in operands), **kwargs)
-    # A torch sparse result (scorch.matmul's for two torch CSR operands) is read through
+    # A torch sparse result (scorch.matmul's for two torch compressed operands) is read through
     # the STensor over its arrays, and returned as a torch tensor of its layout.
     torch_result: Optional[torch.Tensor] = None
     if type(result) is torch.Tensor and result.layout is not torch.strided:

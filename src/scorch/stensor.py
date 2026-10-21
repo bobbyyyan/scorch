@@ -568,9 +568,23 @@ except Exception:
     _NATIVE_INDEX_MEMBERS = None
 
 
+# The torch layouts from_torch adopts (patch 0073 added CSC). The block layouts, BSR and BSC,
+# are refused by code: they need blocked levels TensorFormat does not have. A module-level
+# tuple in this order, so a dense, COO or CSR tensor matches at the position it did in the
+# tuple this replaces, which from_torch built on every call. ops.matmul hands torch every
+# pair of torch tensors with no COO or CSR operand (its tier 1), so of matmul's torch pairs
+# only those with a COO or CSR operand reach from_torch.
+TORCH_ADOPTED_LAYOUTS = (
+    torch.strided,
+    torch.sparse_coo,
+    torch.sparse_csr,
+    torch.sparse_csc,
+)
+
+
 def _torch_index_members(tensor: torch.Tensor) -> Tuple[torch.Tensor, ...]:
     """A torch sparse tensor's index arrays as every cache must key them: (crow, col) for CSR,
-    (indices,) for COO.
+    (ccol, row) for CSC, (indices,) for COO.
 
     Not ``crow_indices()``/``col_indices()``/``indices()``: torch gives those aliases the sparse
     tensor's own version counter, so caches keyed on them never saw a write through the caller's
@@ -584,6 +598,8 @@ def _torch_index_members(tensor: torch.Tensor) -> Tuple[torch.Tensor, ...]:
         return tuple(_NATIVE_INDEX_MEMBERS(tensor))
     if tensor.layout == torch.sparse_csr:
         return tensor.crow_indices(), tensor.col_indices()
+    if tensor.layout == torch.sparse_csc:
+        return tensor.ccol_indices(), tensor.row_indices()
     return (tensor.indices(),)
 
 
@@ -719,6 +735,48 @@ def _linked(
             result, given, _grad.given_structure(result, mode_indices, given.numel())
         )
     return result
+
+
+def _csc_from_torch(
+    tensor: torch.Tensor,
+    name: Optional[str],
+    mode_order: List[int],
+    natural_order: bool,
+) -> "STensor":
+    """A torch CSC matrix as an STensor, its arrays adopted (``from_torch``, patch 0073).
+
+    A logical M x N CSC matrix's (ccol_indices, row_indices, values) are exactly the CSR
+    arrays of its N x M transpose, so it is stored as that: "ds" over the storage order
+    [1, 0] (columns, then rows), sharing the caller's arrays, as CSR's are shared. That
+    is its natural order, taken when no mode_order is given or [1, 0] is. An explicit
+    identity order asks for row-major storage, a different arrangement of the entries:
+    torch converts it (a copy), and the CSR is adopted. A CSC tensor with batch or dense
+    dimensions is refused, as ``from_csr`` refuses a CSR one of another rank. The values
+    keep their history (``_linked``), as a CSR or COO operand's do: the stored order of a
+    CSC's entries is its own, so the STensor's values are the caller's, one for one."""
+
+    if tensor.dim() != 2:
+        raise TensorStorageError(
+            "CSC tensors are only supported at rank 2, with no batch or dense "
+            f"dimensions (got rank {tensor.dim()})",
+            code="csc_rank_invalid",
+        )
+    if not natural_order and mode_order == [0, 1]:
+        return STensor.from_torch(tensor.to_sparse_csr(), name)
+    ccol_indices, row_indices = _torch_index_members(tensor)
+    rows, cols = tensor.shape
+    csc_values = tensor.values().resolve_conj().resolve_neg()
+    csc_indices: List[List[torch.Tensor]] = [[], [ccol_indices, row_indices]]
+    built = STensor._from_parts(
+        name,
+        (cols, rows),
+        "ds",
+        csc_indices,
+        csc_values,
+        mode_order=[1, 0],
+        adopt=True,  # shared with `tensor`, as torch shares them
+    )
+    return _linked(built, csc_values, csc_indices)
 
 
 def _dense_from_torch(
@@ -2498,19 +2556,29 @@ class STensor:
         """Create an STensor from a ``torch.Tensor``, auto-detecting layout.
 
         The primary constructor. Accepts a dense tensor, a ``torch.sparse_coo``
-        tensor, or a 2-D ``torch.sparse_csr`` tensor and picks the Scorch format
-        automatically:
+        tensor, or a 2-D ``torch.sparse_csr`` or ``torch.sparse_csc`` tensor and
+        picks the Scorch format automatically:
 
         - **dense** input → every mode ``DENSE`` (format ``"d,d,..."``); values
           are the row-major flattening.
         - **sparse_coo** input → coalesced; every mode ``COORDINATE``
           (format ``"o,o,..."``).
         - **sparse_csr** input (2-D) → format ``"d,s"`` (canonical CSR).
+        - **sparse_csc** input (2-D) → format ``"d,s"`` over the storage order
+          ``[1, 0]``: the CSC arrays are the CSR arrays of the transpose, shared,
+          not copied. An explicit identity ``mode_order`` converts it to CSR (a
+          copy) instead.
+
+        The block layouts (``sparse_bsr``, ``sparse_bsc``) are refused with
+        ``torch_layout_unsupported``: scorch has no blocked levels yet.
+        ``matmul`` hands torch every product of two torch tensors with no COO
+        or CSR operand, so a block or CSC operand times a dense one is torch's
+        product, as it always was.
 
         Parameters
         ----------
         tensor : torch.Tensor
-            The source tensor (dense, COO, or CSR).
+            The source tensor (dense, COO, CSR or CSC).
         name : str, optional
             Name for the tensor. Defaults to ``"tensor"``.
         mode_order : list of int, optional
@@ -2553,17 +2621,17 @@ class STensor:
             raise TensorStorageError(
                 "Scorch only supports CPU tensors", code="device_not_cpu_unsupported"
             )
-        if tensor.layout not in (
-            torch.strided,
-            torch.sparse_coo,
-            torch.sparse_csr,
-        ):
+        # Read once: the tests below would otherwise each ask torch for it, and
+        # every operand of every scorch call comes through here.
+        layout = tensor.layout
+        if layout not in TORCH_ADOPTED_LAYOUTS:
             raise TensorStorageError(
-                f"unsupported torch tensor layout {tensor.layout}",
+                f"unsupported torch tensor layout {layout}",
                 code="torch_layout_unsupported",
             )
         rank = tensor.dim()
         identity_order = list(range(rank))
+        natural_order = mode_order is None
         if mode_order is None:
             mode_order = identity_order
         else:
@@ -2588,13 +2656,15 @@ class STensor:
                     code="mode_order_not_permutation",
                 )
         mode_order = list(mode_order)
-        if tensor.layout == torch.sparse_csr and mode_order != identity_order:
+        if layout == torch.sparse_csc:
+            return _csc_from_torch(tensor, name, mode_order, natural_order)
+        if layout == torch.sparse_csr and mode_order != identity_order:
             raise TensorLayoutError(
                 "CSR tensors only support the identity mode_order; convert to COO "
                 "before applying a permutation",
                 code="csr_mode_order_unsupported",
             )
-        if tensor.layout == torch.sparse_coo and tensor.dense_dim() != 0:
+        if layout == torch.sparse_coo and tensor.dense_dim() != 0:
             raise TensorStorageError(
                 "hybrid COO tensors with dense value dimensions are unsupported",
                 code="hybrid_coo_unsupported",

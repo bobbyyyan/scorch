@@ -195,9 +195,10 @@ inline PlannedMatmul& planned_matmul_state() {
 // arrays and every view of them move it. Writes through `a`'s accessors move `a`'s counter, which
 // the witness registered here puts into the storages' epochs.
 //
-// A CSR operand gives (crow, col), a COO operand (indices,). Anything else is a TypeError.
+// A CSR operand gives (crow, col), a CSC operand (ccol, row) -- the same impl, its compressed and
+// plain indices -- and a COO operand (indices,). Anything else is a TypeError.
 inline py::tuple torch_sparse_index_members(const at::Tensor& a) {
-  if (a.layout() == c10::kSparseCsr) {
+  if (a.layout() == c10::kSparseCsr || a.layout() == c10::kSparseCsc) {
     auto* impl = at::sparse_csr::get_sparse_csr_impl(a);
     const at::Tensor& positions = impl->compressed_indices();
     const at::Tensor& coordinates = impl->plain_indices();
@@ -211,7 +212,7 @@ inline py::tuple torch_sparse_index_members(const at::Tensor& a) {
     abi_watch_register(indices, a);
     return py::make_tuple(indices.detach());
   }
-  throw py::type_error("torch_sparse_index_members expects a sparse CSR or COO tensor");
+  throw py::type_error("torch_sparse_index_members expects a sparse CSR, CSC or COO tensor");
 }
 
 // The key a plan for a dense operand of these sizes and dtype is stored under, (sizes, dtype,
