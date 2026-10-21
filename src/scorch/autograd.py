@@ -80,6 +80,7 @@ from .exceptions import (
 )
 from .format import LevelType
 from .layout import TensorLayout, TensorSpec
+from .matmul_rules import operands_expression
 from .plan import GRAD_ATTR, torch_object_state
 from . import einsum_grad
 from .stensor import STensor
@@ -1731,10 +1732,10 @@ def not_differentiable(
 
 
 _MATMUL_DIFFERENTIABLE = (
-    "differentiable products are those of 1-D and 2-D operands with no keyword "
-    "arguments: a sparse operand times a dense float32/float64 CPU matrix or vector "
-    "either way round by scorch's SpMM, and every other such product as the einsum it "
-    "is (scorch.einsum's derivative)"
+    "differentiable products are a sparse matrix times a dense float32/float64 CPU "
+    "matrix or vector either way round with no keyword arguments, by scorch's SpMM, and "
+    "every other product of operands of rank one or more, batched ones included, as the "
+    "einsum it is (scorch.einsum's derivative)"
 )
 
 
@@ -1746,20 +1747,14 @@ def _describe(x: Any) -> str:
     return type(x).__name__
 
 
-# The einsum each product of 1-D and 2-D operands is (torch.matmul's semantics), whose
-# derivative einsum_grad records for a product the Functions above do not cover.
-_PRODUCT_EXPRESSIONS: Dict[Tuple[Optional[int], Optional[int]], str] = {
-    (2, 2): "ij,jk->ik",
-    (2, 1): "ij,j->i",
-    (1, 2): "j,jk->k",
-    (1, 1): "j,j->",
-}
-
-
-def _rank(x: Any) -> Optional[int]:
-    if type(x) is STensor or isinstance(x, torch.Tensor):
-        return int(x.dim())
-    return None
+def _expression(a: Any, b: Any) -> Optional[str]:
+    """The einsum ``a @ b`` is by torch.matmul's rules (``matmul_rules``, the expression
+    ``ops.matmul`` computes), whose derivative einsum_grad records for a product the
+    Functions above do not cover; None for an operand that is not a tensor, or a pair
+    ``ops.matmul`` refuses."""
+    if not all(type(x) is STensor or isinstance(x, torch.Tensor) for x in (a, b)):
+        return None
+    return operands_expression(a, b)
 
 
 def _not_differentiable(
@@ -1771,9 +1766,9 @@ def _not_differentiable(
     what = f"{_describe(a)} @ {_describe(b)}" + (
         f" with {', '.join(sorted(kwargs))}" if kwargs else ""
     )
-    expression = _PRODUCT_EXPRESSIONS.get((_rank(a), _rank(b)))
+    expression = _expression(a, b)
     if expression is not None:
-        # A product of 1-D and 2-D operands is an einsum: its derivative is the
+        # A product is an einsum (batched ones included): its derivative is the
         # einsum's (einsum_grad), recorded on the result the ordinary path returns for
         # the same call, keyword arguments included (``format=`` names the result's
         # layout, which the derivative reads), so the product has one type and one value

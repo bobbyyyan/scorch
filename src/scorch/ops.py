@@ -100,6 +100,7 @@ from .format import (
     dense_prefix_unaddressable,
     stores_only_its_entries,
 )
+from .matmul_rules import matmul_result_rank, operand_shape, operands_expression
 from .layout import (
     TensorLayout,
     TensorSpec,
@@ -2188,8 +2189,7 @@ def _matmul_result_rank(a: Any, b: Any) -> Optional[int]:
         and isinstance(b, (torch.Tensor, STensor))
     ):
         return None
-    expression = _MATMUL_EXPRESSIONS.get((a.dim(), b.dim()))
-    return None if expression is None else len(expression.split("->")[1])
+    return matmul_result_rank(operand_shape(a), operand_shape(b))
 
 
 def _is_sparse_matrix(x: Any) -> bool:
@@ -2619,14 +2619,18 @@ def _dense_result_as_tensor(
     return result
 
 
-def _matmul_result(result: STensor, torch_result: bool) -> Union[torch.Tensor, STensor]:
-    """What ``matmul`` returns for the 2-D product ``result``: for two torch sparse CSR
+def _matmul_result(
+    result: Union[torch.Tensor, STensor], torch_result: bool
+) -> Union[torch.Tensor, STensor]:
+    """What ``matmul`` returns for the product ``result``: for two torch sparse CSR
     operands whose result is torch's type (``_TORCH_RESULT_KEYWORDS``), the torch sparse
     tensor holding its arrays (``_as_torch_compressed``); else ``_dense_result_as_tensor``'s.
+    A batched product computed by its rank-two products (``_batched_by_matrix_products``)
+    is a torch tensor already, which ``_dense_result_as_tensor`` returns as it is.
     """
 
     if torch_result:
-        return _as_torch_compressed(result)
+        return _as_torch_compressed(cast(STensor, result))
     return _dense_result_as_tensor(result)
 
 
@@ -2690,16 +2694,200 @@ def _not_a_view(t: torch.Tensor) -> torch.Tensor:
     return t if t._base is None or t.requires_grad else t.detach()
 
 
-# The einsum expression of each pair of operand ranks under torch.matmul's rules: a
-# vector first operand is a row (``"j,jk->k"``), a vector second operand a column, and
-# two vectors give their dot product, a scalar.  ``matmul`` sends matrix x vector to
-# ``spmv`` before the generated path; the entry is here so the table is the whole rule.
-_MATMUL_EXPRESSIONS = {
-    (2, 2): "ij,jk->ik",
-    (1, 2): "j,jk->k",
-    (2, 1): "ij,j->i",
-    (1, 1): "j,j->",
-}
+#: The keyword arguments a batched product may carry and still take one of the matrix
+#: routes below (``_batched_by_matrix_products``): any other names a result or a kernel
+#: the batched einsum honours, so it goes there.
+_BATCHED_ROUTE_KEYWORDS = frozenset({"time_dict"})
+
+
+def _stacked_matrix(x: Any) -> Optional[STensor]:
+    """``x``, a sparse STensor of rank three or more stored in logical order, as the CSR
+    matrix of all its rows: batch modes and row mode stacked into one row mode of their
+    product's extent, the column mode kept.  None for any other ``x``.
+
+    - Batch and row levels dense, column level compressed (format ``d...ds``): the
+      compressed level's position array already runs over the stacked rows, so the
+      matrix adopts ``x``'s arrays and values as they are, with no copy.
+    - Every level a coordinate level (format ``o...o``, a torch COO tensor's): when the
+      entries are in row-major order (each one's stacked row no smaller than the one
+      before, which a coalesced COO tensor's are), the position array is the running
+      count of entries per stacked row, one pass over the entries; the column array and
+      the values are adopted.  Out of order entries give None.
+    """
+
+    if type(x) is not STensor or x.dim() < 3:
+        return None
+    if list(x.mode_order) != list(range(x.dim())):
+        return None
+    levels = x.format.get_level_types()
+    shape = tuple(int(extent) for extent in x.logical_shape)
+    rows = 1
+    for extent in shape[:-1]:
+        rows *= extent
+    arrays = x._native_mode_indices()
+    if levels[-1] is LevelType.COMPRESSED and all(
+        level is LevelType.DENSE for level in levels[:-1]
+    ):
+        mode_indices = [[], list(arrays[-1])]
+    elif all(level is LevelType.COORDINATE for level in levels):
+        stacked = arrays[0][-1].to(torch.int64)
+        for level, extent in zip(arrays[1:-1], shape[1:-1]):
+            stacked = stacked * extent + level[-1]
+        if stacked.numel() > 1 and not bool((stacked[1:] >= stacked[:-1]).all()):
+            return None
+        counts = torch.bincount(stacked, minlength=rows)
+        columns = arrays[-1][-1]
+        pos = torch.zeros(rows + 1, dtype=columns.dtype)
+        pos[1:] = torch.cumsum(counts, 0)
+        mode_indices = [[], [pos, columns]]
+    else:
+        return None
+    return STensor._from_parts(
+        None,
+        (rows, shape[-1]),
+        "ds",
+        mode_indices,
+        x._raw_values,
+        adopt=True,
+    )
+
+
+def _dense_torch(x: Any) -> Optional[torch.Tensor]:
+    """``x`` as a dense torch tensor in logical order when it is one already (a strided
+    torch tensor, or a dense STensor, whose values are viewed, not copied); else None.
+    """
+
+    if isinstance(x, torch.Tensor) and x.layout is torch.strided:
+        return x
+    if type(x) is STensor and x.format.is_dense():
+        return x.to_torch(in_place=False)
+    return None
+
+
+def _batched_by_matrix_products(
+    a: Any, b: Any, time_dict: Optional[dict]
+) -> Optional[torch.Tensor]:
+    """A batched product computed by the rank-two products it is made of, when the
+    operands' storage lets it be, else None (the batched einsum computes it).  Each route
+    returns what the batched einsum returns for the call (``matmul_rules``): a dense
+    result, as a torch tensor, since each takes a sparse operand times a dense one.
+
+    - A sparse operand of rank three or more whose storage is its stacked rows' CSR matrix
+      (``_stacked_matrix``) times a dense matrix or vector, or a dense operand whose batch
+      extents are all 1 (the matrix it wraps): that matrix times the dense matrix, one
+      rank-two product over every batch's rows at once, reshaped.
+    - A sparse matrix, or a sparse operand whose batch extents are all 1 with that storage,
+      times a dense operand of rank three or more: the matrix times the dense operand's
+      batches laid side by side as one wide matrix (its contracted mode first, then batch
+      and column modes), one rank-two product, reshaped back.
+    - A sparse operand with that storage times a dense operand of rank three or more with
+      the same batch shape: the block-diagonal CSR matrix of its batches (its column
+      indices offset by the batch's position times the contracted extent, one pass over the
+      nonzeros into a new index array) times the dense operand's batches stacked, one
+      rank-two product.
+
+    ``time_dict`` is the rank-two product's.  Gradients are recorded by autograd.py as the
+    batched einsum's (``einsum_grad``), whose forward calls ``matmul`` on the operands
+    without history and so may come here.
+
+    A route's result is its rank-two product reshaped, which can be a view of that
+    product; ``_generated_matmul`` returns it through ``_not_a_view``, as the batched
+    einsum's dense result is returned (``_dense_result_as_tensor``), so the product the
+    caller receives is not a view, as torch.matmul's is not.
+    """
+
+    dense_b = _dense_torch(b)
+    if dense_b is None or type(a) is not STensor or a.format.is_dense():
+        return None
+    a_shape = tuple(a.logical_shape)
+    b_shape = tuple(dense_b.shape)
+    p, q = len(a_shape), len(b_shape)
+    if a_shape[-1] != (b_shape[0] if q == 1 else b_shape[-2]):
+        return None  # the batched einsum refuses it by code
+    kwargs = {} if time_dict is None else {"time_dict": time_dict}
+    stacked = _stacked_matrix(a) if p >= 3 else None
+    if stacked is not None and q <= 2:
+        product = _sparse_dense_product(stacked, dense_b, kwargs)
+        return product.reshape(a_shape[:-1] + b_shape[1:])
+    if stacked is not None and all(e == 1 for e in b_shape[:-2]):
+        # Every batch extent of the dense operand is 1: it is the matrix it wraps, and
+        # the result's batch shape is ``a``'s, after any further leading 1s it has.
+        product = _sparse_dense_product(stacked, dense_b.reshape(b_shape[-2:]), kwargs)
+        lead = (1,) * max(q - p, 0)
+        return product.reshape(lead + a_shape[:-1] + (b_shape[-1],))
+    if q >= 3 and (
+        p == 2 or (stacked is not None and all(e == 1 for e in a_shape[:-2]))
+    ):
+        matrix = a if stacked is None else stacked
+        rows, inner = a_shape[-2], a_shape[-1]
+        batch = b_shape[:-2]
+        width = dense_b.movedim(-2, 0).reshape(inner, -1)
+        product = _sparse_dense_product(matrix, width, kwargs)
+        out = product.reshape((rows,) + batch + (b_shape[-1],)).movedim(0, -2)
+        lead = (1,) * max(p - q, 0)
+        return out.reshape(lead + out.shape).contiguous()
+    if stacked is not None and q == p and a_shape[:-2] == b_shape[:-2]:
+        return _block_diagonal_product(stacked, a_shape, dense_b, kwargs)
+    return None
+
+
+#: The largest column index an int32 index array holds.
+_INT32_MAX = 2**31 - 1
+
+
+def _sparse_dense_product(
+    a: STensor, b: torch.Tensor, kwargs: Dict[str, Any]
+) -> torch.Tensor:
+    """``matmul(a, b)`` for a sparse matrix ``a`` and a dense matrix ``b``, whose result
+    is a dense torch tensor on every route (``_plain_dense_result_rank``)."""
+
+    return cast(torch.Tensor, matmul(a, b, **kwargs))
+
+
+def _block_diagonal_product(
+    stacked: STensor,
+    a_shape: Tuple[int, ...],
+    b: torch.Tensor,
+    kwargs: Dict[str, Any],
+) -> torch.Tensor:
+    """``a @ b`` for ``a`` (of shape ``a_shape``) given as its stacked rows' CSR matrix
+    ``stacked`` and a dense ``b`` of the same batch shape: the block-diagonal matrix of
+    ``a``'s batches, whose column indices are ``a``'s offset by each batch's position
+    times the contracted extent, times ``b``'s batches stacked as rows (a reshape of a
+    contiguous ``b``).  The offset indices are a new array, made on every call, so no
+    copy of ``a``'s structure outlives the call."""
+
+    pos, crd = stacked._native_mode_indices()[-1]
+    rows, inner = a_shape[-2], a_shape[-1]
+    batches = 1
+    for extent in a_shape[:-2]:
+        batches *= int(extent)
+    if crd.numel() == 0:
+        offset_crd = crd
+    else:
+        # Batch t's entries are pos[t * rows] to pos[(t + 1) * rows]; each one's column
+        # moves by t * inner.  The offsets are computed in int64 and kept there only
+        # when the block matrix's columns do not fit in int32.
+        starts = pos[::rows].to(torch.int64)
+        offsets = torch.repeat_interleave(
+            torch.arange(batches, dtype=torch.int64) * inner, starts[1:] - starts[:-1]
+        )
+        offset_crd = crd.to(torch.int64) + offsets
+        if batches * inner > _INT32_MAX:
+            pos = pos.to(torch.int64)
+        else:
+            offset_crd = offset_crd.to(crd.dtype)
+    block = STensor._from_parts(
+        None,
+        (batches * rows, batches * inner),
+        "ds",
+        [[], [pos, offset_crd]],
+        stacked._raw_values,
+        adopt=True,
+    )
+    stacked_b = b.reshape(batches * inner, b.shape[-1])
+    product = _sparse_dense_product(block, stacked_b, kwargs)
+    return product.reshape(a_shape[:-1] + (b.shape[-1],))
 
 
 def _generated_matmul(
@@ -2707,13 +2895,17 @@ def _generated_matmul(
     b: Union[torch.Tensor, STensor],
     einsum_kwargs: dict[str, Any],
     options: Optional[_DeferredOptions],
-) -> STensor:
+) -> Union[torch.Tensor, STensor]:
     """The product ``matmul`` sends to the generated path, as an ``einsum``.
 
-    The expression follows ``torch.matmul``'s rank rules (``_MATMUL_EXPRESSIONS``).  A
-    pair of ranks with no entry, a batched product, is refused by code
-    (``MatmulOperandRankError``) before anything is built; vector x vector is refused
-    by ``einsum``, by code, until a scalar result is computed.
+    The expression is ``torch.matmul``'s rank rules written as einsum labels
+    (``matmul_rules.matmul_expression``), batched products included: their batch modes
+    broadcast as torch broadcasts them, an operand's batch mode of extent 1 against the
+    other's ``n`` taking a label of its own that the product sums over.  A pair with no
+    expression (a rank-0 operand, or more batch modes than there are labels) is refused
+    by code (``MatmulOperandRankError``) before anything is built; vector x vector is
+    refused by ``einsum``, by code, until a scalar result is computed, and batch extents
+    that do not broadcast by ``einsum``'s extent check (``einsum_index_extent_mismatch``).
 
     ``options`` is the call's options holder when an earlier step of the call made it
     (a relayout), and ``einsum`` then runs under it, so the call makes at most one
@@ -2727,9 +2919,18 @@ def _generated_matmul(
     project's complexity bound.
     """
 
-    expression = _MATMUL_EXPRESSIONS.get((a.dim(), b.dim()))
+    expression = operands_expression(a, b)
     if expression is None:
         raise MatmulOperandRankError((a.dim(), b.dim()))
+    if (
+        (a.dim() > 2 or b.dim() > 2)
+        and options is None
+        and einsum_kwargs.keys() <= _BATCHED_ROUTE_KEYWORDS
+        and get_forced_schedule() is None
+    ):
+        served = _batched_by_matrix_products(a, b, einsum_kwargs.get("time_dict"))
+        if served is not None:
+            return _not_a_view(served)
     if options is not None:
         einsum_kwargs["_deferred_options"] = options
     if "output_mode_order" not in einsum_kwargs:
@@ -2827,8 +3028,10 @@ def matmul(
        probe baseline) and the host-thread composition hints.
     3. **Generic JIT compiler pipeline.** On a prebuilt miss the product is emitted
        as the ``einsum`` of ``torch.matmul``'s rank rules, ``einsum("ij,jk->ik", a,
-       b, ...)`` for two matrices (2-D x 1-D goes to :func:`spmv`),
-       compiling a C++ kernel through the CIN -> LLIR -> codegen pipeline.
+       b, ...)`` for two matrices (2-D x 1-D goes to :func:`spmv`), and for an operand
+       of rank three or more the batched product, its batch modes broadcast as torch
+       broadcasts them (``matmul_rules``), compiling a C++ kernel through the CIN ->
+       LLIR -> codegen pipeline.
 
     Sparse 2-D operands are normalized to canonical mode order ``[0, 1]`` before
     dispatch so transposed / non-default layouts stay correct on the fast paths.
@@ -3191,7 +3394,7 @@ def matmul(
                 result_cpp, result_shape = execute_prebuilt_binary_kernel(
                     resolved.fn, a, b, time_dict=time_dict
                 )
-                result = _wrap_generated_result(
+                result: Union[torch.Tensor, STensor] = _wrap_generated_result(
                     shape=result_shape,
                     tensor_format=resolved.output_format,
                     result_cpp=result_cpp,

@@ -180,15 +180,15 @@ class EinsumScalarResultError(CompileSpecError):
 
 
 class MatmulOperandRankError(CompileSpecError):
-    """A ``matmul`` whose operand ranks its generated path does not compute yet.
+    """A ``matmul`` whose operand ranks its generated path does not compute.
 
     The generated path follows ``torch.matmul``'s rank rules for operands of rank one
-    and two: matrix x matrix, vector x matrix and matrix x vector are computed, and
-    vector x vector, whose result is a scalar, is refused by ``einsum`` by code until a
-    scalar result is computed.  A batched product (an operand of rank three or more) is not
-    computed yet.  Before the refusal had a code, ``matmul`` sent every such pair to
-    ``einsum("ij,jk->ik")``, which raised a plain ``CompileSpecError`` on the rank, as
-    it did for a vector first operand; this is a ``CompileSpecError`` too.  ``code``
+    or more (``matmul_rules.matmul_expression``), batched products included.  It refuses
+    a rank-0 operand, which ``torch.matmul`` refuses too, and a product with more batch
+    modes than einsum has labels for.  Vector x vector, whose result is a scalar, is
+    refused by ``einsum`` by code until a scalar result is computed.  Before the refusal
+    had a code, ``matmul`` sent every such pair to ``einsum("ij,jk->ik")``, which raised a
+    plain ``CompileSpecError`` on the rank; this is a ``CompileSpecError`` too.  ``code``
     names the defect.
     """
 
@@ -198,7 +198,8 @@ class MatmulOperandRankError(CompileSpecError):
         self.ranks = ranks
         super().__init__(
             f"matmul of operands of ranks {self.ranks[0]} and {self.ranks[1]}: the "
-            "generated path computes operands of rank one and two only"
+            "generated path computes operands of rank one or more, with at most as many "
+            "batch modes as einsum has labels for"
         )
 
 

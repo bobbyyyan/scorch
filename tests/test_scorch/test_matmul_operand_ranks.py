@@ -8,12 +8,13 @@ format, a schedule); a dense ``torch.Tensor`` vector with no keyword is computed
 ``autograd.serve``.  ken's run of the coded-schedule-refusal acceptance found 86 such
 cases with a schedule (172 arms).
 
-The expression now comes from a table of operand ranks: ``"j,jk->k"`` for vector x
-matrix, ``"j,j->"`` for vector x vector (the dot product, a rank-0 result), and
-``"ij,jk->ik"`` as before.  A pair with no entry, a batched
-product, is refused with ``MatmulOperandRankError`` (code
-``matmul_operand_rank_unsupported``) before any kernel is built.  Results are compared
-with the float64 product to 1e-12, on both automatic arms.
+The expression now follows the operands' ranks (``matmul_rules.matmul_expression``):
+``"j,jk->k"`` for vector x matrix, ``"j,j->"`` for vector x vector (the dot product, a
+rank-0 result), ``"ij,jk->ik"`` as before, and since the batched product (series step 23)
+the batched expression for an operand of rank three or more, which was refused with
+``MatmulOperandRankError`` before any kernel was built and is now computed.  A rank-0
+operand is still refused that way.  Results are compared with the float64 product to
+1e-12, on both automatic arms.
 """
 
 import itertools
@@ -25,6 +26,7 @@ import scorch
 from scorch import ops, stensor, utils
 from scorch.compiler.scheduler import Schedule
 from scorch.exceptions import CompileSpecError, MatmulOperandRankError
+from scorch.matmul_rules import matmul_expression
 from tests.test_scorch.level_array_support import assert_matches, stored
 
 F64 = torch.float64
@@ -69,14 +71,14 @@ def _dense(shape, sparse, seed):
     return values
 
 
-@pytest.mark.parametrize("ranks", sorted(ops._MATMUL_EXPRESSIONS))
+@pytest.mark.parametrize("ranks", [(1, 1), (1, 2), (2, 1), (2, 2)])
 def test_each_expression_is_the_torch_product_of_its_ranks(ranks):
     shapes = {(2, 2): [(3, 4), (4, 5)], (1, 2): [(4,), (4, 5)]}
     shapes[(2, 1)] = [(3, 4), (4,)]
     shapes[(1, 1)] = [(4,), (4,)]
     left, right = (_dense(shape, False, 3 + n) for n, shape in enumerate(shapes[ranks]))
     expected = torch.matmul(left, right)
-    got = torch.einsum(ops._MATMUL_EXPRESSIONS[ranks], left, right)
+    got = torch.einsum(matmul_expression(*shapes[ranks]), left, right)
     assert got.shape == expected.shape
     torch.testing.assert_close(got, expected, rtol=1e-12, atol=0.0)
 
@@ -158,18 +160,30 @@ BATCHED = [
 @pytest.mark.parametrize(
     ("left_shape", "left_format", "right_shape", "right_format"), BATCHED
 )
-def test_a_batched_product_is_refused_by_code_before_any_build(
-    arm, monkeypatch, left_shape, left_format, right_shape, right_format
+def test_a_batched_product_is_computed(
+    arm, left_shape, left_format, right_shape, right_format
 ):
-    left = stored(_dense(left_shape, True, 51), left_format, "A")
-    right = stored(_dense(right_shape, True, 52), right_format, "B")
+    left_values = _dense(left_shape, True, 51)
+    right_values = _dense(right_shape, True, 52)
+    left = stored(left_values, left_format, "A")
+    right = stored(right_values, right_format, "B")
+    expected = torch.matmul(left_values, right_values)
+    for kwargs in ({}, {"schedule": Schedule()}):
+        assert_matches(scorch.matmul(left, right, **kwargs), expected, F64)
+    # A format of another rank than the result's is refused by einsum's rank check.
+    with pytest.raises(CompileSpecError) as raised:
+        scorch.matmul(left, right, format="d")
+    assert raised.value.code == "einsum_output_format_rank_mismatch"
+
+
+def test_a_rank_zero_operand_is_refused_by_code_before_any_build(arm, monkeypatch):
+    left = stored(_dense((2, 3, 4), True, 53), "sss", "A")
     _no_build(monkeypatch)
-    for kwargs in ({}, {"format": "d"}, {"schedule": Schedule()}):
-        with pytest.raises(MatmulOperandRankError) as raised:
-            scorch.matmul(left, right, **kwargs)
-        assert raised.value.code == "matmul_operand_rank_unsupported"
-        assert isinstance(raised.value, CompileSpecError)
-        assert raised.value.ranks == (len(left_shape), len(right_shape))
+    with pytest.raises(MatmulOperandRankError) as raised:
+        scorch.matmul(left, torch.tensor(2.0, dtype=F64))
+    assert raised.value.code == "matmul_operand_rank_unsupported"
+    assert isinstance(raised.value, CompileSpecError)
+    assert raised.value.ranks == (3, 0)
 
 
 def test_dense_batched_operands_still_go_to_torch():

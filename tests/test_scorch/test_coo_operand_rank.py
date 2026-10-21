@@ -126,7 +126,9 @@ def test_a_dense_coo_vector_product_stays_on_the_graph(shapes, kwargs):
 
 
 @pytest.mark.parametrize("shapes", ["T@M", "M@T", "T@T", "T@v", "v@T"])
-def test_rank3_coo_operands_are_refused_as_the_same_stensors_are(shapes):
+def test_rank3_coo_operands_are_computed_as_the_same_stensors_are(shapes):
+    """Since the batched product (series step 23) a rank-3 COO operand is computed, as
+    the same STensor is; before, both were refused with matmul_operand_rank_unsupported."""
     t = _dense_matrix(2 * ROWS, INNER, torch.float64, 50).reshape(2, ROWS, INNER)
     u = _dense_matrix(2 * INNER, COLS, torch.float64, 51).reshape(2, INNER, COLS)
     m_left = _dense_matrix(ROWS, INNER, torch.float64, 52)
@@ -145,8 +147,9 @@ def test_rank3_coo_operands_are_refused_as_the_same_stensors_are(shapes):
             scorch.from_torch(a.to_sparse()), scorch.from_torch(b.to_sparse())
         )
     )
-    assert got == ("code", "matmul_operand_rank_unsupported")
-    assert want == got
+    assert got[0] == "value" and want[0] == "value", (got, want)
+    _assert_within_bound(got[1], a, b, torch.float64)
+    torch.testing.assert_close(got[1], want[1], rtol=0, atol=0)
 
 
 @pytest.mark.parametrize("side", ["left", "right"])
