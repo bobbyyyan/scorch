@@ -2984,11 +2984,20 @@ def matmul(
             and (served := _torch_csr_spgemm(a, b, kwargs.get("time_dict"))) is not None
         ):
             return served
+        # Two COO matrices go over as CSR, the format chosen for them (a schedule choice
+        # kept as the candidate until the coordinate route is measured against it).  Only
+        # matrices whose two modes are both sparse: torch's to_sparse_csr refuses any other
+        # COO tensor (a vector, a rank-3 tensor, a hybrid one with dense value dimensions)
+        # with an uncoded RuntimeError.  Those are handed over as they are, and from_torch
+        # makes them what it makes of every COO tensor ("o" per mode, or its own code for a
+        # hybrid one), to be computed or refused by code like any operand of their rank.
         if (
-            a.is_sparse
-            and b.is_sparse
-            and a.layout == torch.sparse_coo
-            and b.layout == torch.sparse_coo
+            a.layout is torch.sparse_coo
+            and b.layout is torch.sparse_coo
+            and a.dim() == 2
+            and b.dim() == 2
+            and a.dense_dim() == 0
+            and b.dense_dim() == 0
         ):
             a = a.to_sparse_csr()
             b = b.to_sparse_csr()
