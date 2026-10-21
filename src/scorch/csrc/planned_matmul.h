@@ -76,6 +76,10 @@ struct PlannedMatmul {
   PyObject* plans_attr = nullptr;    // interned plan.PLANS_ATTR
   PyObject* storage_attr = nullptr;  // interned "_storage"
   PyObject* value_attr = nullptr;    // interned "_value"
+  // Interned "_metadata" and "requires_grad", for planned_matmul_stensor_wants_grad: static, so
+  // they take no place in the state and no member's offset moves.
+  static inline PyObject* metadata_attr = nullptr;
+  static inline PyObject* requires_grad_attr = nullptr;
   // Torch sparse CSR operands: their plans and sightings live in their structure's entry
   // (torch_structures.h).
   PyObject* seen_attr = nullptr;         // interned plan.SEEN_ATTR
@@ -333,6 +337,36 @@ inline int64_t planned_matmul_nthreads(const PlannedMatmul& s) {
   return s.match_host_threads ? (int64_t)at::get_num_threads() : -1;
 }
 
+// Whether a gradient is wanted through the STensor `a`: grad mode is on and its requires_grad
+// is set, read as the property reads it (a._metadata.requires_grad). Such a call is the Python
+// function's, which records it (scorch/autograd.py); a plan would serve it and the result would
+// carry no gradient. Under no_grad the operand's plan still serves it, so a trained sparse
+// weight evaluated for inference keeps its planned path. Asked only of a call a plan would
+// serve, and grad mode first, so a call under no_grad pays one thread-local read for it and a
+// call without a plan nothing. A flag that cannot be read, or is anything but False, counts as
+// wanting one: the Python function then decides. Out of line, so that planned_matmul_try, which
+// every planned call runs, gains only this call and its branch. Not cold: a call in grad mode,
+// torch's default, makes it on every served call, and a cold callee would mark the rest of the
+// served path unlikely.
+SCORCH_NOINLINE inline bool planned_matmul_stensor_wants_grad(const PlannedMatmul& s,
+                                                              PyObject* a) {
+  if (!at::GradMode::is_enabled()) return false;
+  PyObject* metadata = PyObject_GetAttr(a, s.metadata_attr);
+  if (metadata == nullptr) {
+    PyErr_Clear();
+    return true;
+  }
+  PyObject* flag = PyObject_GetAttr(metadata, s.requires_grad_attr);
+  Py_DECREF(metadata);
+  if (flag == nullptr) {
+    PyErr_Clear();
+    return true;
+  }
+  const bool wants = flag != Py_False;
+  Py_DECREF(flag);
+  return wants;
+}
+
 // An STensor operand. The served result as a new reference; nullptr with no Python error set
 // when this call is not one a plan serves (the caller then runs the ordinary path); nullptr
 // WITH an error set only for a failure the ordinary path would also have raised from the same
@@ -359,6 +393,7 @@ inline PyObject* planned_matmul_try(const PlannedMatmul& s, PyObject* a, PyObjec
   SpmmCsrPlan* plan = planned_matmul_find(plans, key);
   Py_DECREF(key);
   if (plan == nullptr) return nullptr;
+  if (planned_matmul_stensor_wants_grad(s, a)) return nullptr;
 
   // a._storage._value, read the way the probe reads it, so a storage that computes its
   // values on access is honoured. Any failure falls through: the ordinary path raises it.
@@ -996,8 +1031,12 @@ inline py::object install_planned_matmul(py::object ordinary, py::object stensor
   Py_XSETREF(s.probed_kwnames, Py_BuildValue("(s)", probed_kw.c_str()));
   if (s.storage_attr == nullptr) s.storage_attr = PyUnicode_InternFromString("_storage");
   if (s.value_attr == nullptr) s.value_attr = PyUnicode_InternFromString("_value");
+  if (s.metadata_attr == nullptr) s.metadata_attr = PyUnicode_InternFromString("_metadata");
+  if (s.requires_grad_attr == nullptr)
+    s.requires_grad_attr = PyUnicode_InternFromString("requires_grad");
   if (s.plans_attr == nullptr || s.seen_attr == nullptr || s.probed_kwnames == nullptr ||
-      s.storage_attr == nullptr || s.value_attr == nullptr)
+      s.storage_attr == nullptr || s.value_attr == nullptr || s.metadata_attr == nullptr ||
+      s.requires_grad_attr == nullptr)
     throw py::error_already_set();
   torch_structures().seen_attr = py::reinterpret_borrow<py::object>(s.seen_attr);
   s.max_plans = max_plans;
