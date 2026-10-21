@@ -4,7 +4,18 @@ from collections import defaultdict, deque
 from contextlib import contextmanager
 from contextvars import ContextVar
 from dataclasses import dataclass, fields as dataclass_fields, replace
-from typing import Any, Dict, List, NoReturn, Optional, Sequence, Set, Tuple
+from typing import (
+    Any,
+    Callable,
+    Dict,
+    List,
+    NoReturn,
+    Optional,
+    Sequence,
+    Set,
+    Tuple,
+    TypeVar,
+)
 
 import torch
 
@@ -1302,6 +1313,27 @@ _SCHEDULE_FORCE: ContextVar[Optional[Schedule]] = ContextVar(
     "scorch_schedule_force", default=None
 )
 
+# Whether schedule_force has run in this process with a schedule: set by its first such
+# entry, before the context variable, and never cleared. The readers that would otherwise
+# read the variable on every call -- ops.matmul's plan check, autograd.py's routes,
+# call_without_forced_schedule, and the C entry point through its own flag
+# (planned_matmul.h, schedule_force_seen) -- read it only once this is set, so a process
+# that never forces a schedule pays one list read per call. Set before the variable, so a
+# context that holds a schedule was made after it was set. A count of open blocks would
+# not do: a context copied inside one (an asyncio task, copy_context().run) keeps the
+# schedule after the block exits. A one-element list, as plan.ENABLED_CELL, so that a
+# module importing it reads the current value.
+FORCE_SEEN_CELL = [False]
+# Called by the first schedule_force, before FORCE_SEEN_CELL is set: ops.py adds the C
+# entry point's setter here.
+_ON_FIRST_SCHEDULE_FORCE: List[Callable[[], None]] = []
+
+
+def _note_schedule_force() -> None:
+    for hook in _ON_FIRST_SCHEDULE_FORCE:
+        hook()
+    FORCE_SEEN_CELL[0] = True
+
 
 def get_forced_schedule() -> Optional[Schedule]:
     """Return the schedule active in this execution context, if any."""
@@ -1310,12 +1342,49 @@ def get_forced_schedule() -> Optional[Schedule]:
 
 @contextmanager
 def schedule_force(value: Optional[Schedule]):
-    """Temporarily force a schedule for ``matmul``/``einsum`` in this context."""
+    """Temporarily force a schedule for ``matmul``/``einsum`` in this context.
+
+    Every product the caller writes in the context is computed by the generated kernel
+    under ``value``, or refused with a coded error where that kernel cannot take it (a
+    matrix times a vector: ScheduleNotThreadedThroughSpMVError). No product is served by a
+    prebuilt kernel or a plan meanwhile, since neither takes a schedule. The schedule names
+    the forward expression only: the products a derivative computes (a backward's
+    ``A^T @ G``, an SDDMM, a forward-mode tangent) are other expressions and run under the
+    default schedule, even when ``backward()`` is called inside the context
+    (``call_without_forced_schedule``).
+    """
     if value is not None and not isinstance(value, Schedule):
         raise TypeError("schedule_force expects a Schedule or None")
+    if value is not None and not FORCE_SEEN_CELL[0]:
+        _note_schedule_force()
     token = _SCHEDULE_FORCE.set(value)
     try:
         yield
+    finally:
+        _SCHEDULE_FORCE.reset(token)
+
+
+_Result = TypeVar("_Result")
+
+
+def call_without_forced_schedule(
+    fn: Callable[..., _Result], *args: Any, **kwargs: Any
+) -> _Result:
+    """``fn(*args, **kwargs)`` with no schedule forced, whatever the calling context forces.
+
+    A forced schedule names the forward expression its caller wrote. The products a
+    derivative computes -- a backward's ``A^T @ G``, an SDDMM, a forward-mode tangent --
+    are other expressions, so they run under the default schedule even when
+    ``backward()`` is called inside ``schedule_force``. Every such product goes through
+    this one function (autograd._matmul). One list read in a process that has never
+    forced a schedule (FORCE_SEEN_CELL), one context-variable read in one that has, and a
+    set and a reset where one is forced.
+    """
+    if not FORCE_SEEN_CELL[0] or _SCHEDULE_FORCE.get() is None:
+        return fn(*args, **kwargs)
+    token = _SCHEDULE_FORCE.set(None)
+    try:
+        return fn(*args, **kwargs)
     finally:
         _SCHEDULE_FORCE.reset(token)
 

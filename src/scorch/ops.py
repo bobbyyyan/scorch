@@ -60,6 +60,8 @@ from .compiler.diagnostics import (
 )
 from .compiler.loop_plan import ScheduledCIN
 from .compiler.scheduler import (
+    FORCE_SEEN_CELL as _SCHEDULE_FORCE_SEEN,
+    _ON_FIRST_SCHEDULE_FORCE,
     _SCHEDULE_FORCE,
     Schedule,
     Scheduler,
@@ -1970,6 +1972,24 @@ def _plain_dense_result_rank(a: Any, b: Any) -> Optional[int]:
     return None
 
 
+def _forced_result_format(a: Any, b: Any, kwargs: Dict[str, Any]) -> Optional[str]:
+    """The result format a forced schedule's generated kernel is given for ``a @ b``: the
+    one the product has without the schedule, so a schedule changes the kernel, never the
+    result's type, layout or format.  A product whose plain result is dense on every route
+    (``_plain_dense_result_rank``) gets the dense layout of its rank, which matmul returns
+    as a torch.Tensor (``_dense_result_as_tensor``), as the unforced routes do; a schedule
+    the dense result cannot take is refused by the scheduler with its code.  Otherwise
+    None: einsum's default, which is the unforced result (the prebuilt kernels' formats are
+    einsum's for every pair they serve), or the ``format=`` the call names.  Read on the
+    caller's operands, before matmul converts them, by every forced call: the C entry
+    point hands one to matmul, and autograd.py's forced forward calls matmul."""
+
+    if "format" in kwargs:
+        return None
+    rank = _plain_dense_result_rank(a, b)
+    return None if rank is None else "d" * rank
+
+
 def _names_plain_dense_result(a: Any, b: Any, requested: FormatInput) -> bool:
     """Whether ``format=requested`` names what ``a @ b`` returns without it: a dense
     layout of the result's rank, on a product whose plain result is a dense tensor on
@@ -2690,8 +2710,18 @@ def matmul(
     ):
         return served
     # `probed is _NOT_PROBED` as well as `not kwargs`: _c_probed pops the C entry point's
-    # keyword, so a call it handed over has no keywords left by now.
-    if _PLAN_ENABLED[0] and probed is _NOT_PROBED and not kwargs and type(b) is _TENSOR:
+    # keyword, so a call it handed over has no keywords left by now. A plan runs a prebuilt
+    # kernel, which takes no schedule, so none serves a call made under a forced schedule:
+    # the generated kernel below honours the schedule or refuses it with a code. Read last,
+    # where only a call a plan could serve pays for it, as the C entry point reads it, and
+    # only once schedule_force has run in this process (scheduler.FORCE_SEEN_CELL).
+    if (
+        _PLAN_ENABLED[0]
+        and probed is _NOT_PROBED
+        and not kwargs
+        and type(b) is _TENSOR
+        and (not _SCHEDULE_FORCE_SEEN[0] or _SCHEDULE_FORCE.get() is None)
+    ):
         if type(a) is STensor:
             plan_a, plan_b = a, b
             # Built once and handed to the installer below, because every call that
@@ -2725,6 +2755,9 @@ def matmul(
         _matmul_compile_policy(kwargs)[1] if kwargs else get_forced_schedule()
     )
     compilation_context = _matmul_compilation_context(kwargs) if kwargs else None
+    forced_format = (
+        None if effective_schedule is None else _forced_result_format(a, b, kwargs)
+    )
     # The call's options holder, made by the first step that needs options
     # (``_matmul_options``) and handed to every later one.
     options: Optional[_DeferredOptions] = None
@@ -2773,7 +2806,10 @@ def matmul(
     time_dict = kwargs.get("time_dict", None)
     # output_format= arrived as format= (_entry_keywords).
     requested_output_format = kwargs.get("format")
-    einsum_kwargs = dict(kwargs)
+    # A forced schedule's kernel makes the unforced result's format (_forced_result_format).
+    einsum_kwargs = (
+        dict(kwargs) if forced_format is None else dict(kwargs, format=forced_format)
+    )
 
     if a.dim() == 2 and b.dim() == 1:
         if effective_schedule is not None:
@@ -2965,6 +3001,19 @@ if _install_planned_matmul is not None:
             csr_dense_symbol(torch.float64) == "spmm_csr_double_v2",
             _STORAGE_WRAP_GRAIN,
         )
+    # And every call made under a forced schedule goes to this function, whose generated
+    # kernel honours it (planned_matmul.h, planned_matmul_schedule_forced).
+    _set_schedule_force = getattr(
+        _scorch_ops, "set_planned_matmul_schedule_force", None
+    )
+    if _set_schedule_force is not None:
+        _set_schedule_force(_SCHEDULE_FORCE)
+        # It reads the variable only once its own flag is set, by the first schedule_force
+        # in the process, before the variable is (scheduler.FORCE_SEEN_CELL).
+        _set_force_seen = _scorch_ops.note_planned_matmul_schedule_force
+        _ON_FIRST_SCHEDULE_FORCE.append(_set_force_seen)
+        if _SCHEDULE_FORCE_SEEN[0]:
+            _set_force_seen()
 
 
 # Activation codes for the fused Linear kernel (must match spmm.h

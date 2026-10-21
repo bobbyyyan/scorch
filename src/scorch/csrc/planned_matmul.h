@@ -63,6 +63,7 @@
 #include <torch/csrc/autograd/python_variable.h>
 #include <torch/csrc/utils/object_ptr.h>
 
+#include <atomic>
 #include <string>
 
 namespace scorch_native {
@@ -115,7 +116,38 @@ struct PlannedMatmul {
   // Products made by planned_matmul_torch_ordinary, for tests: a statistic, which calls on the
   // shared state count through a const reference like every other read of it.
   mutable int64_t ordinary_served = 0;
+  // scheduler._SCHEDULE_FORCE, the context variable `schedule_force` sets. While it holds a
+  // schedule, every call goes to the Python function, whose generated kernel honours the
+  // schedule or refuses it with a code: every product made here is a prebuilt kernel's, which
+  // takes no schedule and would ignore it (planned_matmul_schedule_forced). Unset, no call is
+  // treated as forced -- a build whose ops.py does not set it never served a forced schedule
+  // correctly either.
+  PyObject* schedule_force = nullptr;
+  // Set by the first schedule_force in the process, before the context variable is, and never
+  // cleared (scheduler.FORCE_SEEN_CELL; ops.py registers note_planned_matmul_schedule_force).
+  // Until then no context holds a schedule, so the variable is not read: a call pays one load.
+  // Relaxed: whatever hands a context to another thread (a queue, a lock, a thread's start)
+  // orders this store before that thread's calls.
+  std::atomic<bool> schedule_force_seen{false};
 };
+
+// Whether a schedule is forced in the calling context: no, without a read, until
+// schedule_force has run in this process (schedule_force_seen); then one PyContextVar_Get,
+// which CPython answers from the variable's per-thread cache while the context is unchanged.
+// A read that fails counts as forced, so the Python function, which reads the variable
+// itself, decides.
+inline bool planned_matmul_schedule_forced(const PlannedMatmul& s) {
+  if (!s.schedule_force_seen.load(std::memory_order_relaxed)) return false;
+  if (s.schedule_force == nullptr) return false;
+  PyObject* value = nullptr;
+  if (PyContextVar_Get(s.schedule_force, Py_None, &value) < 0) {
+    PyErr_Clear();
+    return true;
+  }
+  const bool forced = value != Py_None;
+  Py_DECREF(value);
+  return forced;
+}
 
 inline PlannedMatmul& planned_matmul_state() {
   static PlannedMatmul state;
@@ -1003,10 +1035,12 @@ inline PyObject* planned_matmul_call(PyObject* /*module*/, PyObject* const* args
                                      Py_ssize_t nargsf, PyObject* kwnames) {
   HANDLE_TH_ERRORS
   const PlannedMatmul& s = planned_matmul_state();
+  // The forced schedule is read last, so only a call this entry could serve pays for it; a
+  // forced call goes to the Python function untouched, with no plan probed or sighted.
   if (PyVectorcall_NARGS(nargsf) == 2 && kwnames == nullptr &&
       reinterpret_cast<PyObject*>(Py_TYPE(args[1])) == s.tensor_type &&
       PyList_CheckExact(s.enabled) && PyList_GET_SIZE(s.enabled) >= 1 &&
-      PyList_GET_ITEM(s.enabled, 0) == Py_True) {
+      PyList_GET_ITEM(s.enabled, 0) == Py_True && !planned_matmul_schedule_forced(s)) {
     const bool b_grad = planned_matmul_wants_grad(THPVariable_Unpack(args[1]));
     if (reinterpret_cast<PyObject*>(Py_TYPE(args[0])) == s.stensor_type) {
       if (!b_grad) {

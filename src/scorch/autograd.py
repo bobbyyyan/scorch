@@ -42,6 +42,7 @@ calls ``backward`` -- inference with parameters that require grad, say -- workin
 
 from __future__ import annotations
 
+import functools
 import threading
 import weakref
 from typing import Any, Callable, Dict, Optional, Tuple, cast
@@ -51,6 +52,11 @@ import torch.autograd.forward_ad as _fwad
 
 import scorch_ops as _native
 
+from .compiler.scheduler import (
+    FORCE_SEEN_CELL as _SCHEDULE_FORCE_SEEN,
+    _SCHEDULE_FORCE,
+    call_without_forced_schedule,
+)
 from .exceptions import (
     ScorchAssertionError,
     ScorchNotImplementedError,
@@ -81,7 +87,15 @@ def _matmul(a: Any, b: torch.Tensor) -> torch.Tensor:
         from . import ops
 
         _MATMUL = ops.matmul
-    # A sparse operand times a dense matrix: a dense torch.Tensor.
+    # A sparse operand times a dense matrix: a dense torch.Tensor. Every product this module
+    # computes for itself runs under the default schedule, a forced one included: a schedule
+    # names the forward expression the caller wrote, and the products here -- a backward's
+    # A^T @ G, a forward-mode pass, an unforced forward -- are other expressions. A forced
+    # schedule reaches a forward only through the caller's own product (_scheduled_product).
+    # Read inline, and only once schedule_force has run in this process
+    # (scheduler.FORCE_SEEN_CELL), so an unforced product makes no call it made before.
+    if _SCHEDULE_FORCE_SEEN[0] and _SCHEDULE_FORCE.get() is not None:
+        return cast(torch.Tensor, call_without_forced_schedule(_MATMUL, a, b))
     return cast(torch.Tensor, _MATMUL(a, b))
 
 
@@ -132,7 +146,11 @@ def _transposed_layout(t: torch.Tensor) -> bool:
 #   the product's column squeezed and ``.detach()``ed: a new tensor over the same memory
 #   with the same version counter, which is not a view.  Neither copies anything;
 # - ``_NotDifferentiable`` returns its input's ``.detach()``, which is cheaper than returning
-#   the input itself, which torch answers by making a view of it.
+#   the input itself, which torch answers by making a view of it;
+# - a forced schedule's product (``_scheduled_product``: ops.matmul's generated kernel, whose
+#   result can be a view of einsum's output) passes through ``_scheduled_out``, which gives it
+#   the strides the Function's own product has, copying it only where its elements are not
+#   already in that order, and ``.detach()``es it if it is a view.
 # So a matrix product's forward and backward make the calls they made before this rule, and
 # no more: each step of a training loop pays for it, not only a new operand's first call.
 # A forward that also saves its result saves that same tensor.  csrc/planned_matmul.h's
@@ -170,6 +188,56 @@ def _in_layout(result: torch.Tensor, transposed: bool) -> torch.Tensor:
         return result
     laid = _transpose(result)
     return laid.t_() if laid._base is None else result
+
+
+def _transpose_copies(rows: int, cols: int, dtype: torch.dtype) -> bool:
+    """Whether ``_transpose`` of a contiguous [rows, cols] matrix of ``dtype`` makes a tensor
+    of its own, which ``_in_layout`` and ``_x_at_a`` read: always for float32, which
+    ops.fast_transpose transposes with its native kernel into a new tensor; for any other
+    dtype it is ``t.t().contiguous()``, which is ``t.t()`` itself, a view, where ``t`` has at
+    most one row or column (its transpose is then contiguous already)."""
+    native = dtype == torch.float32 and hasattr(_native, "scorch_transpose_2d_float")
+    return native or min(rows, cols) > 1
+
+
+def _scheduled_out(
+    product: torch.Tensor, transposed: bool, x_at_a: bool = False
+) -> torch.Tensor:
+    """A forced schedule's product (``_scheduled_product``: the caller's ``a @ b``) with the
+    strides the Function's own product has, and never a view (see the note above
+    ``_x_at_a``).
+
+    Those strides are the dense operand's layout (``_in_layout``, ``_x_at_a``): a vector
+    contiguous; ``A @ b`` column-major for a transposed ``b``, and ``x @ A`` column-major for
+    an ``x`` that is not contiguous, each row-major otherwise -- except where ``_transpose``
+    makes no copy (``_transpose_copies``), where the kernel's product keeps its own layout:
+    ``A @ b`` row-major, ``x @ A`` column-major (the transpose of a row-major
+    ``A^T @ x^T``). ``transposed`` is the Function's ``ctx.b_transposed``, read on the
+    operand its kernel takes (``x^T`` for ``x @ A``)."""
+    if product.dim() == 1:
+        return _with_strides(product, (1,))
+    rows, cols = product.shape
+    copies = _transpose_copies(rows, cols, product.dtype)
+    column_major = not (transposed and copies) if x_at_a else transposed and copies
+    return _with_strides(
+        product, (1, max(rows, 1)) if column_major else (max(cols, 1), 1)
+    )
+
+
+def _with_strides(t: torch.Tensor, strides: Tuple[int, ...]) -> torch.Tensor:
+    """``t`` with ``strides``, and not a view: ``t`` itself where it has them (its
+    ``.detach()`` where it is a view); a ``.detach()`` restrided in place where its elements
+    already lie in that order, only the stride of a dimension of at most one element
+    differing; and one copy into a new tensor with those strides otherwise."""
+    out = t if t._base is None else t.detach()
+    if out.stride() == strides:
+        return out
+    if out.numel() == 0 or all(
+        s == w for n, s, w in zip(out.shape, out.stride(), strides) if n > 1
+    ):
+        return out.detach().as_strided_(out.shape, strides)
+    laid = torch.empty_strided(out.shape, strides, dtype=out.dtype, device=out.device)
+    return laid.copy_(out)
 
 
 def _stamp(t: torch.Tensor) -> _Stamp:
@@ -546,26 +614,43 @@ def _add(
 
 
 class _SparseMM(torch.autograd.Function):
-    """``A(values) @ b``, for a dense matrix or vector ``b``."""
+    """``A(values) @ b``, for a dense matrix or vector ``b``. ``forward``, a fourth argument
+    when given, computes the product instead of ``op.mm``: the caller's product under a
+    forced schedule (_scheduled_product), in the caller's shape. The backward and the
+    forward-mode pass are the same either way, under the default schedule."""
 
     @staticmethod
     def forward(
-        ctx: Any, op: _Operand, values: torch.Tensor, b: torch.Tensor
+        ctx: Any,
+        op: _Operand,
+        values: torch.Tensor,
+        b: torch.Tensor,
+        *forward: Callable[[], torch.Tensor],
     ) -> torch.Tensor:
         _record(ctx, op, values, b)
-        # not a view: see the note above _x_at_a
-        return _in_layout(op.mm(values, b), ctx.b_transposed)
+        if not forward:
+            # not a view: see the note above _x_at_a
+            return _in_layout(op.mm(values, b), ctx.b_transposed)
+        return _scheduled_out(forward[0](), ctx.b_transposed)
 
     @staticmethod
     def backward(ctx: Any, g: torch.Tensor):
         values, b = ctx.saved_tensors
         need = ctx.needs_input_grad
-        return (None,) + _mm_backward(
-            ctx.op, values, b, g, need[1], need[2], ctx.b_transposed
+        return (
+            (None,)
+            + _mm_backward(ctx.op, values, b, g, need[1], need[2], ctx.b_transposed)
+            + (None,) * (len(need) - 3)  # a forced forward's argument, if any
         )
 
     @staticmethod
-    def jvp(ctx: Any, _op: Any, dv: Optional[torch.Tensor], db: Optional[torch.Tensor]):
+    def jvp(
+        ctx: Any,
+        _op: Any,
+        dv: Optional[torch.Tensor],
+        db: Optional[torch.Tensor],
+        *_forward: Any,
+    ):
         values, b = ctx.saved_tensors
         op = ctx.op
         total = _add(
@@ -693,26 +778,41 @@ def planned_mm_t_backward(
 
 
 class _SparseMMT(torch.autograd.Function):
-    """``A(values)^T @ b``, for a dense matrix or vector ``b``."""
+    """``A(values)^T @ b``, for a dense matrix or vector ``b``. A fourth argument, when
+    given, is ``forward`` as for :class:`_SparseMM`."""
 
     @staticmethod
     def forward(
-        ctx: Any, op: _Operand, values: torch.Tensor, b: torch.Tensor
+        ctx: Any,
+        op: _Operand,
+        values: torch.Tensor,
+        b: torch.Tensor,
+        *forward: Callable[[], torch.Tensor],
     ) -> torch.Tensor:
         _record(ctx, op, values, b)
-        # not a view: see the note above _x_at_a
-        return _in_layout(op.mm_t(values, b, right=True), ctx.b_transposed)
+        if not forward:
+            # not a view: see the note above _x_at_a
+            return _in_layout(op.mm_t(values, b, right=True), ctx.b_transposed)
+        return _scheduled_out(forward[0](), ctx.b_transposed)
 
     @staticmethod
     def backward(ctx: Any, g: torch.Tensor):
         values, b = ctx.saved_tensors
         need = ctx.needs_input_grad
-        return (None,) + _mm_t_backward(
-            ctx.op, values, b, g, need[1], need[2], ctx.b_transposed
+        return (
+            (None,)
+            + _mm_t_backward(ctx.op, values, b, g, need[1], need[2], ctx.b_transposed)
+            + (None,) * (len(need) - 3)  # a forced forward's argument, if any
         )
 
     @staticmethod
-    def jvp(ctx: Any, _op: Any, dv: Optional[torch.Tensor], db: Optional[torch.Tensor]):
+    def jvp(
+        ctx: Any,
+        _op: Any,
+        dv: Optional[torch.Tensor],
+        db: Optional[torch.Tensor],
+        *_forward: Any,
+    ):
         values, b = ctx.saved_tensors
         op = ctx.op
         total = _add(
@@ -728,26 +828,44 @@ class _SparseXA(torch.autograd.Function):
     ``A^T @ b`` and returned as ``x @ A`` itself (``_x_at_a``), so the caller receives this
     Function's output and not a transpose of it (see the note above ``_x_at_a``). A Function
     of its own rather than a flag on ``_SparseMMT``: an argument more costs torch's ``apply``
-    work on every call."""
+    work on every call. A fourth argument, when given, is ``forward`` as for
+    :class:`_SparseMM`: the caller's ``x @ A``, not ``A^T @ x^T``; an unforced call passes
+    none."""
 
     @staticmethod
     def forward(
-        ctx: Any, op: _Operand, values: torch.Tensor, b: torch.Tensor
+        ctx: Any,
+        op: _Operand,
+        values: torch.Tensor,
+        b: torch.Tensor,
+        *forward: Callable[[], torch.Tensor],
     ) -> torch.Tensor:
         _record(ctx, op, values, b)
-        return _x_at_a(op.mm_t(values, b, right=True), ctx.b_transposed)
+        if not forward:
+            return _x_at_a(op.mm_t(values, b, right=True), ctx.b_transposed)
+        return _scheduled_out(forward[0](), ctx.b_transposed, x_at_a=True)
 
     @staticmethod
     def backward(ctx: Any, g: torch.Tensor):
         values, b = ctx.saved_tensors
         need = ctx.needs_input_grad
         # x @ A's gradient is that of A^T @ x^T, transposed
-        return (None,) + _mm_t_backward(
-            ctx.op, values, b, g.t(), need[1], need[2], ctx.b_transposed
+        return (
+            (None,)
+            + _mm_t_backward(
+                ctx.op, values, b, g.t(), need[1], need[2], ctx.b_transposed
+            )
+            + (None,) * (len(need) - 3)  # a forced forward's argument, if any
         )
 
     @staticmethod
-    def jvp(ctx: Any, _op: Any, dv: Optional[torch.Tensor], db: Optional[torch.Tensor]):
+    def jvp(
+        ctx: Any,
+        _op: Any,
+        dv: Optional[torch.Tensor],
+        db: Optional[torch.Tensor],
+        *_forward: Any,
+    ):
         values, b = ctx.saved_tensors
         op = ctx.op
         total = _add(
@@ -990,6 +1108,11 @@ def serve(a: Any, b: Any, ordinary: Callable[..., Any], kwargs: Dict[str, Any]) 
         return None
     if kwargs or not is_sparse(b):
         return None
+    # Under a forced schedule ``x @ A`` is left to ops.matmul's generated kernel, which
+    # honours the schedule: right_product computes it on the drop-in kernel, which takes none.
+    # Read only once schedule_force has run in this process (scheduler.FORCE_SEEN_CELL).
+    if _SCHEDULE_FORCE_SEEN[0] and _SCHEDULE_FORCE.get() is not None:
+        return None
     return right_product(a, b)
 
 
@@ -997,9 +1120,11 @@ def matmul(a: Any, b: Any, ordinary: Callable[..., Any], kwargs: Dict[str, Any])
     """``a @ b`` recorded for autograd.
 
     ``ordinary`` is scorch's matmul itself, which computes a product this module does not
-    cover; its result is given a ``grad_fn`` that raises if a gradient is asked of it.
+    cover; its result is given a ``grad_fn`` that raises if a gradient is asked of it. Under
+    a forced schedule it also computes the forward of a product this module records
+    (_scheduled_product).
     """
-    served = None if kwargs else _differentiable(a, b)
+    served = None if kwargs else _differentiable(a, b, ordinary)
     if served is not None:
         return served
     return _not_differentiable(a, b, ordinary, kwargs)
@@ -1041,20 +1166,48 @@ def computes(a: Any, b: Any) -> bool:
     return _covered(a, b) is not None
 
 
-def _differentiable(a: Any, b: Any) -> Optional[torch.Tensor]:
+def _differentiable(
+    a: Any, b: Any, ordinary: Optional[Callable[..., Any]] = None
+) -> Optional[torch.Tensor]:
     covered = _covered(a, b)
     if covered is None:
         return None
     left, op, values, dense = covered
     # Each Function returns the product as the caller receives it (see the note above
-    # _x_at_a).
+    # _x_at_a). Under a forced schedule each also takes the caller's product as its forward
+    # (_scheduled_product). Read inline, and only once schedule_force has run in this
+    # process (scheduler.FORCE_SEEN_CELL), so an unforced call makes no call it made before
+    # and passes each Function exactly the arguments it passed before.
+    forced: Tuple[Callable[[], torch.Tensor], ...] = ()
+    if (
+        ordinary is not None
+        and _SCHEDULE_FORCE_SEEN[0]
+        and _SCHEDULE_FORCE.get() is not None
+    ):
+        forced = (_scheduled_product(a, b, ordinary),)
     if left:
-        return _SparseMM.apply(op, values, dense)
+        return _SparseMM.apply(op, values, dense, *forced)
     # v @ A = A^T @ v
     if dense.dim() == 1:
-        return _SparseMMT.apply(op, values, dense)
+        return _SparseMMT.apply(op, values, dense, *forced)
     # x @ A = (A^T @ x^T)^T
-    return _SparseXA.apply(op, values, dense.t())
+    return _SparseXA.apply(op, values, dense.t(), *forced)
+
+
+def _scheduled_product(
+    a: Any, b: Any, ordinary: Callable[..., Any]
+) -> Callable[[], torch.Tensor]:
+    """The forward of ``a @ b`` under a forced schedule, in the caller's shape.
+
+    A schedule names how the caller's product is computed, so the recorded Function takes
+    its forward from ``ordinary`` (ops.matmul) on the primals, whose generated kernel
+    honours the schedule or refuses it with a code -- never the drop-in kernel, which takes
+    no schedule and would ignore it. The Function gives it its own product's strides
+    (_scheduled_out). The backward is recorded as without a schedule and runs its products
+    (``A^T @ G`` and the SDDMM) under the default one (_matmul): they are other expressions,
+    which the schedule does not name."""
+    primals = [x.detach() if isinstance(x, torch.Tensor) else x for x in (a, b)]
+    return functools.partial(ordinary, *primals)
 
 
 def right_product(a: Any, b: Any) -> Optional[torch.Tensor]:

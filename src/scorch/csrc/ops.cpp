@@ -1199,6 +1199,34 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     // For tests: how many products planned_matmul_torch_ordinary has made.
     m.def("planned_matmul_ordinary_served",
           [] { return scorch_native::planned_matmul_state().ordinary_served; });
+    // The context variable schedule_force sets (scheduler._SCHEDULE_FORCE): while it holds a
+    // schedule the C entry point serves no call (planned_matmul.h,
+    // planned_matmul_schedule_forced). None unsets it.
+    m.def("set_planned_matmul_schedule_force",
+          [](py::object var) {
+            if (!var.is_none() && !PyContextVar_CheckExact(var.ptr()))
+              throw py::type_error("var must be a contextvars.ContextVar or None");
+            scorch_native::planned_matmul_set(
+                scorch_native::planned_matmul_state().schedule_force,
+                var.is_none() ? nullptr : var.ptr());
+          },
+          "Make the C entry point hand every call to the Python function while a schedule is "
+          "forced",
+          py::arg("var"));
+    // Called once, by the first schedule_force in the process, before the variable is set
+    // (scheduler._ON_FIRST_SCHEDULE_FORCE): until then the C entry point reads no context
+    // variable (planned_matmul.h, planned_matmul_schedule_forced).
+    m.def("note_planned_matmul_schedule_force",
+          [] {
+            scorch_native::planned_matmul_state().schedule_force_seen.store(
+                true, std::memory_order_relaxed);
+          },
+          "Make the C entry point read the forced schedule from now on");
+    // For tests: whether note_planned_matmul_schedule_force has been called.
+    m.def("planned_matmul_schedule_force_seen", [] {
+      return scorch_native::planned_matmul_state().schedule_force_seen.load(
+          std::memory_order_relaxed);
+    });
     m.def("install_planned_matmul", &scorch_native::install_planned_matmul,
           "Build the C callable ops.py binds as matmul",
           py::arg("ordinary"), py::arg("stensor_type"), py::arg("tensor_type"),
