@@ -39,7 +39,11 @@ import torch
 import scorch
 from scorch import ops
 from scorch import plan as plan_mod
-from scorch.compiler.diagnostics import VerificationError
+from scorch.compiler.diagnostics import (
+    ScheduleNotThreadedThroughSpMVError,
+    VerificationError,
+)
+from scorch.compiler.scheduler import Schedule, schedule_force
 import scorch_ops
 from scorch.exceptions import (
     CompileSpecError,
@@ -259,6 +263,44 @@ def _spmv_cases():
 )
 def test_spmv_refuses_operands_that_cannot_be_multiplied(call, cls, code, builds):
     _assert_refused(call, cls, code, builds)
+
+
+def _spmv_operand_pairs():
+    dense = _dense(torch.float32)
+    st = STensor.from_torch(dense).to_sparse("ds")
+    v = torch.rand(COLS)
+    return [
+        ("correct", lambda: (st, STensor.from_torch(v))),
+        ("short vector", lambda: (st, STensor.from_torch(v[:-1]))),
+        ("2-D vector", lambda: (st, STensor.from_torch(torch.rand(COLS, 1)))),
+        ("torch vector", lambda: (st, v)),
+        ("None", lambda: (None, None)),
+    ]
+
+
+@pytest.mark.parametrize(
+    "operands", [c[1] for c in _spmv_operand_pairs()], ids=[c[0] for c in _spmv_operand_pairs()]
+)
+@pytest.mark.parametrize("spelling", ["keyword", "context"])
+def test_a_schedule_given_to_spmv_is_refused_whatever_its_operands(
+    operands, spelling, builds
+):
+    """A schedule is refused by the options it came in, which no operand changes, so
+    it is refused first, with its own code, for correct operands and for each mistake
+    above alike (test_compile_options passes None for both)."""
+    a, b = operands()
+    schedule = Schedule(loop_order=("i", "j"))
+    if spelling == "keyword":
+        call = lambda: ops.spmv(a, b, schedule=schedule)  # noqa: E731
+    else:
+
+        def call():
+            with schedule_force(schedule):
+                return ops.spmv(a, b)
+
+    _assert_refused(
+        call, ScheduleNotThreadedThroughSpMVError, "schedule_not_threaded_through_spmv", builds
+    )
 
 
 def test_einsums_extent_refusal_is_the_same_class(builds):

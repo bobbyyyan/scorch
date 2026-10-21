@@ -1343,11 +1343,14 @@ def _spmv_owned(
     one snapshot, and a warm one makes none.
     """
 
-    _require_matrix_vector_operands(a, b)
     # Every spelling of a schedule lands in requested_schedule, a schedule_force context
     # included.  The SpMV path takes none yet: the refusal matmul's SpMV branch makes.
+    # It is a refusal of the call's options, which no operand changes, so it comes
+    # first and a scheduled call gets this code whatever its operands are; the operand
+    # checks follow, still before anything reads an operand.
     if options.requested_schedule is not None:
         raise ScheduleNotThreadedThroughSpMVError()
+    _require_matrix_vector_operands(a, b)
     compilation = _DeferredCompilation(kwargs, options)
     # The kernel below reads A by rows, in its storage order, so an A stored in another
     # mode order is moved first, as matmul's matrix-vector branch moves it.  The move
