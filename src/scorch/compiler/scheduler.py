@@ -22,6 +22,9 @@ from typing import (
 
 import torch
 
+# After torch, which scorch_ops links against.
+import scorch_ops as _native  # type: ignore[import-not-found]
+
 from scorch.compiler.cin import (
     BinaryOp,
     CIN,
@@ -588,7 +591,10 @@ class Schedule:
             )
         if type(self.tiles) is list:
             object.__setattr__(self, "tiles", tuple(self.tiles))
-        if any(type(tile) is not TileSpec for tile in self.tiles):
+        # Each check over the tiles passes when there are none, so it is skipped
+        # then: most schedules have no tiles, and building Schedule() cost 6,310
+        # instructions more than on 864745d (sapling 85672).
+        if self.tiles and any(type(tile) is not TileSpec for tile in self.tiles):
             # Exact-type admission: a TileSpec subclass is caller code that
             # would otherwise execute inside compiler-trusted scopes.
             raise ScorchTypeError(
@@ -608,22 +614,25 @@ class Schedule:
                     "relayout",
                     replace(self.relayout, scope_var=panel_tiles[0].index_var),
                 )
-        tile_names = [tile.index_var for tile in self.tiles]
-        if len(tile_names) != len(set(tile_names)):
-            raise ScorchValueError(
-                "Schedule cannot tile the same index variable twice",
-                code="schedule_tiles_duplicate_index",
-            )
-        if sum(tile.parallel for tile in self.tiles) > 1:
-            raise ScorchValueError(
-                "Schedule may select at most one parallel tile loop",
-                code="schedule_parallel_selection_conflict",
-            )
-        if self.parallel_loop is not None and any(tile.parallel for tile in self.tiles):
-            raise ScorchValueError(
-                "Use either Schedule.parallel_loop or TileSpec.parallel, not both",
-                code="schedule_parallel_selection_conflict",
-            )
+        if self.tiles:
+            tile_names = [tile.index_var for tile in self.tiles]
+            if len(tile_names) != len(set(tile_names)):
+                raise ScorchValueError(
+                    "Schedule cannot tile the same index variable twice",
+                    code="schedule_tiles_duplicate_index",
+                )
+            if sum(tile.parallel for tile in self.tiles) > 1:
+                raise ScorchValueError(
+                    "Schedule may select at most one parallel tile loop",
+                    code="schedule_parallel_selection_conflict",
+                )
+            if self.parallel_loop is not None and any(
+                tile.parallel for tile in self.tiles
+            ):
+                raise ScorchValueError(
+                    "Use either Schedule.parallel_loop or TileSpec.parallel, not both",
+                    code="schedule_parallel_selection_conflict",
+                )
         if self.parallel_loop is not None:
             if type(self.parallel_loop) is not str:
                 raise ScorchTypeError(
@@ -666,166 +675,468 @@ class Schedule:
 
         Every read validates the schedule's current state, but the full validation
         (``_canonical_schedule``) and the formatting run once per distinct state.  A
-        read first rebuilds its state's memo key (``_schedule_memo_key``), which makes
-        the reads and refusals the full validation starts with, and returns the
-        string memoized under it.  A state changed through ``object.__setattr__``
-        has another memo key, so its next read validates it in full and refuses it
-        if it is invalid.  A state the memo does not key is validated in full on
-        every read, as before.  Rebuilding two Schedule objects on each read cost
-        a warm ``einsum`` with a schedule about 87,000 instructions per read, twice
-        per call (sapling 85220 and 85225).
+        read first builds its state's key (``_schedule_state_key``), which makes the
+        reads and refusals the full validation starts with, and returns the string
+        memoized for that key under the module state the validation reads
+        (``_current_context``).  A state changed through ``object.__setattr__`` has
+        another key, so its next read validates it in full and refuses it if it is
+        invalid.  A state the memo does not key is validated in full on every read,
+        as before.  The key is built by value, so a schedule built afresh for each
+        call finds the entry of an equal one, and no reference to a schedule is
+        kept.  Rebuilding two Schedule objects on each read cost a warm ``einsum``
+        with a schedule about 87,000 instructions per read, twice per call (sapling
+        85220 and 85225); building the key through generic per-field checks then
+        cost 40,243 instructions per read, about four times 864745d's ``repr`` (sapling
+        85672).  Each of the key's checks is a sweep over the fields, which in Python
+        cost 14,378 instructions at ``Schedule()``, more than 864745d's whole read; the
+        C version (``scorch_ops._schedule_state_key``) makes the same checks in 2,614
+        (sapling 85683 and 85684).  The read uses it when scorch_ops has it, and the
+        Python version, which gives the same answers, otherwise.
         """
 
-        context = _schedule_validation_context()
-        memo_key = _schedule_memo_key(self, context)
-        if memo_key is not None:
-            try:
-                known = _SCHEDULE_KEY_MEMO.get(memo_key)
-            except TypeError:  # module state replaced by an unhashable value
-                memo_key = known = None
-            if known is not None:
-                return known
+        context = _current_context()
+        state_key: Optional[tuple] = None
+        if context is not None:
+            native = _native_state_key
+            if native is not None:
+                state_key = native(self, _NATIVE_KEY_TABLE)
+            else:
+                state_key = _schedule_state_key(self)
+            entries = context[6]
+            if state_key is not None and entries is not None:
+                known = entries.get(state_key)
+                if known is not None:
+                    return known
         canonical = _canonical_schedule(self)
         key = _format_schedule_key(canonical)
-        if memo_key is not None:
-            # Under the memo key of the state validated and formatted: the canonical
-            # copy, which no caller holds, rather than the key read above, which
-            # another thread could have changed since.
-            stored_key = _schedule_memo_key(canonical, context)
-            if stored_key is not None:
-                if len(_SCHEDULE_KEY_MEMO) >= _SCHEDULE_KEY_MEMO_LIMIT:
-                    _SCHEDULE_KEY_MEMO.clear()
-                _SCHEDULE_KEY_MEMO[stored_key] = key
+        if context is not None and state_key is not None:
+            _remember_schedule_key(context, canonical, key)
         return key
 
 
 #: Schedule fields whose unset value (``None``) leaves the cache key unchanged.
 _SCHEDULE_KEY_WHEN_SET = frozenset({"vector_loops", "entries_of"})
 
-#: The stored fields of each schedule carrier, in declaration order: the names
-#: ``_stored_schedule_fields`` requires, and the order of a state's memo key.
-_SCHEDULE_FIELDS = (
-    "loop_order",
-    "tiles",
-    "relayout",
-    "tag",
-    "parallel_loop",
-    "assembly",
-    "accumulator",
-    "vector_loops",
-    "entries_of",
+_NONE_TYPE = type(None)
+_GENERIC_GETATTRIBUTE = object.__getattribute__
+
+#: The stored fields of each schedule carrier in declaration order, each with the
+#: exact types a memo key admits there and, for a tuple, the exact type of its
+#: items.  The names are the ones ``_stored_schedule_fields`` requires and the order
+#: of a state's memo key.  A value of any other type leaves the state unkeyed (see
+#: ``_schedule_state_key``).  Not ``float`` anywhere: ``0.0 == -0.0``, and their
+#: reprs differ.  A test pins each table to ``dataclasses.fields`` and to the key
+#: functions.
+_SCHEDULE_KEY_TYPES: Tuple[Tuple[str, Tuple[type, ...], Optional[type]], ...] = (
+    ("loop_order", (_NONE_TYPE, tuple), str),
+    ("tiles", (tuple,), TileSpec),
+    ("relayout", (_NONE_TYPE, RelayoutSpec), None),
+    ("tag", (str,), None),
+    ("parallel_loop", (_NONE_TYPE, str), None),
+    ("assembly", (_NONE_TYPE, str), None),
+    ("accumulator", (_NONE_TYPE, str), None),
+    ("vector_loops", (_NONE_TYPE, tuple), str),
+    ("entries_of", (_NONE_TYPE, str), None),
 )
-_TILE_SPEC_FIELDS = (
-    "index_var",
-    "width",
-    "placement",
-    "parallel",
-    "kind",
-    "accum",
-    "unroll",
+_TILE_SPEC_KEY_TYPES: Tuple[Tuple[str, Tuple[type, ...], Optional[type]], ...] = (
+    ("index_var", (str,), None),
+    ("width", (int,), None),
+    ("placement", (str,), None),
+    ("parallel", (bool,), None),
+    ("kind", (str,), None),
+    ("accum", (str,), None),
+    ("unroll", (bool,), None),
 )
-_RELAYOUT_SPEC_FIELDS = ("operand", "pack_var", "strip_width", "scope_var")
+_RELAYOUT_SPEC_KEY_TYPES: Tuple[Tuple[str, Tuple[type, ...], Optional[type]], ...] = (
+    ("operand", (str,), None),
+    ("pack_var", (str,), None),
+    ("strip_width", (int,), None),
+    ("scope_var", (_NONE_TYPE, str), None),
+)
+_SCHEDULE_FIELDS = tuple(name for name, _, _ in _SCHEDULE_KEY_TYPES)
+_TILE_SPEC_FIELDS = tuple(name for name, _, _ in _TILE_SPEC_KEY_TYPES)
+_RELAYOUT_SPEC_FIELDS = tuple(name for name, _, _ in _RELAYOUT_SPEC_KEY_TYPES)
 
-#: The cache key of each schedule state validated so far, under the state's memo
-#: key (``_schedule_memo_key``).  Bounded like the parse memo: emptied when full.
-_SCHEDULE_KEY_MEMO: Dict[tuple, str] = {}
-_SCHEDULE_KEY_MEMO_LIMIT = 4096
+#: Each carrier class, its method resolution order when this module loaded --
+#: ``(cls, object)``, which a test pins -- and a live view of its own attributes.
+#: While that order holds, the class defines neither ``__getattribute__`` nor
+#: ``__getattr__`` and it holds no data descriptor at a field name, reading a field
+#: through the class returns the stored object, which ``_stored_values`` relies on.
+_SCHEDULE_CLASS = (Schedule, Schedule.__mro__, Schedule.__dict__)
+_TILE_SPEC_CLASS = (TileSpec, TileSpec.__mro__, TileSpec.__dict__)
+_RELAYOUT_SPEC_CLASS = (RelayoutSpec, RelayoutSpec.__mro__, RelayoutSpec.__dict__)
 
-#: The leaf values a memo key holds: exact immutable built-in types whose equal
-#: values have equal ``repr``, so that equal memo keys format equal cache keys.
-#: Not ``float`` (``0.0 == -0.0``, and their reprs differ).
-_MEMO_LEAF_TYPES = frozenset({str, int, bool, type(None)})
-_EXACT_STR = frozenset({str})
-
-
-class _UnkeyedState(Exception):
-    """A schedule state the memo does not key: its read takes the full validation."""
+_TYPE_MRO = type.__dict__["__mro__"].__get__
+_TYPE_DICT = type.__dict__["__dict__"].__get__
+_IMMUTABLE_DEFAULT_TYPES = (_NONE_TYPE, str, int, bool)
 
 
-def _schedule_validation_context() -> tuple:
-    """The module state the validation and the key format read besides the schedule.
+def _is_data_descriptor(entry: object) -> bool:
+    """Whether ``entry`` is a data descriptor: a class in its type's method
+    resolution order defines ``__set__`` or ``__delete__``.
 
-    The assembly and accumulator name registries (``is_assembly_strategy`` and
-    ``is_accumulator_structure`` read their modules' tuples), the tile width bound
-    and the fields a key leaves out when unset.  It enters every memo key, so a
-    change to any of them is a new state.
+    The order and the dicts are read through ``type``'s own descriptors, so no
+    metaclass code runs.  A type implemented in C shows each slot it fills in its
+    dict, so this is the test the interpreter's generic read makes
+    (``tp_descr_set``), which the C version (``csrc/schedule_key.cpp``) reads.
     """
 
-    return (
-        _sparse_assembly_module.SPARSE_ASSEMBLY_STRATEGIES,
-        _sparse_accumulator_module.SPARSE_ACCUMULATOR_STRUCTURES,
-        MAX_AFFINE_TILE_WIDTH,
-        _SCHEDULE_KEY_WHEN_SET,
+    return any(
+        "__set__" in attributes or "__delete__" in attributes
+        for attributes in map(_TYPE_DICT, _TYPE_MRO(type(entry)))
     )
 
 
-def _schedule_memo_key(schedule: object, context: tuple) -> Optional[tuple]:
-    """The memo key of ``schedule``'s current state, or None if the memo does not
-    key it."""
+def _class_entries(carrier_class: tuple, fields: Tuple[str, ...]) -> tuple:
+    """A carrier's own class entries at its field names, recorded at import:
+    ``(attributes, present, recorded, absent)`` -- the live view, the field names
+    the class holds an entry at, those entries, and the names it holds none at.
 
-    try:
-        return (context, _carrier_memo_key(schedule, Schedule, _SCHEDULE_FIELDS))
-    except _UnkeyedState:
-        return None
-
-
-def _carrier_memo_key(
-    value: object, expected_type: type, fields: Tuple[str, ...]
-) -> tuple:
-    """The typed key of one schedule carrier's stored state.
-
-    Read the way ``_stored_schedule_fields`` reads it, and ``_UnkeyedState`` wherever
-    that function refuses: a value not exactly ``expected_type``, a ``__dict__`` that
-    is not a dict of exactly ``fields`` under exact ``str`` names, or a field whose
-    ``object.__getattribute__`` read is not the stored object.  A TileSpec or
-    RelayoutSpec held by the carrier is keyed by the same rule.  No method of a
-    stored name or value runs: every one is known to be of an exact built-in type
-    before anything hashes or compares it.
+    Each recorded entry must be a default of an immutable builtin type (None, str,
+    int, bool, or the empty tuple), so none is a data descriptor and none can become
+    one; and no field name may be one of ``object``'s attributes, which the read
+    through the class would reach next.
     """
 
-    if type(value) is not expected_type:
-        raise _UnkeyedState
-    try:
-        state = object.__getattribute__(value, "__dict__")
-    except Exception:
-        raise _UnkeyedState from None
+    carrier, _, attributes = carrier_class
+    present = tuple(name for name in fields if name in attributes)
+    recorded = tuple(attributes[name] for name in present)
+    for name, entry in zip(present, recorded):
+        empty_tuple = type(entry) is tuple and not entry
+        if type(entry) not in _IMMUTABLE_DEFAULT_TYPES and not empty_tuple:
+            raise TypeError(
+                f"{carrier.__name__}.{name}: a class entry at a field name must be an "
+                f"immutable builtin default, not {type(entry).__name__}"
+            )
+    for name in fields:
+        if name in object.__dict__:
+            raise TypeError(f"{carrier.__name__}.{name} names an attribute of object")
+    absent = tuple(name for name in fields if name not in attributes)
+    return attributes, present, recorded, absent
+
+
+_SCHEDULE_ENTRIES = _class_entries(_SCHEDULE_CLASS, _SCHEDULE_FIELDS)
+_TILE_SPEC_ENTRIES = _class_entries(_TILE_SPEC_CLASS, _TILE_SPEC_FIELDS)
+_RELAYOUT_SPEC_ENTRIES = _class_entries(_RELAYOUT_SPEC_CLASS, _RELAYOUT_SPEC_FIELDS)
+
+
+def _native_description(carrier_class: tuple, key_types: tuple) -> tuple:
+    """One carrier as the C version reads it: ``(cls, mro, fields, allowed, items)``."""
+
+    carrier, mro, _ = carrier_class
+    return (
+        carrier,
+        mro,
+        tuple(name for name, _, _ in key_types),
+        tuple(types for _, types, _ in key_types),
+        tuple(item for _, _, item in key_types),
+    )
+
+
+#: The carriers as the C version of ``_schedule_state_key`` reads them
+#: (``scorch_ops._schedule_state_key``, ``csrc/schedule_key.cpp``): Schedule, then
+#: the carriers it holds, from the same tables the Python version reads.
+_NATIVE_KEY_TABLE = (
+    _native_description(_SCHEDULE_CLASS, _SCHEDULE_KEY_TYPES),
+    (
+        _native_description(_TILE_SPEC_CLASS, _TILE_SPEC_KEY_TYPES),
+        _native_description(_RELAYOUT_SPEC_CLASS, _RELAYOUT_SPEC_KEY_TYPES),
+    ),
+)
+
+#: The C version, or None in a scorch_ops built before it existed, whose reads then
+#: build the key in Python (``_schedule_state_key``): the same answers, slower.
+_native_state_key: Optional[Callable[[object, tuple], Optional[tuple]]] = getattr(
+    _native, "_schedule_state_key", None
+)
+
+#: The cache key of each schedule state validated so far: one dict for each value
+#: of the module state the validation reads (``_current_context``), mapping a
+#: state's memo key (``_schedule_state_key``) to its cache key.  Bounded like the
+#: parse memo: the dicts and their entries together, all emptied when full.
+_SCHEDULE_KEY_MEMO: Dict[tuple, Dict[tuple, str]] = {}
+_SCHEDULE_KEY_MEMO_LIMIT = 4096
+
+#: The module state the last read keyed, as ``_current_context`` returns it, or
+#: None after the memo gained or lost a dict.
+_LAST_CONTEXT: Optional[tuple] = None
+
+
+def _current_context() -> Optional[tuple]:
+    """The module state the validation and the key format read besides the schedule,
+    or None if the memo does not key it.
+
+    The state is the assembly and accumulator name registries
+    (``is_assembly_strategy`` and ``is_accumulator_structure`` read their modules'
+    tuples), the tile width bound and the fields a key leaves out when unset.  It
+    is keyed only when each is of an exact immutable type (a tuple or frozenset of
+    exact str, an exact int), so that one object is one value: a registry rebound
+    to a list could change in place between two reads, and is judged by the full
+    validation on every read.  A read compares the four objects by identity with
+    the last ones keyed; after a change it keys them by value, so restoring a value
+    finds its entries again.
+
+    Returned as ``(memo, strategies, structures, width, when_set, values, entries)``:
+    the memo read, the four objects, their tuple (the memo's key) and the memo's
+    dict for it, or None if it has none yet.
+    """
+
+    global _LAST_CONTEXT
+    memo = _SCHEDULE_KEY_MEMO
+    strategies = _sparse_assembly_module.SPARSE_ASSEMBLY_STRATEGIES
+    structures = _sparse_accumulator_module.SPARSE_ACCUMULATOR_STRUCTURES
+    width = MAX_AFFINE_TILE_WIDTH
+    when_set = _SCHEDULE_KEY_WHEN_SET
+    last = _LAST_CONTEXT
     if (
-        type(state) is not dict
-        or len(state) != len(fields)
-        or not _EXACT_STR.issuperset(map(type, state))
+        last is not None
+        and last[0] is memo
+        and last[1] is strategies
+        and last[2] is structures
+        and last[3] is width
+        and last[4] is when_set
     ):
-        raise _UnkeyedState
+        return last
+    if (
+        type(strategies) is not tuple
+        or type(structures) is not tuple
+        or type(width) is not int
+        or type(when_set) is not frozenset
+        or not all(map(operator.is_, map(type, strategies), repeat(str)))
+        or not all(map(operator.is_, map(type, structures), repeat(str)))
+        or not all(map(operator.is_, map(type, when_set), repeat(str)))
+    ):
+        return None
+    values = (strategies, structures, width, when_set)
+    last = (memo, strategies, structures, width, when_set, values, memo.get(values))
+    _LAST_CONTEXT = last
+    return last
+
+
+def _stored_values(
+    value: object,
+    carrier_class: tuple,
+    fields: Tuple[str, ...],
+    entries: tuple,
+) -> Optional[tuple]:
+    """``value``'s stored field values in declaration order, or None if the memo
+    does not key them.
+
+    Read the way ``_stored_schedule_fields`` reads them, and None wherever that
+    function refuses, and wherever this read could not tell without running caller
+    code: a value not exactly the carrier class; a class whose attribute read is
+    no longer ``object.__getattribute__``'s (``_SCHEDULE_CLASS``); a ``__dict__``
+    that is not a dict whose keys are the interned ``fields`` themselves, in order
+    (compared by identity, so no key's ``__eq__`` or ``__hash__`` runs, and a state
+    whose order changed is unkeyed); or a class holding a data descriptor at a field
+    name, which a read through the class would run (``_no_data_descriptor``).  The
+    C version (``scorch_ops._schedule_state_key``) refuses exactly these, and a test
+    holds the two to one answer.
+    """
+
+    carrier, mro, attributes = carrier_class
+    if (
+        type(value) is not carrier
+        or carrier.__mro__ is not mro
+        or "__getattribute__" in attributes
+        or "__getattr__" in attributes
+    ):
+        return None
     try:
-        stored = tuple(map(state.__getitem__, fields))
-        observed = tuple(map(object.__getattribute__, repeat(value), fields))
+        state = _GENERIC_GETATTRIBUTE(value, "__dict__")
+        if (
+            type(state) is not dict
+            or len(state) != len(fields)
+            or not all(map(operator.is_, state, fields))
+        ):
+            return None
+        values = tuple(state.values())
+        if not _no_data_descriptor(entries):
+            return None
     except Exception:
-        raise _UnkeyedState from None
-    if not all(map(operator.is_, observed, stored)):
-        raise _UnkeyedState
-    return _memo_tuple(stored)
+        return None
+    return values
 
 
-def _memo_tuple(values: tuple) -> tuple:
-    """A tuple of stored values as it enters a memo key: each value's exact type
-    beside the values, a nested tuple or carrier replaced by its own typed key."""
+def _no_data_descriptor(entries: tuple) -> bool:
+    """Whether a carrier class holds no data descriptor at any field name.
 
-    types = tuple(map(type, values))
-    if not _MEMO_LEAF_TYPES.issuperset(types):
-        values = tuple(map(_memo_value, values))
-    return (types, values)
+    ``entries`` is the class's record (``_class_entries``).  While its entries at
+    the field names are the ones recorded at import, none is; an entry added,
+    replaced or removed since is judged by its type (``_is_data_descriptor``).
+    """
+
+    attributes, present, recorded, absent = entries
+    if not any(map(attributes.__contains__, absent)):
+        try:
+            current: Optional[tuple] = tuple(map(attributes.__getitem__, present))
+        except KeyError:  # an entry removed since import: judged below
+            current = None
+        if current is not None and all(map(operator.is_, current, recorded)):
+            return True
+    return not any(
+        _is_data_descriptor(attributes[name])
+        for name in present + absent
+        if name in attributes
+    )
 
 
-def _memo_value(value: object) -> object:
-    kind = type(value)
-    if kind in _MEMO_LEAF_TYPES:
-        return value
-    if kind is tuple:
-        return _memo_tuple(cast(tuple, value))
-    if kind is TileSpec:
-        return _carrier_memo_key(value, TileSpec, _TILE_SPEC_FIELDS)
-    if kind is RelayoutSpec:
-        return _carrier_memo_key(value, RelayoutSpec, _RELAYOUT_SPEC_FIELDS)
-    raise _UnkeyedState
+def _schedule_state_key(value: object) -> Optional[tuple]:
+    """The memo key of a schedule's current state, or None if the memo does not key
+    it.
+
+    The key is the flat tuple of the stored values (``_stored_values``), each
+    TileSpec and RelayoutSpec replaced by its own (``_tile_state_key``,
+    ``_relayout_state_key``).  It is built only when every value is of an exact type
+    ``_SCHEDULE_KEY_TYPES`` admits at its position, checked by identity before
+    anything hashes or compares it, so no method of a stored value or of its type
+    runs.  Since each position admits one type besides None, equal keys hold equal
+    values of equal types (``True`` and ``1`` never meet), and so are one state:
+    one verdict and one cache key.  No reference to the schedule is kept, and a
+    change to a carrier it holds changes the next read's key.
+    """
+
+    values = _stored_values(value, _SCHEDULE_CLASS, _SCHEDULE_FIELDS, _SCHEDULE_ENTRIES)
+    if values is None:
+        return None
+    (
+        loop_order,
+        tiles,
+        relayout,
+        tag,
+        parallel_loop,
+        assembly,
+        accumulator,
+        vector_loops,
+        entries_of,
+    ) = values
+    if (
+        type(tiles) is not tuple
+        or type(tag) is not str
+        or (relayout is not None and type(relayout) is not RelayoutSpec)
+        or (parallel_loop is not None and type(parallel_loop) is not str)
+        or (assembly is not None and type(assembly) is not str)
+        or (accumulator is not None and type(accumulator) is not str)
+        or (entries_of is not None and type(entries_of) is not str)
+        or (
+            loop_order is not None
+            and (
+                type(loop_order) is not tuple
+                or not all(map(operator.is_, map(type, loop_order), repeat(str)))
+            )
+        )
+        or (
+            vector_loops is not None
+            and (
+                type(vector_loops) is not tuple
+                or not all(map(operator.is_, map(type, vector_loops), repeat(str)))
+            )
+        )
+    ):
+        return None
+    if not tiles and relayout is None:
+        return values
+    if tiles:
+        tiles = tuple(map(_tile_state_key, tiles))
+        if None in tiles:
+            return None
+    if relayout is not None:
+        relayout = _relayout_state_key(relayout)
+        if relayout is None:
+            return None
+    return (
+        loop_order,
+        tiles,
+        relayout,
+        tag,
+        parallel_loop,
+        assembly,
+        accumulator,
+        vector_loops,
+        entries_of,
+    )
+
+
+def _tile_state_key(value: object) -> Optional[tuple]:
+    """A TileSpec's part of a memo key (``_TILE_SPEC_KEY_TYPES``), or None."""
+
+    values = _stored_values(
+        value, _TILE_SPEC_CLASS, _TILE_SPEC_FIELDS, _TILE_SPEC_ENTRIES
+    )
+    if values is None:
+        return None
+    index_var, width, placement, parallel, kind, accum, unroll = values
+    if (
+        type(index_var) is not str
+        or type(width) is not int
+        or type(placement) is not str
+        or type(parallel) is not bool
+        or type(kind) is not str
+        or type(accum) is not str
+        or type(unroll) is not bool
+    ):
+        return None
+    return values
+
+
+def _relayout_state_key(value: object) -> Optional[tuple]:
+    """A RelayoutSpec's part of a memo key (``_RELAYOUT_SPEC_KEY_TYPES``), or None."""
+
+    values = _stored_values(
+        value, _RELAYOUT_SPEC_CLASS, _RELAYOUT_SPEC_FIELDS, _RELAYOUT_SPEC_ENTRIES
+    )
+    if values is None:
+        return None
+    operand, pack_var, strip_width, scope_var = values
+    if (
+        type(operand) is not str
+        or type(pack_var) is not str
+        or type(strip_width) is not int
+        or (scope_var is not None and type(scope_var) is not str)
+    ):
+        return None
+    return values
+
+
+def _remember_schedule_key(context: tuple, canonical: Schedule, key: str) -> None:
+    """Memoize ``key``, the cache key of a state the full validation just accepted.
+
+    It is stored under the memo key of the canonical copy, which no caller holds,
+    rather than under the key the read built, since another thread could have
+    changed the schedule since; and only if the module state is still the one the
+    read keyed (``context``).  The bound counts the memo's dicts and their entries
+    together; reaching it empties them all.
+    """
+
+    global _LAST_CONTEXT
+    memo, strategies, structures, width, when_set, values, _ = context
+    if (
+        memo is not _SCHEDULE_KEY_MEMO
+        or strategies is not _sparse_assembly_module.SPARSE_ASSEMBLY_STRATEGIES
+        or structures is not _sparse_accumulator_module.SPARSE_ACCUMULATOR_STRUCTURES
+        or width is not MAX_AFFINE_TILE_WIDTH
+        or when_set is not _SCHEDULE_KEY_WHEN_SET
+    ):
+        return
+    native = _native_state_key
+    if native is not None:
+        state_key = native(canonical, _NATIVE_KEY_TABLE)
+    else:
+        state_key = _schedule_state_key(canonical)
+    if state_key is None:
+        return
+    entries = memo.get(values)
+    added = 1 if entries is not None else 2
+    if len(memo) + sum(map(len, memo.values())) + added > _SCHEDULE_KEY_MEMO_LIMIT:
+        memo.clear()
+        _LAST_CONTEXT = None
+        entries = None
+        if _SCHEDULE_KEY_MEMO_LIMIT < 2:
+            return
+    if entries is None:
+        entries = memo[values] = {}
+        _LAST_CONTEXT = None
+    entries[state_key] = key
 
 
 def _format_schedule_key(schedule: Schedule) -> str:

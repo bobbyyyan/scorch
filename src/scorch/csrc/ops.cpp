@@ -874,9 +874,12 @@ void bind_sddmm_variants(py::module_& m) {
 
 // sealed_values.cpp: the stored state of scorch.format's and scorch.layout's value types.
 int register_sealed_values(PyObject* module);
+// schedule_key.cpp: the memo key of a schedule's stored state (scorch.compiler.scheduler).
+int register_schedule_key(PyObject* module);
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     if (register_sealed_values(m.ptr()) < 0) throw py::error_already_set();
+    if (register_schedule_key(m.ptr()) < 0) throw py::error_already_set();
 
     // The caller's thread setting (scorch_policy.h, "The caller's thread setting"): read here,
     // once, before any kernel can run. The capsule is how a JIT-compiled kernel module reads the
