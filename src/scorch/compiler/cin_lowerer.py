@@ -159,9 +159,17 @@ def _result_tensor_abi_assembler(
     known_nnz_var: Optional[str] = None,
     exact_dense_parent_positions: bool = False,
     reserve_hint_var: Optional[str] = None,
-    value_post_ops: Tuple[Tuple[str, Optional[str]], ...] = (),
+    value_post_ops: Optional[Tuple[Tuple[str, Optional[str]], ...]] = None,
 ) -> ResultTensorAssembler:
-    """Snapshot one semantic result at the Torch/C++ ABI ownership boundary."""
+    """Snapshot one semantic result at the Torch/C++ ABI ownership boundary.
+
+    The lowering's only way to build a result assembler.  ``value_post_ops``
+    is left ``None`` (not decided) by a caller that only allocates storage
+    before the loop nest is lowered, when the copy-out has not yet decided
+    whether it applies the post-ops; such an assembler refuses to finish the
+    result (``result_post_ops_undecided``).  A caller that finishes the
+    result passes ``self._value_post_ops()``.
+    """
 
     return ResultTensorAssembler(
         name=tensor_var.get_name(),

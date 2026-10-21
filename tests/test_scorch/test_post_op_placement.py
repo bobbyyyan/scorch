@@ -44,7 +44,7 @@ from scorch.compiler.cin import (
     TensorAssign,
     TensorVar,
 )
-from scorch.compiler.cin_lowerer import CINLowerer
+from scorch.compiler.cin_lowerer import CINLowerer, _result_tensor_abi_assembler
 from scorch.compiler.codegen import LLIRLowerer
 from scorch.compiler.torch_cpp_abi import ResultTensorAssembler
 from scorch.exceptions import ScorchError, defect_code
@@ -651,6 +651,37 @@ def test_an_assembler_without_post_ops_emits_what_it_emitted() -> None:
     assert plain.emit_value_post_ops() == []
     lowered = [LLIRLowerer().lower_llir(stmt) for stmt in plain.emit_storage_epilogue()]
     assert not any("post_op" in line for line in lowered)
+
+
+@pytest.mark.parametrize(
+    "entry", ["emit_value_post_ops", "emit_storage_epilogue", "emit_final_assembly"]
+)
+@pytest.mark.parametrize("level_types", [(D, D), (D, S)], ids=["dense", "sparse"])
+def test_an_assembler_with_undecided_post_ops_refuses_to_finish(
+    level_types, entry
+) -> None:
+    """``value_post_ops=None``: built before the lowering decided the post-ops.
+
+    The lowering builds such an assembler to allocate the result's storage before
+    its loop nest is lowered, when it cannot know whether the copy-out will apply
+    the post-ops.  It allocates (those emitters never read the post-ops), but the
+    value pass and both entries that reach it refuse with a code, so a path that
+    finished a result with it would fail closed instead of dropping the post-ops
+    or applying them twice.  The lowering's helper leaves them undecided unless
+    its caller passes them.
+    """
+
+    undecided = _assembler(level_types, None)
+    assert undecided.emit_value_array_init()
+    assert undecided.emit_level_indices_init() is not None
+    with pytest.raises(ScorchError) as raised:
+        getattr(undecided, entry)()
+    assert defect_code(raised.value) == "result_post_ops_undecided"
+    fmt = "".join("d" if t is D else "s" for t in level_types)
+    result = TensorVar("C", fmt=fmt, dtype=torch.float64)
+    assert _result_tensor_abi_assembler(result).value_post_ops is None
+    decided = _result_tensor_abi_assembler(result, value_post_ops=())
+    assert decided.emit_value_post_ops() == []
 
 
 def test_the_post_op_tensor_is_handed_over_in_storage_order() -> None:

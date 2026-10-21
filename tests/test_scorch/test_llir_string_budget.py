@@ -187,10 +187,16 @@ def test_direct_string_encoded_var_expression_budget_is_explicit() -> None:
         # ``level_total_check`` and ``drained_entries_check`` (each a copy of the
         # int64 count it checks), plain identifiers.  91: the entry's index-extent
         # check (each argument's shape parameter, ``"<argument>_shape"``) and the extra
-        # tensor check's ``result_shape``, plain identifiers.
-        "torch_cpp_abi.py": 91,
+        # tensor check's ``result_shape``, plain identifiers.  89 with the value
+        # post-ops (row 16): ``emit_value_post_ops`` adds four Vars, one factory
+        # each for ``{name}_post_op_values``, ``_post_op_count`` and
+        # ``_post_op_position`` and the read of a post-op tensor
+        # ``{tensor}_val``; and ``_values_owner`` is now the one Var for
+        # ``{name}_values_torch``, which nine sites (the value pass's two among
+        # them) each built before.  Plain identifiers throughout.
+        "torch_cpp_abi.py": 89,
     }
-    assert sum(constructor_counts.values()) == 540
+    assert sum(constructor_counts.values()) == 538
     assert unclassified_counts == {
         "cin.py": 9,
         "cin_lowerer.py": 195,
@@ -208,10 +214,10 @@ def test_direct_string_encoded_var_expression_budget_is_explicit() -> None:
         "schedule_lowerer.py": 106,
         "single_iteration_loop_pass.py": 1,
         "sparse_prefetch_pass.py": 1,
-        # 91: as in constructor_counts above.
-        "torch_cpp_abi.py": 91,
+        # 89: as in constructor_counts above.
+        "torch_cpp_abi.py": 89,
     }
-    assert sum(unclassified_counts.values()) == 530
+    assert sum(unclassified_counts.values()) == 528
     assert known_indirect == {
         ("cin_lowerer.py", "actual_size"): 2,
         ("cin_lowerer.py", "expr.name.replace(old, new)"): 1,
@@ -390,7 +396,12 @@ def test_expression_producer_budgets_are_explicit() -> None:
         # The fifth: mode_position_length, the position array's entry count that
         # caps a deeper read of the SpGEMM work estimate (row 15b).
         ("torch_cpp_abi.py", "mode_index_tensor"): 5,
-        ("torch_cpp_abi.py", "tensor_data_ptr"): 12,
+        # The thirteenth: the value post-ops' pointer into ``{name}_values_torch``
+        # (row 16).  On the appended-vector path that tensor first exists in
+        # ``emit_final_assembly`` (moved out of the values vector), so the pass,
+        # which every path reaches through ``emit_storage_epilogue``, can only take
+        # its pointer there.
+        ("torch_cpp_abi.py", "tensor_data_ptr"): 13,
         ("torch_cpp_abi.py", "tensor_storage_member"): 2,
     }
     assert member_call_constructors == {
@@ -398,10 +409,12 @@ def test_expression_producer_budgets_are_explicit() -> None:
         "compressed_where_openmp_pass.py": 1,
         "llir_traversal.py": 1,
         "schedule_lowerer.py": 2,
-        # data_ptr's, and mode_position_length's numel() (row 15b).
-        "torch_cpp_abi.py": 2,
+        # data_ptr's, mode_position_length's numel() (row 15b), and the value
+        # post-ops' numel() of ``{name}_values_torch`` (row 16): the pass's loop
+        # bound, the one count every assembly path's values tensor carries.
+        "torch_cpp_abi.py": 3,
     }
-    assert sum(member_call_constructors.values()) == 8
+    assert sum(member_call_constructors.values()) == 9
 
 
 def test_panel_lower_bound_calls_cannot_return_to_var_names() -> None:
@@ -1179,16 +1192,125 @@ def test_compressed_result_assembly_is_owned_by_the_typed_abi_epilogue() -> None
     assert "self._get_mode_index_set(i, level_type)" in epilogue
     assert "stmts.extend(self.emit_storage_epilogue())" in final
 
-    lowerer_source = (_COMPILER_ROOT / "cin_lowerer.py").read_text()
-    compressed_context = lowerer_source.split("CompressedWhereOpenMPContext(", 1)[
-        1
-    ].split("workspace_name=workspace_name", 1)[0]
-    assert (
-        compressed_context.count(
-            "result_assembler=_result_tensor_abi_assembler(result_tensor)"
-        )
-        == 1
-    )
+    # The compressed path hands over the lowering's typed assembler for its
+    # result, with the post-ops decided (row 16): its final assembly finishes the
+    # result through emit_storage_epilogue.
+    lowerer_tree = ast.parse((_COMPILER_ROOT / "cin_lowerer.py").read_text())
+    contexts = [
+        node
+        for node in ast.walk(lowerer_tree)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Name)
+        and node.func.id == "CompressedWhereOpenMPContext"
+    ]
+    assert len(contexts) == 1
+    assert [
+        ast.unparse(keyword.value)
+        for keyword in contexts[0].keywords
+        if keyword.arg == "result_assembler"
+    ] == [
+        "_result_tensor_abi_assembler(result_tensor, "
+        "value_post_ops=self._value_post_ops())"
+    ]
+
+
+#: What a result assembler the lowering builds is used for, by the methods called
+#: on it: finishing the result reaches the value post-ops; the storage
+#: allocators never read them.
+_FINISHING = {"emit_final_assembly", "emit_storage_epilogue", "emit_value_post_ops"}
+_ALLOCATING = {"emit_value_array_init", "emit_level_indices_init"}
+
+
+def test_every_lowered_result_assembler_decides_its_post_ops() -> None:
+    """One helper builds the lowering's result assemblers, and each call decides.
+
+    ``_result_tensor_abi_assembler`` holds cin_lowerer.py's only
+    ``ResultTensorAssembler(``.  A call whose assembler finishes the result (an
+    entry in ``_FINISHING``, or handed to the compressed path, whose final assembly
+    calls ``emit_storage_epilogue``) passes ``value_post_ops=self._value_post_ops()``,
+    read once the loop nest is lowered and the copy-out has decided.  A call whose
+    assembler only allocates storage passes none, so they stay ``None`` (not
+    decided) and that assembler refuses to finish a result
+    (test_post_op_placement.py).  A new call, or a new use of one, fails here until
+    it is classified.
+    """
+
+    tree = ast.parse((_COMPILER_ROOT / "cin_lowerer.py").read_text())
+    parents = {
+        child: node for node in ast.walk(tree) for child in ast.iter_child_nodes(node)
+    }
+    functions = [
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+    ]
+
+    def called(node: ast.AST) -> Optional[str]:
+        if not isinstance(node, ast.Call):
+            return None
+        if isinstance(node.func, ast.Name):
+            return node.func.id
+        if isinstance(node.func, ast.Attribute):
+            return node.func.attr
+        return None
+
+    helpers = [node for node in functions if node.name == "_result_tensor_abi_assembler"]
+    assert len(helpers) == 1
+    constructions = [
+        node for node in ast.walk(tree) if called(node) == "ResultTensorAssembler"
+    ]
+    assert len(constructions) == 1
+    assert any(node is constructions[0] for node in ast.walk(helpers[0]))
+
+    def innermost(node: ast.AST) -> ast.AST:
+        holder = parents[node]
+        while not isinstance(holder, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            holder = parents[holder]
+        return holder
+
+    classified = []
+    for call in ast.walk(tree):
+        if called(call) != "_result_tensor_abi_assembler":
+            continue
+        assert isinstance(call, ast.Call)
+        parent = parents[call]
+        if isinstance(parent, ast.keyword):
+            assert parent.arg == "result_assembler", ast.unparse(parent)
+            assert called(parents[parent]) == "CompressedWhereOpenMPContext"
+            use = "finishes"
+        else:
+            assert isinstance(parent, ast.Assign), ast.unparse(parent)
+            (target,) = parent.targets
+            assert isinstance(target, ast.Name), ast.unparse(parent)
+            methods = {
+                node.func.attr
+                for node in ast.walk(innermost(call))
+                if isinstance(node, ast.Call)
+                and isinstance(node.func, ast.Attribute)
+                and isinstance(node.func.value, ast.Name)
+                and node.func.value.id == target.id
+            }
+            assert methods <= _FINISHING | _ALLOCATING | {"emit_position_tail_close"}, (
+                call.lineno,
+                methods,
+            )
+            use = "finishes" if methods & _FINISHING else "allocates"
+            assert use == "finishes" or methods <= _ALLOCATING, (call.lineno, methods)
+        post_ops = [
+            ast.unparse(keyword.value)
+            for keyword in call.keywords
+            if keyword.arg == "value_post_ops"
+        ]
+        expected = ["self._value_post_ops()"] if use == "finishes" else []
+        assert post_ops == expected, (call.lineno, use, post_ops)
+        classified.append((getattr(innermost(call), "name"), use))
+
+    assert sorted(classified) == [
+        ("_lower_prepared_index_stmt", "allocates"),
+        ("assemble_body", "allocates"),
+        ("assemble_body", "finishes"),
+        ("lower_ForAll", "finishes"),
+    ]
 
 
 def test_direct_initialization_budget_and_live_owners_are_explicit() -> None:
@@ -1296,13 +1418,18 @@ def test_known_nnz_coordinate_torch_allocation_is_structured() -> None:
             len(_llir_constructor_calls(path, constructor))
             for constructor in ("VarInit", "Array", "FunctionCall", "QualifiedName")
         )
-        == 67
+        == 71
     )
-    assert len(_llir_constructor_calls(path, "VarInit")) == 29
+    # 32 with the value post-ops' three declarations (row 16): the pointer into
+    # ``{name}_values_torch``, the value count the loop runs to, and the loop's
+    # position.
+    assert len(_llir_constructor_calls(path, "VarInit")) == 32
     # 12 with the index-extent check's argument names and index names.
     assert len(_llir_constructor_calls(path, "Array")) == 12
-    # 14 with the coordinate count ``emit_position_tail_close`` reads.
-    assert len(_llir_constructor_calls(path, "FunctionCall")) == 14
+    # 14 with the coordinate count ``emit_position_tail_close`` reads.  15 with
+    # the value post-ops' ``scorch_<kind>`` call, which applies a unary post-op
+    # (csrc/header.h) to one value (row 16).
+    assert len(_llir_constructor_calls(path, "FunctionCall")) == 15
     assert len(_llir_constructor_calls(path, "QualifiedName")) == 12
 
 
@@ -1586,7 +1713,11 @@ def test_compressed_value_allocation_has_typed_and_legacy_paths() -> None:
     expected_template_inventory = {
         "RawStmt": 0,
         "VarInit": 2,
-        "Var": 3,
+        # The total and the pointer.  The owner ``{name}_values_torch`` is
+        # ``_values_owner()``, the one Var every reference to it is built by
+        # (row 16d), called for its declaration and for its data pointer.
+        "Var": 2,
+        "_values_owner": 2,
         "Array": 1,
         "FunctionCall": 1,
         "QualifiedName": 1,

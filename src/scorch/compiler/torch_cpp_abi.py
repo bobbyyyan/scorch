@@ -1407,8 +1407,14 @@ class ResultTensorAssembler:
     #: nest has finished, as ``(kind, post-op tensor name or None)`` pairs in
     #: program order (``emit_value_post_ops``).  Empty when there are none, and
     #: when the lowering applied them where it copied each cell out of a dense
-    #: workspace; then every statement is emitted exactly as before.
-    value_post_ops: Tuple[Tuple[str, Optional[str]], ...] = ()
+    #: workspace; then every statement is emitted exactly as before.  ``None``
+    #: when they were not decided: the lowering builds assemblers that only
+    #: allocate storage before its loop nest is lowered, when it cannot yet
+    #: know whether the copy-out applies them.  Such an assembler refuses the
+    #: value pass and both entries that reach it (``result_post_ops_undecided``),
+    #: so a path that finished a result with it would fail closed rather than
+    #: drop the post-ops or apply them twice.
+    value_post_ops: Optional[Tuple[Tuple[str, Optional[str]], ...]] = ()
 
     def __post_init__(self) -> None:
         self.validate()
@@ -1467,18 +1473,21 @@ class ResultTensorAssembler:
                 "result identity must be an exact SymbolId or None",
                 code="internal_argument_type_invalid",
             )
-        if type(self.value_post_ops) is not tuple or any(
-            type(op) is not tuple or len(op) != 2 or type(op[0]) is not str
-            for op in self.value_post_ops
+        if self.value_post_ops is not None and (
+            type(self.value_post_ops) is not tuple
+            or any(
+                type(op) is not tuple or len(op) != 2 or type(op[0]) is not str
+                for op in self.value_post_ops
+            )
         ):
             raise ScorchTypeError(
-                "value post-ops must be a tuple of (kind, tensor name) pairs",
+                "value post-ops must be None or a tuple of (kind, tensor name) pairs",
                 code="internal_argument_type_invalid",
             )
         sparse = any(
             level_type is not LevelType.DENSE for level_type in self.level_types
         )
-        for kind, tensor_name in self.value_post_ops:
+        for kind, tensor_name in self.value_post_ops or ():
             if kind in BINARY_POST_OPS:
                 if type(tensor_name) is not str or not tensor_name.isidentifier():
                     raise ScorchTypeError(
@@ -1509,6 +1518,31 @@ class ResultTensorAssembler:
                     code="post_op_kind_unsupported",
                 )
 
+    def _values_owner(self) -> llir.Var:
+        """A reference to ``{name}_values_torch``, the tensor every assembly path
+        stores as the result's values.
+
+        Every reference to it in this file is built here.  A fresh node per call:
+        nothing reachable from an emitted LLIR node is shared with another.
+        """
+
+        return llir.Var(
+            name=f"{self.name}_values_torch", type=llir.DataType.TORCH_TENSOR
+        )
+
+    def _decided_value_post_ops(
+        self, entry: str
+    ) -> Tuple[Tuple[str, Optional[str]], ...]:
+        """The post-ops, refused when they were not decided (``None``)."""
+
+        if self.value_post_ops is None:
+            raise ScorchAssertionError(
+                f"{entry} needs the result's post-ops decided, and this assembler "
+                "was built before they were (value_post_ops is None)",
+                code="result_post_ops_undecided",
+            )
+        return self.value_post_ops
+
     def emit_value_post_ops(self) -> List[llir.Stmt]:
         """Apply the post-ops to every stored value of the finished result.
 
@@ -1535,21 +1569,34 @@ class ResultTensorAssembler:
                 code="internal_argument_type_invalid",
             )
         self.validate()
-        if not self.value_post_ops:
+        value_post_ops = self._decided_value_post_ops("emit_value_post_ops")
+        if not value_post_ops:
             return []
         c_datatype = dtype_to_c_datatype(self.dtype)
         values = f"{self.name}_post_op_values"
         count = f"{self.name}_post_op_count"
         position = f"{self.name}_post_op_position"
 
+        def values_reference(is_restrict: bool = False) -> llir.Var:
+            return llir.Var(
+                name=values,
+                type=llir.DataType.ptr_type(c_datatype),
+                is_restrict=is_restrict,
+            )
+
+        def count_reference() -> llir.Var:
+            return llir.Var(name=count, type=llir.DataType.INT64)
+
+        def position_reference() -> llir.Var:
+            return llir.Var(name=position, type=llir.DataType.INT64)
+
         def target() -> llir.ArrayAccess:
             return llir.ArrayAccess(
-                array=llir.Var(name=values, type=llir.DataType.ptr_type(c_datatype)),
-                index=llir.Var(name=position, type=llir.DataType.INT64),
+                array=values_reference(), index=position_reference()
             )
 
         body: List[llir.Stmt] = []
-        for kind, tensor_name in self.value_post_ops:
+        for kind, tensor_name in value_post_ops:
             if kind in BINARY_POST_OPS:
                 body.append(
                     llir.Assign(
@@ -1558,7 +1605,7 @@ class ResultTensorAssembler:
                             array=llir.Var(
                                 name=f"{tensor_name}_val", type=llir.DataType.NO_TYPE
                             ),
-                            index=llir.Var(name=position, type=llir.DataType.INT64),
+                            index=position_reference(),
                         ),
                         op=BINARY_POST_OPS[kind],
                     )
@@ -1574,43 +1621,27 @@ class ResultTensorAssembler:
                         op=llir.AssignOp.ASSIGN,
                     )
                 )
-        values_torch = llir.Var(
-            name=f"{self.name}_values_torch", type=llir.DataType.TORCH_TENSOR
-        )
         return [
             llir.Comment("Apply the post-ops to every stored value"),
             llir.VarInit(
-                var=llir.Var(
-                    name=values,
-                    type=llir.DataType.ptr_type(c_datatype),
-                    is_restrict=True,
-                ),
-                value=tensor_data_ptr(values_torch, c_datatype),
+                var=values_reference(is_restrict=True),
+                value=tensor_data_ptr(self._values_owner(), c_datatype),
             ),
             llir.VarInit(
-                var=llir.Var(name=count, type=llir.DataType.INT64),
+                var=count_reference(),
                 value=llir.MemberCall(
-                    base=llir.Var(
-                        name=f"{self.name}_values_torch",
-                        type=llir.DataType.TORCH_TENSOR,
-                    ),
-                    member="numel",
-                    args=(),
+                    base=self._values_owner(), member="numel", args=()
                 ),
             ),
             llir.ForLoop(
                 init=llir.VarInit(
-                    var=llir.Var(name=position, type=llir.DataType.INT64),
+                    var=position_reference(),
                     value=llir.Literal(value=0, data_type=llir.DataType.INT64),
                 ),
                 cond=llir.BinOp(
-                    op="<",
-                    left=llir.Var(name=position, type=llir.DataType.INT64),
-                    right=llir.Var(name=count, type=llir.DataType.INT64),
+                    op="<", left=position_reference(), right=count_reference()
                 ),
-                update=llir.Increment(
-                    var=llir.Var(name=position, type=llir.DataType.INT64)
-                ),
+                update=llir.Increment(var=position_reference()),
                 body=body,
                 omp_parallel_for=True,
                 omp_schedule="static",
@@ -2266,18 +2297,14 @@ class ResultTensorAssembler:
                 code="dtype_unsupported",
             ) from failure
 
-        owner_name = f"{self.name}_values_torch"
         pointer_name = f"{self.name}_values_data"
 
         def total_reference() -> llir.Var:
             return llir.Var(name=total_name, type=total_type)
 
-        def owner_reference() -> llir.Var:
-            return llir.Var(name=owner_name, type=llir.DataType.TORCH_TENSOR)
-
         return [
             llir.VarInit(
-                var=owner_reference(),
+                var=self._values_owner(),
                 value=llir.FunctionCall(
                     name="torch::empty",
                     args=(
@@ -2295,7 +2322,7 @@ class ResultTensorAssembler:
             ),
             llir.VarInit(
                 var=llir.Var(name=pointer_name, type=pointer_type),
-                value=tensor_data_ptr(owner_reference(), c_datatype),
+                value=tensor_data_ptr(self._values_owner(), c_datatype),
             ),
         ]
 
@@ -2345,10 +2372,7 @@ class ResultTensorAssembler:
             )
             stmts.append(
                 llir.VarInit(
-                    var=llir.Var(
-                        name=f"{self.name}_values_torch",
-                        type=llir.DataType.TORCH_TENSOR,
-                    ),
+                    var=self._values_owner(),
                     value=llir.FunctionCall(
                         name="torch::empty",
                         args=[
@@ -2389,10 +2413,7 @@ class ResultTensorAssembler:
                         is_restrict=True,
                     ),
                     value=tensor_data_ptr(
-                        llir.Var(
-                            name=f"{self.name}_values_torch",
-                            type=llir.DataType.TORCH_TENSOR,
-                        ),
+                        self._values_owner(),
                         c_datatype,
                     ),
                 )
@@ -2434,10 +2455,7 @@ class ResultTensorAssembler:
             c_datatype = dtype_to_c_datatype(self.dtype)
             stmts.append(
                 llir.VarInit(
-                    var=llir.Var(
-                        name=f"{self.name}_values_torch",
-                        type=llir.DataType.TORCH_TENSOR,
-                    ),
+                    var=self._values_owner(),
                     value=llir.FunctionCall(
                         name="torch::empty",
                         args=[
@@ -2466,10 +2484,7 @@ class ResultTensorAssembler:
                         type=llir.DataType.ptr_type(c_datatype),
                     ),
                     value=tensor_data_ptr(
-                        llir.Var(
-                            name=f"{self.name}_values_torch",
-                            type=llir.DataType.TORCH_TENSOR,
-                        ),
+                        self._values_owner(),
                         c_datatype,
                     ),
                 )
@@ -2763,6 +2778,7 @@ class ResultTensorAssembler:
                 code="internal_argument_type_invalid",
             )
         self.validate()
+        self._decided_value_post_ops("emit_storage_epilogue")
         return [
             *self.emit_value_post_ops(),
             llir.Assign(
@@ -2782,10 +2798,7 @@ class ResultTensorAssembler:
             ),
             llir.Assign(
                 var=tensor_storage_member(self.name, "storage", "value"),
-                value=llir.Var(
-                    name=f"{self.name}_values_torch",
-                    type=llir.DataType.TORCH_TENSOR,
-                ),
+                value=self._values_owner(),
             ),
             llir.Return(
                 value=llir.Var(
@@ -2803,6 +2816,7 @@ class ResultTensorAssembler:
                 code="internal_argument_type_invalid",
             )
         self.validate()
+        self._decided_value_post_ops("emit_final_assembly")
         stmts: List[llir.Stmt] = []
 
         # TacoTensor decl
@@ -2882,10 +2896,7 @@ class ResultTensorAssembler:
         if not self.is_dense and not self.known_nnz_var:
             stmts.append(
                 llir.VarInit(
-                    var=llir.Var(
-                        name=f"{self.name}_values_torch",
-                        type=llir.DataType.TORCH_TENSOR,
-                    ),
+                    var=self._values_owner(),
                     value=llir.FunctionCall(
                         name="scorch_tensor_from_vector",
                         args=[
