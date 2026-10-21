@@ -540,6 +540,55 @@ def _reject_unsupported_requested_schedule(
         )
 
 
+def _layout_contract(tensor: Any) -> Any:
+    """An operand's layout as ``_einsum_cache_key`` keys it."""
+
+    layout = getattr(tensor, "layout", None)
+    if isinstance(layout, TensorLayout):
+        # The layout *is* the contract. It is a frozen dataclass over logical shape,
+        # physical shape, format, permutation and index dtype, so the __eq__ and
+        # __hash__ it already has distinguish exactly what a dispatch key has to
+        # distinguish -- test_einsum_dispatch_key_discriminates_every_layout_field
+        # pins that against serialize() field by field. This cache is an in-process
+        # dict, so there is nothing the string bought: serializing to JSON to get a
+        # dict key cost 2.32 us per sparse operand on an M5 for no information at
+        # all, and 3.20 us for the whole key -- 7% of the smallest einsum there is.
+        return layout
+    serialize = getattr(layout, "serialize", None)
+    if callable(serialize):
+        # Not one of ours, but it offers its own canonical string, so keep keying on
+        # that rather than dropping to the weaker tensor-like contract below. Every
+        # `.layout` in this tree returns a TensorLayout, so this branch costs one
+        # failed isinstance on the hot path and is otherwise unreachable.
+        return serialize()
+    # Scheduling tools may use lightweight tensor-like objects. Preserve a
+    # deterministic fallback without weakening real tensors' canonical key.
+    shape = getattr(tensor, "shape", ()) or ()
+    mode_order = getattr(tensor, "mode_order", ()) or ()
+    return (
+        "tensor_like",
+        str(getattr(tensor, "format", None)),
+        tuple(shape),
+        tuple(mode_order),
+        str(getattr(tensor, "index_dtype", None)),
+    )
+
+
+def _runtime_key(value: Any) -> Any:
+    """An operand's dtype or device as ``_einsum_cache_key`` keys it: torch's own
+    ``torch.dtype`` and ``torch.device`` as they are, else the value's string.
+
+    Two of torch's dtypes or devices are equal exactly when their strings are, and
+    they hash, so keying the objects keys what the strings keyed without making two
+    strings per operand and call.  A value of another type (a tensor-like's) keeps
+    its string, as the key held before."""
+
+    kind = type(value)
+    if kind is torch.dtype or kind is torch.device:
+        return value
+    return str(value)
+
+
 def _einsum_cache_key(
     expression: str,
     tensors: Sequence[Any],
@@ -558,46 +607,40 @@ def _einsum_cache_key(
     fingerprint), which names them without making them.  The schedule enters as
     ``schedule_key`` when the caller has read it (``_DeferredOptions.schedule_key``,
     ``schedule``'s key read once per call), else as ``schedule.cache_key`` read here.
+
+    An exact STensor's layout, dtype and device are read from its metadata, where its
+    ``layout``, ``dtype`` and ``device`` properties read them.  Every einsum that
+    reaches a kernel builds this key, so it is one loop and no nested function.
     """
 
-    def layout_contract(tensor: Any) -> Any:
-        layout = getattr(tensor, "layout", None)
-        if isinstance(layout, TensorLayout):
-            # The layout *is* the contract. It is a frozen dataclass over logical shape,
-            # physical shape, format, permutation and index dtype, so the __eq__ and
-            # __hash__ it already has distinguish exactly what a dispatch key has to
-            # distinguish -- test_einsum_dispatch_key_discriminates_every_layout_field
-            # pins that against serialize() field by field. This cache is an in-process
-            # dict, so there is nothing the string bought: serializing to JSON to get a
-            # dict key cost 2.32 us per sparse operand on an M5 for no information at
-            # all, and 3.20 us for the whole key -- 7% of the smallest einsum there is.
-            return layout
-        serialize = getattr(layout, "serialize", None)
-        if callable(serialize):
-            # Not one of ours, but it offers its own canonical string, so keep keying on
-            # that rather than dropping to the weaker tensor-like contract below. Every
-            # `.layout` in this tree returns a TensorLayout, so this branch costs one
-            # failed isinstance on the hot path and is otherwise unreachable.
-            return serialize()
-        # Scheduling tools may use lightweight tensor-like objects. Preserve a
-        # deterministic fallback without weakening real tensors' canonical key.
-        shape = getattr(tensor, "shape", ()) or ()
-        mode_order = getattr(tensor, "mode_order", ()) or ()
-        return (
-            "tensor_like",
-            str(getattr(tensor, "format", None)),
-            tuple(shape),
-            tuple(mode_order),
-            str(getattr(tensor, "index_dtype", None)),
+    contracts = []
+    runtimes = []
+    for t in tensors:
+        if type(t) is STensor:
+            metadata = t._metadata
+            layout = metadata.layout
+            dtype = metadata.dtype
+            device = metadata.device
+            if (
+                type(layout) is TensorLayout
+                and type(dtype) is torch.dtype
+                and type(device) is torch.device
+            ):
+                # What the three calls below give such an operand, read in place.
+                contracts.append(layout)
+                runtimes.append((dtype, device))
+                continue
+        contracts.append(_layout_contract(t))
+        runtimes.append(
+            (
+                _runtime_key(getattr(t, "dtype", None)),
+                _runtime_key(getattr(t, "device", "cpu")),
+            )
         )
-
     return (
         expression,
-        tuple(layout_contract(t) for t in tensors),
-        tuple(
-            (str(getattr(t, "dtype", None)), str(getattr(t, "device", "cpu")))
-            for t in tensors
-        ),
+        tuple(contracts),
+        tuple(runtimes),
         str(output_format) if output_format is not None else None,
         tuple(output_mode_order) if output_mode_order else None,
         (
