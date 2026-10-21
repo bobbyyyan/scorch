@@ -494,6 +494,75 @@ def test_memo_does_not_keep_a_dead_operand_alive(copy_arms):
     )
 
 
+@pytest.mark.parametrize("dtype", [torch.float32, torch.float64])
+@pytest.mark.parametrize("native", [True, False])
+def test_memo_remembers_a_copy_without_autograd_history(copy_arms, dtype, native):
+    """An operand that requires grad, in grad mode: the remembered copy has no graph.
+
+    The native transpose (2-D float32 only) records no history, but `.contiguous()` --
+    every other dtype, and float32 with the kernel off -- did, and the memo kept that
+    copy: a float64 entry with a grad_fn (b5 84322).  The memo still has to serve one
+    copy for both calls, with the operand's values.
+    """
+    copy_arms(memo=True, native=native)
+    torch.manual_seed(0)
+    leaf = torch.rand(16, 4, dtype=dtype, requires_grad=True)
+    first = STensor.from_torch(leaf.T)
+    second = STensor.from_torch(leaf.T)
+    assert len(stensor_module._OPERAND_COPY_CACHE) == 1
+    remembered = next(iter(stensor_module._OPERAND_COPY_CACHE.values()))[2]
+    assert not remembered.requires_grad and remembered.grad_fn is None
+    for wrapped in (first, second):
+        stored = wrapped._storage._value
+        assert not stored.requires_grad
+        assert stored.data_ptr() == remembered.data_ptr()
+    torch.testing.assert_close(
+        second._storage._value, leaf.detach().T.reshape(-1), atol=0, rtol=0
+    )
+
+
+@pytest.mark.parametrize("dtype", [torch.float32, torch.float64])
+def test_memo_does_not_keep_the_callers_graph_alive(copy_arms, dtype):
+    """A forward in grad mode that is never differentiated must not pin its graph.
+
+    `big` is referenced only by the graph: `leaf * big` saves it to differentiate with
+    respect to `leaf`.  Once the caller drops the product, nothing should hold it.  A
+    remembered copy with history kept it alive through its grad_fn chain for as long as
+    the entry lived.  With the kernel off, so float32 takes `.contiguous()` too.
+    """
+    import gc
+    import weakref
+
+    copy_arms(memo=True, native=False)
+    leaf = torch.rand(16, 4, dtype=dtype, requires_grad=True)
+    big = torch.rand(16, 4, dtype=dtype)
+    watch = weakref.ref(big)
+    product = leaf * big
+    STensor.from_torch(product.T)
+    assert len(stensor_module._OPERAND_COPY_CACHE) == 1
+    del big, product
+    gc.collect()
+    assert watch() is None
+
+
+def test_memo_misses_after_a_no_grad_write_to_a_leaf_that_requires_grad(copy_arms):
+    """An optimizer-style write (add_ under no_grad) moves the leaf's version counter.
+
+    The detached copy shares that counter, so the next call misses and copies the new
+    values -- the training loop's case, where the memo serves nothing and must cost
+    nothing but the miss.
+    """
+    copy_arms(memo=True, native=False)
+    torch.manual_seed(0)
+    leaf = torch.rand(16, 4, dtype=torch.float64, requires_grad=True)
+    before = STensor.from_torch(leaf.T)._storage._value
+    with torch.no_grad():
+        leaf.add_(0.5)
+    after = STensor.from_torch(leaf.T)._storage._value
+    assert after.data_ptr() != before.data_ptr()
+    torch.testing.assert_close(after, leaf.detach().T.reshape(-1), atol=0, rtol=0)
+
+
 def test_memo_separates_views_that_share_a_base(copy_arms):
     """Same base, different geometry: different entries, and each one correct."""
     copy_arms(memo=True, native=True)

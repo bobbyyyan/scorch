@@ -645,15 +645,26 @@ def _remember_operand_copy(key, base: torch.Tensor, copy: torch.Tensor) -> None:
 
 
 def _flat_contiguous_values(tensor: torch.Tensor) -> torch.Tensor:
-    """The flat contiguous values array for a dense operand, copying only when needed."""
-    if tensor.is_conj() or tensor.is_neg():
+    """The flat contiguous values array for a dense operand, copying only when needed.
+
+    Never with autograd history.  The result is stored as an STensor's values and a copy
+    is remembered in ``_OPERAND_COPY_CACHE``; a copy made from ``tensor`` itself in grad
+    mode would carry the caller's graph into the cache and keep it alive as long as the
+    entry lives.  An STensor's ``requires_grad`` is stored but inert, and its values do
+    not carry the graph of the tensor they came from.  ``detach`` shares storage and the
+    version counter, so the hit test below sees the same writes; the key and the weak
+    reference stay on ``tensor``'s own base, because a detached alias has no ``_base``
+    and is a new object on every call.
+    """
+    values = tensor.detach() if tensor.requires_grad else tensor
+    if values.is_conj() or values.is_neg():
         # Resolving produces a tensor whose relation to the caller's base is no longer the
         # one the key describes, so this rare shape is left alone.
-        return tensor.resolve_conj().resolve_neg().contiguous().reshape(-1)
-    if tensor.is_contiguous():
-        return tensor.reshape(-1)
+        return values.resolve_conj().resolve_neg().contiguous().reshape(-1)
+    if values.is_contiguous():
+        return values.reshape(-1)
     if not _MEMO_OPERAND_COPY[0] or _OPERAND_COPY_STATE[0] >= _OPERAND_COPY_GIVE_UP:
-        return _contiguous_copy(tensor).reshape(-1)
+        return _contiguous_copy(values).reshape(-1)
     base = tensor._base if tensor._base is not None else tensor
     key = (
         id(base),
@@ -681,8 +692,8 @@ def _flat_contiguous_values(tensor: torch.Tensor) -> torch.Tensor:
             # small cells. Release them, and do not install this call's copy either --
             # every later call takes the early return above.
             _OPERAND_COPY_CACHE.clear()
-            return _contiguous_copy(tensor).reshape(-1)
-    copy = _contiguous_copy(tensor).reshape(-1)
+            return _contiguous_copy(values).reshape(-1)
+    copy = _contiguous_copy(values).reshape(-1)
     _remember_operand_copy(key, base, copy)
     return copy
 
