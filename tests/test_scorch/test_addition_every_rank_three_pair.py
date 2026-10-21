@@ -32,6 +32,14 @@ THREE = ["ddd", "dds", "dsd", "dss", "sdd", "sds", "ssd", "sss", "ooo"]
 EXTENTS = {"small": (4, 3, 5), "large": (40, 3, 5)}
 
 
+@pytest.fixture(autouse=True)
+def _torch_allows_the_teams_these_shapes_were_built_for(torch_threads):
+    # "large" gives 40 // 16 = 2 workers where a loop is parallel.
+    # torch's count must allow that, or a process started with MKL_NUM_THREADS=1 runs every kernel
+    # here on one worker (tests/conftest.py, torch_threads).
+    torch_threads(2, needs_team=False)
+
+
 def cells_a_result_stores(result):
     """Which cells ``result`` stores, read from its own level arrays."""
 

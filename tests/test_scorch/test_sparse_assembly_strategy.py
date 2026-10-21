@@ -1301,7 +1301,7 @@ def test_a_drain_spanning_two_compressed_levels_refuses_the_two_pass(strategy):
     ],
 )
 def test_the_two_pass_strategies_reproduce_the_single_pass_storage(
-    operand_fmt, result_fmt, operand_indices, result_indices, shape
+    operand_fmt, result_fmt, operand_indices, result_indices, shape, torch_threads
 ):
     """Interchangeable means the same output tensor, index arrays included.
 
@@ -1324,6 +1324,9 @@ def test_the_two_pass_strategies_reproduce_the_single_pass_storage(
     from scorch.stensor import STensor
 
     rows = 2 * ROWS_PER_THREAD
+    # The extent at which a row loop first reaches two workers; torch's count must allow them
+    # (tests/conftest.py, torch_threads).
+    torch_threads(rows // ROWS_PER_THREAD, needs_team=False)
     generator = torch.Generator().manual_seed(20260816)
     operand_shape = (rows,) + shape
     dense = torch.rand(operand_shape, generator=generator, dtype=torch.float64)

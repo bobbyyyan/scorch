@@ -53,6 +53,15 @@ SMALL = {1: (7,), 2: (5, 4), 3: (4, 3, 5), 4: (3, 4, 2, 3)}
 # 16 rows per worker: several workers wherever a loop is parallel.
 LARGE = {3: (200, 5, 4), 4: (70, 3, 4, 3)}
 
+
+@pytest.fixture(autouse=True)
+def _torch_allows_the_teams_these_shapes_were_built_for(torch_threads):
+    # LARGE gives up to 200 // 16 = 12 workers, and sum_cin_support.LARGE (300 rows) 18.
+    # torch's count must allow that, or a process started with MKL_NUM_THREADS=1 runs every kernel
+    # here on one worker (tests/conftest.py, torch_threads).
+    torch_threads(18, needs_team=False)
+
+
 # Sums on the developer entry: (operand formats, indices, coordinate result format).
 DEVELOPER_ENTRY = [
     (formats, "ijk", "ooo")

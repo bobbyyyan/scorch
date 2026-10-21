@@ -878,6 +878,24 @@ int register_sealed_values(PyObject* module);
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     if (register_sealed_values(m.ptr()) < 0) throw py::error_already_set();
 
+    // The caller's thread setting (scorch_policy.h, "The caller's thread setting"): read here,
+    // once, before any kernel can run. The capsule is how a JIT-compiled kernel module reads the
+    // same state; the functions are scorch.set_num_threads's and the tests'.
+    scorch_thread_policy_record_load();
+    m.attr("_thread_policy") =
+        py::capsule(static_cast<void*>(&scorch_thread_policy_owner_state()),
+                    "scorch_ops._thread_policy");
+    m.def("thread_policy_record_setting", &scorch_thread_policy_record_setting,
+          "Record that the caller set a thread count (scorch.set_num_threads): from now on every "
+          "team stays within torch's count");
+    m.def("thread_ceiling", [] { return scorch_thread_ceiling(); },
+          "The most workers a team scorch launches may have now: omp_get_num_procs() unless the "
+          "caller set a thread count, then the smaller of that and torch.get_num_threads()");
+    m.def("thread_policy_uncapped_at",
+          [] { return scorch_thread_policy_owner_state().load(std::memory_order_relaxed); },
+          "torch's count at which no setting is in force: torch's default, or -1 once a setting "
+          "was recorded (scorch.set_num_threads, or OMP/MKL_NUM_THREADS when this module loaded)");
+
     // Whether the SpMM A/B tune hooks (SCORCH_SPMM_WORKSPACE and friends) are
     // compiled in. A harness that selects between two kernel paths by environment
     // variable has no way to tell a build without them from a build where the change

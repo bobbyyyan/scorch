@@ -131,6 +131,14 @@ EXTENTS = (
 )
 
 
+@pytest.fixture(autouse=True)
+def _torch_allows_the_teams_these_shapes_were_built_for(torch_threads):
+    # The last extents give a parallel outer loop 70 // 16 = 4 workers.
+    # torch's count must allow that, or a process started with MKL_NUM_THREADS=1 runs every kernel
+    # here on one worker (tests/conftest.py, torch_threads).
+    torch_threads(4, needs_team=False)
+
+
 def _cell_id(cell) -> str:
     expr, fmts, _ = cell
     return f"{','.join(fmts)} {expr}"

@@ -26,6 +26,7 @@ from .layout import TensorLayout, TensorMetadata, TensorSpec
 from .storage import SparseStorage, TensorIndex
 from .compiler.scheduler import RelayoutSpec, Schedule, TileSpec, schedule_force
 from .trace import compile
+from .threads import set_num_threads
 from .tiling import (
     autotune,
     clear_autotune_cache,
@@ -91,6 +92,7 @@ __all__ = [
     "schedule_force",
     "schedule_from_tuner_choice",
     "set_autotune",
+    "set_num_threads",
     "sparse_attention",
     "sparse_linear",
     "sparse_linear_fm",

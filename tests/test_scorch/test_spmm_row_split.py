@@ -137,6 +137,10 @@ def test_which_bound_binds_moves_with_k_and_not_with_the_worker_count():
 _PROBE = r"""
 import os, numpy as np, torch, scorch_ops as so
 M, deg, big, k, dt, pool = %s
+# The override `pool` is a team only if torch's count allows it, and this child inherits the parent's
+# environment (MKL_NUM_THREADS=1 holds torch at 1): set the count, capped at the processors.
+procs = len(os.sched_getaffinity(0)) if hasattr(os, "sched_getaffinity") else (os.cpu_count() or 1)
+torch.set_num_threads(max(1, min(pool, procs)))
 npd = np.float32 if dt == 32 else np.float64
 td = torch.float32 if dt == 32 else torch.float64
 sym = so.spmm_csr_float_v2 if dt == 32 else so.spmm_csr_double_v2
@@ -296,7 +300,7 @@ def test_the_floor_still_admits_the_matrices_the_split_is_for():
 
 @_needs_hooks
 @pytest.mark.parametrize("wide_at", [0, 1, 5, 6, 99])
-def test_the_multirow_kernel_stays_correct_next_to_a_split_row(wide_at):
+def test_the_multirow_kernel_stays_correct_next_to_a_split_row(wide_at, torch_threads):
     """The register-block kernel that takes 2-4 rows at a time must refuse a group containing a
     wide row, and must never index A1_pos by a claim index past the last row.
 
@@ -307,6 +311,7 @@ def test_the_multirow_kernel_stays_correct_next_to_a_split_row(wide_at):
     is allowed now, under two conditions, and the wide row is placed at several offsets here because
     which groups straddle it depends on the alignment.
     """
+    torch_threads(4, needs_team=False)  # the override of 4 below
     deg = np.full(200, 4, dtype=np.int64)
     deg[wide_at] = 200000                      # 200796 nonzeros, one row far over its share
     indptr, idx, _, cols = _csr(deg, cols=200000)

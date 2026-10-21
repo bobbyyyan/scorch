@@ -54,6 +54,15 @@ SMALL = {1: (7,), 2: (5, 4), 3: (4, 3, 5)}
 # 16 rows per worker: several workers from 32 rows up.
 LARGE = {1: (4000,), 2: (600, 9), 3: (200, 5, 4)}
 
+
+@pytest.fixture(autouse=True)
+def _torch_allows_the_teams_these_shapes_were_built_for(torch_threads):
+    # LARGE gives a parallel row loop up to 4000 // 16 = 250 workers (600 rows: 37).
+    # torch's count must allow that, or a process started with MKL_NUM_THREADS=1 runs every kernel
+    # here on one worker (tests/conftest.py, torch_threads).
+    torch_threads(250, needs_team=False)
+
+
 _DECLARED = re.compile(r"\b(?:int|int64_t|double|float|bool|auto)\s+([A-Za-z_]\w*)")
 _ASSIGNED = re.compile(r"^\s*([A-Za-z_]\w*)\s*(?:\+=|-=|=(?!=)|\+\+)", re.MULTILINE)
 

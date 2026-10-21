@@ -691,7 +691,9 @@ def legacy_args(dense, b):
 
 
 @pytest.mark.parametrize("nthreads", [-1, 1, 2])
-def test_plan_matches_the_v2_symbol_bitwise(nthreads):
+def test_plan_matches_the_v2_symbol_bitwise(nthreads, torch_threads):
+    # The override of 2 is a team only if torch's count allows it; both sides are compared either way.
+    torch_threads(2, needs_team=False)
     generator = torch.Generator().manual_seed(3)
     dense = (torch.rand((96, 96), generator=generator) < 0.1).float()
     dense *= torch.rand((96, 96), generator=generator)
@@ -713,7 +715,8 @@ def test_plan_matches_the_v2_symbol_bitwise(nthreads):
 
 
 @pytest.mark.parametrize("panel", [0, 16, 64])
-def test_plan_matches_the_tilej_symbol_bitwise(panel):
+def test_plan_matches_the_tilej_symbol_bitwise(panel, torch_threads):
+    torch_threads(2, needs_team=False)  # its override of 2, as in the v2 case above
     generator = torch.Generator().manual_seed(4)
     dense = (torch.rand((128, 256), generator=generator) < 0.08).float()
     dense *= torch.rand((128, 256), generator=generator)
@@ -743,7 +746,8 @@ def test_plan_matches_the_tilej_symbol_bitwise(panel):
 
 
 @pytest.mark.parametrize("panels", [(0, 0), (16, 64), (8, 32)])
-def test_plan_matches_the_tileijk_symbol_bitwise(panels):
+def test_plan_matches_the_tileijk_symbol_bitwise(panels, torch_threads):
+    torch_threads(2, needs_team=False)  # its override of 2, as in the v2 case above
     free, contraction = panels
     generator = torch.Generator().manual_seed(5)
     dense = (torch.rand((96, 192), generator=generator) < 0.08).float()

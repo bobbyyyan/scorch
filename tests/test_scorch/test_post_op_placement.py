@@ -168,11 +168,25 @@ def run(name, expr, formats, result, chain, extents, dtype=torch.float64, path=F
 """
 
 
-def _child(body: str) -> List[str]:
-    """``body``'s printed lines, run in a fresh interpreter after ``_PRELUDE``."""
+def _child(body: str, threads: int = 0) -> List[str]:
+    """``body``'s printed lines, run in a fresh interpreter after ``_PRELUDE``.
 
+    ``threads``, when given, is the worker count the body's shapes were built for, and the child
+    sets torch's count to it, capped at its processors, before the body runs. The child inherits
+    this process's environment, and a thread setting there (MKL_NUM_THREADS=1) would otherwise hold
+    every team scorch launches to torch's count (scorch_thread_ceiling in scorch_policy.h).
+    """
+
+    setup = ""
+    if threads:
+        setup = (
+            "import os\n"
+            "procs = len(os.sched_getaffinity(0)) if hasattr(os, 'sched_getaffinity') "
+            "else (os.cpu_count() or 1)\n"
+            "torch.set_num_threads(max(1, min(%d, procs)))\n" % threads
+        )
     proc = subprocess.run(
-        [sys.executable, "-c", _PRELUDE + textwrap.dedent(body)],
+        [sys.executable, "-c", _PRELUDE + setup + textwrap.dedent(body)],
         capture_output=True,
         text=True,
         timeout=3600,
@@ -315,7 +329,7 @@ def test_the_value_pass_on_every_assembly_path(dtype, extents) -> None:
                 name = expr + " " + ",".join(formats) + "->" + result
                 name += " " + "+".join(chain)
                 run(name, expr, formats, result, chain, extents, dtype, path=True)
-        """)
+        """, threads=6)  # the large results' 3,072 values: 3072 // 500 = 6 workers
     assert len(lines) == 1 * 3 + 7 * 2, lines
     wrong = [line for line in lines if line.split(" | ")[1] != "OK"]
     assert not wrong, wrong

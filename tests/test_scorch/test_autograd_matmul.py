@@ -1474,15 +1474,17 @@ GATHERED_CASES = [
 )
 @pytest.mark.parametrize("wide", [False, True], ids=["plain", "wide_rows"])
 def test_gathered_run_is_run_on_the_gathered_values(
-    kind, dtype, panels, width, nthreads, atparallel, wide
+    kind, dtype, panels, width, nthreads, atparallel, wide, torch_threads
 ):
     """run_gathered(buffer, src, perm) is run(src[perm]) bit for bit, and leaves the buffer
     holding src[perm]: on every v2 row kernel (widths 1-64 cover the exact, half-vector,
     register-block and register-tile loops), with and without wide rows in segments, on
     one worker and on a team, on torch's pool and on a private one; and on the kernels
-    that take the buffer filled beforehand (tile-j, tile-ijk, reference)."""
+    that take the buffer filled beforehand (tile-j, tile-ijk, reference). The team needs
+    torch's count to allow the override of 4; on one processor only the one-worker arm runs."""
     if wide and kind not in ("v2", "v2_double"):
         pytest.skip("wide rows are the v2 kernels'")
+    torch_threads(4, needs_team=False)
     if wide:
         a = _wide_csr(dtype)
     else:
@@ -1519,12 +1521,13 @@ def _workers(plan, width, nthreads, full_team):
 
 
 @pytest.mark.parametrize("dtype", [torch.float32, torch.float64])
-def test_gathered_cases_run_both_fills(dtype):
+def test_gathered_cases_run_both_fills(dtype, torch_threads):
     """run_gathered fills on the product's team where a v2 product has one and before the
     call where it runs on one worker (scorch_spmm_v2_workers decides). The grid of
     test_gathered_run_is_run_on_the_gathered_values holds both fills to `run` bit for bit
-    only if it reaches both: here, whichever team width torch's pool resolves to, it has
-    calls of each."""
+    only if it reaches both: here, at the count that grid needs for its override of 4, it
+    has calls of each."""
+    torch_threads(4)
     kind = "v2" if dtype == torch.float32 else "v2_double"
     matrices = [dense_matrix(300, 500, 0.05, dtype=dtype).to_sparse_csr(), _wide_csr(dtype)]
     for full_team in (False, True):

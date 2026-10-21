@@ -435,7 +435,7 @@ def test_both_cache_queries_honour_the_same_override():
 # ---------------------------------------------------------------------------
 # the SpMM thread policy's new argument, and what the shipped build must ignore
 # ---------------------------------------------------------------------------
-def test_passing_nnz_to_the_thread_policy_changes_nothing_by_default():
+def test_passing_nnz_to_the_thread_policy_changes_nothing_by_default(torch_threads):
     """The rule gained an `nnz` argument; at the shipped constants it must be inert.
 
     `scorch_spmm_nthreads` takes the nonzero count so that the row-axis ceiling can be
@@ -450,6 +450,8 @@ def test_passing_nnz_to_the_thread_policy_changes_nothing_by_default():
     thread count in the ledger to a rule that had not shipped.
     """
     scorch_ops = pytest.importorskip("scorch_ops")
+    # The overrides go up to 24; with torch at 1 every count is 1 and the two forms cannot differ.
+    torch_threads(24)
     shapes = [
         (71, 212536), (73, 904910), (64, 18432), (256, 294912),
         (2708, 13264), (19717, 108365), (8081, 6323), (232965, 11461589),
@@ -470,7 +472,7 @@ def test_passing_nnz_to_the_thread_policy_changes_nothing_by_default():
                 )
 
 
-def test_the_thread_policy_never_exceeds_the_machine_or_the_rows():
+def test_the_thread_policy_never_exceeds_the_machine_or_the_rows(torch_threads):
     """Two bounds the rule must hold whatever the arguments say.
 
     A count above `omp_get_num_procs()` oversubscribes the box; a count above `rows`
@@ -480,6 +482,8 @@ def test_the_thread_policy_never_exceeds_the_machine_or_the_rows():
     composition adoption) can each be the one that sets the answer.
     """
     scorch_ops = pytest.importorskip("scorch_ops")
+    # The override is 64; with torch at 1 every count is 1, under every bound below.
+    torch_threads(64)
     # The hardware bound the rule uses is omp_get_num_procs(), which is not bound to
     # Python. os.cpu_count() is the same number on both hosts here (it counts logical
     # processors), and using it as an UPPER bound is safe either way: if the two ever

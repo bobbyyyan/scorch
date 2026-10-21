@@ -267,6 +267,16 @@ def test_a_coordinate_result_stays_serial():
 
 #: Enough rows for ``scorch_nthreads(-1, rows)`` to return four.
 ROWS = 4 * ROWS_PER_THREAD + 6
+
+
+@pytest.fixture(autouse=True)
+def _torch_allows_the_teams_these_shapes_were_built_for(torch_threads):
+    # ROWS was built for scorch_nthreads(-1, rows) to return ROWS // ROWS_PER_THREAD = 4.
+    # torch's count must allow that, or a process started with MKL_NUM_THREADS=1 runs every kernel
+    # here on one worker (tests/conftest.py, torch_threads).
+    torch_threads(ROWS // ROWS_PER_THREAD, needs_team=False)
+
+
 #: Slices of the first result index every operand that has it leaves empty: the
 #: first two, one alone, a run, and the last two.
 EMPTY = (0, 1, 9, 30, 31, 32, 33, ROWS - 2, ROWS - 1)

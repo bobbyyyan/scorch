@@ -24,6 +24,14 @@ VECTOR = ["d", "s", "o"]
 SHAPES = {"small": (5, 4), "large": (300, 40)}
 
 
+@pytest.fixture(autouse=True)
+def _torch_allows_the_teams_these_shapes_were_built_for(torch_threads):
+    # "large" gives a parallel row loop 300 // 16 = 18 workers.
+    # torch's count must allow that, or a process started with MKL_NUM_THREADS=1 runs every kernel
+    # here on one worker (tests/conftest.py, torch_threads).
+    torch_threads(18, needs_team=False)
+
+
 def _operands(shape, matrix_format, vector_format, seed):
     generator = torch.Generator().manual_seed(seed)
     a = 0.5 + torch.rand(shape, generator=generator, dtype=torch.float64)

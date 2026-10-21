@@ -19,7 +19,6 @@ resolved to mode 3 with more than one worker, using the exported policy -- a seq
 happened to run everything on one worker would otherwise pass without testing anything.
 """
 import hashlib
-import os
 import threading
 
 import numpy as np
@@ -28,17 +27,24 @@ import torch
 
 scorch_ops = pytest.importorskip("scorch_ops")
 
-pytestmark = [
-    pytest.mark.skipif(
-        not hasattr(scorch_ops, "scorch_spmm_partition_mode"),
-        reason="scorch_ops predates the exported partition policy",
-    ),
-    pytest.mark.skipif((os.cpu_count() or 1) < 2, reason="one CPU: every call runs on one worker"),
-]
+pytestmark = pytest.mark.skipif(
+    not hasattr(scorch_ops, "scorch_spmm_partition_mode"),
+    reason="scorch_ops predates the exported partition policy",
+)
 
 # Up, down, up past the first maximum (so the pool grows after it has been used), and through
 # counts that do and do not divide the row count.
 _WORKERS = [8, 2, 64, 3, 1, 17, 5, 96, 4, 32, 2, 96]
+_WIDTHS = (1, 2, 3, 4, 8, 32)
+
+# The policy constants the non-vacuity threshold is derived from. scorch_ops does not export them,
+# so they are stated here, as test_spmm_narrow_rows.py states GRAIN; if one moves, _premise fails
+# and names it, rather than the threshold failing as if the cursors were wrong.
+GRAIN = 150000  # SCORCH_GRAIN_SPMM: a second worker needs work = nnz * max(k, 16) of one grain
+PARTITION_MINGRAINS = 2  # SCORCH_SPMM_PARTITION_MINGRAINS: below two grains, mode 0 ...
+PARTITION_GATE_MAXTHREADS = 16  # SCORCH_SPMM_PARTITION_GATE_MAXTHREADS: ... when the pool is <= 16
+PARTITION_MAXOUT_LLC = 2  # SCORCH_SPMM_PARTITION_MAXOUT_LLC: mode 0 from an output of 2 x LLC
+ROWS_PER_THREAD = 16  # SCORCH_ROWS_PER_THREAD: the adopted count is at most rows / 16
 
 
 def _matrix(kind, seed):
@@ -79,9 +85,27 @@ def _mode3_multiworker(rows, nnz, k, esz, workers):
     return nt > 1 and scorch_ops.scorch_spmm_partition_mode(rows, nnz, k, k, esz, nt, workers) == 3
 
 
+def _premise(kind, rows, nnz, esz):
+    """What the threshold's arithmetic (below) assumes about one matrix, checked rather than trusted:
+    a random stream or a policy constant that moved fails here, by name, not as a cursor defect."""
+    widest = max(_WIDTHS)
+    if kind == "fewer_rows_than_workers":
+        assert nnz * widest < GRAIN, (kind, nnz)  # under one grain at every width: one worker
+        return
+    assert rows // ROWS_PER_THREAD >= max(_WORKERS), (kind, rows)  # rows never bound the count below w
+    assert rows * widest * esz < PARTITION_MAXOUT_LLC * scorch_ops.scorch_llc_bytes(), (kind, rows)
+    floored = nnz * 16  # nnz * max(k, 16) at every width but 32
+    if kind == "uniform":
+        assert floored >= PARTITION_MINGRAINS * GRAIN, (kind, nnz)
+    else:  # skewed, empty_rows: one grain or more, under two, at k <= 16; two or more at k = 32
+        assert GRAIN <= floored < PARTITION_MINGRAINS * GRAIN, (kind, nnz)
+        assert nnz * widest >= PARTITION_MINGRAINS * GRAIN, (kind, nnz)
+
+
 @pytest.mark.parametrize("dt", [torch.float32, torch.float64])
 @pytest.mark.parametrize("atparallel", [True, False])
-def test_changing_worker_counts_give_the_same_bits_and_the_right_answer(dt, atparallel):
+def test_changing_worker_counts_give_the_same_bits_and_the_right_answer(dt, atparallel, torch_threads):
+    torch_threads(max(_WORKERS))
     torch.manual_seed(0)
     exercised = calls = 0
     for kind in ("skewed", "uniform", "fewer_rows_than_workers", "empty_rows"):
@@ -89,7 +113,8 @@ def test_changing_worker_counts_give_the_same_bits_and_the_right_answer(dt, atpa
         vt = torch.from_numpy(vals).to(dt)
         A = torch.sparse_csr_tensor(ipt.long(), ixt.long(), vt, size=(rows, cols))
         nnz = int(ipt[-1])
-        for k in (1, 2, 3, 4, 8, 32):
+        _premise(kind, rows, nnz, dt.itemsize)
+        for k in _WIDTHS:
             B = torch.randn(cols, k, dtype=dt)
             first = None
             for workers in _WORKERS:
@@ -103,13 +128,27 @@ def test_changing_worker_counts_give_the_same_bits_and_the_right_answer(dt, atpa
                 assert h == first, ("answer depends on the worker count", kind, k, workers)
                 exercised += _mode3_multiworker(rows, nnz, k, dt.itemsize, workers)
                 calls += 1
-    # Non-vacuity: a good share of these calls must actually have gone through the cursors
-    # (138 of 288 on a 18-core M5, more on wider hosts).
-    assert exercised >= calls // 4, (exercised, calls)
+    # Non-vacuity: enough of these calls must actually have gone through the cursors. The number is
+    # derived from the policy at the count torch_threads set (at least 2 workers allowed), not read off
+    # a run. Of the 12 overrides, 11 are above 1 and 5 above PARTITION_GATE_MAXTHREADS (17, 32, 64, 96,
+    # 96); _premise checks each matrix's side of it.
+    #   uniform: work 589,824 (k <= 16) or 1,179,648 clears the adoption grain, so every override w >= 2
+    #     runs min(w, processors) >= 2 workers, and clears two grains, so mode 3 holds: 11 x 6 = 66.
+    #   fewer_rows_than_workers: under one grain at every width, so one worker: 0.
+    #   skewed and empty_rows: at k <= 16 the work is one grain or more but under two, so the count is
+    #     min(w, processors) but the two-grain gate sets mode 0 wherever w <= 16: 5 overrides x 5 widths;
+    #     at k = 32 it clears two grains: all 11. So 25 + 11 = 36 each.
+    #   66 + 0 + 36 + 36 = 138 of the 288 calls, on any host with 2 or more processors: the processor
+    #   count decides how many workers a call gets, never whether it gets more than one.
+    assert sum(w > 1 for w in _WORKERS) == 11
+    assert sum(w > PARTITION_GATE_MAXTHREADS for w in _WORKERS) == 5
+    assert calls == 288, calls
+    assert exercised >= 138, (exercised, calls)
 
 
 @pytest.mark.parametrize("atparallel", [True, False])
-def test_a_fresh_B_every_call_is_answered_fresh_every_call(atparallel):
+def test_a_fresh_B_every_call_is_answered_fresh_every_call(atparallel, torch_threads):
+    torch_threads(max(_WORKERS))
     rows, cols, ipt, ixt, vals = _matrix("skewed", seed=3)
     vt = torch.from_numpy(vals).float()
     A = torch.sparse_csr_tensor(ipt.long(), ixt.long(), vt, size=(rows, cols))
@@ -127,7 +166,8 @@ def test_a_fresh_B_every_call_is_answered_fresh_every_call(atparallel):
         prev = got
 
 
-def test_launchers_on_several_threads_each_get_their_own_cursors():
+def test_launchers_on_several_threads_each_get_their_own_cursors(torch_threads):
+    torch_threads(max(_WORKERS))
     mats = [_matrix(kind, seed=s) for s, kind in enumerate(("skewed", "uniform", "empty_rows", "skewed"))]
     errors = []
 

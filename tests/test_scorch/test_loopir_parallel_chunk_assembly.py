@@ -622,6 +622,14 @@ def test_transformation_rejects_a_foreign_context():
 _PARALLEL_SHAPE = (64, 128, 64, 128)
 
 
+@pytest.fixture(autouse=True)
+def _torch_allows_the_teams_these_shapes_were_built_for(torch_threads):
+    # _PARALLEL_SHAPE (and the three-level shape, 64 rows) gives min(64 // 16, stored / 500) = 4 workers.
+    # torch's count must allow that, or a process started with MKL_NUM_THREADS=1 runs every kernel
+    # here on one worker (tests/conftest.py, torch_threads).
+    torch_threads(_PARALLEL_SHAPE[0] // ROWS_PER_THREAD, needs_team=False)
+
+
 def _operands(a_fmt, b_fmt, shape, density, seed=20260812):
     i, j, k, l = shape  # noqa: E741 -- the contraction's own index names
     a_dense = random_dense((i, j, k), seed, density)

@@ -48,6 +48,14 @@ SHAPES = {1: (6,), 2: (6, 5), 3: (6, 5, 4), 4: (6, 5, 4, 3)}
 LARGE = {3: (40, 5, 4), 4: (40, 3, 4, 3)}
 
 
+@pytest.fixture(autouse=True)
+def _torch_allows_the_teams_these_shapes_were_built_for(torch_threads):
+    # LARGE (and the einsum below, a = 40) gives the loop over the outer extent 40 // 16 = 2 workers.
+    # torch's count must allow that, or a process started with MKL_NUM_THREADS=1 runs every kernel
+    # here on one worker (tests/conftest.py, torch_threads).
+    torch_threads(2, needs_team=False)
+
+
 class _Emitted(Exception):
     """Raised in place of building the kernel."""
 

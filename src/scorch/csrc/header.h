@@ -296,8 +296,10 @@ static inline void scorch_zero_dense(T* __restrict__ p, int64_t n) {
     }
   }
 #endif
-  const int thread_count = scorch_num_procs();
-  if (bytes < SCORCH_MEMSET_GRAIN_BYTES || thread_count <= 1) {
+  // A span below the grain is zeroed serially, so it never asks for the ceiling.
+  const int thread_count =
+      bytes < SCORCH_MEMSET_GRAIN_BYTES ? 1 : scorch_thread_ceiling();
+  if (thread_count <= 1) {
     std::memset(p, 0, static_cast<size_t>(bytes));
     return;
   }

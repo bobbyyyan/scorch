@@ -36,6 +36,14 @@ THREE_PAIRS = [
 THREE_ORDERS = [(2, 0, 1), (1, 2, 0), (0, 2, 1), (2, 1, 0), (1, 0, 2)]
 
 
+@pytest.fixture(autouse=True)
+def _torch_allows_the_teams_these_shapes_were_built_for(torch_threads):
+    # Every test adds at an outermost stored extent of 40: 40 // 16 = 2 workers where a loop is parallel.
+    # torch's count must allow that, or a process started with MKL_NUM_THREADS=1 runs every kernel
+    # here on one worker (tests/conftest.py, torch_threads).
+    torch_threads(2, needs_team=False)
+
+
 def shape_for(order, outer):
     """A logical shape whose outermost stored mode has extent ``outer``."""
 

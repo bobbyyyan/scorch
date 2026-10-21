@@ -72,6 +72,10 @@
 #if defined(__linux__)
 #include <sched.h>    // scorch_phys_cores_avail reads the process's affinity mask
 #endif
+#include <ATen/Parallel.h>  // scorch_thread_ceiling: torch's thread count
+#if !defined(SCORCH_ABI_WATCH_OWNER)
+#include <Python.h>   // a kernel module reaches scorch_ops' thread state through a capsule
+#endif
 
 // The processor count, read once per process. On Linux, libgomp's omp_get_num_procs()
 // re-reads the affinity mask with a sched_getaffinity system call on EVERY call, and the
@@ -147,6 +151,144 @@ __attribute__((noinline)) inline bool scorch_omp_is_libgomp() {
     return std::strstr(base ? base + 1 : p, "libgomp") != nullptr;
   }();
   return v;
+}
+
+// --- The caller's thread setting -----------------------------------------------------------------
+//
+// scorch sizes each team from the work and has capped it at scorch_num_procs(), not at torch's
+// pool, on purpose: on a hybrid CPU torch's pool is the performance cores, and the policy below
+// recruits the others for large products. That is right while nobody has asked for a thread count
+// and wrong once somebody has. Under torch.set_num_threads(1), under OMP_NUM_THREADS=1, or with any
+// pool narrower than the allocation, the prebuilt SpGEMM, the drop-in SpMM's recruit decline, the
+// tile kernels, the dense zero-fill and every generated kernel still ran teams as wide as the
+// allocation: 7 threads more than the setting on an 8-CPU allocation under each route, and 16
+// threads per process under OMP_NUM_THREADS=1 on 16 CPUs.
+//
+// So every site that capped at scorch_num_procs() caps at scorch_thread_ceiling() below. With no
+// setting in force that is scorch_num_procs(), as before. With one, it is the smaller of
+// scorch_num_procs() and torch's count: a count above the processors this process may use gives
+// scorch_num_procs(), because a wider team only oversubscribes them. The count itself always comes
+// from torch (at::get_num_threads()); scorch keeps no count of its own.
+//
+// Two bounds follow. No team is wider than a count the caller set. A team scorch sizes itself
+// (scorch_nthreads, the SpMM thread decision, the zero-fill, the SpGEMM phases) is also no wider
+// than the processors. A region whose team the runtime sizes -- a `#pragma omp parallel` with no
+// num_threads clause, or torch's at::parallel_for / at::parallel_reduce pool -- takes the caller's
+// count, as torch's own ops do, so above the processors it oversubscribes them exactly as torch
+// does when asked to (sapling 84403 and 84423: such regions ran at twice the processors under a
+// count of twice the processors, beside torch.mm and torch.add at the same width). Narrowing those
+// teams instead would make libgomp release and re-create pool threads on every switch between them
+// and torch's own ops (300-1064 us per alternation, MKT 2026-10-03). Every region and who sizes it:
+// tests/test_scorch/test_thread_sites.py.
+//
+// A setting is in force when any of these holds:
+//   * torch's count differs from its count when scorch_ops loaded (`import scorch`);
+//   * OMP_NUM_THREADS or MKL_NUM_THREADS was set, non-empty, when scorch_ops loaded;
+//   * scorch.set_num_threads(n) has been called, for any n.
+// Two calls to torch.set_num_threads cannot be seen, because each leaves torch's count where it
+// was at load: one made before `import scorch`, and one that sets the count it had at load. Either
+// reads as no setting, and the ceiling stays scorch_num_procs() -- twice the count on a pool of one
+// thread per physical core whose SMT siblings the process may also use. scorch.set_num_threads(n)
+// has neither gap.
+//
+// Not torch's DEFAULT count, which would have closed the first gap. torch exposes it as
+// at::intraop_default_num_threads(), but a torch built with MKL starts its pool from
+// mkl_get_max_threads() instead, and the two disagree: on mkt1 (torch 2.13.0+cpu) the pool follows
+// the allocation, 8, 16 and 32 under 8, 16 and 32 CPUs, while at::intraop_default_num_threads()
+// read 128 in all three. Those three runs would still have kept their teams, because there the pool
+// equals the processors; under 126 CPUs, where the pool is 64, a run with nothing set would have
+// been capped at 64 of its 126 processors. On sapling (torch 2.14.1) the two agree.
+//
+// The state is one int, the count at which no setting is in force: torch's count at load, -1 once
+// a setting has been recorded, and 0 until scorch_ops has loaded (torch's count is never -1 or 0,
+// so both read as a setting). A call therefore costs one relaxed load, one at::get_num_threads()
+// and one compare.
+//
+// The state lives in scorch_ops, the module SCORCH_ABI_WATCH_OWNER already marks as the owner of
+// the write-witness table. A JIT-compiled kernel module, which compiles its own copy of this
+// header, reaches it through the capsule scorch_ops._thread_policy, the same way it reaches the
+// witness table; see native_abi.h ("Write witnesses") for why the owner's names are ones no kernel
+// module defines and the module's are static.
+#ifdef SCORCH_ABI_WATCH_OWNER
+
+inline std::atomic<int>& scorch_thread_policy_owner_state() {
+  static std::atomic<int> uncapped_at{0};
+  return uncapped_at;
+}
+
+// Called once, when scorch_ops loads.
+inline void scorch_thread_policy_record_load() {
+  const char* omp = std::getenv("OMP_NUM_THREADS");
+  const char* mkl = std::getenv("MKL_NUM_THREADS");
+  const bool set = (omp != nullptr && *omp != '\0') || (mkl != nullptr && *mkl != '\0');
+  scorch_thread_policy_owner_state().store(set ? -1 : at::get_num_threads(),
+                                           std::memory_order_relaxed);
+}
+
+// scorch.set_num_threads(n): from now on a setting is in force, whatever n was.
+inline void scorch_thread_policy_record_setting() {
+  scorch_thread_policy_owner_state().store(-1, std::memory_order_relaxed);
+}
+
+static inline int scorch_thread_policy_uncapped_at() {
+  return scorch_thread_policy_owner_state().load(std::memory_order_relaxed);
+}
+
+#else  // a kernel module: the state is scorch_ops', reached through its capsule
+
+// Imported only by a thread outside every parallel region (omp_get_level() == 0). Importing
+// takes the GIL; a worker of a region whose calling thread holds the GIL and waits at the region's
+// barrier would never get it. A first use deeper than that returns nullptr -- a setting in force,
+// the capped count -- and leaves the import to the next use outside a region. That can change no
+// team only because inner regions are inactive (the default of one active level): whatever an
+// inner num_threads clause asks for, it runs one thread. Making nested regions active means
+// revisiting this.
+//
+// Not a lazily initialized static, for the reason abi_watch_imported_api gives: its
+// initialization guard would be held while waiting for the GIL. Two threads importing at once
+// both find the same capsule.
+//
+// So the import happens once per kernel module, on its first call at level 0, and never again: a
+// later call costs two acquire loads here, the relaxed load of the state, at::get_num_threads()
+// and a compare in scorch_thread_ceiling.
+static inline const std::atomic<int>* scorch_thread_policy_imported() {
+  static std::atomic<const std::atomic<int>*> imported{nullptr};
+  static std::atomic<bool> looked{false};
+  if (looked.load(std::memory_order_acquire)) {
+    return imported.load(std::memory_order_acquire);
+  }
+  if (omp_get_level() != 0) return nullptr;
+  PyGILState_STATE gil = PyGILState_Ensure();
+  const auto* found = static_cast<const std::atomic<int>*>(
+      PyCapsule_Import("scorch_ops._thread_policy", 0));
+  // Not found: the module reads every call as a setting in force, so its teams take
+  // min(torch's count, scorch_num_procs()). torch's count is always readable
+  // (at::get_num_threads() cannot fail), so that bound is always defined. It costs speed, never
+  // correctness, and never exceeds a caller's setting. It can only happen when this header and
+  // the scorch_ops a process loaded disagree: the JIT cache key covers the preamble text, this
+  // header included, but not scorch_ops' binary, so a source tree whose header changed without
+  // rebuilding scorch_ops compiles modules that look for a capsule its scorch_ops lacks.
+  if (found == nullptr) PyErr_Clear();
+  PyGILState_Release(gil);
+  imported.store(found, std::memory_order_release);
+  looked.store(true, std::memory_order_release);
+  return found;
+}
+
+static inline int scorch_thread_policy_uncapped_at() {
+  const std::atomic<int>* state = scorch_thread_policy_imported();
+  return state != nullptr ? state->load(std::memory_order_relaxed) : -1;
+}
+
+#endif  // SCORCH_ABI_WATCH_OWNER
+
+// The most workers a team scorch launches may have (see above). noinline for the reason
+// scorch_num_procs gives; static so that no kernel module's copy is merged with scorch_ops'.
+__attribute__((noinline)) static inline int scorch_thread_ceiling() {
+  const int procs = scorch_num_procs();
+  const int pool = at::get_num_threads();
+  if (pool == scorch_thread_policy_uncapped_at()) return procs;
+  return pool < procs ? pool : procs;
 }
 
 // --- Per-host autotune overrides (optional, generated, gitignored) -----------
@@ -1956,10 +2098,13 @@ __attribute__((noinline)) inline bool scorch_omp_is_libgomp() {
 // omp_get_num_procs() so M5's bandwidth-bound big graphs keep all cores. Because
 // this only ever RAISES the count toward what the platform already offers, it
 // cannot reintroduce an all-cores E-core cliff beyond torch's own default.
+//
+// The cap is scorch_thread_ceiling(): scorch_num_procs() unless the caller set a thread count,
+// and then the smaller of that and torch's count. So the floor too stops at a caller's count.
 inline int scorch_nthreads(long work, long rows, long grain_default = SCORCH_GRAIN_DEFAULT,
                            int nfloor = 1,
                            long rows_per_thread = SCORCH_ROWS_PER_THREAD) {
-  int hw = scorch_num_procs();                // stable; torch mutates omp_get_max_threads
+  int hw = scorch_thread_ceiling();
   if (rows_per_thread < 1) rows_per_thread = 1;
   long n = rows / rows_per_thread;            // row-axis parallel capacity
   if (work >= 0) {
@@ -2621,6 +2766,14 @@ inline int scorch_spmm_nthreads(long work, long rows, int nthreads_override,
     if (nt_cap > 0 && (long)nthreads > nt_cap) nthreads = (int)nt_cap;
   }
 #endif
+  // The caller's thread setting bounds every branch above, the recruit decline included: the
+  // decline may lift the pool cap, but not past a count the caller asked for (see
+  // scorch_thread_ceiling). With no setting the ceiling is scorch_num_procs(), which every branch
+  // above already stays within, so there this never lowers the count.
+  {
+    const int ceiling = scorch_thread_ceiling();
+    if (nthreads > ceiling) nthreads = ceiling;
+  }
 #if SCORCH_SPMM_FORCE_TEAM == 1
   nthreads = 1;
 #endif

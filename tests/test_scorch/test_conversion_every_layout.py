@@ -23,6 +23,14 @@ from tests.test_scorch.level_array_support import assert_matches, stored
 SHAPES = {1: (64,), 2: (48, 7), 3: (40, 5, 4)}
 
 
+@pytest.fixture(autouse=True)
+def _torch_allows_the_teams_these_shapes_were_built_for(torch_threads):
+    # SHAPES gives a parallel row loop up to 64 // 16 = 4 workers.
+    # torch's count must allow that, or a process started with MKL_NUM_THREADS=1 runs every kernel
+    # here on one worker (tests/conftest.py, torch_threads).
+    torch_threads(4, needs_team=False)
+
+
 def layouts(rank):
     return ["".join(kinds) for kinds in itertools.product("ds", repeat=rank)] + [
         "o" * rank

@@ -47,7 +47,9 @@ def test_formula(width):
     assert scorch_ops.scorch_spmm_work(1000, 300, width, width) == 1000 * w + 300 * width
 
 
-def test_a_nearly_empty_matrix_stays_on_one_worker():
+def test_a_nearly_empty_matrix_stays_on_one_worker(torch_threads):
+    # At a pool of 24, which torch's count must allow, or "one worker" holds for every product.
+    torch_threads(24)
     rows, nnz, empty, pool = 9669, 24, 9645, 24  # flowmeter5_B
     work = scorch_ops.scorch_spmm_work(nnz, empty, 1, 1)
     assert work < GRAIN
@@ -83,10 +85,12 @@ def test_mixed_row_lengths_match_torch(dtype, width):
 
 @pytest.mark.parametrize("dtype", [torch.float32, torch.float64])
 @pytest.mark.parametrize("width", [1, 2, 3, 4, 5, 8])
-def test_nearly_empty_matches_torch(dtype, width):
+def test_nearly_empty_matches_torch(dtype, width, torch_threads):
     # More rows than nonzeros and empty runs of every length. From width 2 up the empty rows credit
     # enough work for several workers, so runs also cross chunk boundaries; the policy is asked,
     # so a change to it that left this on one worker fails here rather than silently narrowing it.
+    # The policy is asked at a pool of 24, which torch's count must allow.
+    torch_threads(24)
     rows, cols, nnz = 40000, 3000, 5000
     g = torch.Generator().manual_seed(3)
     row = torch.randint(0, rows, (nnz,), generator=g)

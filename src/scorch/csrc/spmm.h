@@ -756,13 +756,17 @@ Tensor spmm_csr_float_ultra(std::vector<int> result_shape, std::vector<int> A_sh
   // Ensure tile size is a multiple of 16 for SIMD operations
   default_tile_size = (default_tile_size + 15) & ~15;
 
-  // Determine optimal thread count
-  int num_threads = omp_get_max_threads();
+  // Determine optimal thread count. torch's count, which at::get_num_threads() first applies to a
+  // thread torch has not initialized yet; omp_get_max_threads() would answer the runtime's default there.
+  int num_threads = at::get_num_threads();
   if (A0_size < 1000 || (avg_nnz_per_row < 10 && A0_size < 10000)) {
     // Use fewer threads for small or very sparse matrices
     num_threads = std::min(num_threads, 4);
   }
-  omp_set_num_threads(num_threads);
+  // The team gets this count through its own num_threads clause. This kernel used to call
+  // omp_set_num_threads(num_threads) and "restore" with omp_set_num_threads(omp_get_max_threads()),
+  // which reads back the value just set: one small input lowered the calling thread's count -- and
+  // torch's, which is the same runtime value -- to 4 for the rest of the process.
 
   // Allocate all worker scratch before entering OpenMP so allocation failures
   // unwind normally instead of escaping a parallel structured block.
@@ -772,7 +776,7 @@ Tensor spmm_csr_float_ultra(std::vector<int> result_shape, std::vector<int> A_sh
       static_cast<size_t>(num_threads), aligned_tile_size);
 
   // Process all rows in a single parallel region with dynamic scheduling
-  #pragma omp parallel
+  #pragma omp parallel num_threads(num_threads)
   {
     float* SCORCH_RESTRICT thread_workspace =
         thread_workspaces.get() +
@@ -909,9 +913,6 @@ Tensor spmm_csr_float_ultra(std::vector<int> result_shape, std::vector<int> A_sh
     }
   }
 
-  // Restore default thread count
-  omp_set_num_threads(omp_get_max_threads());
-
   // Assemble final result
   Tensor C;
   C.storage.index.mode_indices = {{}, {}};
@@ -975,20 +976,21 @@ Tensor spmm_csr_float_apex(std::vector<int> result_shape, std::vector<int> A_sha
   // Ensure tile size is aligned to 16 bytes for SIMD operations
   default_tile_size = (default_tile_size + 15) & ~15;
 
-  // Determine optimal thread count
-  int num_threads = omp_get_max_threads();
+  // Determine optimal thread count. torch's count, which at::get_num_threads() first applies to a
+  // thread torch has not initialized yet; omp_get_max_threads() would answer the runtime's default there.
+  int num_threads = at::get_num_threads();
   if (A0_size < 1000 || (avg_nnz_per_row < 10 && A0_size < 10000)) {
     // Use fewer threads for small or very sparse matrices
     num_threads = std::min(num_threads, 4);
   }
-  omp_set_num_threads(num_threads);
+  // A num_threads clause, not omp_set_num_threads: see spmm_csr_float_ultra.
 
   auto thread_workspaces = scorch_make_aligned_buffer_pool<float>(
       static_cast<size_t>(num_threads),
       static_cast<size_t>(default_tile_size));
 
   // Process all rows in a single parallel region with dynamic scheduling
-  #pragma omp parallel
+  #pragma omp parallel num_threads(num_threads)
   {
     float* SCORCH_RESTRICT thread_workspace =
         thread_workspaces.get() +
@@ -1117,9 +1119,6 @@ Tensor spmm_csr_float_apex(std::vector<int> result_shape, std::vector<int> A_sha
       }
     }
   }
-
-  // Restore default thread count
-  omp_set_num_threads(omp_get_max_threads());
 
   // Assemble final result
   Tensor C;
@@ -6962,7 +6961,7 @@ torch::Tensor spmm_csr_float_tilej_core(
   const long work = total_nnz * k_eff;
   int nthreads = scorch_nthreads(work, A0_size, SCORCH_GRAIN_SPMM);
   if (nthreads_override > 0) {
-    const long hw = (long)scorch_num_procs();
+    const long hw = (long)scorch_thread_ceiling();  // a caller's thread setting bounds it too
     long cand = (long)nthreads_override < hw ? (long)nthreads_override : hw;
     if (cand > (long)nthreads) nthreads = (int)cand;
   }
@@ -7103,7 +7102,7 @@ torch::Tensor spmm_csr_float_tileijk_core(
   const long work = total_nnz * k_eff;
   int nthreads = scorch_nthreads(work, A0_size, SCORCH_GRAIN_SPMM);
   if (nthreads_override > 0) {
-    const long hw = (long)scorch_num_procs();
+    const long hw = (long)scorch_thread_ceiling();  // a caller's thread setting bounds it too
     long cand = (long)nthreads_override < hw ? (long)nthreads_override : hw;
     if (cand > (long)nthreads) nthreads = (int)cand;
   }

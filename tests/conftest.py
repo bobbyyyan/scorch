@@ -55,3 +55,58 @@ def _validate_kernel_results():
             os.environ.pop("SCORCH_VALIDATE_KERNEL_RESULTS", None)
         else:
             os.environ["SCORCH_VALIDATE_KERNEL_RESULTS"] = old_env
+
+
+def processors():
+    """The processors this process may run on: the affinity mask where the platform has one.
+
+    That is the set libgomp's omp_get_num_procs() counts on Linux (and so scorch_num_procs(), the
+    ceiling of every team scorch launches with no thread setting in force). macOS has no affinity
+    mask, and LLVM's libomp reports every processor, which is os.cpu_count().
+    """
+    if hasattr(os, "sched_getaffinity"):
+        return len(os.sched_getaffinity(0))
+    return os.cpu_count() or 1
+
+
+@pytest.fixture
+def torch_threads():
+    """Run a test at a torch thread count it names, and restore the count afterwards.
+
+    Once a thread setting is in force (OMP_NUM_THREADS or MKL_NUM_THREADS at load, or torch's count
+    changed since), scorch caps every team it launches at torch's count (scorch_thread_ceiling in
+    scorch_policy.h). So a test that passes a worker override above 1, asserts a team above 1, or
+    runs a kernel at a shape chosen for several workers gets that team only if torch's count allows
+    it, and a process started with MKL_NUM_THREADS=1 runs it on one worker. The test calls
+    ``torch_threads(n)`` with the largest count it simulates; the count is capped at the processors.
+
+    ``needs_team`` (the default) skips the test where only one processor is available, because what
+    it asserts needs a second worker. A test whose assertions hold on one worker as well passes
+    ``needs_team=False`` and runs anyway.
+
+    torch.set_num_threads, not scorch.set_num_threads: scorch's records a setting for the rest of
+    the process. Restoring torch's count restores the state exactly.
+    """
+    import scorch_ops
+    import torch
+
+    before = torch.get_num_threads()
+
+    def use(n, needs_team=True):
+        procs = processors()
+        if needs_team and procs < 2:
+            pytest.skip("one processor: every team is one worker")
+        count = max(1, min(n, procs))
+        torch.set_num_threads(count)
+        # The ceiling is now `count`, or scorch_num_procs() when `count` is torch's count at load
+        # and nothing was set; never less than `count` unless scorch counts fewer processors than
+        # processors() does, which would make the test's premise false. Say so here, not in the
+        # test's own assertion.
+        ceiling = scorch_ops.thread_ceiling()
+        assert ceiling >= count, (
+            "asked for %d threads (processors %d) but scorch's ceiling is %d" % (count, procs, ceiling)
+        )
+        return count
+
+    yield use
+    torch.set_num_threads(before)
