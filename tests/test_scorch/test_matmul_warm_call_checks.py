@@ -135,7 +135,14 @@ def test_no_schedule_runs_a_dense_product_without_the_policy(monkeypatch, pair):
     torch.testing.assert_close(scorch.matmul(a, b), expected)
 
 
-def test_keyword_arguments_still_resolve_the_policy(monkeypatch):
+@pytest.mark.parametrize(
+    "keywords", [{"format": "ds"}, {"use_cache": False}], ids=["format_ds", "use_cache"]
+)
+def test_keyword_arguments_still_resolve_the_policy(monkeypatch, keywords):
+    """A keyword that changes the computation makes the call a keyword call, which
+    resolves the policy with it.  (format="dd" on this product used to be the case here;
+    it names the plain result's own layout, so it is computed as the plain call: the
+    next test.)"""
     a = stored(_matrix(torch.float64), "ds", "A")
     b = _dense((5, 3), torch.float64)
     calls = []
@@ -145,8 +152,55 @@ def test_keyword_arguments_still_resolve_the_policy(monkeypatch):
         "_matmul_compile_policy",
         lambda kwargs: calls.append(dict(kwargs)) or policy(kwargs),
     )
-    scorch.matmul(a, b, format="dd")
-    assert calls == [{"format": "dd"}]
+    scorch.matmul(a, b, **keywords)
+    assert calls == [keywords]
+
+
+@pytest.mark.parametrize(
+    "keywords, taken_out",
+    [
+        ({"format": "dd"}, {"format": "dd"}),
+        ({"output_format": "dd"}, {"format": "dd"}),
+        ({"format": ["d", "d"]}, {"format": "dd"}),
+        ({"output_mode_order": (0, 1)}, {"output_mode_order": [0, 1]}),
+        (
+            {"format": "dd", "output_mode_order": [0, 1]},
+            {"format": "dd", "output_mode_order": [0, 1]},
+        ),
+    ],
+    ids=["format", "output_format", "format_list", "identity_order", "both"],
+)
+def test_a_result_keyword_naming_the_plain_result_is_kept_apart(
+    monkeypatch, keywords, taken_out
+):
+    """A result keyword that names what the plain call returns is computed as the plain
+    call (no policy, the plain call's bits) and is not forgotten: the caller passed it,
+    which the drop-in rule reads as a request for scorch's form of the result, so it
+    reaches _result_as_requested, normalised.  A keyword left at its default (None)
+    is not passed, and reaches nothing."""
+    a = stored(_matrix(torch.float64), "ds", "A")
+    b = _dense((5, 3), torch.float64)
+    plain = scorch.matmul(a, b)
+    requests = []
+    present = ops._result_as_requested
+    monkeypatch.setattr(ops, "_matmul_compile_policy", _fail)
+    monkeypatch.setattr(
+        ops,
+        "_result_as_requested",
+        lambda result, kept: requests.append(dict(kept)) or present(result, kept),
+    )
+    got = scorch.matmul(a, b, **keywords)
+    assert len(requests) == 1
+    want = {
+        k: (ops.parse_format(v) if k == "format" else v) for k, v in taken_out.items()
+    }
+    assert requests[0] == want
+    assert type(got) is type(plain)
+    torch.testing.assert_close(got, plain, rtol=0, atol=0)
+
+    requests.clear()
+    scorch.matmul(a, b, format=None, output_mode_order=None)
+    assert requests == []
 
 
 def _generated_product():

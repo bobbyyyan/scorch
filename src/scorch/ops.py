@@ -1986,26 +1986,37 @@ def _matmul_keyword_call(a: Any, b: Any, kwargs: Dict[str, Any]) -> Any:
     """Apply ``matmul``'s keyword rule to ``kwargs``, in place (patch 0072).
 
     The rule every product entry applies (``_entry_keywords``), and three more that make
-    a keyword which changes nothing about the result leave the call the plain call:
-    an identity ``output_mode_order`` is dropped (any other order is checked, by
-    einsum's codes, against the result's rank); a ``format=`` naming the plain result's
-    own dense layout is dropped (``_names_plain_dense_result``).  Any other order
-    changes the result's storage order and nothing else, so with no ``format=`` a
-    product whose plain result is dense (``_plain_dense_result_rank``) asks for a dense
-    result: the generated kernel the order goes to infers "ds" for x @ A from A's
-    compressed level, where the plain call returns a dense tensor.  ``out=`` is filled
-    here (``_matmul_into``), except for an fx Proxy operand, whose call is recorded as
-    it was made.  Returns the result of a call completed here, else ``_PLAIN_CALL``.
-    A separate function so ``matmul`` stays within the project's complexity bound.
+    a keyword which changes nothing about the computation leave it the plain call's:
+    an identity ``output_mode_order`` is taken out of the computation (any other order
+    is checked, by einsum's codes, against the result's rank); so is a ``format=``
+    naming the plain result's own dense layout (``_names_plain_dense_result``).  Any
+    other order changes the result's storage order and nothing else, so with no
+    ``format=`` a product whose plain result is dense (``_plain_dense_result_rank``)
+    asks for a dense result: the generated kernel the order goes to infers "ds" for
+    x @ A from A's compressed level, where the plain call returns a dense tensor.
+    ``out=`` is filled here (``_matmul_into``), except for an fx Proxy operand, whose
+    call is recorded as it was made.
+
+    A keyword taken out of the computation is still one the caller passed, which is
+    not the same as one left at its default (``_entry_keywords`` drops those, by
+    identity with the default): the drop-in rule reads a passed result keyword as a
+    request for the result in scorch's form, whatever its value.  So a call that passed
+    one is computed here as the plain call -- the same bits, its derivative, its plan,
+    the plain call's cache keys -- and its result goes to ``_result_as_requested`` with
+    the keywords taken out, their values normalised (a ``TensorFormat``, an order as a
+    list).  Returns the result of a call completed here, else ``_PLAIN_CALL``.  A
+    separate function so ``matmul`` stays within the project's complexity bound.
     """
 
     _entry_keywords(kwargs, _MATMUL_KEYWORDS, "matmul")
+    taken_out: Dict[str, Any] = {}
     if "output_mode_order" in kwargs:
         rank = _matmul_result_rank(a, b)
         if rank is not None:
             order = _checked_output_mode_order(kwargs["output_mode_order"], rank)
             if order == list(range(rank)):
                 del kwargs["output_mode_order"]
+                taken_out["output_mode_order"] = order
             else:
                 kwargs["output_mode_order"] = order
     requested = kwargs.get("format")
@@ -2016,9 +2027,28 @@ def _matmul_keyword_call(a: Any, b: Any, kwargs: Dict[str, Any]) -> Any:
                 kwargs["format"] = "d" * dense_rank
     elif requested is not None and _names_plain_dense_result(a, b, requested):
         del kwargs["format"]
+        taken_out["format"] = parse_format(requested)
     if "out" in kwargs and not (isinstance(a, Proxy) or isinstance(b, Proxy)):
+        # out= is the result (torch.matmul's contract), so nothing is left to present.
         return _matmul_into(a, b, kwargs.pop("out"), kwargs)
+    if taken_out:
+        return _result_as_requested(matmul(a, b, **kwargs), taken_out)
     return _PLAIN_CALL
+
+
+def _result_as_requested(result: Any, taken_out: Dict[str, Any]) -> Any:
+    """The result of a call whose caller passed result keywords that did not change the
+    computation (``_matmul_keyword_call``): ``format=`` naming the plain result's dense
+    layout, an identity ``output_mode_order``.  ``taken_out`` holds them, normalised.
+
+    The drop-in rule reads such a keyword as a request for the result in scorch's form
+    (rule (a), scorch-merge 2026-10-14 18:48); building that form is the result-type
+    patch's (0073, one helper with the dense einsum's), not this one's.  Until it lands
+    the result is the plain call's, as it was before the keyword was taken out; this is
+    the one place that patch changes, and the keywords reach it.
+    """
+
+    return result
 
 
 def _operand_requires_grad(x: Any) -> bool:
