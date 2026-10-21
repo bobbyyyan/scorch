@@ -29,7 +29,17 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Dict, List, NoReturn, Optional, Sequence, Tuple, cast
+from typing import (
+    TYPE_CHECKING,
+    Dict,
+    FrozenSet,
+    List,
+    NoReturn,
+    Optional,
+    Sequence,
+    Tuple,
+    cast,
+)
 
 from . import llir
 from .identity import SymbolId
@@ -65,7 +75,11 @@ from .sparse_accumulator import (
     UNSUPPORTED_ACCUMULATOR_STRUCTURE,
     is_accumulator_structure,
 )
-from .torch_cpp_abi import ResultTensorAssembler, level_total_check
+from .torch_cpp_abi import (
+    ResultTensorAssembler,
+    level_total_check,
+    mode_position_length,
+)
 from ..format import LevelType
 from ..utils import dtype_to_c_datatype
 
@@ -214,6 +228,11 @@ class CompressedWhereOpenMPContext:
     #: ``unsupported_accumulator_structure``.  This pass is the only layer that
     #: knows whether the emitted body has one, which is why the refusal is here.
     accumulator: Optional[str] = None
+    #: The position arrays the kernel binds from its mode-index arguments
+    #: (``TorchCppKernelABI.bound_position_arrays``), whose entry counts the work
+    #: estimate may read to keep its reads in bounds.  Empty: a deeper operand's
+    #: count is not read, and the estimate falls back to the guarded one.
+    bound_position_arrays: FrozenSet[str] = frozenset()
 
 
 @dataclass(frozen=True)
@@ -609,6 +628,17 @@ def _validate_context(context: object) -> CompressedWhereOpenMPContext:
             ),
             path=("context", "accumulator"),
             value=accumulator,
+        )
+    position_arrays = typed_context.bound_position_arrays
+    if type(position_arrays) is not frozenset or not all(
+        type(name) is str and _parse_pos(name) is not None for name in position_arrays
+    ):
+        _raise_compressed_where_error(
+            typed_context,
+            code="invalid_compressed_where_position_arrays",
+            message="bound_position_arrays must hold position array names",
+            path=("context", "bound_position_arrays"),
+            value=position_arrays,
         )
     return typed_context
 
@@ -1088,45 +1118,58 @@ def _parse_pos(pos_name: str) -> Optional[Tuple[str, int]]:
     return match.group(1), int(match.group(2))
 
 
-def _stored_count_chain(
-    prefix: str, levels: set[int], outer: llir.Var
+def _stored_count_read(
+    prefix: str,
+    levels: set[int],
+    outer: llir.Var,
+    bound_position_arrays: FrozenSet[str],
 ) -> Optional[Tuple[str, llir.Expr]]:
-    """The stored count at an operand's deepest compressed level, read in bounds.
+    """An operand's count as the work estimate reads it, inside the array.
 
-    ``outer`` is the operand's dense level-0 extent.  Level ``l``'s position array has
-    one entry per stored position of level ``l - 1``, plus one, so when the compressed
-    levels are exactly ``1..L`` the chain ``X{L}_pos[...X2_pos[X1_pos[X0_size]]]``
-    reads every array inside its length and yields the stored count at level ``L``
-    (and at any singleton level below it).  For two-level CSR it is ``X1_pos[X0_size]``.
-
-    Reading ``X{L}_pos[X0_size]`` for ``L > 1``, as this estimate did, indexes level
-    ``L``'s array by the level-0 extent: past its end when fewer positions are stored
-    above it (``ijkl,ijkl->il`` with ``A`` in ``dssd``, dennis, region scan 82815), and
-    a wrong count otherwise.  The estimate sizes the team (``num_threads``), the
-    per-thread workspace count and the chunk, each from its own read, so a read past
-    the end can give them different values.  Any other set of levels (a dense level
-    between compressed ones) has no such chain in the kernel's names, and ``None``
-    sends the caller to the guarded estimate (``_sparse_pos_work_estimate``).
+    ``outer`` is the operand's dense level-0 extent and ``L`` its deepest compressed
+    level.  The estimate reads ``X{L}_pos[X0_size]``.  Level ``L``'s position array has
+    one entry per stored position of level ``L - 1``, plus one, so for ``L == 1`` that
+    read is the stored count and lies inside the array.  For ``L > 1`` it lies past the
+    array's end when level ``L - 1`` stores fewer than ``X0_size`` positions
+    (``ijkl,ijkl->il`` with ``A`` in ``dssd``, dennis, region scan 82815: ``A2_pos[4]``
+    of a three-entry array).  So for ``L > 1`` the index is clamped to the array's last
+    entry, ``X{L}_pos[std::min<int64_t>(X0_size, X_mode_indices[L][0].numel() - 1)]``.
+    Wherever the unclamped read was inside the array it reads the same entry, so the
+    team, the chunk and the workspace count do not change; where it was past the end
+    it reads the stored count at level ``L``.  A deeper array the kernel does not bind
+    from a mode-index argument has no entry count to clamp by, and ``None`` sends the
+    caller to the guarded estimate (``_sparse_pos_work_estimate``).
     """
 
     deepest = max(levels)
-    if levels != set(range(1, deepest + 1)):
+    name = f"{prefix}{deepest}_pos"
+    array = llir.Var(name=name, type=llir.DataType.NO_TYPE)
+    if deepest == 1:
+        return f"{name}[{outer.name}]", llir.ArrayAccess(array=array, index=outer)
+    if name not in bound_position_arrays:
         return None
-    text = outer.name
-    expr: llir.Expr = outer
-    for level in range(1, deepest + 1):
-        name = f"{prefix}{level}_pos"
-        text = f"{name}[{text}]"
-        expr = llir.ArrayAccess(
-            array=llir.Var(name=name, type=llir.DataType.NO_TYPE), index=expr
-        )
-    return text, expr
+    last_entry = llir.BinOp(
+        "-",
+        mode_position_length(prefix, deepest),
+        llir.Literal(1, llir.DataType.INT),
+    )
+    index = llir.FunctionCall(
+        name="std::min",
+        args=[outer, last_entry],
+        template_args=(llir.DataType.INT64,),
+    )
+    text = (
+        f"{name}[std::min<int64_t>({outer.name}, "
+        f"{prefix}_mode_indices[{deepest}][0].numel() - 1)]"
+    )
+    return text, llir.ArrayAccess(array=array, index=index)
 
 
 def _spgemm_flop_work_estimate(
     body: Sequence[llir.Stmt],
     bound: llir.Var,
     traversal: LLIRTraversalContext,
+    bound_position_arrays: FrozenSet[str] = frozenset(),
 ) -> Optional[_PolicyExpression]:
     levels: Dict[str, set[int]] = {}
     for position_name in _find_all_sparse_pos_arrays(body, traversal):
@@ -1155,13 +1198,17 @@ def _spgemm_flop_work_estimate(
     def _right_outer_reference() -> llir.Var:
         return llir.Var(name=right_outer, type=llir.DataType.INT64)
 
-    left = _stored_count_chain(
+    left = _stored_count_read(
         left_prefix,
         levels[left_prefix],
         llir.Var(name=bound.name, type=bound.type),
+        bound_position_arrays,
     )
-    right = _stored_count_chain(
-        right_prefix, levels[right_prefix], _right_outer_reference()
+    right = _stored_count_read(
+        right_prefix,
+        levels[right_prefix],
+        _right_outer_reference(),
+        bound_position_arrays,
     )
     if left is None or right is None:
         return None
@@ -1269,7 +1316,9 @@ def _build_phase_loop(
     header = _phase_header_copy(source, context)
     flop_bound = _extract_loop_bound_reference(header)
     flop_work = (
-        _spgemm_flop_work_estimate(body, flop_bound, context.traversal)
+        _spgemm_flop_work_estimate(
+            body, flop_bound, context.traversal, context.bound_position_arrays
+        )
         if flop_bound is not None
         else None
     )
@@ -1327,6 +1376,57 @@ def _build_phase_loop(
             omp_chunk_expr=decision.chunk_expr,
         ),
         policy=decision,
+    )
+
+
+def _with_team(phase: _PhaseLoop, num_threads: str) -> _PhaseLoop:
+    """``phase`` with its region's ``num_threads`` spelled ``num_threads``."""
+
+    loop = phase.loop
+    return _PhaseLoop(
+        loop=llir.ForLoop(
+            init=loop.init,
+            cond=loop.cond,
+            update=loop.update,
+            body=loop.body,
+            omp_parallel_for=loop.omp_parallel_for,
+            omp_schedule=loop.omp_schedule,
+            pre_parallel_body=loop.pre_parallel_body,
+            omp_num_threads=num_threads,
+            omp_chunk_expr=loop.omp_chunk_expr,
+        ),
+        policy=phase.policy,
+        preamble=phase.preamble,
+    )
+
+
+def _teams_within_pool(
+    context: CompressedWhereOpenMPContext,
+    count_phase: _PhaseLoop,
+    fill_phase: _PhaseLoop,
+) -> Tuple[_PhaseLoop, _PhaseLoop]:
+    """Give both parallel phases a team no larger than the workspace pool.
+
+    The pool holds ``<workspace>_thread_count`` workspaces, one evaluation of the
+    phases' policy, and every worker takes ``<workspace>_pool[omp_get_thread_num()]``
+    unchecked.  A region evaluating its policy again could get more threads than that
+    whenever the two evaluations differ, as a work estimate read past an array's end
+    could.  When both phases spell one policy, as the pool's count does, each region
+    takes the count itself.  When they differ the pool holds their ``std::max`` and
+    each region takes its own policy capped by the count, which is its own policy
+    whenever the evaluations agree.
+    """
+
+    if not context.parallel:
+        return count_phase, fill_phase
+    count_threads = count_phase.policy.num_threads or "omp_get_max_threads()"
+    fill_threads = fill_phase.policy.num_threads or "omp_get_max_threads()"
+    pool_count = _thread_count_reference(context).name
+    if count_threads == fill_threads:
+        return _with_team(count_phase, pool_count), _with_team(fill_phase, pool_count)
+    return (
+        _with_team(count_phase, f"std::min({count_threads}, {pool_count})"),
+        _with_team(fill_phase, f"std::min({fill_threads}, {pool_count})"),
     )
 
 
@@ -1954,6 +2054,11 @@ def _build_transformed_statements(
             context,
             workspace_hoisted=workspace_hoisted,
         )
+
+        if workspace_hoisted:
+            count_phase, fill_phase = _teams_within_pool(
+                context, count_phase, fill_phase
+            )
 
         result = _filtered_prefix(statements, loop_index, context)
         if workspace_hoisted:

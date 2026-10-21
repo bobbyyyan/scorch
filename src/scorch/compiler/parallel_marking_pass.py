@@ -931,6 +931,12 @@ def attach_serial_workspace_pools(
     allocator.  A policy string without a typed value would silently
     desynchronize the pragma from the worker count, so that combination
     fails closed.
+
+    Every worker then slices its pool by ``omp_get_thread_num()``, so the
+    region's team is the pools' worker count, evaluated once, and not the
+    policy evaluated a second time: two evaluations agree only while every
+    read the policy makes lies inside its array.  With several pools the
+    team is the smallest count, ``std::min`` over them.
     """
     if not pool_specs:
         return
@@ -998,6 +1004,10 @@ def attach_serial_workspace_pools(
             ]
         )
     loop.before_parallel_body = before
+    team = f"{pool_specs[0].name}_thread_count"
+    for spec in pool_specs[1:]:
+        team = f"std::min({team}, {spec.name}_thread_count)"
+    loop.omp_num_threads = team
 
 
 def mark_first_for_loop_parallel(

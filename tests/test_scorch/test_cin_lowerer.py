@@ -6536,9 +6536,11 @@ def test_dense_workspace_pool_ownership_is_structured_and_byte_exact() -> None:
             llir.Var(name="A0_size", type=llir.DataType.INT),
         ],
     )
+    # The policy, evaluated once for the pool; the region's team is the count.
     assert LLIRLowerer().lower_llir(cast(llir.Expr, count_init.value)) == (
-        loop.omp_num_threads
+        "scorch_nthreads(-1, A0_size)"
     )
+    assert loop.omp_num_threads == "wksp_thread_count"
 
     assert type(owner) is llir.VarInit
     owner_init = cast(llir.VarInit, owner)
@@ -6645,12 +6647,14 @@ def test_sparse_workspace_pool_policy_is_typed_on_the_atomic_path() -> None:
         ],
     )
     assert LLIRLowerer().lower_llir(cast(llir.Expr, count_init.value)) == (
-        loop.omp_num_threads
+        "scorch_nthreads(A1_pos[A0_size], A0_size)"
     )
+    assert loop.omp_num_threads == "wksp_thread_count"
     assert cast(llir.VarInit, owner).value == _expected_pool_owner_value()
 
     cpp = LLIRLowerer().lower_llir(lowered)
     assert "int wksp_thread_count = scorch_nthreads(A1_pos[A0_size], A0_size);" in cpp
+    assert "num_threads(wksp_thread_count)" in cpp
     assert (
         "float* __restrict__ wksp = wksp_pool_owner.get() + "
         "(size_t)omp_get_thread_num() * (size_t)B1_size;"

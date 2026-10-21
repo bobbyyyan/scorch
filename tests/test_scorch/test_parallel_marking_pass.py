@@ -298,9 +298,12 @@ def test_cluster_alloc_is_placed_on_the_plain_parallel_path() -> None:
     assert len(loop.before_parallel_body) == 2
     count_init = cast(llir.VarInit, loop.before_parallel_body[0])
     assert count_init.var.name == "wksp_thread_count"
+    # The policy is evaluated once, for the pool's count; every worker slices the
+    # pool by omp_get_thread_num(), so the region's team is that count.
     assert LLIRLowerer().lower_llir(cast(llir.Expr, count_init.value)) == (
-        loop.omp_num_threads
+        "scorch_nthreads(-1, A0_size)"
     )
+    assert loop.omp_num_threads == "wksp_thread_count"
     owner_init = cast(llir.VarInit, loop.before_parallel_body[1])
     owner_value = cast(llir.FunctionCall, owner_init.value)
     assert owner_value.template_args == (llir.DataType.FLOAT32,)
@@ -321,7 +324,7 @@ def test_atomic_path_owns_prelude_markers_and_typed_policy() -> None:
     assert loop._atomic_chunk_var == "_chunk"
     assert loop._atomic_counter_var == "_next_row"
     assert loop._loop_bound == "A0_size"
-    assert loop.omp_num_threads == "scorch_nthreads(A1_pos[A0_size], A0_size)"
+    assert loop.omp_num_threads == "wksp_thread_count"
     assert loop.pre_parallel_body is not None
     assert loop.pre_parallel_body[0] == alloc
     assert loop.pre_parallel_body[0] is not alloc
@@ -340,7 +343,34 @@ def test_atomic_path_owns_prelude_markers_and_typed_policy() -> None:
     assert loop.before_parallel_body is not None
     count_init = cast(llir.VarInit, loop.before_parallel_body[0])
     assert LLIRLowerer().lower_llir(cast(llir.Expr, count_init.value)) == (
-        loop.omp_num_threads
+        "scorch_nthreads(A1_pos[A0_size], A0_size)"
+    )
+
+
+def test_two_pools_give_the_region_the_smaller_count() -> None:
+    loop = _plain_dense_loop()
+    second = ParallelWorkspacePoolSpec(
+        name="other",
+        scalar_type=llir.DataType.FLOAT64,
+        extent="B1_size",
+    )
+    cluster = ParallelWorkspaceCluster(pool_specs=(_pool_spec(), second))
+
+    mark_first_for_loop_parallel([loop], cluster)
+
+    assert loop.before_parallel_body is not None
+    counts = [
+        cast(llir.VarInit, statement)
+        for statement in loop.before_parallel_body
+        if cast(llir.VarInit, statement).var.name.endswith("_thread_count")
+    ]
+    assert [count.var.name for count in counts] == [
+        "wksp_thread_count",
+        "other_thread_count",
+    ]
+    assert loop.omp_num_threads == "std::min(wksp_thread_count, other_thread_count)"
+    assert "num_threads(std::min(wksp_thread_count, other_thread_count))" in (
+        LLIRLowerer().lower_llir(loop)
     )
 
 

@@ -387,7 +387,9 @@ def test_expression_producer_budgets_are_explicit() -> None:
     assert helper_calls == {
         ("cin_lowerer.py", "tensor_data_ptr"): 2,
         ("cin_lowerer.py", "tensor_storage_member"): 1,
-        ("torch_cpp_abi.py", "mode_index_tensor"): 4,
+        # The fifth: mode_position_length, the position array's entry count that
+        # caps a deeper read of the SpGEMM work estimate (row 15b).
+        ("torch_cpp_abi.py", "mode_index_tensor"): 5,
         ("torch_cpp_abi.py", "tensor_data_ptr"): 12,
         ("torch_cpp_abi.py", "tensor_storage_member"): 2,
     }
@@ -396,9 +398,10 @@ def test_expression_producer_budgets_are_explicit() -> None:
         "compressed_where_openmp_pass.py": 1,
         "llir_traversal.py": 1,
         "schedule_lowerer.py": 2,
-        "torch_cpp_abi.py": 1,
+        # data_ptr's, and mode_position_length's numel() (row 15b).
+        "torch_cpp_abi.py": 2,
     }
-    assert sum(member_call_constructors.values()) == 7
+    assert sum(member_call_constructors.values()) == 8
 
 
 def test_panel_lower_bound_calls_cannot_return_to_var_names() -> None:

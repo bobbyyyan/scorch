@@ -469,6 +469,17 @@ def tensor_data_ptr(receiver: llir.Expr, data_type: llir.DataType) -> llir.Membe
     )
 
 
+def mode_position_length(tensor_name: str, level: int) -> llir.MemberCall:
+    """Build ``<tensor>_mode_indices[level][0].numel()``: the entry count of the
+    position array :meth:`KernelTensorABI.emit_level_array_bindings` binds as
+    ``<tensor><level>_pos`` for a compressed level."""
+
+    return llir.MemberCall(
+        base=mode_index_tensor(tensor_name, level, 0),
+        member="numel",
+    )
+
+
 @dataclass(frozen=True)
 class KernelTensorABI:
     """Immutable ABI metadata for one public JIT tensor argument triple."""
@@ -1287,6 +1298,19 @@ class TorchCppKernelABI:
             stmts.extend(tensor.emit_level_array_bindings())
             stmts.append(tensor.emit_value_pointer())
         return stmts
+
+    def bound_position_arrays(self) -> FrozenSet[str]:
+        """The ``<tensor><level>_pos`` names the input prologue binds from a
+        mode-index argument, whose entry count :func:`mode_position_length`
+        reads."""
+
+        self._validate()
+        return frozenset(
+            f"{tensor.name}{level}_pos"
+            for tensor in self.input_tensors
+            for level, level_type in enumerate(tensor.level_types)
+            if level_type == LevelType.COMPRESSED
+        )
 
     def emit_extra_tensor_prologue(self) -> List[llir.Stmt]:
         """Build fresh typed value pointers for post-op tensor arguments."""

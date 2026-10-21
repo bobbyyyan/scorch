@@ -7262,6 +7262,7 @@ class _TargetLowering:
                 parallel=strategy == "two_pass_parallel",
                 outer_cell=outer_cell,
                 accumulator=accumulator,
+                bound_position_arrays=self.kernel_abi().bound_position_arrays(),
             )
         )
 
@@ -12805,7 +12806,10 @@ class _ParallelSparseWorkspaceLowering(_TargetLowering):
             omp_parallel_for=True,
             omp_schedule="dynamic, 64",
             pre_parallel_body=[self._completed_view_statement()],
-            omp_num_threads=f"scorch_nthreads({work_text}, {rows_text}, {grain})",
+            # Both phase regions index the pool by omp_get_thread_num(), so their team is
+            # the pool's worker count; the two phases' policies are equal here
+            # (compressed_where_openmp_pass._teams_within_pool).
+            omp_num_threads=f"{self.workspace_decl.name}_thread_count",
             omp_chunk_expr=f"scorch_chunk({rows_text}, {work_text}, {grain})",
         )
         return loop

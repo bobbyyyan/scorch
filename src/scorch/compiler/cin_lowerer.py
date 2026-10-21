@@ -2,6 +2,7 @@ from dataclasses import dataclass, replace
 from typing import (
     TYPE_CHECKING,
     Dict,
+    FrozenSet,
     Iterable,
     List,
     NoReturn,
@@ -461,6 +462,10 @@ class CINLowerer:
         self.need_compute: List[TensorVar] = []
         self.tensor_var_to_llir: Dict[TensorVar, llir.Expr] = {}
         self._value_array_ctypes: Dict[str, str] = {}
+        # The position arrays the kernel ABI binds from mode-index arguments, set
+        # with the ABI snapshot before the body is lowered; the compressed-Where
+        # pass reads their entry counts to keep its work estimate in bounds.
+        self._bound_position_arrays: FrozenSet[str] = frozenset()
         self._llir_pass_run_records: Tuple[LLIRPassRunRecord, ...] = ()
 
     @property
@@ -4608,6 +4613,7 @@ class CINLowerer:
             f"{tensor.name}_val": dtype_to_c_datatype(tensor.dtype).value
             for tensor in rhs_tensor_vars
         }
+        self._bound_position_arrays = kernel_abi.bound_position_arrays()
 
         tensor_value_array_init_stmts: List[llir.Stmt] = []
         result_level_indices_init_stmts: List[llir.Stmt] = []
@@ -6547,6 +6553,7 @@ class CINLowerer:
                             if self.loop_plan is None
                             else self.loop_plan.accumulator
                         ),
+                        bound_position_arrays=self._bound_position_arrays,
                     )
                 ),
             )

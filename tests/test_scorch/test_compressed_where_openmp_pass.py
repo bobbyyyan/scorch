@@ -603,6 +603,26 @@ def _phase_loops(result: CompressedWhereOpenMPResult) -> Tuple[llir.ForLoop, ...
     return loops
 
 
+def _pool_thread_count_text(result: CompressedWhereOpenMPResult) -> str:
+    """The rendered initializer of the pool's worker count: the policy, evaluated once,
+    whose name both phase regions take as their team."""
+
+    for statement in result.statements:
+        if (
+            type(statement) is llir.VarInit
+            and cast(llir.VarInit, statement).var.name == "wksp_thread_count"
+        ):
+            return LLIRLowerer().lower_llir(
+                cast(llir.Expr, cast(llir.VarInit, statement).value)
+            )
+        if type(statement) is llir.RawStmt and cast(
+            llir.RawStmt, statement
+        ).code.startswith("int wksp_thread_count = "):
+            code = cast(llir.RawStmt, statement).code
+            return code[len("int wksp_thread_count = ") : code.index(";")]
+    raise AssertionError("the transform must build the pool's worker count")
+
+
 def _result_assembly_tail(
     statements: List[llir.Stmt],
 ) -> Tuple[llir.VarDecl, llir.Assign, llir.Assign, llir.Return]:
@@ -784,11 +804,13 @@ def test_ds_transform_builds_exact_count_fill_allocation_and_policy() -> None:
     flop = (
         "(long)A1_pos[A0_size] * (B0_size > 0 ? " "B1_pos[B0_size] / B0_size + 1 : 1)"
     )
+    assert _pool_thread_count_text(result) == (
+        f"scorch_nthreads({flop}, A0_size, " "SCORCH_GRAIN_CODEGEN_SPGEMM)"
+    )
     for loop in (count_loop, fill_loop):
         assert loop.omp_schedule == "dynamic, 64"
-        assert loop.omp_num_threads == (
-            f"scorch_nthreads({flop}, A0_size, " "SCORCH_GRAIN_CODEGEN_SPGEMM)"
-        )
+        # Both regions index the pool by omp_get_thread_num(): their team is its count.
+        assert loop.omp_num_threads == "wksp_thread_count"
         assert loop.omp_chunk_expr == (
             f"scorch_chunk(A0_size, {flop}, SCORCH_GRAIN_CODEGEN_SPGEMM)"
         )
@@ -802,10 +824,11 @@ def test_structured_position_bounds_drive_the_exact_spgemm_policy() -> None:
     flop = (
         "(long)A1_pos[A0_size] * (B0_size > 0 ? " "B1_pos[B0_size] / B0_size + 1 : 1)"
     )
+    assert _pool_thread_count_text(result) == (
+        f"scorch_nthreads({flop}, A0_size, SCORCH_GRAIN_CODEGEN_SPGEMM)"
+    )
     for loop in _phase_loops(result):
-        assert loop.omp_num_threads == (
-            f"scorch_nthreads({flop}, A0_size, SCORCH_GRAIN_CODEGEN_SPGEMM)"
-        )
+        assert loop.omp_num_threads == "wksp_thread_count"
         assert loop.omp_chunk_expr == (
             f"scorch_chunk(A0_size, {flop}, SCORCH_GRAIN_CODEGEN_SPGEMM)"
         )
@@ -2956,9 +2979,10 @@ def test_custom_parallel_policy_is_an_explicit_context_input() -> None:
         _context(policy=policy),
     )
 
+    assert "CUSTOM_FLOP_GRAIN" in _pool_thread_count_text(result)
     for phase in _phase_loops(result):
         assert phase.omp_schedule == "guided, 7"
-        assert "CUSTOM_FLOP_GRAIN" in cast(str, phase.omp_num_threads)
+        assert phase.omp_num_threads == "wksp_thread_count"
         assert "CUSTOM_FLOP_GRAIN" in cast(str, phase.omp_chunk_expr)
 
 
@@ -3199,8 +3223,10 @@ def test_free_form_workspace_ctype_preserves_the_legacy_hoisted_pool() -> None:
     )
 
     count_loop, fill_loop = _phase_loops(result)
-    assert count_loop.omp_num_threads == fill_loop.omp_num_threads
-    thread_count = cast(str, count_loop.omp_num_threads)
+    assert count_loop.omp_num_threads == "wksp_thread_count"
+    assert fill_loop.omp_num_threads == "wksp_thread_count"
+    thread_count = _pool_thread_count_text(result)
+    assert thread_count.startswith("scorch_nthreads(")
     pool_codes = [
         code for code in _raw_codes(result.statements) if "wksp_thread_count" in code
     ]
@@ -4197,10 +4223,11 @@ def test_production_ds_generated_cpp_locks_typed_offset_family(
     assert len({id(bound) for bound in production_bounds}) == 4
     cpp = LLIRLowerer().lower_llir(function)
 
-    # 7387 with the entry's index-extent check (validate_jit_index_extents), one line.
-    assert len(cpp) == 7387
+    # 7387 with the entry's index-extent check (validate_jit_index_extents), one line;
+    # 7031 with row 15b's team, the pool's worker count, in both phase regions.
+    assert len(cpp) == 7031
     assert hashlib.sha256(cpp.encode()).hexdigest() == (
-        "f317a83500ba4be0f2687cb9408010d3f2ca572a91d9628122bc5e17ac8cffaa"
+        "5359f5cf4465866516119130bddc6d784a37940f4a5218e859d6bf6b3975b553"
     )
     assert cpp.count("wksp.insert_unchecked(") == 2
     assert "wksp.insert(" not in cpp
@@ -4338,10 +4365,13 @@ def test_production_dss_generated_cpp_locks_typed_offset_family() -> None:
     assert len({id(bound) for bound in production_bounds}) == 8
     cpp = LLIRLowerer().lower_llir(lowered)
 
-    # 9092 with the entry's index-extent check (validate_jit_index_extents), one line.
-    assert len(cpp) == 9092
+    # 9092 with the entry's index-extent check (validate_jit_index_extents), one line;
+    # 9452 with row 15b: the work estimate's eight stored-count reads,
+    # X2_pos[X1_pos[X0_size]], become the clamped read of X2_pos (this kernel holds no
+    # workspace pool, so its teams are unchanged).
+    assert len(cpp) == 9452
     assert hashlib.sha256(cpp.encode()).hexdigest() == (
-        "423053e8800e868f9ee0bc0ff094e1d78b3e9e6ddd1a020dbdfcd14be004b2b7"
+        "9b515d2c3d7cdd445a42471ccd1032df7241070a8849b44d90ab13c6b224477e"
     )
     assert cpp.count("wksp.insert(") == 2
     assert "wksp.insert_unchecked(" not in cpp
@@ -4401,10 +4431,11 @@ def test_production_ds_float64_locks_typed_value_source() -> None:
         for code in _raw_codes(lowered)
     )
     cpp = LLIRLowerer().lower_llir(lowered)
-    # 6538 with the entry's index-extent check (validate_jit_index_extents), one line.
-    assert len(cpp) == 6538
+    # 6538 with the entry's index-extent check (validate_jit_index_extents), one line;
+    # 6266 with row 15b's team, the pool's worker count, in both phase regions.
+    assert len(cpp) == 6266
     assert hashlib.sha256(cpp.encode()).hexdigest() == (
-        "59d8815b1db8b97f13562890857b8a906c8a701e6fc1a1cb07c100daa03966b5"
+        "547e530fc761e78c051f2f27bc07d8526c736596941563f4a58b1247c96c7ed2"
     )
 
 
@@ -4692,12 +4723,15 @@ def test_ds_transform_builds_the_typed_workspace_pool_construction() -> None:
         llir.Literal(True, llir.DataType.BOOL),
     )
 
-    # The typed worker-count value renders byte-identically to both phase
-    # pragma spellings, and the pool block precedes the count owner exactly.
+    # The typed worker-count value is the policy both phases spell, evaluated
+    # once; both phase pragmas take the count by name, and the pool block
+    # precedes the count owner exactly.
     count_loop, fill_loop = _phase_loops(result)
     rendered_value = LLIRLowerer().lower_llir(cast(llir.Expr, initializer.value))
-    assert rendered_value == count_loop.omp_num_threads
-    assert rendered_value == fill_loop.omp_num_threads
+    assert rendered_value == _pool_thread_count_text(result)
+    assert rendered_value.startswith("scorch_nthreads(")
+    assert count_loop.omp_num_threads == "wksp_thread_count"
+    assert fill_loop.omp_num_threads == "wksp_thread_count"
     count_owner = result.statements[4]
     assert type(count_owner) is llir.DirectInit
     assert cast(llir.DirectInit, count_owner).var.name == "_count1"
@@ -4763,10 +4797,9 @@ def test_production_workspace_pool_construction_is_structured_and_byte_exact() -
     declaration = cast(llir.VarDecl, first_block[1])
     assert declaration.var.type is _pool_type()
 
-    rendered_value = LLIRLowerer().lower_llir(cast(llir.Expr, initializer.value))
     phase_loops = _pre_parallel_view_loops(first)
     assert len(phase_loops) == 2
-    assert all(loop.omp_num_threads == rendered_value for loop in phase_loops)
+    assert all(loop.omp_num_threads == "wksp_thread_count" for loop in phase_loops)
 
     assert _structural_snapshot(first_block) == _structural_snapshot(second_block)
     assert _mutable_ir_ids(first_block).isdisjoint(_mutable_ir_ids(second_block))
@@ -4791,6 +4824,9 @@ COMPRESSED_WHERE_REFUSAL_CODES = {
     "invalid_compressed_where_flop_grain",
     "invalid_compressed_where_levels",
     "invalid_compressed_where_outer_cell",
+    # The position arrays the entry binds, which decide where the work estimate
+    # caps a deeper read at its array's last entry.
+    "invalid_compressed_where_position_arrays",
     "invalid_compressed_where_policy",
     "invalid_compressed_where_result_assembler",
     "invalid_compressed_where_result_id",

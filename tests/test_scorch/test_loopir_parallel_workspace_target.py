@@ -93,9 +93,17 @@ _CURRENT_RESULT_CHECK = (
 # And 0038c's check of the level's total, between the prefix sum and the allocations.
 _TOTAL_LOAD = "  int64_t _total1 = _offset1[A0_size];\n"
 _TOTAL_CHECK = "  scorch_check_level_total(_total1, false, 1);\n"
-# f718fa51... with 0038's result check alone; this one with 0038c's check as well.
+# And row 15b's team: both phase regions index the pool by omp_get_thread_num(), so
+# each takes the pool's worker count rather than evaluating the policy again.
+_SEALED_TEAM = (
+    "num_threads(scorch_nthreads((long)A1_pos[A0_size] * (B0_size > 0 ? "
+    "B1_pos[B0_size] / B0_size + 1 : 1), A0_size, SCORCH_GRAIN_CODEGEN_SPGEMM))"
+)
+_CURRENT_TEAM = "num_threads(wksp_thread_count)"
+# f718fa51... with 0038's result check alone; 5302541f... with 0038c's check as well;
+# this one with row 15b's team too.
 _CURRENT_SPGEMM_SHA256 = (
-    "5302541ffe8278a8de0eaa6f8de846ae1eb96317d262ce41aaa35de7624186f7"
+    "1b6800d89f846b6de5041ca7ee009b99283cdfa8baa3eb36400279a46b200f59"
 )
 
 
@@ -109,16 +117,21 @@ def _with_current_result_check(sealed: str) -> str:
     ``{0, 1}`` for a ``ds`` result (csrc/native_abi.h), and no overload takes a rank, so
     the sealed text no longer builds against the current preamble.  Since 0038c the
     two-pass assembly holds ``_total1`` to the 32-bit position bound right after reading
-    it (``scorch_check_level_total``, csrc/header.h).  Those two statements are the only
-    permitted changes, and each must occur exactly once.
+    it (``scorch_check_level_total``, csrc/header.h).  Since row 15b both phase regions
+    take the pool's worker count as their team.  Those are the only permitted changes:
+    the two statements occur exactly once, the team exactly twice.
     """
 
     assert sealed.count(_SEALED_RESULT_CHECK) == 1
     assert _CURRENT_RESULT_CHECK not in sealed
     assert sealed.count(_TOTAL_LOAD) == 1
     assert _TOTAL_CHECK not in sealed
-    return sealed.replace(_SEALED_RESULT_CHECK, _CURRENT_RESULT_CHECK).replace(
-        _TOTAL_LOAD, _TOTAL_LOAD + _TOTAL_CHECK
+    assert sealed.count(_SEALED_TEAM) == 2
+    assert _CURRENT_TEAM not in sealed
+    return (
+        sealed.replace(_SEALED_RESULT_CHECK, _CURRENT_RESULT_CHECK)
+        .replace(_TOTAL_LOAD, _TOTAL_LOAD + _TOTAL_CHECK)
+        .replace(_SEALED_TEAM, _CURRENT_TEAM)
     )
 
 
@@ -247,10 +260,12 @@ def test_source_parity_matches_legacy_in_both_arms(dtype):
     assert f"std::vector<linked_list_workspace_1d<{element}>> wksp_pool;" in cpp
     assert "wksp_pool[(size_t)omp_get_thread_num()].make_view()" in cpp
     assert "wksp.insert_unchecked({k}, A_val[pA1] * B_val[pB1]);" in cpp
-    assert cpp.count("#pragma omp parallel num_threads(scorch_nthreads(") == 2
-    # Three thread-count sites (pool sizing plus both phase regions) and
-    # two dynamic-chunk sites carry the SpGEMM work grain.
-    assert cpp.count("SCORCH_GRAIN_CODEGEN_SPGEMM") == 5
+    # Both phase regions take the pool's worker count as their team (row 15b).
+    assert cpp.count("#pragma omp parallel num_threads(wksp_thread_count)") == 2
+    assert "num_threads(scorch_nthreads(" not in cpp
+    # One thread-count site (the pool's sizing) and two dynamic-chunk sites
+    # carry the SpGEMM work grain.
+    assert cpp.count("SCORCH_GRAIN_CODEGEN_SPGEMM") == 3
     assert "std::vector<int> _count1((size_t)A0_size, 0);" in cpp
     assert "C1_pos_torch = torch::empty({(int64_t)(A0_size + 1)}, torch::kInt);" in (
         cpp
