@@ -97,9 +97,11 @@ from .parallel_marking_pass import (
     serial_workspace_cluster_placement,
 )
 from .torch_cpp_abi import (
+    BINARY_POST_OPS,
     KernelTensorABI,
     ResultTensorAssembler,
     TorchCppKernelABI,
+    ZERO_PRESERVING_POST_OPS,
     dense_block_check,
     drained_entries_check,
     index_extent_bindings,
@@ -156,6 +158,7 @@ def _result_tensor_abi_assembler(
     known_nnz_var: Optional[str] = None,
     exact_dense_parent_positions: bool = False,
     reserve_hint_var: Optional[str] = None,
+    value_post_ops: Tuple[Tuple[str, Optional[str]], ...] = (),
 ) -> ResultTensorAssembler:
     """Snapshot one semantic result at the Torch/C++ ABI ownership boundary."""
 
@@ -166,6 +169,7 @@ def _result_tensor_abi_assembler(
         known_nnz_var=known_nnz_var,
         exact_dense_parent_positions=exact_dense_parent_positions,
         reserve_hint_var=reserve_hint_var,
+        value_post_ops=value_post_ops,
     )
 
 
@@ -428,6 +432,14 @@ class CINLowerer:
         # ``defined_index_vars`` is not this: it only grows, so it also holds
         # the loops of sibling nests already finished.
         self._enclosing_forall_vars: List[IndexVar] = []
+        # Beside it, whether each of those loops visits every coordinate of its
+        # extent (its iteration lattice has a point with no sparse iterator), as
+        # opposed to only the coordinates its operands store.
+        self._enclosing_forall_visits_all: List[bool] = []
+        # Whether a dense-workspace copy-out applied the post-ops to every cell
+        # (``_copy_out_applies_post_ops``); if not, the result's assembler
+        # applies them to its finished values (``_value_post_ops``).
+        self._post_ops_applied_in_copy_out = False
         # Dense workspace name -> the flag its producer sets when it writes,
         # for a workspace copied out to a dense level below a compressed one.
         self._workspace_written_flags: Dict[str, str] = {}
@@ -2386,6 +2398,118 @@ class CINLowerer:
             if (loop.parent if loop.has_parent else loop) not in result_vars
         ]
 
+    def _copy_out_applies_post_ops(
+        self,
+        result_tensor_access: TensorAccess,
+        level: int,
+        reductions_around: List[IndexVar],
+    ) -> bool:
+        """Whether this dense-workspace copy-out is where the post-ops apply.
+
+        The copy-out's element loop writes each cell of ``level`` once per
+        iteration of the loops around it, so it can apply the post-ops as it
+        writes, one pass over each row while the row is hot.  That is correct
+        only where the write gives every cell of the result its final value:
+
+        - No reduction loop encloses the copy-out.  With one, each write adds
+          one iteration's partial sums, and the cell is final only after the
+          last.
+        - Every enclosing loop over another dense level of the result visits
+          every coordinate of its extent.  A loop that visits only the
+          coordinates its operands store (the rows of a compressed ``A`` in
+          ``A @ B``) never reaches the cells of the rows it skips.  They hold
+          zero and still owe the post-ops: a bias add makes them nonzero.  A
+          compressed result level needs no such loop.  The coordinates it does
+          not store are not cells, and a sparse result takes only post-ops
+          that keep zero (``_refuse_post_ops_the_result_cannot_take``).
+
+        Otherwise the post-ops go to the result's assembler, which applies them
+        to the finished values (``_value_post_ops``).  That pass is correct for
+        every program, and costs one more pass over the result.
+        """
+
+        if not self.post_ops or not self.post_ops.ops:
+            return False
+        if reductions_around or result_tensor_access.is_workspace():
+            return False
+        level_types = result_tensor_access.level_types()
+        level_vars = result_tensor_access.get_sorted_index_vars()
+        for other in range(len(level_types)):
+            if other == level or level_types[other] != LevelType.DENSE:
+                continue
+            visits = [
+                visits_all
+                for loop, visits_all in zip(
+                    self._enclosing_forall_vars, self._enclosing_forall_visits_all
+                )
+                if (loop.parent if loop.has_parent else loop) == level_vars[other]
+            ]
+            if not visits or not all(visits):
+                return False
+        return True
+
+    def _value_post_ops(self) -> Tuple[Tuple[str, Optional[str]], ...]:
+        """The post-ops the result's assembler applies to its finished values.
+
+        All of them, as ``(kind, post-op tensor name or None)``, unless a
+        dense-workspace copy-out applied them to every cell
+        (``_copy_out_applies_post_ops``).  Read once the loop nest is lowered,
+        when the copy-out has decided.
+        """
+
+        if (
+            self.post_ops is None
+            or not self.post_ops.ops
+            or self._post_ops_applied_in_copy_out
+        ):
+            return ()
+        return tuple(
+            (op.kind, op.tensor_name if op.kind in BINARY_POST_OPS else None)
+            for op in self.post_ops.ops
+        )
+
+    def _refuse_post_ops_the_result_cannot_take(self) -> None:
+        """Refuse a post-op that would change the zeros a sparse result omits.
+
+        A sparse result stores some entries.  Every other entry is zero and is
+        never written, so a post-op applied to the stored values agrees with
+        one applied to every entry only if it maps zero to zero:
+        ``sigmoid(0)`` is 1/2.  A post-op tensor is refused for such a result
+        by the kernel's ABI (``post_op_extra_tensor_sparse_result``).  This is
+        the matching refusal for the unary kinds, made before the body is
+        lowered.
+        """
+
+        result = self.final_result_tensor_var
+        if (
+            self.post_ops is None
+            or result is None
+            or all(
+                level_type == LevelType.DENSE for level_type in result.get_level_types()
+            )
+        ):
+            return
+        for op in self.post_ops.ops:
+            if op.kind in ZERO_PRESERVING_POST_OPS or op.kind in BINARY_POST_OPS:
+                continue
+            diagnostic = CINDiagnostic(
+                code="post_op_sparse_result_changes_zero",
+                message=(
+                    f"post-op {op.kind!r} does not map zero to zero, so it would "
+                    "change every entry the sparse result "
+                    f"{result.get_name()!r} does not store"
+                ),
+                path=("post_ops",),
+                entity_id=result.symbol_id,
+                stage="legacy_cin_lowering",
+                pass_name="lower_IndexStmt",
+            )
+            raise UnsupportedFeature(
+                "stage=legacy CIN lowering: post_op_sparse_result_changes_zero "
+                f"for post-op {op.kind!r} and tensor {result.get_name()!r}",
+                diagnostics=(diagnostic,),
+            )
+
     def _refuse_consumer_inside_reduction(
         self,
         result_tensor_access: TensorAccess,
@@ -2687,17 +2811,20 @@ class CINLowerer:
                         "its row is appended below a compressed level and is "
                         "not the result's last level",
                     )
+                # Post-ops no longer refuse a copy-out of partial sums: they are
+                # then applied to the finished values (``_value_post_ops``).
                 if reductions_around and (
-                    not result_is_dense
-                    or written_flag is not None
-                    or (self.post_ops is not None and self.post_ops.ops)
+                    not result_is_dense or written_flag is not None
                 ):
                     self._refuse_consumer_inside_reduction(
                         result_tensor_access,
                         reductions_around,
                         "copies the dense workspace into a result row that is "
-                        "appended or post-processed, which partial sums cannot be",
+                        "appended, which partial sums cannot be",
                     )
+                post_ops_here = self._copy_out_applies_post_ops(
+                    result_tensor_access, level, reductions_around
+                )
                 if result_is_dense and written_flag is not None:
                     return self._dense_block_workspace_copy_out(
                         result_tensor_access,
@@ -2708,8 +2835,15 @@ class CINLowerer:
                         parent_level_type,
                         written_flag,
                     )
-                if result_is_dense and not reductions_around and level == last_level:
+                if (
+                    result_is_dense
+                    and not reductions_around
+                    and level == last_level
+                    and not post_ops_here
+                ):
                     # Emit memcpy: the workspace has the full row, write once.
+                    # A copy-out that applies post-ops takes the element loop
+                    # below, which applies them as it writes.
                     wname = wksp.get_name()
                     size_var = wksp_index_var.size_llir_var.name
                     wksp_write_ctype = dtype_to_c_datatype(wksp.dtype)
@@ -2813,14 +2947,18 @@ class CINLowerer:
                     )
                 )
 
-                # Inject post-ops (bias add, relu, etc.) after workspace -> output write
-                loop_body.extend(
-                    self._emit_post_ops(
-                        f"{result_tensor_name}_values",
-                        cell.name,
-                        result_value_metadata,
+                # Inject post-ops (bias add, relu, etc.) after workspace -> output
+                # write, where this copy-out reaches every cell with its final
+                # value; elsewhere the result's assembler applies them.
+                if post_ops_here:
+                    loop_body.extend(
+                        self._emit_post_ops(
+                            f"{result_tensor_name}_values",
+                            cell.name,
+                            result_value_metadata,
+                        )
                     )
-                )
+                    self._post_ops_applied_in_copy_out = True
 
                 for_loop = llir.ForLoop(
                     init=llir.VarInit(
@@ -4463,6 +4601,7 @@ class CINLowerer:
             result_levels_bounded_in_kernel=None,
             accesses=stmt.tensor_accesses,
         )
+        self._refuse_post_ops_the_result_cannot_take()
         # The ABI snapshot is the fail-closed dtype/rank boundary.  Do not
         # index the raw dtype mapping before it has validated every input.
         self._value_array_ctypes = {
@@ -4795,6 +4934,7 @@ class CINLowerer:
                         known_nnz_var=self._known_nnz_var,
                         exact_dense_parent_positions=exact_dense_parent_positions,
                         reserve_hint_var=reserve_hint_var,
+                        value_post_ops=self._value_post_ops(),
                     )
                     if self.result_dense_level_sparse_driven:
                         body_stmts.extend(
@@ -6302,6 +6442,9 @@ class CINLowerer:
                     )
 
         self._enclosing_forall_vars.append(index_var)
+        self._enclosing_forall_visits_all.append(
+            iter_lattice.dense_index_var_llir is not None
+        )
         try:
             stmts.extend(
                 [
@@ -6312,6 +6455,7 @@ class CINLowerer:
             )
         finally:
             self._enclosing_forall_vars.pop()
+            self._enclosing_forall_visits_all.pop()
         self._tag_first_loop(stmts, index_var)
         if is_outermost_forall and any(
             isinstance(candidate, (llir.ForLoop, llir.WhileLoop)) for candidate in stmts
@@ -6378,7 +6522,9 @@ class CINLowerer:
                         result_name=result_tensor.get_name(),
                         result_id=result_access.tensor_id,
                         compressed_levels=compressed_levels,
-                        result_assembler=_result_tensor_abi_assembler(result_tensor),
+                        result_assembler=_result_tensor_abi_assembler(
+                            result_tensor, value_post_ops=self._value_post_ops()
+                        ),
                         workspace_name=workspace_name,
                         workspace_ctype=workspace_ctype,
                         policy=CompressedWhereOpenMPPolicy(

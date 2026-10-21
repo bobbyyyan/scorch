@@ -765,6 +765,35 @@ def _logical_index_sizes(
     return index_to_size
 
 
+def _post_op_tensor_in_storage_order(
+    tensor: Any,
+    logical_shape: Sequence[int],
+    storage_order: Sequence[int],
+) -> Any:
+    """A post-op tensor laid out the way the kernel stores the result's cells.
+
+    The kernel reads a post-op tensor at the result's storage position
+    (``CINLowerer._emit_post_ops``, ``ResultTensorAssembler.emit_value_post_ops``).
+    The caller's tensor holds the result's entries in row-major order of its
+    logical shape.  When the kernel stores the result in another mode order
+    (``storage_order[physical] = logical``, the order einsum picks from the
+    loop order), an entry sits at a different position there, so the tensor is
+    permuted to that order and made contiguous.  A tensor whose element count
+    is not the result's is passed unchanged; the kernel's argument check then
+    refuses it with its code.
+    """
+
+    if list(storage_order) == list(range(len(storage_order))):
+        return tensor
+    if not isinstance(tensor, torch.Tensor) or tensor.numel() != math.prod(
+        logical_shape
+    ):
+        return tensor
+    return (
+        tensor.reshape(tuple(logical_shape)).permute(tuple(storage_order)).contiguous()
+    )
+
+
 def _storage_letters(tensor_format: TensorFormat) -> str:
     """One letter per storage level: ``"d"`` dense, ``"s"`` any level that stores
     only the coordinates put in it (compressed, coordinate or singleton)."""
@@ -4244,10 +4273,15 @@ def _einsum_owned(
     effective_schedule = options.requested_schedule
 
     # ── Prebuilt SDDMM dispatch ────────────────────────────────────────
-    # Pattern: 'ij,ik,jk->ij' with S(COO), A(dense), B(dense)
+    # Pattern: 'ij,ik,jk->ij' with S(COO), A(dense), B(dense).  The prebuilt kernel
+    # computes the bare product and has no post-operations, so a call that carries
+    # them (``_post_ops``, ``_post_ops_tensors``) keeps the compiler path, which
+    # applies them; taking this route returned the product without them.
     if (
         effective_schedule is None
         and not compile_only
+        and "_post_ops" not in kwargs
+        and "_post_ops_tensors" not in kwargs
         and expression == "ij,ik,jk->ij"
         and len(tensors) == 3
         and cast(STensor, tensors[0])._raw_values.dtype == torch.float32
@@ -4859,7 +4893,11 @@ def _einsum_owned(
     # Append extra tensors for PostOps (bias, scale, etc.)
     if _post_ops_tensors:
         for extra_t in _post_ops_tensors:
-            args.append(extra_t)  # type: ignore
+            # The kernel reads it at the result's storage position.
+            ordered = _post_op_tensor_in_storage_order(
+                extra_t, logical_result_shape, result_mode_order
+            )
+            args.append(ordered)  # type: ignore
 
     start_time = time.time()
     result_cpp = _evaluate_native(module.evaluate, *args)

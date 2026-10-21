@@ -50,6 +50,15 @@ _LEVEL_KIND_CODE = {
 #: the kernel body holds its block to the position bound itself (:func:`dense_block_check`).
 _DENSE_BOUNDED_IN_KERNEL_CODE = 3
 
+#: Post-op kinds (``cin.PostOp``) that combine a value with a post-op tensor's entry at
+#: the same position, and the update each one emits.
+BINARY_POST_OPS = {"add": llir.AssignOp.ADD_ASSIGN, "mul": llir.AssignOp.MUL_ASSIGN}
+#: Post-op kinds applied to the value alone, by csrc/header.h's ``scorch_<kind>``.
+UNARY_POST_OPS = frozenset({"relu", "gelu", "tanh", "sigmoid"})
+#: The unary kinds whose function maps zero to zero (``sigmoid(0)`` is 1/2), the only
+#: ones a sparse result can take: its unstored entries are zero and stay so.
+ZERO_PRESERVING_POST_OPS = frozenset({"relu", "gelu", "tanh"})
+
 #: csrc/header.h: the call that holds one dense block of the result to the position bound.
 DENSE_BLOCK_CHECK = "scorch_check_dense_block"
 #: csrc/header.h: the call that holds a compressed level the two-pass assembly counted to
@@ -1370,6 +1379,12 @@ class ResultTensorAssembler:
     #: and passes nothing -- so nothing legacy emits gains a marker, which is
     #: what keeps this change off the shipping path.
     result_id: Optional[SymbolId] = None
+    #: The post-ops this assembler applies to every stored value once the loop
+    #: nest has finished, as ``(kind, post-op tensor name or None)`` pairs in
+    #: program order (``emit_value_post_ops``).  Empty when there are none, and
+    #: when the lowering applied them where it copied each cell out of a dense
+    #: workspace; then every statement is emitted exactly as before.
+    value_post_ops: Tuple[Tuple[str, Optional[str]], ...] = ()
 
     def __post_init__(self) -> None:
         self.validate()
@@ -1428,6 +1443,156 @@ class ResultTensorAssembler:
                 "result identity must be an exact SymbolId or None",
                 code="internal_argument_type_invalid",
             )
+        if type(self.value_post_ops) is not tuple or any(
+            type(op) is not tuple or len(op) != 2 or type(op[0]) is not str
+            for op in self.value_post_ops
+        ):
+            raise ScorchTypeError(
+                "value post-ops must be a tuple of (kind, tensor name) pairs",
+                code="internal_argument_type_invalid",
+            )
+        sparse = any(
+            level_type is not LevelType.DENSE for level_type in self.level_types
+        )
+        for kind, tensor_name in self.value_post_ops:
+            if kind in BINARY_POST_OPS:
+                if type(tensor_name) is not str or not tensor_name.isidentifier():
+                    raise ScorchTypeError(
+                        f"post-op {kind!r} needs a tensor name that is an identifier",
+                        code="internal_argument_type_invalid",
+                    )
+                if sparse:
+                    raise ScorchValueError(
+                        "a post-op's extra tensor is read at the result's cell, "
+                        "which a result with a sparse level does not have",
+                        code="post_op_extra_tensor_sparse_result",
+                    )
+            elif kind in UNARY_POST_OPS:
+                if tensor_name is not None:
+                    raise ScorchTypeError(
+                        f"post-op {kind!r} takes no tensor",
+                        code="internal_argument_type_invalid",
+                    )
+                if sparse and kind not in ZERO_PRESERVING_POST_OPS:
+                    raise ScorchValueError(
+                        f"post-op {kind!r} does not map zero to zero, so it would "
+                        "change every entry a sparse result does not store",
+                        code="post_op_sparse_result_changes_zero",
+                    )
+            else:
+                raise ScorchValueError(
+                    f"unsupported post-op kind {kind!r}",
+                    code="post_op_kind_unsupported",
+                )
+
+    def emit_value_post_ops(self) -> List[llir.Stmt]:
+        """Apply the post-ops to every stored value of the finished result.
+
+        Emitted after the loop nest and before the values become the result's
+        storage, where every value is final whatever the loops did: a dense
+        result's value tensor holds every cell, a loop that skipped a cell left
+        it zero, and a cell a reduction reached several times holds its sum.
+        So this is the one place correct for every result.  A post-op tensor
+        is read at the same position as the value; its argument check holds it
+        to the result's cell count, and einsum hands it over in the result's
+        storage order.  A sparse result's unstored entries stay zero, so only
+        post-ops that map zero to zero, with no tensor, apply to one
+        (``validate``).
+
+        The values are read through a fresh pointer into
+        ``{name}_values_torch``, the tensor every assembly path stores as the
+        result's values.  The loop's thread count is chosen from its length,
+        as for the parallel initialization loops.
+        """
+
+        if type(self) is not ResultTensorAssembler:
+            raise ScorchTypeError(
+                "value post-ops require an exact ResultTensorAssembler",
+                code="internal_argument_type_invalid",
+            )
+        self.validate()
+        if not self.value_post_ops:
+            return []
+        c_datatype = dtype_to_c_datatype(self.dtype)
+        values = f"{self.name}_post_op_values"
+        count = f"{self.name}_post_op_count"
+        position = f"{self.name}_post_op_position"
+
+        def target() -> llir.ArrayAccess:
+            return llir.ArrayAccess(
+                array=llir.Var(name=values, type=llir.DataType.ptr_type(c_datatype)),
+                index=llir.Var(name=position, type=llir.DataType.INT64),
+            )
+
+        body: List[llir.Stmt] = []
+        for kind, tensor_name in self.value_post_ops:
+            if kind in BINARY_POST_OPS:
+                body.append(
+                    llir.Assign(
+                        var=target(),
+                        value=llir.ArrayAccess(
+                            array=llir.Var(
+                                name=f"{tensor_name}_val", type=llir.DataType.NO_TYPE
+                            ),
+                            index=llir.Var(name=position, type=llir.DataType.INT64),
+                        ),
+                        op=BINARY_POST_OPS[kind],
+                    )
+                )
+            else:
+                body.append(
+                    llir.Assign(
+                        var=target(),
+                        value=llir.FunctionCall(
+                            name=f"scorch_{kind}",
+                            args=[target()],
+                        ),
+                        op=llir.AssignOp.ASSIGN,
+                    )
+                )
+        values_torch = llir.Var(
+            name=f"{self.name}_values_torch", type=llir.DataType.TORCH_TENSOR
+        )
+        return [
+            llir.Comment("Apply the post-ops to every stored value"),
+            llir.VarInit(
+                var=llir.Var(
+                    name=values,
+                    type=llir.DataType.ptr_type(c_datatype),
+                    is_restrict=True,
+                ),
+                value=tensor_data_ptr(values_torch, c_datatype),
+            ),
+            llir.VarInit(
+                var=llir.Var(name=count, type=llir.DataType.INT64),
+                value=llir.MemberCall(
+                    base=llir.Var(
+                        name=f"{self.name}_values_torch",
+                        type=llir.DataType.TORCH_TENSOR,
+                    ),
+                    member="numel",
+                    args=(),
+                ),
+            ),
+            llir.ForLoop(
+                init=llir.VarInit(
+                    var=llir.Var(name=position, type=llir.DataType.INT64),
+                    value=llir.Literal(value=0, data_type=llir.DataType.INT64),
+                ),
+                cond=llir.BinOp(
+                    op="<",
+                    left=llir.Var(name=position, type=llir.DataType.INT64),
+                    right=llir.Var(name=count, type=llir.DataType.INT64),
+                ),
+                update=llir.Increment(
+                    var=llir.Var(name=position, type=llir.DataType.INT64)
+                ),
+                body=body,
+                omp_parallel_for=True,
+                omp_schedule="static",
+                omp_num_threads=f"scorch_nthreads({count}, {count})",
+            ),
+        ]
 
     def result_storage_marker(
         self,
@@ -2562,7 +2727,11 @@ class ResultTensorAssembler:
         )
 
     def emit_storage_epilogue(self) -> List[llir.Stmt]:
-        """Assign result storage and return without moving dynamic buffers."""
+        """Assign result storage and return without moving dynamic buffers.
+
+        Every assembly path ends here, the compressed two-phase one included, so
+        the value post-ops (``emit_value_post_ops``) are emitted here first.
+        """
 
         if type(self) is not ResultTensorAssembler:
             raise ScorchTypeError(
@@ -2571,6 +2740,7 @@ class ResultTensorAssembler:
             )
         self.validate()
         return [
+            *self.emit_value_post_ops(),
             llir.Assign(
                 var=tensor_storage_member(
                     self.name,

@@ -384,10 +384,19 @@ def test_a_post_op_tensor_must_hold_the_result() -> None:
                 )
 
             print(count, "|", outcome(call))
+            if count == 18:
+                want = a @ b + extra.reshape(6, 3)
+                error = (call().to_torch() - want).abs().max().item()
+                print(count, "value |", error <= 1e-12)
         """)
-    # 18 values, the result's cells, pass the entry check.  The value the call returns is
-    # the post-op's to get right, not this check's.
-    assert lines == ["17 | " + REFUSED, "18 | RETURNED", "19 | " + REFUSED]
+    # 18 values, the result's cells, pass the entry check, and the bias is added to every
+    # cell (test_post_op_placement.py has the rest of the post-op population).
+    assert lines == [
+        "17 | " + REFUSED,
+        "18 | RETURNED",
+        "18 value | True",
+        "19 | " + REFUSED,
+    ]
 
 
 def test_agreeing_shapes_compute_what_torch_does() -> None:
