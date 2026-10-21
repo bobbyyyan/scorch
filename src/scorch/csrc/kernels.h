@@ -132,23 +132,35 @@ Tensor spmv_csr(
   return C;
 }
 
-template <typename scalar_t>
-Tensor spmspm_csr(
-  std::vector<int> result_shape, std::vector<int> A_shape, std::vector<std::vector<torch::Tensor>> A_mode_indices, torch::Tensor A_values, std::vector<int> B_shape, std::vector<std::vector<torch::Tensor>> B_mode_indices, torch::Tensor B_values) {
-  // Get A's level & value arrays
-  const int A0_size = A_shape[0];
-  const int* SCORCH_RESTRICT A1_pos = A_mode_indices[1][0].data_ptr<int>();
-  const int* SCORCH_RESTRICT A1_crd = A_mode_indices[1][1].data_ptr<int>();
-  const scalar_t* SCORCH_RESTRICT A_val = A_values.data_ptr<scalar_t>();
+// The three arrays of a CSR x CSR product, each owned by the tensor holding it
+// (scorch_tensor_from_unique_array): what spmspm_csr_core returns, for the legacy binding to
+// pack into a Tensor and for the C entry to hand to csr_result_as_torch (result_builders.h).
+struct SpgemmCsrArrays {
+  torch::Tensor positions;
+  torch::Tensor coordinates;
+  torch::Tensor values;
+};
 
-  // Get B's level & value arrays
-  const int B0_size = B_shape[0];
-  const int* SCORCH_RESTRICT B1_pos = B_mode_indices[1][0].data_ptr<int>();
-  const int* SCORCH_RESTRICT B1_crd = B_mode_indices[1][1].data_ptr<int>();
-  const scalar_t* SCORCH_RESTRICT B_val = B_values.data_ptr<scalar_t>();
-
-  const int C1_size = result_shape.size() > 1 ? result_shape[1] : B0_size;
-
+// C = A x B for CSR A (A0_size rows) and CSR B (B0_size rows, C1_size columns), over raw int32
+// index arrays. `index_t` is the result's index type, int32_t or int64_t: the kernel writes it
+// directly, so a result of either type costs no widening copy (which one a caller asks for is
+// decided by measurement, not here).
+//
+// The rows of A and B need not have their column coordinates in order, and a row may repeat a
+// coordinate: each row of C is accumulated through a dense workspace and a linked list of the
+// columns it touched, so the sum does not depend on the order the entries are visited in, and a
+// repeated coordinate contributes its value again, as torch's to_dense counts it. The result's
+// rows are always sorted and distinct (the per-row sort below) -- torch's own CSR invariant,
+// which torch's mul and sparse_mask rely on.
+template <typename scalar_t, typename index_t>
+SpgemmCsrArrays spmspm_csr_core(const int A0_size, const int* SCORCH_RESTRICT A1_pos,
+                                const int* SCORCH_RESTRICT A1_crd,
+                                const scalar_t* SCORCH_RESTRICT A_val, const int B0_size,
+                                const int* SCORCH_RESTRICT B1_pos,
+                                const int* SCORCH_RESTRICT B1_crd,
+                                const scalar_t* SCORCH_RESTRICT B_val, const int C1_size) {
+  static_assert(std::is_same<index_t, int32_t>::value || std::is_same<index_t, int64_t>::value,
+                "a CSR result's index type is int32 or int64");
   // Estimate the multiply's work (A nonzeros x average B row length) to drive the
   // adaptive threading below.
   const long A_nnz = A1_pos[A0_size];
@@ -186,9 +198,9 @@ Tensor spmspm_csr(
   // Phase 1: Count nnz directly into the eventual position owner. Keeping the
   // counts in slots [1, rows] lets Phase 2 prefix them in place, avoiding a
   // second temporary allocation and copy while ownership remains move-only.
-  auto C1_pos_owner = scorch_make_unique_array_pool<int>(
+  auto C1_pos_owner = scorch_make_unique_array_pool<index_t>(
       1, static_cast<size_t>(A0_size) + 1);
-  int* C1_pos_data = C1_pos_owner.get();
+  index_t* C1_pos_data = C1_pos_owner.get();
   C1_pos_data[0] = 0;
 
   #pragma omp parallel num_threads(nthreads)
@@ -226,28 +238,32 @@ Tensor spmspm_csr(
     }
   }
 
-  // Phase 2: Prefix sum to compute row pointers
+  // Phase 2: Prefix sum to compute row pointers. A row's count is at most C1_size, an int.
   int max_row_nnz = 0;
   for (int i = 0; i < A0_size; i++) {
-    const int count = C1_pos_data[i + 1];
+    const int count = static_cast<int>(C1_pos_data[i + 1]);
     max_row_nnz = std::max(max_row_nnz, count);
-    if (count > std::numeric_limits<int>::max() - C1_pos_data[i]) {
-      // Coded, and a c10::Error like the boundary's own refusals: a std::length_error
-      // reached Python as a ValueError that no caller could tell from a bad argument.
-      scorch_native::refuse_index_capacity(
-          "spmspm_csr: the result's column coordinates",
-          static_cast<int64_t>(C1_pos_data[i]) + count);
+    // Only a 32-bit result can overflow: an int64 one holds at most A0_size * C1_size
+    // entries, below 2^62.
+    if constexpr (sizeof(index_t) == sizeof(int32_t)) {
+      if (count > std::numeric_limits<int>::max() - C1_pos_data[i]) {
+        // Coded, and a c10::Error like the boundary's own refusals: a std::length_error
+        // reached Python as a ValueError that no caller could tell from a bad argument.
+        scorch_native::refuse_index_capacity(
+            "spmspm_csr: the result's column coordinates",
+            static_cast<int64_t>(C1_pos_data[i]) + count);
+      }
     }
     C1_pos_data[i + 1] = C1_pos_data[i] + count;
   }
-  int total_nnz = C1_pos_data[A0_size];
+  const index_t total_nnz = C1_pos_data[A0_size];
 
   // Phase 3: Numeric multiply in parallel - each row writes to its own slice
-  auto C1_crd_owner = scorch_make_unique_array_pool<int>(
+  auto C1_crd_owner = scorch_make_unique_array_pool<index_t>(
       1, static_cast<size_t>(total_nnz));
   auto C_values_owner = scorch_make_unique_array_pool<scalar_t>(
       1, static_cast<size_t>(total_nnz));
-  int* C1_crd_data = C1_crd_owner.get();
+  index_t* C1_crd_data = C1_crd_owner.get();
   scalar_t* C_values_data = C_values_owner.get();
 
   struct SortEntry {
@@ -301,7 +317,7 @@ Tensor spmspm_csr(
       }
 
       // Collect and sort the row's entries directly into output
-      int base = C1_pos_data[i];
+      const index_t base = C1_pos_data[i];
       int pos = 0;
       while (head >= 0) {
         C1_crd_data[base + pos] = head;
@@ -317,7 +333,7 @@ Tensor spmspm_csr(
       // Use simple insertion sort for short rows, std::sort for longer ones
       if (length <= 32) {
         for (int a = 1; a < length; a++) {
-          int key_c = C1_crd_data[base + a];
+          const index_t key_c = C1_crd_data[base + a];
           scalar_t key_v = C_values_data[base + a];
           int b = a - 1;
           while (b >= 0 && C1_crd_data[base + b] > key_c) {
@@ -332,8 +348,8 @@ Tensor spmspm_csr(
         // Sort a worker-local coordinate/value copy so the parallel region never
         // allocates, then copy the ordered row back to its output slice.
         for (int jj = 0; jj < length; jj++) {
-          entries[jj] =
-              SortEntry{C1_crd_data[base + jj], C_values_data[base + jj]};
+          entries[jj] = SortEntry{static_cast<int>(C1_crd_data[base + jj]),
+                                  C_values_data[base + jj]};
         }
         std::sort(entries, entries + length, [](const SortEntry& left,
                                                 const SortEntry& right) {
@@ -348,17 +364,33 @@ Tensor spmspm_csr(
   }
 
   // Assemble final result
-  torch::Tensor C1_pos_torch = scorch_tensor_from_unique_array(
-      std::move(C1_pos_owner), static_cast<int64_t>(A0_size) + 1, torch::kInt);
-  torch::Tensor C1_crd_torch = scorch_tensor_from_unique_array(
-      std::move(C1_crd_owner), static_cast<int64_t>(total_nnz), torch::kInt);
-  torch::Tensor C_values_torch = scorch_tensor_from_unique_array(
+  constexpr torch::ScalarType kIndexDtype =
+      sizeof(index_t) == sizeof(int64_t) ? torch::kLong : torch::kInt;
+  SpgemmCsrArrays result;
+  result.positions = scorch_tensor_from_unique_array(
+      std::move(C1_pos_owner), static_cast<int64_t>(A0_size) + 1, kIndexDtype);
+  result.coordinates = scorch_tensor_from_unique_array(
+      std::move(C1_crd_owner), static_cast<int64_t>(total_nnz), kIndexDtype);
+  result.values = scorch_tensor_from_unique_array(
       std::move(C_values_owner),
       static_cast<int64_t>(total_nnz),
       scorch_torch_dtype<scalar_t>());
+  return result;
+}
+
+// The legacy binding's form: the product over a Tensor's level vectors, with an int32 result.
+template <typename scalar_t>
+Tensor spmspm_csr(
+  std::vector<int> result_shape, std::vector<int> A_shape, std::vector<std::vector<torch::Tensor>> A_mode_indices, torch::Tensor A_values, std::vector<int> B_shape, std::vector<std::vector<torch::Tensor>> B_mode_indices, torch::Tensor B_values) {
+  const int B0_size = B_shape[0];
+  SpgemmCsrArrays product = spmspm_csr_core<scalar_t, int32_t>(
+      A_shape[0], A_mode_indices[1][0].data_ptr<int>(), A_mode_indices[1][1].data_ptr<int>(),
+      A_values.data_ptr<scalar_t>(), B0_size, B_mode_indices[1][0].data_ptr<int>(),
+      B_mode_indices[1][1].data_ptr<int>(), B_values.data_ptr<scalar_t>(),
+      result_shape.size() > 1 ? result_shape[1] : B0_size);
   Tensor C;
-  C.storage.index.mode_indices = {{}, {C1_pos_torch, C1_crd_torch}};
-  C.storage.value = C_values_torch;
+  C.storage.index.mode_indices = {{}, {product.positions, product.coordinates}};
+  C.storage.value = product.values;
   return C;
 }
 

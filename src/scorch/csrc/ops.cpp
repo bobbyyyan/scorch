@@ -8,6 +8,7 @@
 #include "kernels.h"
 #include "plan.h"
 #include "planned_matmul.h"
+#include "result_builders.h"
 #include "sparse_grad.h"
 
 namespace scorch {
@@ -160,6 +161,92 @@ torch::Tensor spmm_csr_v2_ordinary(const torch::Tensor& positions,
       {rows, k}, {rows, cols}, {{}, {positions, coordinates}}, values, {cols, k}, {{}, {}},
       b.reshape(-1), kSpmmV2DefaultTile, static_cast<int>(nthreads), atparallel);
   return std::move(c.storage.value);
+}
+
+// A CSR x CSR product of two torch operands' arrays, as the torch sparse CSR tensor the drop-in
+// returns for a product whose inputs were all torch tensors (result_builders.h): what ops.matmul
+// calls for it, and what the C entry point calls for the same product without a plan
+// (planned_matmul_torch_spgemm) -- one function, so the two cannot drift apart.
+//
+// Validated under the legacy prebuilt_spmspm_csr_<dtype> binding's name, so a refusal reads the
+// same from every route, and narrowed as it narrows (int64 index arrays to the memoized int32
+// copies the kernel reads). Unlike that binding it checks spans and bounds only, not the order of
+// a row's coordinates (checked_csr_view with require_sorted false): spmspm_csr_core sums a row's
+// entries wherever they sit and however often a coordinate repeats, and writes its result sorted
+// and distinct, so an operand torch itself produced unsorted -- torch.sparse.mm's own CSR x CSR
+// result -- is read as it is, with no sorted copy (section 8 of the SpGEMM design note). The
+// legacy binding keeps its strict check: STensor operands reach it, and nothing here changes it.
+// `int64_indices` picks the result's index type, which the kernel writes directly.
+template <typename scalar_t>
+torch::Tensor spgemm_csr_torch_result_typed(
+    const torch::Tensor& a_positions, const torch::Tensor& a_coordinates,
+    const torch::Tensor& a_values, const torch::Tensor& b_positions,
+    const torch::Tensor& b_coordinates, const torch::Tensor& b_values, int64_t rows,
+    int64_t inner, int64_t cols, bool int64_indices) {
+  static const std::string op =
+      std::string("prebuilt_spmspm_csr_") + scorch_dtype_suffix<scalar_t>();
+  std::vector<std::vector<torch::Tensor>> a_levels = {{}, {a_positions, a_coordinates}};
+  std::vector<std::vector<torch::Tensor>> b_levels = {{}, {b_positions, b_coordinates}};
+  const std::vector<int64_t> a_shape = {rows, inner};
+  const std::vector<int64_t> b_shape = {inner, cols};
+  const auto a = scorch_native::checked_csr_view(a_shape, a_levels, a_values,
+                                                 scorch_torch_dtype<scalar_t>(), op.c_str(), "A",
+                                                 /*require_sorted=*/false);
+  const auto b = scorch_native::checked_csr_view(b_shape, b_levels, b_values,
+                                                 scorch_torch_dtype<scalar_t>(), op.c_str(), "B",
+                                                 /*require_sorted=*/false);
+  // Both extents are `inner`, so this cannot fail today. It refuses by code, as every
+  // prebuilt entry's contraction check does, so no exit of this function is uncoded.
+  if (C10_UNLIKELY_OR_CONST(!(a.shape[1] == b.shape[0]))) {
+    scorch_native::refuse_contraction_mismatch(op.c_str(), a.shape[1], b.shape[0]);
+  }
+  // The kernel indexes rows, the inner extent and columns with int, as every prebuilt kernel does.
+  const auto e = scorch_native::narrow_legacy_shape(std::vector<int64_t>{rows, inner, cols},
+                                                    op.c_str(), "extents");
+  const SpgemmCsrArrays product =
+      int64_indices
+          ? spmspm_csr_core<scalar_t, int64_t>(e[0], a.pos, a.crd, a_values.data_ptr<scalar_t>(),
+                                               e[1], b.pos, b.crd, b_values.data_ptr<scalar_t>(),
+                                               e[2])
+          : spmspm_csr_core<scalar_t, int32_t>(e[0], a.pos, a.crd, a_values.data_ptr<scalar_t>(),
+                                               e[1], b.pos, b.crd, b_values.data_ptr<scalar_t>(),
+                                               e[2]);
+  return scorch_native::csr_result_as_torch(product.positions, product.coordinates,
+                                            product.values, rows, cols);
+}
+
+// The same at whichever of the prebuilt kernel's dtypes the values have. Anything else is refused
+// as the legacy bindings refuse a dtype they do not take (check_tensor_common); no scorch route
+// reaches that, since ops.py and the C entry call this only at a dtype the registry resolves to
+// prebuilt_spmspm_csr_<dtype>.
+torch::Tensor spgemm_csr_torch_result(const torch::Tensor& a_positions,
+                                      const torch::Tensor& a_coordinates,
+                                      const torch::Tensor& a_values,
+                                      const torch::Tensor& b_positions,
+                                      const torch::Tensor& b_coordinates,
+                                      const torch::Tensor& b_values, int64_t rows, int64_t inner,
+                                      int64_t cols, bool int64_indices) {
+  switch (a_values.scalar_type()) {
+    case torch::kFloat32:
+      return spgemm_csr_torch_result_typed<float>(a_positions, a_coordinates, a_values,
+                                                  b_positions, b_coordinates, b_values, rows,
+                                                  inner, cols, int64_indices);
+    case torch::kFloat64:
+      return spgemm_csr_torch_result_typed<double>(a_positions, a_coordinates, a_values,
+                                                   b_positions, b_coordinates, b_values, rows,
+                                                   inner, cols, int64_indices);
+    case torch::kInt32:
+      return spgemm_csr_torch_result_typed<int32_t>(a_positions, a_coordinates, a_values,
+                                                    b_positions, b_coordinates, b_values, rows,
+                                                    inner, cols, int64_indices);
+    case torch::kInt64:
+      return spgemm_csr_torch_result_typed<int64_t>(a_positions, a_coordinates, a_values,
+                                                    b_positions, b_coordinates, b_values, rows,
+                                                    inner, cols, int64_indices);
+    default:
+      TORCH_CHECK(false, "spgemm_csr_torch_result: no prebuilt CSR x CSR kernel takes values of "
+                  "dtype ", a_values.scalar_type());
+  }
 }
 
 void bind_binary_kernel(py::module_& m, const char* name, BinaryKernelFn fn,
@@ -1199,6 +1286,32 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     // For tests: how many products planned_matmul_torch_ordinary has made.
     m.def("planned_matmul_ordinary_served",
           [] { return scorch_native::planned_matmul_state().ordinary_served; });
+    // Two torch CSR operands' product as a torch sparse CSR tensor: what ops.matmul returns for
+    // it, and what the C entry point makes itself (planned_matmul_torch_spgemm) at the dtypes
+    // set_planned_matmul_spgemm names.
+    m.def("spgemm_csr_torch_result", &spgemm_csr_torch_result,
+          "C = A @ B for two CSR operands' arrays, as a torch sparse CSR tensor; a row's "
+          "coordinates need not be in order",
+          py::call_guard<py::gil_scoped_release>(), py::arg("a_positions"),
+          py::arg("a_coordinates"), py::arg("a_values"), py::arg("b_positions"),
+          py::arg("b_coordinates"), py::arg("b_values"), py::arg("rows"), py::arg("inner"),
+          py::arg("cols"), py::arg("int64_indices"));
+    scorch_native::planned_matmul_state().ordinary_spgemm = &spgemm_csr_torch_result;
+    m.def("set_planned_matmul_spgemm",
+          [](bool float32, bool float64, bool int32, bool int64, bool int64_indices) {
+            scorch_native::PlannedMatmul& s = scorch_native::planned_matmul_state();
+            s.serve_spgemm[0] = float32;
+            s.serve_spgemm[1] = float64;
+            s.serve_spgemm[2] = int32;
+            s.serve_spgemm[3] = int64;
+            s.spgemm_int64_indices = int64_indices;
+          },
+          "Let the C entry point make two torch CSR operands' product at these value dtypes",
+          py::arg("float32"), py::arg("float64"), py::arg("int32"), py::arg("int64"),
+          py::arg("int64_indices"));
+    // For tests: how many products planned_matmul_torch_spgemm has made.
+    m.def("planned_matmul_spgemm_served",
+          [] { return scorch_native::planned_matmul_state().spgemm_served; });
     // The context variable schedule_force sets (scheduler._SCHEDULE_FORCE): while it holds a
     // schedule the C entry point serves no call (planned_matmul.h,
     // planned_matmul_schedule_forced). None unsets it.

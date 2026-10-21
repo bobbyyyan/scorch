@@ -129,6 +129,24 @@ struct PlannedMatmul {
   // Relaxed: whatever hands a context to another thread (a queue, a lock, a thread's start)
   // orders this store before that thread's calls.
   std::atomic<bool> schedule_force_seen{false};
+  // The product of two torch CSR operands is made here when it is the call the Python function
+  // would make (planned_matmul_torch_spgemm). `ordinary_spgemm` is ops.cpp's
+  // spgemm_csr_torch_result, the one function both routes call; `serve_spgemm` says, per value
+  // dtype (float32, float64, int32, int64), whether ops.py found the CSR x CSR product resolves to
+  // the prebuilt kernel; `spgemm_int64_indices` is the result's index type, which ops.py passes to
+  // the same function. Unset, every such product goes to the Python function.
+  using OrdinarySpgemm = at::Tensor (*)(const at::Tensor& a_positions,
+                                        const at::Tensor& a_coordinates,
+                                        const at::Tensor& a_values,
+                                        const at::Tensor& b_positions,
+                                        const at::Tensor& b_coordinates,
+                                        const at::Tensor& b_values, int64_t rows, int64_t inner,
+                                        int64_t cols, bool int64_indices);
+  OrdinarySpgemm ordinary_spgemm = nullptr;
+  bool serve_spgemm[4] = {false, false, false, false};
+  bool spgemm_int64_indices = false;
+  // Products made by planned_matmul_torch_spgemm, for tests, like ordinary_served.
+  mutable int64_t spgemm_served = 0;
 };
 
 // Whether a schedule is forced in the calling context: no, without a read, until
@@ -147,6 +165,17 @@ inline bool planned_matmul_schedule_forced(const PlannedMatmul& s) {
   const bool forced = value != Py_None;
   Py_DECREF(value);
   return forced;
+}
+
+// The slot of serve_spgemm for a value dtype, or -1 when no prebuilt CSR x CSR kernel takes it.
+inline int planned_matmul_spgemm_slot(at::ScalarType dtype) {
+  switch (dtype) {
+    case at::kFloat: return 0;
+    case at::kDouble: return 1;
+    case at::kInt: return 2;
+    case at::kLong: return 3;
+    default: return -1;
+  }
 }
 
 inline PlannedMatmul& planned_matmul_state() {
@@ -683,6 +712,59 @@ inline PyObject* planned_matmul_torch_ordinary(const PlannedMatmul& s, const at:
   return THPVariable_Wrap(std::move(out));
 }
 
+// The product of two torch sparse CSR operands, made here when it is exactly the call the Python
+// function would make: the prebuilt CSR x CSR kernel at the operands' value dtype (serve_spgemm),
+// both on the CPU with one dtype, inner extents that match, and structures the function's own
+// check clears (abi_csr_screen, order-free). The result is the torch sparse CSR tensor the Python
+// function returns for the same product, from the same function (ops.cpp,
+// spgemm_csr_torch_result). Before this, such a product always went to the Python function: two
+// STensors built around torch's arrays, the prebuilt registry, the binding and an STensor around
+// the result -- 234 Python calls, 87% of a warm call's instructions on a 400-row product (sapling
+// 84182). The new reference; nullptr with no error set for a call it does not make, which the
+// Python function then makes, reporting whatever is wrong with it.
+//
+// Both operands are recorded as write witnesses of their arrays, as the Python function's reading
+// of them records them (torch_sparse_index_members).
+inline PyObject* planned_matmul_torch_spgemm(const PlannedMatmul& s, const at::Tensor& a,
+                                             const at::Tensor& b) {
+  if (s.ordinary_spgemm == nullptr) return nullptr;
+  const at::ScalarType dtype = a.scalar_type();
+  const int which = planned_matmul_spgemm_slot(dtype);
+  if (which < 0 || !s.serve_spgemm[which] || b.scalar_type() != dtype) return nullptr;
+  if (!a.device().is_cpu() || !b.device().is_cpu()) return nullptr;
+  const int64_t rows = a.size(0), inner = a.size(1), cols = b.size(1);
+  if (b.size(0) != inner) return nullptr;
+  auto* a_impl = at::sparse_csr::get_sparse_csr_impl(a);
+  auto* b_impl = at::sparse_csr::get_sparse_csr_impl(b);
+  const at::Tensor& a_positions = a_impl->compressed_indices();
+  const at::Tensor& a_coordinates = a_impl->plain_indices();
+  const at::Tensor& a_values = a_impl->values();
+  const at::Tensor& b_positions = b_impl->compressed_indices();
+  const at::Tensor& b_coordinates = b_impl->plain_indices();
+  const at::Tensor& b_values = b_impl->values();
+  if (a_values.scalar_type() != dtype || b_values.scalar_type() != dtype) return nullptr;
+  abi_watch_register(a_positions, a);
+  abi_watch_register(a_coordinates, a);
+  abi_watch_register(b_positions, b);
+  abi_watch_register(b_coordinates, b);
+  // Order-free, as the function's own check is: the kernel does not need a row's coordinates in
+  // order, so torch.sparse.mm's own unsorted CSR result is made here too.
+  if (!abi_csr_screen(a_positions, a_coordinates, a_values, rows, inner, s.screen_grain,
+                      /*require_sorted=*/false) ||
+      !abi_csr_screen(b_positions, b_coordinates, b_values, inner, cols, s.screen_grain,
+                      /*require_sorted=*/false))
+    return nullptr;
+  at::Tensor out;
+  try {
+    out = s.ordinary_spgemm(a_positions, a_coordinates, a_values, b_positions, b_coordinates,
+                            b_values, rows, inner, cols, s.spgemm_int64_indices);
+  } catch (...) {
+    return nullptr;  // the Python function makes the same call, and reports
+  }
+  ++s.spgemm_served;
+  return THPVariable_Wrap(std::move(out));
+}
+
 inline PyObject* planned_matmul_torch_call(const PlannedMatmul& s, PyObject* a, PyObject* b,
                                            PyObject* const* args, Py_ssize_t nargsf) {
   const at::Tensor& bt = THPVariable_Unpack(b);
@@ -1048,8 +1130,20 @@ inline PyObject* planned_matmul_call(PyObject* /*module*/, PyObject* const* args
         if (served != nullptr || PyErr_Occurred()) return served;
       }
     } else if (planned_matmul_torch_csr(s, args[0])) {
-      if (!b_grad && !planned_matmul_wants_grad(THPVariable_Unpack(args[0])))
-        return planned_matmul_torch_call(s, args[0], args[1], args, nargsf);
+      const bool a_grad = planned_matmul_wants_grad(THPVariable_Unpack(args[0]));
+      if (planned_matmul_torch_csr(s, args[1])) {
+        // Two torch CSR operands: a CSR x CSR product, which no CSR x dense plan serves. A call
+        // that wants a gradient is autograd.py's, in the Python function; any other is made here
+        // or handed over as probed, which is what the CSR x dense path above hands such a call
+        // over as when it has no plan for it.
+        if (b_grad || a_grad) return PyObject_Vectorcall(s.ordinary, args, nargsf, kwnames);
+        PyObject* served = planned_matmul_torch_spgemm(s, THPVariable_Unpack(args[0]),
+                                                       THPVariable_Unpack(args[1]));
+        if (served != nullptr || PyErr_Occurred()) return served;
+        PyObject* argv[3] = {args[0], args[1], Py_None};
+        return PyObject_Vectorcall(s.ordinary, argv, 2, s.probed_kwnames);
+      }
+      if (!b_grad && !a_grad) return planned_matmul_torch_call(s, args[0], args[1], args, nargsf);
       PyObject* served = planned_matmul_torch_grad(s, args[0], args[1]);
       if (served != nullptr || PyErr_Occurred()) return served;
     } else if (reinterpret_cast<PyObject*>(Py_TYPE(args[0])) == s.tensor_type &&

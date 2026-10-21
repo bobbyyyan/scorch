@@ -18,7 +18,7 @@ import torch.autograd.forward_ad as fwAD
 import scorch
 import scorch_ops
 from scorch import STensor
-from scorch.exceptions import TensorIndexError
+from scorch.exceptions import ScorchNotImplementedError, TensorIndexError
 from scorch import autograd as grad_mod
 from scorch import einsum_grad as einsum_grad_mod
 from scorch import plan as plan_mod
@@ -1363,12 +1363,22 @@ def test_the_uncovered_products_function_returns_no_input():
         torch.testing.assert_close(y.detach(), (d @ w.detach()).relu())
 
 
-def test_sparse_times_sparse_is_unchanged():
+def test_torch_csr_times_csr_returns_torch_csr_and_refuses_grad():
+    """Two torch CSR operands: the product is torch's sparse CSR, as torch's own is, and a
+    gradient asked through it is refused with the code every product without a derivative
+    has (autograd._not_differentiable), until series step 20 gives it torch's gradient.
+    The full grid is test_torch_csr_spgemm's
+    test_a_gradient_call_is_recorded_and_refuses_with_a_code."""
     d = dense_matrix(5, 5)
     a = d.to_sparse_csr().requires_grad_()
     b = d.t().contiguous().to_sparse_csr()
     out = scorch.matmul(a, b)
-    assert type(out) is STensor  # no autograd for an STensor result
+    assert type(out) is torch.Tensor and out.layout is torch.sparse_csr
+    torch.testing.assert_close(out.detach().to_dense(), d @ d.t(), rtol=1e-12, atol=1e-12)
+    assert out.grad_fn is not None
+    with pytest.raises(ScorchNotImplementedError) as refused:
+        out.to_dense().sum().backward()
+    assert refused.value.code == "matmul_derivative_unsupported"
 
 
 # --------------------------------------------------------------------------- #

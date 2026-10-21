@@ -140,20 +140,35 @@ def _resolve_symbol(
 # single dict lookup, eliminating a large slice of the per-call Python overhead
 # that dominates SpMM latency on small matrices. The key space is tiny and
 # bounded (a handful of formats/ranks/dtypes), so no eviction is needed.
-def csr_dense_symbol(dtype: torch.dtype) -> Optional[str]:
-    """The symbol a CSR x dense -> dense product of this dtype resolves to in this build, or
-    None: what ``resolve_prebuilt_matmul`` picks for it, read from the same table. ops.py asks,
-    to tell the C entry point which products it may make itself."""
+def _matrix_product_symbol(
+    lhs_format: str, rhs_format: str, dtype: torch.dtype
+) -> Optional[str]:
+    """The symbol a 2-D x 2-D product of these operand formats and this dtype resolves to in
+    this build, or None: what ``resolve_prebuilt_matmul`` picks for it, read from the same
+    table."""
     for spec in _MATMUL_PREBUILT_SPECS:
         if (spec.lhs_rank, spec.rhs_rank, spec.lhs_format, spec.rhs_format) == (
             2,
             2,
-            "d,s",
-            "d,d",
+            lhs_format,
+            rhs_format,
         ):
             symbols = spec.symbol_by_dtype.get(dtype)
             return None if symbols is None else _resolve_symbol(symbols)[1]
     return None
+
+
+def csr_dense_symbol(dtype: torch.dtype) -> Optional[str]:
+    """The symbol a CSR x dense -> dense product of this dtype resolves to in this build, or
+    None. ops.py asks, to tell the C entry point which products it may make itself."""
+    return _matrix_product_symbol("d,s", "d,d", dtype)
+
+
+def csr_csr_symbol(dtype: torch.dtype) -> Optional[str]:
+    """The symbol a CSR x CSR -> CSR product of this dtype resolves to in this build, or None.
+    ops.py asks, to know where two torch CSR operands' product is the prebuilt kernel's.
+    """
+    return _matrix_product_symbol("d,s", "d,s", dtype)
 
 
 _RESOLVE_MISS = object()

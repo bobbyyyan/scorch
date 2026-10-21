@@ -84,6 +84,7 @@ from .exceptions import (
     MatmulOperandRankError,
     ScheduleWithoutSparseOperandError,
     ScorchAssertionError,
+    ScorchNotImplementedError,
     ScorchRuntimeError,
     ScorchTypeError,
     ScorchValueError,
@@ -115,6 +116,7 @@ from .plan import TRANSPOSED_PLANS_ATTR as _PLAN_TRANSPOSED_ATTR
 from .plan import install as _plan_install
 from .plan import torch_operand_state as _plan_torch_operand_state
 from .prebuilt_kernels import (
+    csr_csr_symbol,
     csr_dense_symbol,
     execute_prebuilt_binary_kernel,
     resolve_prebuilt_matmul,
@@ -1732,6 +1734,95 @@ def _run_torch_operand_plan(a: torch.Tensor, b: torch.Tensor, key: Any) -> Any:
     )
 
 
+# The value dtypes at which two torch CSR operands' product is the prebuilt CSR x CSR kernel's
+# in this build (prebuilt_kernels.csr_csr_symbol), and so is made by _torch_csr_spgemm; empty in
+# a build without spgemm_csr_torch_result.
+_SPGEMM_SERVES: Dict[torch.dtype, bool] = (
+    {
+        dtype: csr_csr_symbol(dtype) == f"prebuilt_spmspm_csr_{suffix}"
+        for dtype, suffix in (
+            (torch.float32, "f32"),
+            (torch.float64, "f64"),
+            (torch.int32, "i32"),
+            (torch.int64, "i64"),
+        )
+    }
+    if hasattr(_scorch_ops, "spgemm_csr_torch_result")
+    else {}
+)
+# The index dtype of that product's result: int64, torch's own for a CSR result
+# (to_sparse_csr, torch.sparse.mm), so a caller mixing scorch's results with torch's sees one.
+# PROVISIONAL: patch A's grid measures an int32 result (half the index bytes, written by the
+# same kernel) against it, and this changes only on that measurement.
+_SPGEMM_INT64_INDICES = True
+
+
+def _torch_csr_spgemm_serves(a: torch.Tensor, b: torch.Tensor) -> bool:
+    """Whether ``_torch_csr_spgemm`` makes ``a @ b``: two 2-D torch sparse CSR operands on the
+    CPU, at a value dtype the prebuilt CSR x CSR kernel takes in this build, whose inner extents
+    match (else the ordinary path raises the shape error). The caller has checked the dtypes
+    match. Without keywords such a product is the torch sparse CSR tensor torch returns for it;
+    ``matmul`` reads its keywords against ``_TORCH_RESULT_KEYWORDS`` for the type with them.
+    """
+    return (
+        a.layout is _SPARSE_CSR
+        and b.layout is _SPARSE_CSR
+        and a.dim() == 2
+        and b.dim() == 2
+        and a.device.type == "cpu"
+        and b.device.type == "cpu"
+        and _SPGEMM_SERVES.get(a.dtype, False)
+        and a.shape[1] == b.shape[0]
+    )
+
+
+def _torch_csr_spgemm(
+    a: torch.Tensor, b: torch.Tensor, time_dict: Optional[dict] = None
+) -> Optional[torch.Tensor]:
+    """``a @ b`` for two operands ``_torch_csr_spgemm_serves`` accepts, as the torch sparse CSR
+    tensor torch returns for the same product; ``time_dict["eval_time"]``, when given, the
+    native call's wall-clock time, as the prebuilt kernels report theirs.
+
+    The native function is the one the C entry point calls for the same pair (planned_matmul.h,
+    planned_matmul_torch_spgemm), so both routes return the same tensor. Before it, the pair was
+    wrapped into two STensors and the product came back as an STensor, a type no caller of
+    ``import scorch as torch`` holding two torch tensors asked for. A row's coordinates need not
+    be in order: torch.sparse.mm's own CSR x CSR result, whose rows are not sorted, is read as
+    it is (the kernel is order-free; see spgemm_csr_torch_result). Both operands are recorded as
+    write witnesses of their index arrays, as every reading of a torch operand's arrays is
+    (torch_sparse_index_members).
+
+    The native function checks the operands' arrays (spans and bounds) with uncoded text, but
+    for a coded refusal (an index past the 32-bit bound), which leaves as its structured error
+    (``raise_if_native_coded``). For any other refusal it returns None, and ``matmul`` computes
+    the product on the ordinary path, as the C entry point hands it over: that path refuses a
+    malformed operand by code, as it did before this function, and a product it computes is
+    returned in torch's type all the same (``_as_torch_compressed``).
+    """
+    a_positions, a_coordinates = _scorch_ops.torch_sparse_index_members(a)
+    b_positions, b_coordinates = _scorch_ops.torch_sparse_index_members(b)
+    start_time = time.time() if time_dict is not None else 0.0
+    try:
+        result = _scorch_ops.spgemm_csr_torch_result(
+            a_positions,
+            a_coordinates,
+            a.values(),
+            b_positions,
+            b_coordinates,
+            b.values(),
+            a.shape[0],
+            a.shape[1],
+            b.shape[1],
+            _SPGEMM_INT64_INDICES,
+        )
+    except RuntimeError as error:
+        raise_if_native_coded(error)
+        return None
+    if time_dict is not None:
+        time_dict["eval_time"] = time.time() - start_time
+    return result
+
+
 def _require_one_product_dtype(a: object, b: object) -> None:
     """Raise ``OperandDtypeMismatchError`` when ``matmul``'s operands differ in dtype.
 
@@ -1857,6 +1948,30 @@ _EINSUM_KEYWORDS = _PRODUCT_KEYWORDS | {
 _SPMV_KEYWORDS = (_PRODUCT_KEYWORDS - {"output_format", "output_mode_order"}) | {
     "format"
 }
+# matmul's keywords by what each does to the type of two torch sparse CSR operands' product,
+# which without keywords is torch's (_torch_csr_spgemm). A result format (format=, and
+# output_format=, read as it) or a schedule (schedule=, _schedule=) asks for the product in
+# scorch's form, an STensor, as it does on every other route; so does a forced schedule given
+# by _compile_options= or by the context. Every other keyword leaves torch's type: time_dict=
+# is served by the same function, timed; use_cache=, output_mode_order=, _compile_options= and
+# _compilation_context= by the route they choose, whose product is returned as the torch sparse
+# tensor holding its arrays (_as_torch_compressed): CSR, or CSC for output_mode_order=[1, 0].
+# out= is neither: out= is the result (_matmul_into), which must be dense. The two sets and out=
+# are every keyword matmul takes (a test checks it), so a keyword added to matmul is placed in
+# one of them before it can change a torch operand's result type.
+_STENSOR_RESULT_KEYWORDS = frozenset(
+    {"format", "output_format", "schedule", "_schedule"}
+)
+_TORCH_RESULT_KEYWORDS = frozenset(
+    {
+        "time_dict",
+        "use_cache",
+        "output_mode_order",
+        "_compile_options",
+        "_compilation_context",
+    }
+)
+_SPGEMM_SERVED_KEYWORDS = frozenset({"time_dict"})
 
 # A keyword given this value is dropped at the entry, compared by identity: every reader
 # takes the same value when the keyword is absent.  So a call whose keywords all hold
@@ -2117,8 +2232,9 @@ def _matmul_into(a: Any, b: Any, out: Any, kwargs: Dict[str, Any]) -> torch.Tens
     mode order (``out``'s own strides are the result's layout); an ``out`` of another
     dtype than the operands' values, or on another device.  Two dense torch tensors with
     nothing else asked are ``torch.matmul(a, b, out=out)`` itself, with torch's own
-    checks.  Every other product is computed by ``matmul(a, b, **kwargs)``, and ``out``
-    resized by torch's rule (``_resize_out``, which warns when a non-empty ``out`` has
+    checks.  Every other product is computed by ``matmul(a, b, **kwargs)``, refused by
+    code when it is sparse (an STensor, or a torch sparse tensor: two torch CSR operands'
+    product, ``_torch_csr_spgemm``), and ``out`` resized by torch's rule (``_resize_out``, which warns when a non-empty ``out`` has
     another shape) and filled.  A product computed into a temporary cannot
     alias an operand, so these routes accept an ``out`` that overlaps one.
     """
@@ -2170,10 +2286,14 @@ def _matmul_into(a: Any, b: Any, out: Any, kwargs: Dict[str, Any]) -> torch.Tens
             kwargs["time_dict"]["eval_time"] = time.time() - start_time
         return out
     result = matmul(a, b, **kwargs)
-    if not isinstance(result, torch.Tensor):
+    if not isinstance(result, torch.Tensor) or result.layout is not torch.strided:
         raise KeywordArgumentError(
             "matmul(): out= takes a dense result, and this product's is "
-            f"{type(result).__name__} of format {getattr(result, 'format', None)}",
+            + (
+                f"a torch tensor of layout {result.layout}"
+                if isinstance(result, torch.Tensor)
+                else f"{type(result).__name__} of format {getattr(result, 'format', None)}"
+            ),
             code="out_requires_dense_result",
         )
     _resize_out(out, result.shape)
@@ -2384,6 +2504,58 @@ def _dense_result_as_tensor(
     if isinstance(result, STensor) and result.format.is_dense():
         return _not_a_view(result.to_torch())
     return result
+
+
+def _matmul_result(result: STensor, torch_result: bool) -> Union[torch.Tensor, STensor]:
+    """What ``matmul`` returns for the 2-D product ``result``: for two torch sparse CSR
+    operands whose result is torch's type (``_TORCH_RESULT_KEYWORDS``), the torch sparse
+    tensor holding its arrays (``_as_torch_compressed``); else ``_dense_result_as_tensor``'s.
+    """
+
+    if torch_result:
+        return _as_torch_compressed(result)
+    return _dense_result_as_tensor(result)
+
+
+def _as_torch_compressed(result: STensor) -> torch.Tensor:
+    """``result``, the product of two torch sparse CSR operands made by the route a keyword
+    chose, as the torch sparse tensor over its arrays: a CSR result (format ``ds``) stored in
+    mode order [0, 1] as a torch sparse CSR tensor, one stored in [1, 0] -- the compressed
+    columns output_mode_order=[1, 0] asks for -- as a torch sparse CSC tensor, torch's type for
+    that order. Its index type is ``_torch_csr_spgemm``'s (``_SPGEMM_INT64_INDICES``), so the
+    result's type and index type do not depend on the keywords. The arrays are the result's own,
+    widened where the index type differs, as nothing else holds the result.
+
+    Every route such a call takes makes a ``ds`` result in one of the two orders: the prebuilt
+    CSR x CSR kernel's, einsum's inferred format for ``ij,jk->ik`` over two CSR operands, and
+    its relayout to the order asked for, which keeps the format's letters by storage position
+    (``_in_default_order``). A result in any other form is refused by code, not converted.
+    """
+
+    order = tuple(result.mode_order)
+    if result.format != _CSR_RESULT_FORMAT or order not in _TORCH_COMPRESSED_LAYOUTS:
+        raise ScorchNotImplementedError(
+            f"matmul(): the product of two torch sparse CSR operands came back in format "
+            f"{result.format} stored in mode order {list(order)}, which has no torch sparse "
+            "layout here",
+            code="torch_result_layout_unsupported",
+        )
+    positions, coordinates = result.storage._native_mode_indices()[1]
+    stored = int(positions[-1])
+    index = torch.int64 if _SPGEMM_INT64_INDICES else torch.int32
+    return _TORCH_COMPRESSED_LAYOUTS[order](
+        positions.to(index),
+        coordinates[:stored].to(index),
+        result.storage.value[:stored].to(result.dtype),
+        size=tuple(result.logical_shape),
+    )
+
+
+_CSR_RESULT_FORMAT = parse_format("ds")
+_TORCH_COMPRESSED_LAYOUTS: Dict[Tuple[int, ...], Callable[..., torch.Tensor]] = {
+    (0, 1): torch.sparse_csr_tensor,
+    (1, 0): torch.sparse_csc_tensor,
+}
 
 
 def _not_a_view(t: torch.Tensor) -> torch.Tensor:
@@ -2795,7 +2967,23 @@ def matmul(
     # (``_matmul_options``) and handed to every later one.
     options: Optional[_DeferredOptions] = None
 
+    # Whether the product is two torch sparse CSR operands' whose result is torch's type
+    # (_TORCH_RESULT_KEYWORDS): at most time_dict= asked of the call, the torch sparse CSR
+    # tensor from the function the C entry point calls for it; any other such keyword, the
+    # product of the route it chooses, returned in torch's type (_matmul_result).
+    torch_result = False
     if isinstance(a, torch.Tensor) and isinstance(b, torch.Tensor):
+        torch_result = (
+            effective_schedule is None
+            and kwargs.keys() <= _TORCH_RESULT_KEYWORDS
+            and _torch_csr_spgemm_serves(a, b)
+        )
+        if (
+            torch_result
+            and kwargs.keys() <= _SPGEMM_SERVED_KEYWORDS
+            and (served := _torch_csr_spgemm(a, b, kwargs.get("time_dict"))) is not None
+        ):
+            return served
         if (
             a.is_sparse
             and b.is_sparse
@@ -2979,7 +3167,7 @@ def matmul(
         # As above: ``einsum`` makes the snapshot where it needs one.
         result = _generated_matmul(a, b, einsum_kwargs, options)
 
-    return _dense_result_as_tensor(result)
+    return _matmul_result(result, torch_result)
 
 
 # The planned fast path in C (csrc/planned_matmul.h). It serves exactly the calls the probe at
@@ -3033,6 +3221,17 @@ if _install_planned_matmul is not None:
             csr_dense_symbol(torch.float32) == "spmm_csr_float_v2",
             csr_dense_symbol(torch.float64) == "spmm_csr_double_v2",
             _STORAGE_WRAP_GRAIN,
+        )
+    # And two torch CSR operands' product, at the dtypes where _torch_csr_spgemm makes it, the
+    # same way (planned_matmul.h, planned_matmul_torch_spgemm).
+    _set_spgemm = getattr(_scorch_ops, "set_planned_matmul_spgemm", None)
+    if _set_spgemm is not None:
+        _set_spgemm(
+            _SPGEMM_SERVES.get(torch.float32, False),
+            _SPGEMM_SERVES.get(torch.float64, False),
+            _SPGEMM_SERVES.get(torch.int32, False),
+            _SPGEMM_SERVES.get(torch.int64, False),
+            _SPGEMM_INT64_INDICES,
         )
     # And every call made under a forced schedule goes to this function, whose generated
     # kernel honours it (planned_matmul.h, planned_matmul_schedule_forced).

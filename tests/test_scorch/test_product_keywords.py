@@ -414,10 +414,17 @@ def test_a_keyword_that_changes_the_result_still_bypasses_the_plan():
 # 5. output_mode_order.
 
 
+# The mode order a torch sparse compressed tensor stores its elements in, by layout.  torch
+# cannot permute one (no as_strided for sparse compressed layouts), so it is read here.
+_COMPRESSED_ORDERS = {torch.sparse_csr: [0, 1], torch.sparse_csc: [1, 0]}
+
+
 def _stored_in(result, order):
     """Whether ``result`` stores its elements in mode order ``order``."""
     if isinstance(result, STensor):
         return list(result.mode_order) == list(order)
+    if result.layout in _COMPRESSED_ORDERS:
+        return _COMPRESSED_ORDERS[result.layout] == list(order)
     return result.permute(*order).is_contiguous()
 
 

@@ -1813,9 +1813,15 @@ inline void abi_narrow_csr_first_sight(const torch::Tensor& positions,
 // copies the kernels read (abi_narrow_csr_first_sight); for an int32 pair, the screen at `grain`.
 // Never raises and never reports: false means "make the checked call and let it report", as from
 // every screen here.
+//
+// `require_sorted` false asks the question of a kernel whose result does not depend on the order
+// of a row's coordinates, or on a coordinate repeating within a row (spmspm_csr_core): spans and
+// bounds only, as checked_csr_view asks it with require_sorted false. A verdict that the
+// coordinates are strictly increasing implies that one, so it is accepted too, and an operand
+// another route has already screened is not scanned again.
 inline bool abi_csr_screen(const torch::Tensor& positions, const torch::Tensor& coordinates,
                            const torch::Tensor& values, int64_t rows, int64_t cols,
-                           int64_t grain) {
+                           int64_t grain, bool require_sorted = true) {
   const auto plain = [](const torch::Tensor& t) {
     return t.defined() && t.device().is_cpu() && t.layout() == torch::kStrided &&
            t.dim() == 1 && t.is_contiguous() && !t.is_neg() && !t.is_conj();
@@ -1829,28 +1835,39 @@ inline bool abi_csr_screen(const torch::Tensor& positions, const torch::Tensor& 
   const int64_t nnz = values.numel();
   if (rows < 0 || cols < 0 || rows > kMax || cols > kMax || nnz > kMax) return false;
   if (positions.numel() != rows + 1 || coordinates.numel() != nnz) return false;
-  const std::vector<int64_t> params = {AbiCheckCompressed, rows, cols, nnz, 1};
+  const std::vector<int64_t> params = {AbiCheckCompressed, rows, cols, nnz,
+                                       require_sorted ? 1 : 0};
+  // Whether the memo holds a clean verdict for this pair: the one asked, or for an order-free
+  // question the strictly increasing one.
+  const auto known = [&](const torch::Tensor& crd, const torch::Tensor& pos) {
+    AbiStructEntry entry;
+    entry.add(crd);
+    entry.add(pos);
+    entry.params = params;
+    if (abi_struct_hit(entry)) return true;
+    if (require_sorted) return false;
+    entry.params.back() = 1;
+    return abi_struct_hit(entry);
+  };
   if (index_dtype == torch::kInt64) {
-    abi_narrow_csr_first_sight(positions, coordinates, values, rows, cols, true);
+    abi_narrow_csr_first_sight(positions, coordinates, values, rows, cols, require_sorted);
     torch::Tensor pos32, crd32;
     if (!abi_narrow_lookup(abi_identify(positions), pos32) ||
         !abi_narrow_lookup(abi_identify(coordinates), crd32))
       return false;
-    AbiStructEntry copies;
-    copies.add(crd32);
-    copies.add(pos32);
-    copies.params = params;
-    return abi_struct_hit(copies);
+    return known(crd32, pos32);
   }
   const int32_t* pos = positions.data_ptr<int32_t>();
   const int32_t* crd = coordinates.data_ptr<int32_t>();
   if (pos[0] != 0 || pos[rows] != nnz) return false;
+  if (!require_sorted && known(coordinates, positions)) return true;
   AbiStructEntry want;
   want.add(coordinates);
   want.add(positions);
   want.params = params;
   return !abi_screen_through_memo(std::move(want), [&] {
-    return abi_screen_compressed_typed<int32_t>(pos, crd, rows, nnz, cols, true, grain);
+    return abi_screen_compressed_typed<int32_t>(pos, crd, rows, nnz, cols, require_sorted,
+                                                grain);
   });
 }
 
@@ -1909,8 +1926,13 @@ inline CsrInputView checked_csr_view(
   AbiStructEntry memo_want;
   memo_want.add(coordinates);
   memo_want.add(positions);
-  memo_want.params = {AbiCheckCompressed, rows, cols, nnz, require_sorted ? 1 : 0};
-  const bool memo_valid = abi_struct_hit(memo_want);
+  memo_want.params = {AbiCheckCompressed, rows, cols, nnz, 1};
+  // A strictly increasing verdict answers an order-free question too (abi_csr_screen).
+  bool memo_valid = abi_struct_hit(memo_want);
+  if (!require_sorted && !memo_valid) {
+    memo_want.params.back() = 0;
+    memo_valid = abi_struct_hit(memo_want);
+  }
 
   const bool bad = !memo_valid && abi_screen_compressed(pos, crd, rows, nnz, cols,
                                                         require_sorted);
