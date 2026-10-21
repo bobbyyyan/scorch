@@ -90,12 +90,43 @@ def test_latency_capture_stops_at_one_nonempty_canonical_timing_owner() -> None:
     assert stage_runs[-1]["stage_id"] == "kernel_name_and_build_request_assembly"
 
 
+def _pin_git_worktree(monkeypatch: pytest.MonkeyPatch, worktree: str) -> None:
+    # The check reads the worktree from Git. Pin Git's answer so these tests do not
+    # depend on whether the suite runs from a Git checkout or from a copied tree.
+    def git_value(*args: str) -> str:
+        assert args == ("rev-parse", "--show-toplevel")
+        return worktree
+
+    monkeypatch.setattr(benchmark_compiler_ir, "_git_value", git_value)
+
+
 def test_benchmark_rejects_an_import_from_a_different_worktree(
-    monkeypatch: pytest.MonkeyPatch,
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
+    _pin_git_worktree(monkeypatch, str(tmp_path))
     monkeypatch.setattr(
         benchmark_compiler_ir.scorch, "__file__", "/tmp/other/scorch.py"
     )
 
     with pytest.raises(RuntimeError, match="different worktree"):
+        benchmark_compiler_ir._require_imported_scorch_from_worktree()
+
+
+def test_benchmark_accepts_an_import_from_its_own_worktree(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    _pin_git_worktree(monkeypatch, str(tmp_path))
+    monkeypatch.setattr(
+        benchmark_compiler_ir.scorch,
+        "__file__",
+        str(tmp_path / "src" / "scorch" / "__init__.py"),
+    )
+
+    benchmark_compiler_ir._require_imported_scorch_from_worktree()
+
+
+def test_benchmark_requires_a_git_worktree(monkeypatch: pytest.MonkeyPatch) -> None:
+    _pin_git_worktree(monkeypatch, "unknown")
+
+    with pytest.raises(RuntimeError, match="requires a Git worktree"):
         benchmark_compiler_ir._require_imported_scorch_from_worktree()
