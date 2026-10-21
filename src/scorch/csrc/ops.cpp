@@ -249,6 +249,134 @@ torch::Tensor spgemm_csr_torch_result(const torch::Tensor& a_positions,
   }
 }
 
+// The two phases of the same product (kernels.h, spmspm_csr_symbolic and spmspm_csr_numeric),
+// bound for the numeric-only kernel's tests and grid; a plan that keeps the structure calls the
+// kernels from C. A and B are checked as spgemm_csr_torch_result checks them (order-free); C's
+// structure, given to the numeric phase, is checked for spans, bounds and strictly increasing
+// rows (memoized, so a repeated structure is not scanned again), which keeps every access in
+// bounds -- whether it is the structure of this A and B is the caller's to know.
+struct SpgemmOperands {
+  scorch_native::CsrInputView a, b;
+  std::vector<int> extents;  // rows, inner, cols, narrowed to int as the kernels take them
+};
+
+inline SpgemmOperands spgemm_checked_operands(
+    const char* op, torch::ScalarType dtype, const torch::Tensor& a_positions,
+    const torch::Tensor& a_coordinates, const torch::Tensor& a_values,
+    const torch::Tensor& b_positions, const torch::Tensor& b_coordinates,
+    const torch::Tensor& b_values, int64_t rows, int64_t inner, int64_t cols) {
+  std::vector<std::vector<torch::Tensor>> a_levels = {{}, {a_positions, a_coordinates}};
+  std::vector<std::vector<torch::Tensor>> b_levels = {{}, {b_positions, b_coordinates}};
+  const std::vector<int64_t> a_shape = {rows, inner};
+  const std::vector<int64_t> b_shape = {inner, cols};
+  auto a = scorch_native::checked_csr_view(a_shape, a_levels, a_values, dtype, op, "A",
+                                           /*require_sorted=*/false);
+  auto b = scorch_native::checked_csr_view(b_shape, b_levels, b_values, dtype, op, "B",
+                                           /*require_sorted=*/false);
+  auto extents = scorch_native::narrow_legacy_shape(std::vector<int64_t>{rows, inner, cols}, op,
+                                                    "extents");
+  return {std::move(a), std::move(b), std::move(extents)};
+}
+
+std::tuple<torch::Tensor, torch::Tensor> spgemm_csr_symbolic(
+    const torch::Tensor& a_positions, const torch::Tensor& a_coordinates,
+    const torch::Tensor& a_values, const torch::Tensor& b_positions,
+    const torch::Tensor& b_coordinates, const torch::Tensor& b_values, int64_t rows,
+    int64_t inner, int64_t cols, bool int64_indices) {
+  const auto o = spgemm_checked_operands("spgemm_csr_symbolic", a_values.scalar_type(),
+                                         a_positions, a_coordinates, a_values, b_positions,
+                                         b_coordinates, b_values, rows, inner, cols);
+  TORCH_CHECK(b_values.scalar_type() == a_values.scalar_type(),
+              "spgemm_csr_symbolic: A and B values differ in dtype");
+  const auto& e = o.extents;
+  const SpgemmCsrStructure c =
+      int64_indices
+          ? spmspm_csr_symbolic<int64_t>(e[0], o.a.pos, o.a.crd, e[1], o.b.pos, o.b.crd, e[2])
+          : spmspm_csr_symbolic<int32_t>(e[0], o.a.pos, o.a.crd, e[1], o.b.pos, o.b.crd, e[2]);
+  return {c.positions, c.coordinates};
+}
+
+template <typename scalar_t, typename index_t>
+torch::Tensor spgemm_csr_numeric_typed(const SpgemmOperands& o, const torch::Tensor& c_positions,
+                                       const torch::Tensor& c_coordinates) {
+  torch::Tensor values = torch::empty({c_coordinates.numel()},
+                                      c_coordinates.options().dtype(scorch_torch_dtype<scalar_t>()));
+  const auto& e = o.extents;
+  spmspm_csr_numeric<scalar_t, index_t>(
+      e[0], o.a.pos, o.a.crd, o.a.values.data_ptr<scalar_t>(), e[1], o.b.pos, o.b.crd,
+      o.b.values.data_ptr<scalar_t>(), e[2], c_positions.data_ptr<index_t>(),
+      c_coordinates.data_ptr<index_t>(), values.data_ptr<scalar_t>());
+  return values;
+}
+
+torch::Tensor spgemm_csr_numeric(const torch::Tensor& a_positions,
+                                 const torch::Tensor& a_coordinates,
+                                 const torch::Tensor& a_values,
+                                 const torch::Tensor& b_positions,
+                                 const torch::Tensor& b_coordinates,
+                                 const torch::Tensor& b_values,
+                                 const torch::Tensor& c_positions,
+                                 const torch::Tensor& c_coordinates, int64_t rows, int64_t inner,
+                                 int64_t cols) {
+  constexpr const char* op = "spgemm_csr_numeric";
+  const torch::ScalarType dtype = a_values.scalar_type();
+  TORCH_CHECK(b_values.scalar_type() == dtype, op, ": A and B values differ in dtype");
+  const auto o = spgemm_checked_operands(op, dtype, a_positions, a_coordinates, a_values,
+                                         b_positions, b_coordinates, b_values, rows, inner, cols);
+  // C's structure: one index dtype, contiguous, rows + 1 positions, sorted distinct rows within
+  // [0, cols). Checked through a copy of the level vector, so the kernel reads C's own arrays at
+  // their own index type.
+  const torch::ScalarType index = c_positions.scalar_type();
+  TORCH_CHECK((index == torch::kInt32 || index == torch::kInt64) &&
+                  c_coordinates.scalar_type() == index && c_positions.is_contiguous() &&
+                  c_coordinates.is_contiguous() && c_positions.dim() == 1 &&
+                  c_coordinates.dim() == 1 && c_positions.device().is_cpu() &&
+                  c_coordinates.device().is_cpu(),
+              op, ": C's positions and coordinates must be contiguous 1-D CPU int32 or int64 "
+              "arrays of one dtype");
+  {
+    std::vector<std::vector<torch::Tensor>> c_levels = {{}, {c_positions, c_coordinates}};
+    const torch::Tensor shape_only =
+        torch::empty({c_coordinates.numel()}, c_coordinates.options().dtype(dtype));
+    scorch_native::checked_csr_view(std::vector<int64_t>{rows, cols}, c_levels, shape_only, dtype,
+                                    op, "C", /*require_sorted=*/true);
+  }
+  switch (dtype) {
+#define SCORCH_SPGEMM_NUMERIC_CASE(kind, scalar)                                          \
+  case torch::kind:                                                                       \
+    return index == torch::kInt64                                                         \
+               ? spgemm_csr_numeric_typed<scalar, int64_t>(o, c_positions, c_coordinates) \
+               : spgemm_csr_numeric_typed<scalar, int32_t>(o, c_positions, c_coordinates);
+    SCORCH_SPGEMM_NUMERIC_CASE(kFloat32, float)
+    SCORCH_SPGEMM_NUMERIC_CASE(kFloat64, double)
+    SCORCH_SPGEMM_NUMERIC_CASE(kInt32, int32_t)
+    SCORCH_SPGEMM_NUMERIC_CASE(kInt64, int64_t)
+#undef SCORCH_SPGEMM_NUMERIC_CASE
+    default:
+      TORCH_CHECK(false, op, ": no CSR x CSR kernel takes values of dtype ", dtype);
+  }
+}
+
+// The numeric phase's product as the torch sparse CSR tensor spgemm_csr_torch_result returns for
+// the same pair: what a plan holding C's structure returns on each call, built in C as the plan
+// will build it, so the grid times it against the two-phase function on equal terms. Each result
+// gets its own copy of C's row pointers and column indices unless `copy_indices` is false; sharing
+// them makes every result alias the others and the plan (a write to one result's col_indices()
+// changes them all), so the shared form is measured and reported, never returned by scorch.
+torch::Tensor spgemm_csr_numeric_result(
+    const torch::Tensor& a_positions, const torch::Tensor& a_coordinates,
+    const torch::Tensor& a_values, const torch::Tensor& b_positions,
+    const torch::Tensor& b_coordinates, const torch::Tensor& b_values,
+    const torch::Tensor& c_positions, const torch::Tensor& c_coordinates, int64_t rows,
+    int64_t inner, int64_t cols, bool copy_indices) {
+  torch::Tensor values = spgemm_csr_numeric(a_positions, a_coordinates, a_values, b_positions,
+                                            b_coordinates, b_values, c_positions, c_coordinates,
+                                            rows, inner, cols);
+  return scorch_native::csr_result_as_torch(
+      copy_indices ? c_positions.clone() : c_positions,
+      copy_indices ? c_coordinates.clone() : c_coordinates, values, rows, cols);
+}
+
 void bind_binary_kernel(py::module_& m, const char* name, BinaryKernelFn fn,
                         const char* doc,
                         scorch_native::BinaryContract contract,
@@ -1297,6 +1425,26 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           py::arg("b_coordinates"), py::arg("b_values"), py::arg("rows"), py::arg("inner"),
           py::arg("cols"), py::arg("int64_indices"));
     scorch_native::planned_matmul_state().ordinary_spgemm = &spgemm_csr_torch_result;
+    // The same product's two phases, for the numeric-only kernel's tests and grid.
+    m.def("spgemm_csr_symbolic", &spgemm_csr_symbolic,
+          "(positions, coordinates) of C = A @ B's structure, rows sorted and distinct",
+          py::call_guard<py::gil_scoped_release>(), py::arg("a_positions"),
+          py::arg("a_coordinates"), py::arg("a_values"), py::arg("b_positions"),
+          py::arg("b_coordinates"), py::arg("b_values"), py::arg("rows"), py::arg("inner"),
+          py::arg("cols"), py::arg("int64_indices"));
+    m.def("spgemm_csr_numeric", &spgemm_csr_numeric,
+          "C = A @ B's values for C's structure from spgemm_csr_symbolic over the same A and B",
+          py::call_guard<py::gil_scoped_release>(), py::arg("a_positions"),
+          py::arg("a_coordinates"), py::arg("a_values"), py::arg("b_positions"),
+          py::arg("b_coordinates"), py::arg("b_values"), py::arg("c_positions"),
+          py::arg("c_coordinates"), py::arg("rows"), py::arg("inner"), py::arg("cols"));
+    m.def("spgemm_csr_numeric_result", &spgemm_csr_numeric_result,
+          "The numeric phase's C = A @ B as a torch sparse CSR tensor, for the grid",
+          py::call_guard<py::gil_scoped_release>(), py::arg("a_positions"),
+          py::arg("a_coordinates"), py::arg("a_values"), py::arg("b_positions"),
+          py::arg("b_coordinates"), py::arg("b_values"), py::arg("c_positions"),
+          py::arg("c_coordinates"), py::arg("rows"), py::arg("inner"), py::arg("cols"),
+          py::arg("copy_indices"));
     m.def("set_planned_matmul_spgemm",
           [](bool float32, bool float64, bool int32, bool int64, bool int64_indices) {
             scorch_native::PlannedMatmul& s = scorch_native::planned_matmul_state();

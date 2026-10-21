@@ -378,6 +378,192 @@ SpgemmCsrArrays spmspm_csr_core(const int A0_size, const int* SCORCH_RESTRICT A1
   return result;
 }
 
+// C = A x B split into its two phases, for a caller that computes the same pair of structures
+// more than once with changing values -- the split MKL's mkl_sparse_sp2m stages and cuSPARSE's
+// SpGEMMreuse make. spmspm_csr_symbolic computes C's structure once (row pointers and each row's
+// sorted, distinct column coordinates); spmspm_csr_numeric then computes C's values for that
+// structure on every call, with no count, no linked list and no sort. Both read A and B as
+// spmspm_csr_core does, in any order within a row and with repeated coordinates, and thread as it
+// does (scorch_nthreads over the same work estimate), so the numeric phase is measured against
+// the two-phase kernel on equal terms (design note, section 2 item 4: the two-phase kernel stays
+// a candidate, and this pair is added beside it).
+struct SpgemmCsrStructure {
+  torch::Tensor positions;
+  torch::Tensor coordinates;
+};
+
+// The work estimate and thread decision spmspm_csr_core makes, shared by the two phases.
+struct SpgemmThreads {
+  int nthreads;
+  int chunk;
+};
+
+inline SpgemmThreads spgemm_threads(const int A0_size, const int* A1_pos, const int B0_size,
+                                    const int* B1_pos) {
+  const long A_nnz = A1_pos[A0_size];
+  const long B_nnz = B1_pos[B0_size];
+  const long avg_B_row = B0_size > 0 ? (B_nnz / B0_size) + 1 : 1;
+  const long flop_est = A_nnz * avg_B_row;
+  return {scorch_nthreads(flop_est, A0_size, SCORCH_GRAIN_SPMSPM),
+          scorch_chunk(A0_size, flop_est, SCORCH_GRAIN_SPMSPM)};
+}
+
+// A worker slice's length in elements: `count`, padded to whole cache lines plus one line of
+// separation between workers when there is more than one (as spmspm_csr_core pads its slices).
+inline size_t spgemm_worker_stride(int nthreads, size_t count, size_t element_size) {
+  if (count == 0) return 0;
+  if (nthreads == 1) return count;
+  const size_t per_line = std::max<size_t>(1, 64 / element_size);
+  return ((count + per_line - 1) / per_line) * per_line + per_line;
+}
+
+template <typename index_t>
+SpgemmCsrStructure spmspm_csr_symbolic(const int A0_size, const int* SCORCH_RESTRICT A1_pos,
+                                       const int* SCORCH_RESTRICT A1_crd, const int B0_size,
+                                       const int* SCORCH_RESTRICT B1_pos,
+                                       const int* SCORCH_RESTRICT B1_crd, const int C1_size) {
+  static_assert(std::is_same<index_t, int32_t>::value || std::is_same<index_t, int64_t>::value,
+                "a CSR result's index type is int32 or int64");
+  const SpgemmThreads threads = spgemm_threads(A0_size, A1_pos, B0_size, B1_pos);
+  const int nthreads = threads.nthreads;
+  const size_t next_stride =
+      spgemm_worker_stride(nthreads, static_cast<size_t>(C1_size), sizeof(int));
+  auto next_by_worker =
+      scorch_make_unique_array_pool<int>(static_cast<size_t>(nthreads), next_stride);
+  std::fill_n(next_by_worker.get(),
+              scorch_checked_size_product(static_cast<size_t>(nthreads), next_stride), -1);
+  auto C1_pos_owner =
+      scorch_make_unique_array_pool<index_t>(1, static_cast<size_t>(A0_size) + 1);
+  index_t* C1_pos_data = C1_pos_owner.get();
+  C1_pos_data[0] = 0;
+
+  // Count each row's distinct columns, as spmspm_csr_core's first phase does.
+  #pragma omp parallel num_threads(nthreads)
+  {
+    int* SCORCH_RESTRICT next =
+        next_by_worker.get() + static_cast<size_t>(omp_get_thread_num()) * next_stride;
+    #pragma omp for schedule(dynamic, threads.chunk)
+    for (int i = 0; i < A0_size; i++) {
+      int head = -2;
+      int length = 0;
+      for (int pA1 = A1_pos[i]; pA1 < A1_pos[i + 1]; pA1++) {
+        const int j = A1_crd[pA1];
+        for (int pB1 = B1_pos[j]; pB1 < B1_pos[j + 1]; pB1++) {
+          const int k = B1_crd[pB1];
+          if (next[k] == -1) {
+            next[k] = head;
+            head = k;
+            length++;
+          }
+        }
+      }
+      C1_pos_data[i + 1] = length;
+      while (head >= 0) {
+        const int temp = head;
+        head = next[head];
+        next[temp] = -1;
+      }
+    }
+  }
+  for (int i = 0; i < A0_size; i++) {
+    const int count = static_cast<int>(C1_pos_data[i + 1]);
+    if constexpr (sizeof(index_t) == sizeof(int32_t)) {
+      if (count > std::numeric_limits<int>::max() - C1_pos_data[i]) {
+        scorch_native::refuse_index_capacity("spmspm_csr: the result's column coordinates",
+                                             static_cast<int64_t>(C1_pos_data[i]) + count);
+      }
+    }
+    C1_pos_data[i + 1] = C1_pos_data[i] + count;
+  }
+  const index_t total_nnz = C1_pos_data[A0_size];
+  auto C1_crd_owner = scorch_make_unique_array_pool<index_t>(1, static_cast<size_t>(total_nnz));
+  index_t* C1_crd_data = C1_crd_owner.get();
+
+  // Each row's columns again, written in place and sorted.
+  #pragma omp parallel num_threads(nthreads)
+  {
+    int* SCORCH_RESTRICT next =
+        next_by_worker.get() + static_cast<size_t>(omp_get_thread_num()) * next_stride;
+    #pragma omp for schedule(dynamic, threads.chunk)
+    for (int i = 0; i < A0_size; i++) {
+      int head = -2;
+      for (int pA1 = A1_pos[i]; pA1 < A1_pos[i + 1]; pA1++) {
+        const int j = A1_crd[pA1];
+        for (int pB1 = B1_pos[j]; pB1 < B1_pos[j + 1]; pB1++) {
+          const int k = B1_crd[pB1];
+          if (next[k] == -1) {
+            next[k] = head;
+            head = k;
+          }
+        }
+      }
+      index_t* row = C1_crd_data + C1_pos_data[i];
+      int length = 0;
+      while (head >= 0) {
+        row[length++] = head;
+        const int temp = head;
+        head = next[head];
+        next[temp] = -1;
+      }
+      std::sort(row, row + length);
+    }
+  }
+  constexpr torch::ScalarType kIndexDtype =
+      sizeof(index_t) == sizeof(int64_t) ? torch::kLong : torch::kInt;
+  SpgemmCsrStructure result;
+  result.positions = scorch_tensor_from_unique_array(
+      std::move(C1_pos_owner), static_cast<int64_t>(A0_size) + 1, kIndexDtype);
+  result.coordinates = scorch_tensor_from_unique_array(
+      std::move(C1_crd_owner), static_cast<int64_t>(total_nnz), kIndexDtype);
+  return result;
+}
+
+// C's values for a structure spmspm_csr_symbolic computed from these same A and B index arrays,
+// written to C_val: each row of A x B scattered into a dense accumulator in exactly the order
+// spmspm_csr_core visits it -- so every value is bit-identical to that kernel's -- then gathered
+// in C's sorted order, which also clears the accumulator for the row after. Correct only for that
+// structure: the caller checks that A's and B's index arrays are the ones it was computed from
+// (a plan's write witnesses). Every coordinate the row touches is then one of C's, so gathering
+// through C's coordinates clears every entry the row set.
+template <typename scalar_t, typename index_t>
+void spmspm_csr_numeric(const int A0_size, const int* SCORCH_RESTRICT A1_pos,
+                        const int* SCORCH_RESTRICT A1_crd, const scalar_t* SCORCH_RESTRICT A_val,
+                        const int B0_size, const int* SCORCH_RESTRICT B1_pos,
+                        const int* SCORCH_RESTRICT B1_crd, const scalar_t* SCORCH_RESTRICT B_val,
+                        const int C1_size, const index_t* SCORCH_RESTRICT C1_pos,
+                        const index_t* SCORCH_RESTRICT C1_crd, scalar_t* SCORCH_RESTRICT C_val) {
+  const SpgemmThreads threads = spgemm_threads(A0_size, A1_pos, B0_size, B1_pos);
+  const int nthreads = threads.nthreads;
+  const size_t sums_stride =
+      spgemm_worker_stride(nthreads, static_cast<size_t>(C1_size), sizeof(scalar_t));
+  auto sums_by_worker =
+      scorch_make_unique_array_pool<scalar_t>(static_cast<size_t>(nthreads), sums_stride);
+  std::fill_n(sums_by_worker.get(),
+              scorch_checked_size_product(static_cast<size_t>(nthreads), sums_stride),
+              static_cast<scalar_t>(0));
+
+  #pragma omp parallel num_threads(nthreads)
+  {
+    scalar_t* SCORCH_RESTRICT sums =
+        sums_by_worker.get() + static_cast<size_t>(omp_get_thread_num()) * sums_stride;
+    #pragma omp for schedule(dynamic, threads.chunk)
+    for (int i = 0; i < A0_size; i++) {
+      for (int pA1 = A1_pos[i]; pA1 < A1_pos[i + 1]; pA1++) {
+        const int j = A1_crd[pA1];
+        const scalar_t v = A_val[pA1];
+        for (int pB1 = B1_pos[j]; pB1 < B1_pos[j + 1]; pB1++) {
+          sums[B1_crd[pB1]] += v * B_val[pB1];
+        }
+      }
+      for (index_t p = C1_pos[i]; p < C1_pos[i + 1]; p++) {
+        const index_t k = C1_crd[p];
+        C_val[p] = sums[k];
+        sums[k] = 0;
+      }
+    }
+  }
+}
+
 // The legacy binding's form: the product over a Tensor's level vectors, with an int32 result.
 template <typename scalar_t>
 Tensor spmspm_csr(
