@@ -3381,6 +3381,155 @@ def _normalize_cin_owned(cin: IndexStmt, options: CompileOptions) -> IndexStmt:
     return clone_stmt(cin)
 
 
+def cin_lowering_key(cin: IndexStmt) -> Optional[Tuple[object, ...]]:
+    """Every field of ``cin`` that :func:`_normalize_cin_owned` copies, as one flat tuple.
+
+    Two statements with equal keys normalize to equal graphs, so they lower to the same
+    kernel under the same options and runtime bindings: the key is what a direct CIN
+    call's kernel cache (``scorch.ops.lower_and_exec_cin``) looks its entry up by.  It
+    reads the same fields as the clone above, so the two change together.
+
+    Unlike :func:`canonical_cin_dump`, it keeps the tensor and index names, which the
+    emitted C++ spells.  Stable IDs, which it does not spell, enter as the order of
+    their first appearance and, per ID type, as the order of their values: the lowering
+    compares IDs only for equality and orders them only within one type (the legacy
+    adapter sorts the accesses by ``access_id.value``; IDs of two types do not compare).
+    Two statements then share a key only when one bijection between their IDs keeps
+    both where each ID appears and how the IDs of one type compare, so they lower the
+    same, and a statement built again in the same order, with new IDs, has the same key.
+    Object identity enters as the order of first appearance too: two index variables,
+    tensors or nodes are one in the key exactly when they are one object, as the clone's
+    memos make them.
+
+    Call it only on a statement :func:`verify_cin_structure` accepted, which bounds its
+    depth and fixes every field's type.  It answers None for a node the clone refuses,
+    so the caller compiles, and normalization raises what it always raised.
+    """
+
+    parts: List[object] = []
+    object_ids: Dict[int, int] = {}
+    stable_ids: Dict[object, int] = {}
+
+    def seen(value: object) -> Optional[int]:
+        """The object's number when it appeared before; else numbers it and answers None."""
+
+        key = id(value)
+        number = object_ids.get(key)
+        if number is None:
+            object_ids[key] = len(object_ids)
+        return number
+
+    def stable(value: object) -> int:
+        number = stable_ids.get(value)
+        if number is None:
+            number = stable_ids[value] = len(stable_ids)
+        return number
+
+    def index(index_var: IndexVar) -> bool:
+        number = seen(index_var)
+        if number is not None:
+            parts.append(("index", number))
+            return True
+        parts.append(("index",))
+        parts.append(stable(index_var.node_id))
+        parts.append(stable(index_var.index_id))
+        parts.append(index_var.name)
+        expr = index_var._expr
+        if isinstance(expr, IndexVarAdd):
+            parts.append(("add", stable(expr.node_id)))
+            return index(expr.lhs) and index(expr.rhs)
+        if expr is not None:
+            return False
+        parts.append(None)
+        return True
+
+    def tensor(tensor_var: TensorVar) -> None:
+        number = seen(tensor_var)
+        if number is not None:
+            parts.append(("tensor", number))
+            return
+        workspace = isinstance(tensor_var, Workspace)
+        parts.append(("workspace",) if workspace else ("tensor",))
+        parts.append(type(tensor_var))
+        parts.append(stable(tensor_var.node_id))
+        parts.append(stable(tensor_var.symbol_id))
+        parts.append(tensor_var.name)
+        parts.append(tensor_var._format)
+        parts.append(tuple(tensor_var.shape) if tensor_var.shape is not None else None)
+        parts.append(tensor_var.dtype)
+        mode_order = tensor_var.mode_order
+        parts.append(tuple(mode_order) if mode_order is not None else None)
+        if workspace:
+            parts.append(cast(Workspace, tensor_var).dim)
+            parts.append(cast(Workspace, tensor_var).dense)
+
+    def access(expr: TensorAccess, owner: TensorVar) -> bool:
+        parts.append(stable(expr.node_id))
+        parts.append(stable(expr.access_id))
+        tensor(owner)
+        parts.append(stable(expr.tensor_id))
+        parts.append(len(expr.indices))
+        if not all(index(value) for value in expr.indices):
+            return False
+        parts.append(tuple(stable(value) for value in expr.index_ids))
+        return True
+
+    def expression(expr: IndexExpr) -> bool:
+        number = seen(expr)
+        if number is not None:
+            parts.append(("node", number))
+            return True
+        if isinstance(expr, WorkspaceAccess):
+            parts.append("workspace_access")
+            return access(expr, expr.wksp)
+        if isinstance(expr, TensorAccess):
+            parts.append("tensor_access")
+            return access(expr, expr.tensor)
+        if isinstance(expr, BinaryOp):
+            parts.append(("binary", stable(expr.node_id), expr.op))
+            return expression(expr.left) and expression(expr.right)
+        if isinstance(expr, UnaryOp):
+            parts.append(("unary", stable(expr.node_id), expr.op))
+            return expression(expr.expr)
+        return False
+
+    def statement(stmt: IndexStmt) -> bool:
+        number = seen(stmt)
+        if number is not None:
+            parts.append(("node", number))
+            return True
+        if isinstance(stmt, ForAll):
+            parts.append(("forall", stable(stmt.node_id), stmt.parallel))
+            return index(stmt.index_var) and statement(stmt.stmt)
+        if isinstance(stmt, Where):
+            parts.append(("where", stable(stmt.node_id)))
+            return statement(stmt.producer) and statement(stmt.consumer)
+        if isinstance(stmt, TensorAssign):
+            parts.append(("assign", stable(stmt.node_id), stmt.op))
+            return expression(stmt.lhs) and expression(stmt.rhs)
+        return False
+
+    if not statement(cin):
+        return None
+    # Per ID type, the first-appearance numbers of its IDs in the order of their values.
+    by_type: Dict[type, List[Tuple[int, int]]] = {}
+    for value, number in stable_ids.items():
+        if type(value) not in (AccessId, IndexId, NodeId, SymbolId):
+            return None
+        by_type.setdefault(type(value), []).append(
+            (cast(EntityId, value).value, number)
+        )
+    parts.append(
+        tuple(
+            (id_type.__name__, tuple(number for _, number in sorted(members)))
+            for id_type, members in sorted(
+                by_type.items(), key=lambda item: item[0].__name__
+            )
+        )
+    )
+    return tuple(parts)
+
+
 def canonical_cin_dump(cin: IndexStmt) -> str:
     """Serialize CIN with traversal-canonical IDs and no allocation-order data."""
 

@@ -44,7 +44,9 @@ from .compiler.cin import (
 from .compiler.cin_lowerer import CINLowerer
 from .compiler.cin_analysis import (
     _trusted_normalized_cin,
+    cin_lowering_key,
     normalize_cin,
+    verify_cin_if_enabled,
     verify_cin_structure,
 )
 from .compiler.compile_options import (
@@ -132,7 +134,12 @@ from .tiling import _current_level as _tiling_current_level
 from .storage import _WRAP_GRAIN as _STORAGE_WRAP_GRAIN
 from .stensor import (
     STensor,
+    _DirectCINKernel,
+    _checking_generated_kernel_hits,
     _generated_kernel,
+    _keep_generated_kernel,
+    _kept_generated_kernel,
+    _refuse_unlike_kept,
     _wrap_generated_result,
     _compilation_context_at_boundary,
 )
@@ -6242,12 +6249,17 @@ def _plan_direct_cin_runtime_binding(
 def _relayout_mode_order_args(
     args: tuple,
     plan: _ModeOrderAlignmentPlan,
-    compile_options: CompileOptions,
+    compile_options: Union[CompileOptions, _DeferredOptions],
     compilation_context: Optional[CompilationContext],
     *,
     snapshots: Optional[Tuple[_RuntimeTensorSnapshot, ...]] = None,
 ) -> tuple:
-    """Execute only runtime relayout prerequisites from a frozen alignment plan."""
+    """Execute only runtime relayout prerequisites from a frozen alignment plan.
+
+    ``compile_options`` is the call's snapshot, or on a direct CIN call's kernel cache
+    hit its options holder, which each relayout's conversion takes as it is
+    (``_conversion_kwargs``), so a conversion that hits its own kernel makes no snapshot.
+    """
 
     if snapshots is None:
         snapshots = _snapshot_runtime_tensors(args)
@@ -6263,14 +6275,10 @@ def _relayout_mode_order_args(
             and snapshot.has_index
         ):
             aligned = STensor.copy(snapshot.tensor)
-            conversion_options, conversion_context = _conversion_compile_inputs(
-                compile_options, compilation_context
-            )
             STensor.change_mode_order(
                 aligned,
                 list(desired_mode_order),
-                _compile_options=conversion_options,
-                _compilation_context=conversion_context,
+                **_conversion_kwargs(compile_options, compilation_context),
             )
             aligned_args[position] = aligned
     return tuple(aligned_args)
@@ -6313,44 +6321,88 @@ def _align_mode_orders_to_loop_order(
     return aligned_args
 
 
-def lower_and_exec_cin(
-    cin_stmt: IndexStmt, result_shape: Sequence[int], *args: STensor, **kwargs
-) -> STensor:
-    """Lower a CIN statement to LLIR then codegen and call on the input tensors.
+def _index_dtype(snapshot: _RuntimeTensorSnapshot) -> Optional[torch.dtype]:
+    """The one dtype of a validated operand's index arrays, or None when it has none."""
 
-    Low-level entry to the generic compiler path: aligns the operand mode orders to
-    the CIN loop order (``_align_mode_orders_to_loop_order``), lowers CIN -> LLIR ->
-    C++, JIT-loads the kernel, executes it on ``args``, and wraps the result as an
-    ``STensor``. This is the primitive the compiler gap tests use to drive the
-    pipeline directly; it is **not exported** — advanced users reach it as
-    ``scorch.ops.lower_and_exec_cin``. Most code should use :func:`matmul` or
-    :func:`einsum` instead.
+    for arrays in snapshot.native_mode_indices:
+        for index in arrays:
+            return index.dtype
+    return None
 
-    Parameters
-    ----------
-    cin_stmt : IndexStmt
-        CIN statement (index-notation AST) to lower.
-    result_shape : tuple[int, ...], list[int], torch.Size, or range
-        Physical shape of the result tensor. Extents must be exact,
-        nonnegative signed-64-bit integers and their product must fit in a
-        signed 64-bit integer.
-    *args : STensor
-        Input tensors, matched left-to-right against the RHS tensor accesses.
-    **kwargs
-        ``time_dict`` : dict, optional -- if given, ``time_dict["eval_time"]`` is
-        set to the kernel wall-clock time in seconds.
 
-    Returns
-    -------
-    STensor
-        Output tensor, in the format and mode order of the compiler-owned
-        result declaration, sparse or dense.  Its value dtype is the operands'
-        promoted dtype (``layout.common_value_dtype``, PyTorch's rule): the
-        dtype of the statement's result ``TensorVar`` is ignored and replaced.
+def _direct_cin_dispatch_key(
+    cin_stmt: object,
+    result_shape: object,
+    args: tuple,
+    options: _DeferredOptions,
+) -> Tuple[
+    Optional[tuple],
+    Optional[Tuple[_RuntimeTensorSnapshot, ...]],
+    Optional[Tuple[int, ...]],
+]:
+    """The key of a direct CIN call's kernel in the generated-kernel cache.
+
+    Returns the key, the operands' snapshots and the checked result shape, or three
+    Nones when an input cannot be read for a key.  It never raises: a call it cannot
+    key compiles, and the compile raises what it always raised, where it always did.
+
+    What the call's kernel and its outputs are a function of, read on every call:
+    - the statement, by every field normalization copies (``cin_lowering_key``), after
+      ``verify_cin_structure`` accepted it, which normalization runs first as well;
+    - the result shape;
+    - each operand's shape, value dtype, format, mode order, whether it has an index
+      (which decides its relayout) and its index dtype, from the snapshot that
+      validates its arrays (``_snapshot_runtime_tensors``), as the compile reads them;
+    - the options key (``_DeferredOptions.reuse_key``), which names the build options
+      and the verification policy without making a snapshot.
+    A requested schedule is refused before this, so it has no part.
     """
-    compile_options = _compile_options_from_kwargs(kwargs)
-    _reject_unsupported_requested_schedule(compile_options, "lower_and_exec_cin")
-    compilation_context = _compilation_context_from_kwargs(kwargs, compile_options)
+
+    try:
+        verify_cin_structure(cast(IndexStmt, cin_stmt))
+        structure = cin_lowering_key(cast(IndexStmt, cin_stmt))
+        if structure is None:
+            return None, None, None
+        checked_shape = _checked_runtime_shape(result_shape, "result shape")
+        snapshots = _snapshot_runtime_tensors(args)
+    except Exception:
+        return None, None, None
+    operands = tuple(
+        (
+            snapshot.shape,
+            snapshot.dtype,
+            snapshot.tensor_format,
+            snapshot.mode_order,
+            snapshot.has_index,
+            _index_dtype(snapshot),
+        )
+        for snapshot in snapshots
+    )
+    key = (
+        "lower_and_exec_cin",
+        structure,
+        checked_shape,
+        operands,
+        options.reuse_key,
+    )
+    return key, snapshots, checked_shape
+
+
+def _compile_direct_cin(
+    cin_stmt: IndexStmt,
+    result_shape: Sequence[int],
+    args: tuple,
+    compile_options: CompileOptions,
+    compilation_context: CompilationContext,
+) -> Tuple[_DirectCINKernel, Tuple[_RuntimeTensorSnapshot, ...], Tuple[int, ...]]:
+    """Normalize, bind, lower, emit, name and load a direct CIN call's kernel.
+
+    The steps ``lower_and_exec_cin`` runs on a call whose kernel is not kept, each in
+    its own stage, with the operands' relayouts the alignment plan asks for.  Returns
+    the entry to keep, the snapshots of the operands the kernel reads (relaid out where
+    the plan says) and the checked result shape.
+    """
+
     cin_stmt = normalize_cin(
         cin_stmt,
         compile_options=compile_options,
@@ -6437,24 +6489,6 @@ def lower_and_exec_cin(
     )
     module = _load_validated_prepared_kernel(prepared_build)
 
-    module_args: List[Any] = [result_shape]
-
-    for snapshot in runtime_args:
-        module_args.append(snapshot.shape)
-        module_args.append(snapshot.native_mode_indices)
-        module_args.append(snapshot.values)
-
-    start_time = time.time()
-    try:
-        result_cpp = module.evaluate(*module_args)
-    except RuntimeError as error:
-        raise_if_native_coded(error)
-        raise
-    end_time = time.time()
-    eval_time = end_time - start_time
-    if "time_dict" in kwargs:
-        kwargs["time_dict"]["eval_time"] = eval_time
-
     # The result is wrapped in the format and mode order its declaration gives,
     # sparse or dense, as ``einsum`` and ``STensor.__add__`` wrap theirs.  A sparse
     # result used to be wrapped as a two-level dense tensor whatever it was, which
@@ -6472,11 +6506,168 @@ def lower_and_exec_cin(
         if declared_result is not None and declared_result.mode_order is not None
         else None
     )
+    entry = _DirectCINKernel(
+        module=module,
+        result_format=result_format,
+        result_mode_order=result_mode_order,
+        alignment_plan=alignment_plan,
+        verify_cin=compile_options.verification.verify_cin,
+    )
+    return entry, runtime_args, result_shape
+
+
+def _bind_direct_cin_hit(
+    key: tuple,
+    entry: _DirectCINKernel,
+    cin_stmt: IndexStmt,
+    result_shape: Tuple[int, ...],
+    snapshots: Tuple[_RuntimeTensorSnapshot, ...],
+    options: _DeferredOptions,
+    handed_context: Optional[CompilationContext],
+) -> Tuple[_RuntimeTensorSnapshot, ...]:
+    """What a direct CIN call whose kernel is kept still runs before its kernel.
+
+    The verification its miss ran under a policy that verifies; the begun and cancelled
+    frontend stage of a context the caller handed in, which records nothing (as an
+    ``einsum`` hit leaves it); in test mode the full build, compared; and the relayouts
+    of the kept alignment plan.  Returns the snapshots of the operands the kernel
+    reads: the call's own, taken when it was keyed, or new ones of the relaid
+    operands, validated as the compile validates them.
+    """
+
+    if entry.verify_cin:
+        verify_cin_if_enabled(cin_stmt, True)
+    if handed_context is not None:
+        handed_context.cancel_stage(
+            handed_context.begin_stage(
+                CompilerStageId.FRONTEND_VALIDATED_OPERATION_CONSTRUCTION,
+                compile_options=options.options(),
+            )
+        )
+    if _checking_generated_kernel_hits():
+        compile_options = options.options()
+        rebuilt, _, _ = _compile_direct_cin(
+            cin_stmt,
+            result_shape,
+            tuple(snapshot.tensor for snapshot in snapshots),
+            compile_options,
+            CompilationContext(compile_options=compile_options),
+        )
+        _refuse_unlike_kept(key, entry, rebuilt)
+    args = tuple(snapshot.tensor for snapshot in snapshots)
+    aligned = _relayout_mode_order_args(
+        args,
+        entry.alignment_plan,
+        options,
+        handed_context,
+        snapshots=snapshots,
+    )
+    if any(new is not old for new, old in zip(aligned, args)):
+        return _snapshot_runtime_tensors(aligned, expected_count=len(snapshots))
+    return snapshots
+
+
+def lower_and_exec_cin(
+    cin_stmt: IndexStmt, result_shape: Sequence[int], *args: STensor, **kwargs
+) -> STensor:
+    """Lower a CIN statement to LLIR then codegen and call on the input tensors.
+
+    Low-level entry to the generic compiler path: aligns the operand mode orders to
+    the CIN loop order (``_align_mode_orders_to_loop_order``), lowers CIN -> LLIR ->
+    C++, JIT-loads the kernel, executes it on ``args``, and wraps the result as an
+    ``STensor``. This is the primitive the compiler gap tests use to drive the
+    pipeline directly; it is **not exported** — advanced users reach it as
+    ``scorch.ops.lower_and_exec_cin``. Most code should use :func:`matmul` or
+    :func:`einsum` instead.
+
+    The kernel is kept in the generated-kernel cache that the conversions and ``spmv``
+    use (``scorch.stensor._GENERATED_KERNELS``), keyed by the statement's structure,
+    the result shape, the operands' layouts and dtypes and the options key, all read
+    on every call (``_direct_cin_dispatch_key``).  A warm call lowers nothing and makes
+    no options snapshot and no compilation context; it still verifies the statement's
+    structure and validates every operand's arrays, as a cold call does.  With
+    ``SCORCH_CHECK_KERNEL_CACHE_HITS=1`` every hit also builds its kernel the full way
+    and raises ``GeneratedKernelCacheError`` when the two differ.
+
+    Parameters
+    ----------
+    cin_stmt : IndexStmt
+        CIN statement (index-notation AST) to lower.
+    result_shape : tuple[int, ...], list[int], torch.Size, or range
+        Physical shape of the result tensor. Extents must be exact,
+        nonnegative signed-64-bit integers and their product must fit in a
+        signed 64-bit integer.
+    *args : STensor
+        Input tensors, matched left-to-right against the RHS tensor accesses.
+    **kwargs
+        ``time_dict`` : dict, optional -- if given, ``time_dict["eval_time"]`` is
+        set to the kernel wall-clock time in seconds.
+
+    Returns
+    -------
+    STensor
+        Output tensor, in the format and mode order of the compiler-owned
+        result declaration, sparse or dense.  Its value dtype is the operands'
+        promoted dtype (``layout.common_value_dtype``, PyTorch's rule): the
+        dtype of the statement's result ``TensorVar`` is ignored and replaced.
+    """
+    # The options holder parses, validates and refuses as the snapshot it stands for
+    # did, in the same order: the options, a requested schedule, a context handed in.
+    options = _DeferredOptions(kwargs)
+    if options.requested_schedule is not None:
+        _reject_unsupported_requested_schedule(options.options(), "lower_and_exec_cin")
+    handed_context = kwargs.get("_compilation_context")
+    if handed_context is not None:
+        handed_context = _compilation_context_at_boundary(
+            handed_context, options.options()
+        )
+    key, snapshots, checked_shape = _direct_cin_dispatch_key(
+        cin_stmt, result_shape, args, options
+    )
+    entry = _kept_generated_kernel(key) if key is not None else None
+    if entry is not None:
+        runtime_args = _bind_direct_cin_hit(
+            cast(tuple, key),
+            entry,
+            cin_stmt,
+            cast(Tuple[int, ...], checked_shape),
+            cast(Tuple[_RuntimeTensorSnapshot, ...], snapshots),
+            options,
+            handed_context,
+        )
+        result_shape = cast(Tuple[int, ...], checked_shape)
+    else:
+        compile_options = options.options()
+        compilation_context = _compilation_context_from_kwargs(kwargs, compile_options)
+        entry, runtime_args, result_shape = _compile_direct_cin(
+            cin_stmt, result_shape, args, compile_options, compilation_context
+        )
+        if key is not None:
+            _keep_generated_kernel(key, entry, options)
+
+    module_args: List[Any] = [result_shape]
+
+    for snapshot in runtime_args:
+        module_args.append(snapshot.shape)
+        module_args.append(snapshot.native_mode_indices)
+        module_args.append(snapshot.values)
+
+    start_time = time.time()
+    try:
+        result_cpp = entry.module.evaluate(*module_args)
+    except RuntimeError as error:
+        raise_if_native_coded(error)
+        raise
+    end_time = time.time()
+    eval_time = end_time - start_time
+    if "time_dict" in kwargs:
+        kwargs["time_dict"]["eval_time"] = eval_time
+
     result = _wrap_generated_result(
         shape=tuple(result_shape),
-        tensor_format=result_format,
+        tensor_format=entry.result_format,
         result_cpp=result_cpp,
-        mode_order=result_mode_order,
+        mode_order=entry.result_mode_order,
     )
 
     return result

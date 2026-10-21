@@ -4,7 +4,17 @@ import os
 import weakref
 from collections.abc import Sequence
 from copy import deepcopy
-from typing import TYPE_CHECKING, Any, Callable, Dict, Optional, Tuple, Union, List
+from typing import (
+    TYPE_CHECKING,
+    Any,
+    Callable,
+    Dict,
+    List,
+    NamedTuple,
+    Optional,
+    Tuple,
+    Union,
+)
 
 import torch
 
@@ -879,7 +889,8 @@ def _is_directly_materialized_format(output_format: TensorFormat) -> bool:
 
 # --------------------------------------------------------------------------- #
 # The generated kernels of ``to_dense``, ``to_sparse``, ``change_mode_order``,
-# ``__add__`` and ``ops.spmv``, by everything their lowering reads.
+# ``__add__``, ``ops.spmv`` and ``ops.lower_and_exec_cin``, by everything their
+# lowering reads.
 #
 # Each of these used to build its CIN, lower it, emit the C++, hash the preamble and the
 # source and prepare a build request on every call, and only then find the module in the
@@ -897,9 +908,13 @@ def _is_directly_materialized_format(output_format: TensorFormat) -> bool:
 # - an entry is kept only when the options the kernel was built under still have that
 #   key (``still_reusable``), and a call that raises keeps nothing.
 #
-# An entry is the module alone.  Each entry point makes its own ``evaluate`` call and
-# builds its own result on a hit as on a miss, so the two paths cannot pass different
-# arguments, and nothing of an earlier call's operands is kept.  Like ``einsum``'s cache it
+# An entry is the module alone, except a direct CIN call's (``_DirectCINKernel``), which
+# also keeps the lowering's outputs its call reads: its result declaration and its
+# alignment plan.  Each entry point makes its own ``evaluate`` call and builds its own
+# result on a hit as on a miss, so the two paths cannot pass different arguments, and
+# nothing of an earlier call's operands is kept.  ``lower_and_exec_cin`` keeps its
+# entries through these rules but not through ``_generated_kernel``: its compile records
+# its normalization stage before its frontend stage, which that driver begins first.  Like ``einsum``'s cache it
 # has no bound: an entry is a key and a module the build cache holds anyway.
 _GENERATED_KERNELS: Dict[tuple, Any] = {}
 
@@ -1143,10 +1158,10 @@ def _generated_kernel(
 
     try:
         if key is not None:
-            module = _GENERATED_KERNELS.get(key)
+            module = _kept_generated_kernel(key)
             if module is not None:
                 compilation.cancel_frontend()
-                if _CHECK_GENERATED_KERNEL_HITS[0]:
+                if _checking_generated_kernel_hits():
                     _check_generated_kernel_hit(
                         key, module, options, build_cin, compile_cin
                     )
@@ -1163,9 +1178,34 @@ def _generated_kernel(
         raise
     compilation_context.complete_stage(frontend_token)
     module = compile_cin(cin_stmt, options.options(), compilation_context)
-    if key is not None and options.still_reusable():
-        _GENERATED_KERNELS[key] = module
+    if key is not None:
+        _keep_generated_kernel(key, module, options)
     return module
+
+
+# The store's three operations, for every entry point that keeps a kernel in it.  They
+# read the module's names when they run, so a test that replaces the store or the
+# check cell reaches every entry point, ``ops.lower_and_exec_cin`` included.
+
+
+def _kept_generated_kernel(key: tuple) -> Any:
+    """The entry kept under ``key``, or None."""
+
+    return _GENERATED_KERNELS.get(key)
+
+
+def _keep_generated_kernel(key: tuple, entry: Any, options: "_DeferredOptions") -> None:
+    """Keep ``entry`` under ``key`` when the options it was built under still have the
+    key's options part (``still_reusable``)."""
+
+    if options.still_reusable():
+        _GENERATED_KERNELS[key] = entry
+
+
+def _checking_generated_kernel_hits() -> bool:
+    """Whether every hit also builds its kernel the full way and compares the two."""
+
+    return bool(_CHECK_GENERATED_KERNEL_HITS[0])
 
 
 def _check_generated_kernel_hit(
@@ -1199,14 +1239,64 @@ def _check_generated_kernel_hit(
         raise
     compilation_context.complete_stage(frontend_token)
     built = compile_cin(cin_stmt, compile_options, compilation_context)
-    if built is module:
+    _refuse_unlike_kept(key, module, built)
+
+
+class _DirectCINKernel(NamedTuple):
+    """The entry ``scorch.ops.lower_and_exec_cin`` keeps: its module and what else its
+    call reads from the lowering.
+
+    The other entries of the store are a module alone, because their result format is
+    one of their key's inputs.  A direct CIN call's result format and mode order are
+    the lowering's result declaration, and its operands' relayouts follow the alignment
+    plan made from the statement, so a hit takes those from here.  ``verify_cin`` is the
+    verification policy the kernel was built under, which the options key covers: a hit
+    under a policy that verifies runs the verification its miss ran.
+    """
+
+    module: Any
+    result_format: TensorFormat
+    result_mode_order: Optional[Tuple[int, ...]]
+    alignment_plan: Tuple[
+        Tuple[Optional[Tuple[int, ...]], ...], Optional[Tuple[int, ...]]
+    ]
+    verify_cin: bool
+
+
+def _kept_kernel_identity(kept: Any) -> tuple:
+    """What a kept entry and the entry its call builds must share.
+
+    A module's name and shared-object path (see ``_check_generated_kernel_hit``); for a
+    direct CIN entry, its module's and then every lowering output it keeps.
+    """
+
+    module = kept.module if type(kept) is _DirectCINKernel else kept
+    identity: tuple = (
+        getattr(module, "__name__", None),
+        getattr(module, "__file__", None),
+    )
+    if type(kept) is _DirectCINKernel:
+        identity += (
+            kept.result_format,
+            kept.result_mode_order,
+            kept.alignment_plan,
+            kept.verify_cin,
+        )
+    return identity
+
+
+def _refuse_unlike_kept(key: tuple, kept: Any, built: Any) -> None:
+    """Raise ``GeneratedKernelCacheError`` unless ``built`` is the entry kept under
+    ``key``: the same object, or one with the same identity and a named module."""
+
+    if built is kept:
         return
-    kept = (getattr(module, "__name__", None), getattr(module, "__file__", None))
-    rebuilt = (getattr(built, "__name__", None), getattr(built, "__file__", None))
-    if kept != rebuilt or None in kept:
+    kept_identity = _kept_kernel_identity(kept)
+    rebuilt_identity = _kept_kernel_identity(built)
+    if kept_identity != rebuilt_identity or None in kept_identity[:2]:
         raise GeneratedKernelCacheError(
-            f"the kernel kept under {key!r} is {kept!r}, but its call builds "
-            f"{rebuilt!r}"
+            f"the kernel kept under {key!r} is {kept_identity!r}, but its call builds "
+            f"{rebuilt_identity!r}"
         )
 
 

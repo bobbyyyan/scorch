@@ -400,10 +400,11 @@ class GeneratedKernelCacheError(ScorchError, RuntimeError):
 
     Raised only with ``SCORCH_CHECK_KERNEL_CACHE_HITS=1`` (or the cell
     ``scorch.stensor._CHECK_GENERATED_KERNEL_HITS``), under which every hit of the
-    conversion, addition and SpMV kernel cache also builds its kernel the full way
-    and compares the two kernels (name and shared-object path).  A difference means
-    the cache key left out something the lowering or the build reads.  ``code``
-    names the defect.
+    conversion, addition, SpMV and direct CIN (``ops.lower_and_exec_cin``) kernel
+    cache also builds its kernel the full way and compares the two kernels (name and
+    shared-object path, and for a direct CIN call the result declaration and the
+    alignment plan it keeps beside its kernel).  A difference means the cache key left
+    out something the lowering or the build reads.  ``code`` names the defect.
     """
 
     code = "kept_kernel_differs_from_built"
