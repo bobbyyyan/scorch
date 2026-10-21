@@ -147,7 +147,8 @@ Tensor spmm_csr_v2_binding(std::vector<int64_t> result_shape, std::vector<int64_
 // A torch CSR operand's product as the C entry point makes it without a plan
 // (planned_matmul_torch_ordinary): the call execute_prebuilt_binary_kernel makes for it -- the
 // operand's member arrays, B flattened, the default tile, the composition hints -- and the result
-// as ops.matmul returns it.
+// as ops.matmul returns it: the kernel's own [rows, k] product (spmm.h allocates it in that
+// shape), not a view, as a plan's product is.
 template <typename scalar_t>
 torch::Tensor spmm_csr_v2_ordinary(const torch::Tensor& positions,
                                    const torch::Tensor& coordinates,
@@ -158,7 +159,7 @@ torch::Tensor spmm_csr_v2_ordinary(const torch::Tensor& positions,
   Tensor c = spmm_csr_v2_binding<scalar_t>(
       {rows, k}, {rows, cols}, {{}, {positions, coordinates}}, values, {cols, k}, {{}, {}},
       b.reshape(-1), kSpmmV2DefaultTile, static_cast<int>(nthreads), atparallel);
-  return c.storage.value.reshape({rows, k});
+  return std::move(c.storage.value);
 }
 
 void bind_binary_kernel(py::module_& m, const char* name, BinaryKernelFn fn,

@@ -114,6 +114,45 @@ def _transposed_layout(t: torch.Tensor) -> bool:
     return t.dim() == 2 and not t.is_contiguous() and t.t().is_contiguous()
 
 
+# Function outputs are never views, and neither is the product a caller receives.  torch
+# makes an input that a custom Function returns as-is into a view created inside the
+# Function, and treats a view of anything the forward computed the same way, and a view of
+# such a view too.  It then refuses an in-place operation on the output in grad mode
+# (``relu_`` after a product, as ``nn.ReLU(inplace=True)`` does), and refuses the output's
+# ``grad_fn`` once the output or its base has been written in place under ``no_grad`` (an
+# optimizer step).  torch.matmul's product is never a view.  So each product is a tensor of
+# its own where it is made, and nothing on its way to the caller makes a view of it:
+# - the SpMM kernels allocate the [rows, k] product itself (csrc/spmm.h, the note on the v2
+#   core's output), so the product ``matmul``, a plan or the C entry returns is the kernel's
+#   own tensor, and a Function returns it as it is;
+# - ``_in_layout`` restrides its transpose's fresh copy in place (``t_``, the one call ``t``
+#   was), and ``_x_at_a`` makes ``x @ A`` from ``A^T @ x^T``'s product the same way, so
+#   ``x @ A`` is the output of a Function of its own (``_SparseXA``), not a transpose of one;
+# - a vector is the one-column matrix the kernels take inside ``_Operand``, which returns
+#   the product's column squeezed and ``.detach()``ed: a new tensor over the same memory
+#   with the same version counter, which is not a view.  Neither copies anything;
+# - ``_NotDifferentiable`` returns its input's ``.detach()``, which is cheaper than returning
+#   the input itself, which torch answers by making a view of it.
+# So a matrix product's forward and backward make the calls they made before this rule, and
+# no more: each step of a training loop pays for it, not only a new operand's first call.
+# A forward that also saves its result saves that same tensor.  csrc/planned_matmul.h's
+# Functions follow the same rule.
+
+
+def _x_at_a(product: torch.Tensor, transposed: bool) -> torch.Tensor:
+    """``x @ A`` from the product ``A^T @ b`` for ``b = x^T``, not a view.
+
+    For a transposed ``b`` (a contiguous ``x``), ``_transpose``'s copy of the product, which
+    is ``x @ A`` contiguous, as torch's is; otherwise, or where ``_transpose`` makes no copy
+    (a product with one row or column), the product itself restrided in place (``t_``).
+    """
+    if transposed:
+        laid = _transpose(product)
+        if laid._base is None:
+            return laid
+    return product.t_()
+
+
 def _in_layout(result: torch.Tensor, transposed: bool) -> torch.Tensor:
     """A contiguous ``result`` in the layout of the dense operand it came from.
 
@@ -122,8 +161,15 @@ def _in_layout(result: torch.Tensor, transposed: bool) -> torch.Tensor:
     transpose of a contiguous matrix makes the ``x @ A`` the caller receives contiguous, as
     torch's is, and makes ``x``'s gradient contiguous, which is the layout autograd
     accumulates into a contiguous ``x.grad`` without another copy.
+
+    The transposed layout is ``_transpose``'s fresh copy restrided in place, which is not a
+    view.  Where ``_transpose`` makes no copy (a matrix with one row or column, or a result
+    already in that layout), ``result`` is already laid out so and is returned as it is.
     """
-    return _transpose(result).t() if transposed else result
+    if not transposed:
+        return result
+    laid = _transpose(result)
+    return laid.t_() if laid._base is None else result
 
 
 def _stamp(t: torch.Tensor) -> _Stamp:
@@ -416,7 +462,11 @@ class _Operand:
         )
 
     def mm(self, values: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
-        """``A @ b``."""
+        """``A @ b``, for a dense matrix or vector ``b``. A vector is the one-column matrix
+        the kernels take, and its product the column as a vector, which is not a view (see
+        the note above ``_x_at_a``)."""
+        if b.ndim == 1:
+            return self.mm(values, b.unsqueeze(1)).squeeze(1).detach()
         if self.direct and self._owns(values):
             return _matmul(self.owner, _plain(b))
         values = self.stored.canonical(values)
@@ -428,11 +478,14 @@ class _Operand:
     def mm_t(
         self, values: torch.Tensor, b: torch.Tensor, right: bool = False
     ) -> torch.Tensor:
-        """``A^T @ b``. ``right`` when it is computed as ``x @ A`` with ``b = x^T``: for a torch
-        CSR operand the product then records itself for the C entry (``_Structure.mm``),
-        unless the structure is not the operand's own (``_Structure.destination``): the C
-        entry gathers the operand's values through ``perm`` and would not sum them first.
+        """``A^T @ b``, for a dense matrix or vector ``b`` (a vector as in ``mm``). ``right``
+        when it is computed as ``x @ A`` with ``b = x^T``: for a torch CSR operand the product
+        then records itself for the C entry (``_Structure.mm``), unless the structure is not
+        the operand's own (``_Structure.destination``): the C entry gathers the operand's
+        values through ``perm`` and would not sum them first.
         """
+        if b.ndim == 1:
+            return self.mm_t(values, b.unsqueeze(1), right).squeeze(1).detach()
         values = self.stored.canonical(values)
         if self.transposed:
             return self.stored.mm(values, b)
@@ -447,7 +500,12 @@ class _Operand:
         return structure.mm(values, b, perm, owner)
 
     def sddmm(self, x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
-        """``x[i, :] . y[j, :]`` for each stored ``A[i, j]``, in storage order."""
+        """``x[i, :] . y[j, :]`` for each stored ``A[i, j]``, in storage order; a vector ``x``
+        or ``y`` is a column (a matrix x vector product's values gradient)."""
+        if x.ndim == 1:
+            x = x.unsqueeze(1)
+        if y.ndim == 1:
+            y = y.unsqueeze(1)
         if self.transposed:
             return self.stored.sddmm(y, x)
         return self.stored.sddmm(x, y)
@@ -488,13 +546,14 @@ def _add(
 
 
 class _SparseMM(torch.autograd.Function):
-    """``A(values) @ b``."""
+    """``A(values) @ b``, for a dense matrix or vector ``b``."""
 
     @staticmethod
     def forward(
         ctx: Any, op: _Operand, values: torch.Tensor, b: torch.Tensor
     ) -> torch.Tensor:
         _record(ctx, op, values, b)
+        # not a view: see the note above _x_at_a
         return _in_layout(op.mm(values, b), ctx.b_transposed)
 
     @staticmethod
@@ -529,7 +588,7 @@ def _mm_backward(
     """The gradients of ``A(values) @ b`` given the output's gradient ``g``: of the values,
     ``SDDMM(g, b)``, and of ``b``, ``A^T @ g``. Under grad mode (a backward asked to build
     its own graph) each is recorded as the Function computing it, so the set is closed
-    under differentiation."""
+    under differentiation. ``b`` and ``g`` are vectors for a matrix x vector product."""
     graph = torch.is_grad_enabled()
     gv = gb = None
     if want_values:
@@ -622,7 +681,9 @@ def planned_mm_t_backward(
     """The backward of ``x @ A`` for a torch CSR ``a`` whose product the C entry point served
     and recorded itself (csrc/planned_matmul.h, PlannedMatmulGradT): :class:`_SparseMMT`'s
     gradients by the same code. ``b`` is ``x^T``, and ``b_transposed`` whether it is laid out
-    as the transpose of a contiguous matrix, as ``_SparseMMT`` records it."""
+    as the transpose of a contiguous matrix, as ``_SparseMMT`` records it; ``g`` is the gradient
+    of ``A^T @ b``, which the node passes as the transpose of ``x @ A``'s, as
+    ``_SparseMMT.backward`` does."""
     held = _torch_operand(a)
     if held is None:  # unreachable: the C entry serves only 2-D torch CSR operands
         raise RuntimeError(
@@ -632,13 +693,14 @@ def planned_mm_t_backward(
 
 
 class _SparseMMT(torch.autograd.Function):
-    """``A(values)^T @ b``."""
+    """``A(values)^T @ b``, for a dense matrix or vector ``b``."""
 
     @staticmethod
     def forward(
         ctx: Any, op: _Operand, values: torch.Tensor, b: torch.Tensor
     ) -> torch.Tensor:
         _record(ctx, op, values, b)
+        # not a view: see the note above _x_at_a
         return _in_layout(op.mm_t(values, b, right=True), ctx.b_transposed)
 
     @staticmethod
@@ -661,6 +723,41 @@ class _SparseMMT(torch.autograd.Function):
         return _in_layout(total, ctx.b_transposed)
 
 
+class _SparseXA(torch.autograd.Function):
+    """``x @ A(values)`` for a dense matrix ``x``, given ``b = x^T``: computed as
+    ``A^T @ b`` and returned as ``x @ A`` itself (``_x_at_a``), so the caller receives this
+    Function's output and not a transpose of it (see the note above ``_x_at_a``). A Function
+    of its own rather than a flag on ``_SparseMMT``: an argument more costs torch's ``apply``
+    work on every call."""
+
+    @staticmethod
+    def forward(
+        ctx: Any, op: _Operand, values: torch.Tensor, b: torch.Tensor
+    ) -> torch.Tensor:
+        _record(ctx, op, values, b)
+        return _x_at_a(op.mm_t(values, b, right=True), ctx.b_transposed)
+
+    @staticmethod
+    def backward(ctx: Any, g: torch.Tensor):
+        values, b = ctx.saved_tensors
+        need = ctx.needs_input_grad
+        # x @ A's gradient is that of A^T @ x^T, transposed
+        return (None,) + _mm_t_backward(
+            ctx.op, values, b, g.t(), need[1], need[2], ctx.b_transposed
+        )
+
+    @staticmethod
+    def jvp(ctx: Any, _op: Any, dv: Optional[torch.Tensor], db: Optional[torch.Tensor]):
+        values, b = ctx.saved_tensors
+        op = ctx.op
+        total = _add(
+            op.mm_t(dv, b) if dv is not None else None,
+            op.mm_t(values, db) if db is not None else None,
+        )
+        assert total is not None  # forward AD asks for this only with some tangent
+        return _x_at_a(total, ctx.b_transposed)
+
+
 class _SparseSDDMM(torch.autograd.Function):
     """``out[q] = x[i, :] . y[j, :]`` for each stored ``A[i, j]``."""
 
@@ -670,6 +767,8 @@ class _SparseSDDMM(torch.autograd.Function):
     ) -> torch.Tensor:
         ctx.x_transposed = _transposed_layout(x)
         _record(ctx, op, x, y)
+        # A native allocation, or its advanced-index gather (a copy): never a view.  x and y
+        # are vectors for a matrix x vector product's values gradient (_Operand.sddmm).
         return op.sddmm(x, y)
 
     @staticmethod
@@ -947,14 +1046,15 @@ def _differentiable(a: Any, b: Any) -> Optional[torch.Tensor]:
     if covered is None:
         return None
     left, op, values, dense = covered
+    # Each Function returns the product as the caller receives it (see the note above
+    # _x_at_a).
     if left:
-        if dense.dim() == 1:
-            return _SparseMM.apply(op, values, dense.unsqueeze(1)).squeeze(1)
         return _SparseMM.apply(op, values, dense)
-    # x @ A = (A^T @ x^T)^T
+    # v @ A = A^T @ v
     if dense.dim() == 1:
-        return _SparseMMT.apply(op, values, dense.unsqueeze(1)).squeeze(1)
-    return _SparseMMT.apply(op, values, dense.t()).t()
+        return _SparseMMT.apply(op, values, dense)
+    # x @ A = (A^T @ x^T)^T
+    return _SparseXA.apply(op, values, dense.t())
 
 
 def right_product(a: Any, b: Any) -> Optional[torch.Tensor]:
@@ -967,9 +1067,9 @@ def right_product(a: Any, b: Any) -> Optional[torch.Tensor]:
         return None
     _, op, values, x = covered
     if x.dim() == 1:
-        return op.mm_t(values, x.unsqueeze(1)).squeeze(1)
+        return op.mm_t(values, x)
     xt = x.t()
-    return _in_layout(op.mm_t(values, xt, right=True), _transposed_layout(xt)).t()
+    return _x_at_a(op.mm_t(values, xt, right=True), _transposed_layout(xt))
 
 
 class _NotDifferentiable(torch.autograd.Function):
@@ -980,7 +1080,7 @@ class _NotDifferentiable(torch.autograd.Function):
         ctx: Any, result: torch.Tensor, what: str, *inputs: torch.Tensor
     ) -> torch.Tensor:
         ctx.what = what
-        return result
+        return result.detach()  # not ``result`` itself: see the note above _x_at_a
 
     @staticmethod
     def backward(ctx: Any, *grads: torch.Tensor):

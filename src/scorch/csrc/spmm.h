@@ -111,9 +111,8 @@ Tensor spmm_csr_bias_act(std::vector<int> result_shape, std::vector<int> A_shape
   scalar_t* SCORCH_RESTRICT B_val = B_values.data_ptr<scalar_t>();
   scalar_t* SCORCH_RESTRICT bias_val = bias_values.data_ptr<scalar_t>();
 
-  int C_capacity = C0_size * C1_size;
   torch::Tensor C_values_torch = torch::empty(
-      {(long long)C_capacity}, scorch_torch_dtype<scalar_t>());
+      {(long long)C0_size, (long long)C1_size}, scorch_torch_dtype<scalar_t>());
   scalar_t* SCORCH_RESTRICT C_values =
       C_values_torch.data_ptr<scalar_t>();
 
@@ -191,7 +190,7 @@ torch::Tensor spmm_csr_typed_core(
   // Initialize result value array
   int C_capacity = C0_size * C1_size;
   torch::Tensor C_values_torch = torch::empty(
-      {(long long)C_capacity}, scorch_torch_dtype<scalar_t>());
+      {(long long)C0_size, (long long)C1_size}, scorch_torch_dtype<scalar_t>());
   scalar_t* SCORCH_RESTRICT C_values =
       C_values_torch.data_ptr<scalar_t>();
   memset(C_values, 0, sizeof(scalar_t) * C_capacity);
@@ -295,7 +294,7 @@ Tensor spmm_csr_float_untiled(std::vector<int> result_shape, std::vector<int> A_
   // Initialize result value array - use size_t to avoid integer overflow
   size_t C_capacity = (size_t)C0_size * (size_t)C1_size;
   torch::Tensor C_values_torch =
-      torch::empty({(long long)C_capacity}, torch::kFloat32);
+      torch::empty({(long long)C0_size, (long long)C1_size}, torch::kFloat32);
   float* SCORCH_RESTRICT C_values = C_values_torch.data_ptr<float>();
   memset(C_values, 0, sizeof(float) * C_capacity);
 
@@ -358,7 +357,7 @@ Tensor spmm_coo_float(std::vector<int> result_shape,
   // Initialize result value array
   int C_capacity = C0_size * C1_size;
   torch::Tensor C_values_torch =
-      torch::empty({(long long)C_capacity}, torch::kFloat32);
+      torch::empty({(long long)C0_size, (long long)C1_size}, torch::kFloat32);
   float* C_values = C_values_torch.data_ptr<float>();
   memset(C_values, 0, sizeof(float) * C_capacity);
 
@@ -479,7 +478,7 @@ Tensor spmm_csr_float_optimized(std::vector<int> result_shape, std::vector<int> 
   // Initialize result value array
   int C_capacity = C0_size * C1_size;
   torch::Tensor C_values_torch =
-      torch::empty({(long long)C_capacity}, torch::kFloat32);
+      torch::empty({(long long)C0_size, (long long)C1_size}, torch::kFloat32);
   float* SCORCH_RESTRICT C_values = C_values_torch.data_ptr<float>();
   memset(C_values, 0, sizeof(float) * C_capacity);
 
@@ -585,7 +584,7 @@ Tensor spmm_csr_float_turbo(std::vector<int> result_shape, std::vector<int> A_sh
   // Initialize result value array
   int C_capacity = C0_size * C1_size;
   torch::Tensor C_values_torch =
-      torch::empty({(long long)C_capacity}, torch::kFloat32);
+      torch::empty({(long long)C0_size, (long long)C1_size}, torch::kFloat32);
   float* SCORCH_RESTRICT C_values = C_values_torch.data_ptr<float>();
   memset(C_values, 0, sizeof(float) * C_capacity);
 
@@ -724,7 +723,7 @@ Tensor spmm_csr_float_ultra(std::vector<int> result_shape, std::vector<int> A_sh
   }
 
   torch::Tensor C_values_torch =
-      torch::empty({(long long)C_capacity}, torch::kFloat32);
+      torch::empty({(long long)C0_size, (long long)C1_size}, torch::kFloat32);
   float* SCORCH_RESTRICT C_values = C_values_torch.data_ptr<float>();
   memset(C_values, 0, allocation_size);
 
@@ -943,7 +942,7 @@ Tensor spmm_csr_float_apex(std::vector<int> result_shape, std::vector<int> A_sha
   // Initialize result value array
   int C_capacity = C0_size * C1_size;
   torch::Tensor C_values_torch =
-      torch::empty({(long long)C_capacity}, torch::kFloat32);
+      torch::empty({(long long)C0_size, (long long)C1_size}, torch::kFloat32);
   float* SCORCH_RESTRICT C_values = C_values_torch.data_ptr<float>();
   memset(C_values, 0, sizeof(float) * C_capacity);
 
@@ -1152,7 +1151,7 @@ Tensor spmm_csr_float_tiled_i_k(std::vector<int> result_shape, std::vector<int> 
   // Initialize result value array - use size_t to avoid integer overflow
   size_t C_capacity = (size_t)C0_size * (size_t)C1_size;
   torch::Tensor C_values_torch =
-      torch::empty({(long long)C_capacity}, torch::kFloat32);
+      torch::empty({(long long)C0_size, (long long)C1_size}, torch::kFloat32);
   float* SCORCH_RESTRICT C_values = C_values_torch.data_ptr<float>();
   memset(C_values, 0, sizeof(float) * C_capacity);
 
@@ -1286,7 +1285,7 @@ Tensor spmm_csr_float_direct(std::vector<int> result_shape, std::vector<int> A_s
 
   size_t C_capacity = (size_t)C0_size * (size_t)C1_size;
   torch::Tensor C_values_torch =
-      torch::empty({(long long)C_capacity}, torch::kFloat32);
+      torch::empty({(long long)C0_size, (long long)C1_size}, torch::kFloat32);
   float* SCORCH_RESTRICT C_values = C_values_torch.data_ptr<float>();
   memset(C_values, 0, sizeof(float) * C_capacity);
 
@@ -1361,7 +1360,7 @@ Tensor spmm_csr_float_neon(std::vector<int> result_shape, std::vector<int> A_sha
 
   size_t C_capacity = (size_t)C0_size * (size_t)C1_size;
   torch::Tensor C_values_torch =
-      torch::empty({(long long)C_capacity}, torch::kFloat32);
+      torch::empty({(long long)C0_size, (long long)C1_size}, torch::kFloat32);
   float* SCORCH_RESTRICT C_values = C_values_torch.data_ptr<float>();
   memset(C_values, 0, sizeof(float) * C_capacity);
 
@@ -1471,7 +1470,7 @@ Tensor spmm_csr_float_row_panel(std::vector<int> result_shape, std::vector<int> 
 
   size_t C_capacity = (size_t)C0_size * (size_t)C1_size;
   torch::Tensor C_values_torch =
-      torch::empty({(long long)C_capacity}, torch::kFloat32);
+      torch::empty({(long long)C0_size, (long long)C1_size}, torch::kFloat32);
   float* SCORCH_RESTRICT C_values = C_values_torch.data_ptr<float>();
   memset(C_values, 0, sizeof(float) * C_capacity);
 
@@ -1606,7 +1605,7 @@ Tensor spmm_csr_float_k_parallel(std::vector<int> result_shape, std::vector<int>
 
   size_t C_capacity = (size_t)C0_size * (size_t)C1_size;
   torch::Tensor C_values_torch =
-      torch::empty({(long long)C_capacity}, torch::kFloat32);
+      torch::empty({(long long)C0_size, (long long)C1_size}, torch::kFloat32);
   float* SCORCH_RESTRICT C_values = C_values_torch.data_ptr<float>();
   memset(C_values, 0, sizeof(float) * C_capacity);
 
@@ -1675,7 +1674,7 @@ Tensor spmm_csr_float_sorted_rows(std::vector<int> result_shape, std::vector<int
 
   size_t C_capacity = (size_t)C0_size * (size_t)C1_size;
   torch::Tensor C_values_torch =
-      torch::empty({(long long)C_capacity}, torch::kFloat32);
+      torch::empty({(long long)C0_size, (long long)C1_size}, torch::kFloat32);
   float* SCORCH_RESTRICT C_values = C_values_torch.data_ptr<float>();
   memset(C_values, 0, sizeof(float) * C_capacity);
 
@@ -1797,7 +1796,7 @@ Tensor spmm_csr_float_neon2(std::vector<int> result_shape, std::vector<int> A_sh
 
   size_t C_capacity = (size_t)C0_size * (size_t)C1_size;
   torch::Tensor C_values_torch =
-      torch::empty({(long long)C_capacity}, torch::kFloat32);
+      torch::empty({(long long)C0_size, (long long)C1_size}, torch::kFloat32);
   float* SCORCH_RESTRICT C_values = C_values_torch.data_ptr<float>();
   memset(C_values, 0, sizeof(float) * C_capacity);
 
@@ -1937,7 +1936,7 @@ Tensor spmm_csr_float_neon4(std::vector<int> result_shape, std::vector<int> A_sh
 
   size_t C_capacity = (size_t)C0_size * (size_t)C1_size;
   torch::Tensor C_values_torch =
-      torch::empty({(long long)C_capacity}, torch::kFloat32);
+      torch::empty({(long long)C0_size, (long long)C1_size}, torch::kFloat32);
   float* SCORCH_RESTRICT C_values = C_values_torch.data_ptr<float>();
   memset(C_values, 0, sizeof(float) * C_capacity);
 
@@ -4324,9 +4323,17 @@ torch::Tensor spmm_csr_v2_core(
   // zeroed is a performance question, settled below; correctness does not depend
   // on it, since a non-empty row is fully overwritten by the kernel and every
   // empty row is zeroed exactly once.
+  //
+  // The buffer is allocated as the [C0_size, C1_size] matrix it holds, as every dense
+  // SpMM product in this file is, so it reaches the caller in its final shape and as a
+  // tensor of its own. Nothing gives it its shape afterwards: a flat buffer took a
+  // `resize_` or a `view` on every new operand, in Python or in plan.h, and a view of a
+  // tensor made inside a custom autograd Function's forward refuses in-place writes in
+  // grad mode. The memory and the writes are the same either way.
   torch::Tensor C_values_torch =
       INTO ? torch::Tensor()
-           : torch::empty({(long long)C_capacity}, scorch_torch_dtype<scalar_t>());
+           : torch::empty({(long long)C0_size, (long long)C1_size},
+                          scorch_torch_dtype<scalar_t>());
   scalar_t* SCORCH_RESTRICT C_values =
       INTO ? scorch_panel_out<scalar_t>(wide_rows) : C_values_torch.data_ptr<scalar_t>();
   bool zero_empty_only = true;
@@ -6935,11 +6942,11 @@ torch::Tensor spmm_csr_float_tilej_core(
                 const float* SCORCH_RESTRICT A_val,
                 int J, int N, const float* SCORCH_RESTRICT B_val,
                 int Jc, int nthreads_override) {
-  const size_t C_capacity = (size_t)C0_size * (size_t)C1_size;
   // tile-j accumulates across panels, so C starts zeroed. torch::zeros gets a
   // clean buffer from the same allocator MKL uses (the O(rows) empty-only trick
   // v2 uses does not apply here — every row is +='d across panels).
-  torch::Tensor C_values_torch = torch::zeros({(long long)C_capacity}, torch::kFloat32);
+  torch::Tensor C_values_torch =
+      torch::zeros({(long long)C0_size, (long long)C1_size}, torch::kFloat32);
   float* SCORCH_RESTRICT C_values = C_values_torch.data_ptr<float>();
 
   // Panel width. Guard degenerate inputs -> single full-width panel.
@@ -7067,11 +7074,11 @@ torch::Tensor spmm_csr_float_tileijk_core(
                 const float* SCORCH_RESTRICT A_val,
                 int J, const float* SCORCH_RESTRICT B_val,
                 int Nc, int Jc, int nthreads_override) {
-  const size_t C_capacity = (size_t)C0_size * (size_t)N;
   // Every C entry is written exactly once (Cp is zeroed per strip and copied to C
   // in full, so empty A-rows and any tail rows C0>A0 land as 0), so torch::empty
   // (the MKL-comparable allocator) suffices — no pre-zero of C needed.
-  torch::Tensor C_values_torch = torch::empty({(long long)C_capacity}, torch::kFloat32);
+  torch::Tensor C_values_torch =
+      torch::empty({(long long)C0_size, (long long)N}, torch::kFloat32);
   float* SCORCH_RESTRICT C_values = C_values_torch.data_ptr<float>();
 
   // Panel/strip widths. Guard degenerate inputs.
@@ -7358,14 +7365,13 @@ Tensor spmm_csr_linear_fused_float(std::vector<int> result_shape,
   const float* SCORCH_RESTRICT B_val = B_values.data_ptr<float>();
   const float* SCORCH_RESTRICT bias_val = bias_values.data_ptr<float>();
 
-  const size_t C_capacity = (size_t)C0_size * (size_t)C1_size;
-
   // Output allocation. Every output row in [0, A0_size) is FULLY written by the
   // worker below (empty channels -> act(bias); non-empty -> regtile + epilogue),
   // so no pre-zeroing pass is needed. Allocate via torch::empty (same CPU
   // allocator MKL's output uses -> apples-to-apples). A tail C0_size>A0_size
   // (never happens for a Linear layer, where out==A0_size) is zeroed for safety.
-  torch::Tensor C_values_torch = torch::empty({(long long)C_capacity}, torch::kFloat32);
+  torch::Tensor C_values_torch =
+      torch::empty({(long long)C0_size, (long long)C1_size}, torch::kFloat32);
   float* SCORCH_RESTRICT C_values = C_values_torch.data_ptr<float>();
   if (C0_size > A0_size)
     memset(C_values + (size_t)A0_size * (size_t)C1_size, 0,
@@ -8164,7 +8170,7 @@ Tensor spmm_csr_float_tiled_neon(std::vector<int> result_shape, std::vector<int>
 
   size_t C_capacity = (size_t)C0_size * (size_t)C1_size;
   torch::Tensor C_values_torch =
-      torch::empty({(long long)C_capacity}, torch::kFloat32);
+      torch::empty({(long long)C0_size, (long long)C1_size}, torch::kFloat32);
   float* SCORCH_RESTRICT C_values = C_values_torch.data_ptr<float>();
   memset(C_values, 0, sizeof(float) * C_capacity);
 

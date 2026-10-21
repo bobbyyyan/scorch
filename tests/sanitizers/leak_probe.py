@@ -69,7 +69,8 @@ try:
 finally:
     lsan_disable()
 
-expected = torch.stack((2 * b_values_2d[0], 3 * b_values_2d[2])).reshape(-1)
+# the [2, width] product itself: the kernel allocates it in that shape (spmm.h)
+expected = torch.stack((2 * b_values_2d[0], 3 * b_values_2d[2]))
 if not torch.equal(result.storage.value, expected):
     raise SystemExit("native COO SpMM returned an incorrect result")
 

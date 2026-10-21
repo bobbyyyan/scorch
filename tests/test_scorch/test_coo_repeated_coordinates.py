@@ -382,11 +382,11 @@ def test_the_prebuilt_coo_spmm_refuses_a_repeat_written_after_a_valid_call(exten
     a, _, _ = coo_operand((rows, cols), seed=8, dtype=torch.float32)
     dense = torch.rand(cols, 5, generator=torch.Generator().manual_seed(9))
     b = STensor.from_torch(dense)
-    result_cpp, shape = execute_prebuilt_binary_kernel(scorch_ops.spmm_coo_float, a, b)
-    result = ops._wrap_generated_result(
-        shape=shape, tensor_format="dd", result_cpp=result_cpp
-    )
-    close(logical_dense(result), logical_dense(a) @ dense.to(F64), torch.float32)
+    result_cpp, _ = execute_prebuilt_binary_kernel(scorch_ops.spmm_coo_float, a, b)
+    # the [rows, 5] product itself: the kernel allocates it in that shape (spmm.h)
+    product = result_cpp.storage.value
+    assert tuple(product.shape) == (rows, 5) and product._base is None
+    close(product, logical_dense(a) @ dense.to(F64), torch.float32)
     coordinate, position = write_repeat_in_place(a)
     with pytest.raises(RepeatedCoordinateError) as caught:
         execute_prebuilt_binary_kernel(scorch_ops.spmm_coo_float, a, b)

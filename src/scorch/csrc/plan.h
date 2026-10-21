@@ -381,7 +381,7 @@ class SpmmCsrPlan {
     }
     ++served_;
     ++team_fills_;
-    return out.view({rows_, free_dim_});
+    return out;
   }
 
  private:
@@ -441,11 +441,10 @@ class SpmmCsrPlan {
         return c10::nullopt;
     }
     ++served_;
-    // The kernels return a flat contiguous [rows * free_dim] buffer; the
-    // ordinary path reshapes it to 2-D in Python. Do it here, so the caller
-    // returns what `run` hands back with no further work. `view` cannot copy:
-    // the buffer was just allocated contiguous.
-    return values.view({rows_, free_dim_});
+    // The kernels allocate the [rows, free_dim] product itself (spmm.h, the note on the v2
+    // core's output), so the caller returns what `run` hands back with no further work, and
+    // it is not a view.
+    return values;
   }
 
   // Whether `run` would serve this call: `run`'s own checks, for run_gathered. `run` keeps them

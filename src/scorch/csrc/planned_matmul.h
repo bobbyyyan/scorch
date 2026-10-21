@@ -769,7 +769,11 @@ struct PlannedMatmulGrad : public torch::autograd::Function<PlannedMatmulGrad> {
     // values, the values' gradient reads b, and b can be a large activation.
     ctx->save_for_backward({b.requires_grad() ? values : at::Tensor(),
                             values.requires_grad() ? b : at::Tensor()});
-    return std::move(product.out);
+    // Never a view: see the note above autograd.py's _x_at_a. The kernel allocates the product as
+    // the [rows, k] matrix it is (csrc/spmm.h), so `out` is a tensor of its own; it is detached
+    // only if it ever arrives as a view.
+    at::Tensor out = std::move(product.out);
+    return out.is_view() ? out.detach() : out;
   }
 
   static torch::autograd::variable_list backward(torch::autograd::AutogradContext* ctx,
@@ -844,9 +848,10 @@ inline PyObject* planned_matmul_torch_grad(const PlannedMatmul& s, PyObject* a, 
       PlannedMatmulGrad::apply(values, bt, PlannedMatmulProduct{at_a, std::move(*served)}));
 }
 
-// x @ A's recorded product, as autograd._SparseMMT records it: A(values)^T @ b with b = x^T, whose
-// output the caller receives transposed. Its backward is autograd.planned_mm_t_backward, the same
-// gradients by the same code as _SparseMMT's.
+// x @ A's recorded product, as autograd._SparseXA records it: A(values)^T @ b with b = x^T,
+// returned as x @ A, its transpose, which the caller receives as it is. Its backward is
+// autograd.planned_mm_t_backward on the gradient's transpose (the gradient of A^T @ b), the same
+// gradients by the same code as _SparseXA's.
 struct PlannedMatmulGradT : public torch::autograd::Function<PlannedMatmulGradT> {
   static at::Tensor forward(torch::autograd::AutogradContext* ctx, const at::Tensor& values,
                             const at::Tensor& b, PlannedMatmulProduct product, bool b_transposed) {
@@ -855,7 +860,10 @@ struct PlannedMatmulGradT : public torch::autograd::Function<PlannedMatmulGradT>
     // As autograd._record saves them: b's gradient reads the values, the values' gradient reads b.
     ctx->save_for_backward({b.requires_grad() ? values : at::Tensor(),
                             values.requires_grad() ? b : at::Tensor()});
-    return std::move(product.out);
+    // Never a view: see the note above autograd.py's _x_at_a. planned_matmul_torch_right makes x @ A
+    // a tensor of its own (planned_matmul_x_at_a); this detaches it only where it could not.
+    at::Tensor out = std::move(product.out);
+    return out.is_view() ? out.detach() : out;
   }
 
   static torch::autograd::variable_list backward(torch::autograd::AutogradContext* ctx,
@@ -870,7 +878,8 @@ struct PlannedMatmulGradT : public torch::autograd::Function<PlannedMatmulGradT>
     THPObjectPtr a(THPVariable_Wrap(ctx->saved_data["a"].toTensor()));
     THPObjectPtr values(THPVariable_Wrap(saved[0]));
     THPObjectPtr b(THPVariable_Wrap(saved[1]));
-    THPObjectPtr g(THPVariable_Wrap(grads[0]));
+    // the gradient of x @ A, transposed: that of A^T @ b, as _SparseXA.backward passes it
+    THPObjectPtr g(THPVariable_Wrap(grads[0].t()));
     const bool b_transposed = ctx->saved_data["b_transposed"].toBool();
     THPObjectPtr result;
     if (a && values && b && g)
@@ -903,9 +912,29 @@ inline at::Tensor planned_matmul_dense_transpose(const PlannedMatmul& s, const a
   return t.t().contiguous();
 }
 
+// x @ A from the plan's product A^T @ b (b = x^T), as autograd._x_at_a makes it, and a tensor of
+// its own: for a transposed b, the product's transposed copy (autograd._in_layout's, before it is
+// restrided back), which is x @ A contiguous; otherwise (x one row or column) the product's
+// transpose, restrided in place when nothing else holds the product (the plan's fresh buffer).
+// Neither adds a copy; only a transpose that arrives as a view is detached.
+inline at::Tensor planned_matmul_x_at_a(const PlannedMatmul& s, at::Tensor product,
+                                        bool b_transposed) {
+  if (b_transposed) {
+    at::Tensor t = planned_matmul_dense_transpose(s, product);
+    return t.is_view() ? t.detach() : t;
+  }
+  if (product.use_count() == 1 && !product.is_view() &&
+      product.unsafeGetTensorImpl()->allow_tensor_metadata_change()) {
+    product.t_();
+    return product;
+  }
+  return product.t().detach();  // a new handle, not a view
+}
+
 // x @ A for a dense `x` and a torch CSR `a` whose transposed product holds a TransposedProductPlan
 // (see above), computed as autograd.py computes it and, when `grad`, recorded as it records it:
-// _SparseMMT.apply(op, values, x.t()).t(), or right_product's unrecorded (A^T @ x^T)^T. The result
+// _SparseXA.apply(op, values, x.t()), or right_product's unrecorded (A^T @ x^T)^T, each x @ A
+// itself and not a view (planned_matmul_x_at_a). The result
 // as a new reference, or nullptr with no error set when the Python function is to compute it.
 //
 // Served only for a contiguous float32 or float64 CPU x of A's dtype whose columns are A's rows,
@@ -950,7 +979,7 @@ inline PyObject* planned_matmul_torch_right(const PlannedMatmul& s, PyObject* x,
   // contiguous itself, which it is when x has one row or one column.
   at::Tensor b = xt.t();
   const bool b_transposed = !b.is_contiguous();
-  at::Tensor out;
+  at::Tensor out;  // x @ A
   {
     at::AutoGradMode no_grad(false);  // recorded below, once
     c10::optional<torch::Tensor> served;
@@ -961,15 +990,13 @@ inline PyObject* planned_matmul_torch_right(const PlannedMatmul& s, PyObject* x,
       served = tp->run(impl->values().contiguous(), m, planned_matmul_nthreads(s), s.atparallel);
     }
     if (!served.has_value()) return nullptr;
-    // autograd._in_layout(result, b_transposed)
-    out = b_transposed ? planned_matmul_dense_transpose(s, *served).t() : std::move(*served);
+    out = planned_matmul_x_at_a(s, std::move(*served), b_transposed);
   }
-  if (!grad) return THPVariable_Wrap(out.t());
+  if (!grad) return THPVariable_Wrap(std::move(out));
   // torch's values(), sharing `a`'s version counter, as PlannedMatmulGrad saves it.
   at::Tensor values = at_a.values();
-  at::Tensor recorded = PlannedMatmulGradT::apply(
-      values, b, PlannedMatmulProduct{at_a, std::move(out)}, b_transposed);
-  return THPVariable_Wrap(recorded.t());
+  return THPVariable_Wrap(PlannedMatmulGradT::apply(
+      values, b, PlannedMatmulProduct{at_a, std::move(out)}, b_transposed));
 }
 
 inline PyObject* planned_matmul_call(PyObject* /*module*/, PyObject* const* args,

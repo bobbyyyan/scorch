@@ -6,6 +6,7 @@ A's structure, as torch.sparse.mm gives). gradcheck and gradgradcheck cover the
 derivatives numerically, first and second order, and forward-mode AD.
 """
 
+import contextlib
 import gc
 import weakref
 import pickle
@@ -420,10 +421,10 @@ C_NODE_T = "torch::autograd::CppNode<scorch_native::PlannedMatmulGradT>"
 
 
 def _right_node(out):
-    """The node that recorded x @ A: the caller receives the transpose of the product the
-    Function returns, so the output's own node is torch's transpose and the product's is next."""
-    assert out.grad_fn.name().startswith("TBackward")
-    return out.grad_fn.next_functions[0][0].name()
+    """The node that recorded x @ A: the output's own, since the Function (C or Python) returns
+    x @ A itself, not a product the caller receives transposed, and it is not a view."""
+    assert out._base is None
+    return out.grad_fn.name()
 
 
 def _served(a):
@@ -861,6 +862,187 @@ def test_invalid_index_arrays_fail_closed(side):
 
 
 # --------------------------------------------------------------------------- #
+# A recorded product's output is never a view (patch 0082)
+# --------------------------------------------------------------------------- #
+#
+# torch takes a custom Function's output that is a view made inside the Function (or an
+# input returned as-is) for a view it cannot replay: an in-place operation on it in grad
+# mode raises, and so does reading its grad_fn once it or its base was written in place
+# under no_grad.  A training loop does both: nn.ReLU(inplace=True) after a product, and an
+# optimizer step on a tensor that aliases the product.  Every Function that records a
+# product returns a tensor that is not a view, so each write below is allowed, and the
+# gradient is the one dense float64 torch computes for the same write.
+
+WRITES = ["relu_ in grad mode", "add_ under no_grad"]
+
+
+def _write(write, *tensors):
+    """The same in-place write on each tensor: relu_ recorded, as nn.ReLU(inplace=True)
+    does, or add_ under no_grad, as an optimizer step does, after which reading grad_fn
+    is what torch refused for a view made inside a Function."""
+    for t in tensors:
+        if write == "relu_ in grad mode":
+            t.relu_()
+        else:
+            with torch.no_grad():
+                t.add_(1.0)
+            if t.requires_grad:
+                assert t.grad_fn is not None
+
+
+# path: (side, how the dense operand is laid out, what records the product, its node).
+# A transposed dense operand and a vector go to autograd.py's Functions, each of which returns
+# the product in the shape the caller receives (x @ A, a vector), so the caller's tensor is the
+# Function's output itself; the C entry records the two contiguous matrix products of a
+# planned operand.
+RECORDED_PRODUCTS = {
+    "A @ b": ("left", "matrix", "python", "_SparseMMBackward"),
+    "A @ b.t()": ("left", "transposed", "python", "_SparseMMBackward"),
+    "A @ v": ("left", "vector", "python", "_SparseMMBackward"),
+    "x @ A": ("right", "matrix", "python", "_SparseXABackward"),
+    "x.t() @ A": ("right", "transposed", "python", "_SparseXABackward"),
+    "v @ A": ("right", "vector", "python", "_SparseMMTBackward"),
+    "A @ b, C entry": ("left", "matrix", "c entry", C_NODE),
+    "x @ A, C entry": ("right", "matrix", "c entry", C_NODE_T),
+}
+
+
+@contextlib.contextmanager
+def _recorded_by(entry):
+    """For "python", the C entry's recording turned off, so a Function in autograd.py
+    records the product even if the operand had a plan."""
+    if entry == "c entry":
+        yield
+        return
+    scorch_ops.set_planned_matmul_backward(None)
+    scorch_ops.set_planned_matmul_right(None)
+    try:
+        yield
+    finally:
+        scorch_ops.set_planned_matmul_backward(grad_mod.planned_mm_backward)
+        _restore_right()
+
+
+def _recording_node(out):
+    """The node that recorded the product: the output's own, since the caller receives the
+    Function's output itself, never a view of it (a transpose or a squeeze)."""
+    return out.grad_fn.name()
+
+
+def _recorded_product(path, dtype, wants):
+    """The product ``path`` names, recorded, with the leaves a gradient is asked of, and the
+    same product in dense float64 torch: (out, a, raw, ref, a64, raw64), where ``raw`` is
+    the dense leaf (the operand is its transpose for a transposed layout)."""
+    side, layout, entry, node = RECORDED_PRODUCTS[path]
+    left = side == "left"
+    d = dense_matrix(dtype=dtype)
+    inner = d.shape[1] if left else d.shape[0]
+    shape = {
+        "matrix": (inner, 3) if left else (4, inner),
+        "transposed": (3, inner) if left else (inner, 4),
+        "vector": (inner,),
+    }[layout]
+    raw = rand(*shape, dtype=dtype) - 0.5  # entries of both signs, for relu_ to change
+    a = d.to_sparse_csr()
+    if entry == "c entry":
+        a = _planned(a, rand(inner, 3, dtype=dtype)) if left else _planned_right(a, 4)
+    a.requires_grad_(wants in ("a", "both"))
+    raw.requires_grad_(wants in ("dense", "both"))
+    dense = raw.t() if layout == "transposed" else raw
+    with _recorded_by(entry):
+        out = scorch.matmul(a, dense) if left else scorch.matmul(dense, a)
+    assert node in _recording_node(out)
+    # the product the caller receives is never a view, as torch.matmul's is not
+    assert out._base is None
+
+    a64 = d.double().requires_grad_(a.requires_grad)
+    raw64 = raw.detach().double().requires_grad_(raw.requires_grad)
+    dense64 = raw64.t() if layout == "transposed" else raw64
+    ref = a64 @ dense64 if left else dense64 @ a64
+    return out, a, raw, ref, a64, raw64
+
+
+@pytest.mark.parametrize("dtype", [torch.float32, torch.float64])
+@pytest.mark.parametrize("wants", ["a", "dense", "both"])
+@pytest.mark.parametrize("write", WRITES)
+@pytest.mark.parametrize("path", list(RECORDED_PRODUCTS))
+def test_a_recorded_products_output_takes_in_place_writes(path, write, wants, dtype):
+    out, a, raw, ref, a64, raw64 = _recorded_product(path, dtype, wants)
+    _write(write, out, ref)
+    g = rand(*ref.shape, seed=2)
+    (out * g.to(dtype)).sum().backward()
+    (ref * g).sum().backward()
+
+    tol = tolerance(dtype)
+    torch.testing.assert_close(out.detach().double(), ref.detach(), **tol)
+    if raw.requires_grad:
+        torch.testing.assert_close(raw.grad.double(), raw64.grad, **tol)
+    else:
+        assert raw.grad is None
+    if a.requires_grad:
+        assert a.grad.layout == torch.sparse_csr
+        mask = a64.detach() != 0
+        torch.testing.assert_close(a.grad.to_dense().double(), a64.grad * mask, **tol)
+    else:
+        assert a.grad is None
+
+
+@pytest.mark.parametrize("dtype", [torch.float32, torch.float64])
+@pytest.mark.parametrize("path", list(RECORDED_PRODUCTS))
+def test_a_recorded_products_gradient_takes_in_place_writes_and_differentiates_again(
+    path, dtype
+):
+    """With create_graph=True the backward records each gradient as a product too
+    (_SparseMMT for the dense operand's of A @ b, _SparseMM for that of x @ A), so the same
+    holds one order up: relu_ on the dense operand's gradient in grad mode, then that
+    gradient's derivative with respect to both operands, against dense float64 torch."""
+    out, a, raw, ref, a64, raw64 = _recorded_product(path, dtype, "both")
+    (gd,) = torch.autograd.grad(out.pow(2).sum(), (raw,), create_graph=True)
+    (gd64,) = torch.autograd.grad(ref.pow(2).sum(), (raw64,), create_graph=True)
+    gd.relu_()
+    gd64.relu_()
+    h = rand(*gd64.shape, seed=6)
+    ga, graw = torch.autograd.grad((gd * h.to(dtype)).sum(), (a, raw))
+    ga64, graw64 = torch.autograd.grad((gd64 * h).sum(), (a64, raw64))
+
+    tol = tolerance(dtype)
+    torch.testing.assert_close(gd.detach().double(), gd64.detach(), **tol)
+    torch.testing.assert_close(graw.double(), graw64, **tol)
+    mask = a64.detach() != 0
+    torch.testing.assert_close(ga.to_dense().double(), ga64 * mask, **tol)
+
+
+@pytest.mark.parametrize("dtype", [torch.float32, torch.float64])
+@pytest.mark.parametrize("write", WRITES)
+def test_the_sddmm_functions_output_takes_in_place_writes(write, dtype):
+    """_SparseSDDMM records the gradient of A's values when a backward builds a graph; its
+    output is those values, which a second-order method may write in place.  Called
+    directly here, against the same sampled product in dense float64 torch."""
+    d = dense_matrix(dtype=dtype)
+    a = d.to_sparse_csr()
+    op, _ = grad_mod._torch_operand(a)
+    x = (rand(7, 3, dtype=dtype) - 0.5).requires_grad_()
+    y = (rand(5, 3, dtype=dtype, seed=3) - 0.5).requires_grad_()
+    out = grad_mod._SparseSDDMM.apply(op, x, y)
+    assert out.grad_fn.name() == "_SparseSDDMMBackward"
+
+    rows = torch.repeat_interleave(torch.arange(7), a.crow_indices().diff())
+    cols = a.col_indices()
+    x64 = x.detach().double().requires_grad_()
+    y64 = y.detach().double().requires_grad_()
+    ref = (x64[rows] * y64[cols]).sum(1)
+    _write(write, out, ref)
+    g = rand(*ref.shape, seed=4)
+    (out * g.to(dtype)).sum().backward()
+    (ref * g).sum().backward()
+
+    tol = tolerance(dtype)
+    torch.testing.assert_close(out.detach().double(), ref.detach(), **tol)
+    torch.testing.assert_close(x.grad.double(), x64.grad, **tol)
+    torch.testing.assert_close(y.grad.double(), y64.grad, **tol)
+
+
+# --------------------------------------------------------------------------- #
 # Products autograd does not cover
 # --------------------------------------------------------------------------- #
 
@@ -879,6 +1061,244 @@ def test_an_uncovered_product_computes_and_raises_only_when_differentiated():
     assert out.grad_fn is not None
     with pytest.raises(NotImplementedError, match="use_cache"):
         out.sum().backward()
+
+
+@pytest.mark.parametrize("write", WRITES)
+def test_an_uncovered_products_output_takes_in_place_writes(write):
+    """The result of a product with no derivative is not a view either (see the section
+    above): it takes either write, and the backward still raises the coded refusal, with
+    or without a graph asked of it."""
+    d = dense_matrix()
+    a = d.to_sparse_csr()
+    w = (rand(5, 3) - 0.5).requires_grad_()
+    out = scorch.matmul(a, w, use_cache=False)
+    assert out.grad_fn.name() == "_NotDifferentiableBackward"
+    ref = d @ w.detach()
+    _write(write, out, ref)
+    torch.testing.assert_close(out.detach(), ref)
+    for create_graph in (False, True):
+        with pytest.raises(NotImplementedError, match="use_cache") as raised:
+            # retain_graph: the first backward frees relu_'s saved result before it raises
+            torch.autograd.grad(
+                out.sum(), (w,), retain_graph=True, create_graph=create_graph
+            )
+        assert raised.value.code == "matmul_derivative_unsupported"
+
+
+# What each of autograd.py's Functions returns, seen at the Function itself: never a view
+# (torch's rule above) and never one of its inputs, on every operand kind, both layouts of
+# the dense operand, and shapes with one row or one column, where ``_transpose`` makes no
+# copy.  The caller's tensor is then checked against dense float64 torch and written in
+# place.  The Functions make no ``.detach()`` on a matrix's path: the kernels' products are
+# tensors of their own (see the note above autograd._x_at_a), so this is what stands behind
+# not making one.
+
+SPIED = ("_SparseMM", "_SparseMMT", "_SparseXA", "_SparseSDDMM", "_NotDifferentiable")
+
+
+@contextlib.contextmanager
+def _function_outputs():
+    """Every (Function name, output, tensor inputs) the Functions in SPIED return meanwhile."""
+    seen = []
+    saved = {name: getattr(grad_mod, name).apply for name in SPIED}
+    own = {name: getattr(grad_mod, name).__dict__.get("apply") for name in SPIED}
+
+    def spy(name):
+        def apply(*args):
+            out = saved[name](*args)
+            seen.append((name, out, [x for x in args if isinstance(x, torch.Tensor)]))
+            return out
+
+        return staticmethod(apply)
+
+    for name in SPIED:
+        setattr(getattr(grad_mod, name), "apply", spy(name))
+    try:
+        yield seen
+    finally:
+        for name in SPIED:
+            if own[name] is None:  # torch.autograd.Function's apply again
+                delattr(getattr(grad_mod, name), "apply")
+            else:
+                setattr(getattr(grad_mod, name), "apply", own[name])
+
+
+def _owned(seen, names):
+    assert {name for name, _, _ in seen} >= set(names), [name for name, _, _ in seen]
+    for name, out, inputs in seen:
+        assert out._base is None, f"{name} returned a view"
+        assert all(out is not x for x in inputs), f"{name} returned an input"
+
+
+# (rows, cols) of A, and the dense operand's free extent: one row or one column of A, or of
+# the dense operand, is where _transpose returns a view instead of a copy
+SHAPES = {
+    "7x5, 3": (7, 5, 3),
+    "1x5, 3": (1, 5, 3),
+    "7x1, 3": (7, 1, 3),
+    "7x5, 1": (7, 5, 1),
+}
+
+
+@pytest.mark.parametrize("kind", sorted(OPERANDS))
+@pytest.mark.parametrize("dtype", [torch.float32, torch.float64])
+@pytest.mark.parametrize("side", ["left", "right"])
+@pytest.mark.parametrize("layout", ["matrix", "transposed"])
+@pytest.mark.parametrize("shape", list(SHAPES))
+def test_no_function_returns_a_view_or_an_input(kind, dtype, side, layout, shape):
+    rows, cols, free = SHAPES[shape]
+    make, sparse_grad = OPERANDS[kind]
+    d = dense_matrix(rows, cols, density=0.8, dtype=dtype)
+    a = make(d)
+    if sparse_grad:
+        a.requires_grad_()
+    left = side == "left"
+    inner = cols if left else rows
+    shaped = (inner, free) if left else (free, inner)
+    raw = rand(*(shaped[::-1] if layout == "transposed" else shaped), dtype=dtype) - 0.5
+    raw.requires_grad_()
+    dense = raw.t() if layout == "transposed" else raw
+    with _recorded_by("python"), _function_outputs() as seen:
+        first = scorch.matmul(a, dense) if left else scorch.matmul(dense, a)
+        # the same product again: the plan the first call installed serves it (the warm call)
+        out = scorch.matmul(a, dense) if left else scorch.matmul(dense, a)
+        # a graph asked of the backward records the gradients as products too, and the
+        # values' gradient of a differentiable sparse operand as _SparseSDDMM
+        grads = torch.autograd.grad(
+            out.pow(2).sum(), (a, raw) if sparse_grad else (raw,), create_graph=True
+        )
+    _owned(seen, ["_SparseMM" if left else "_SparseXA"])
+    if sparse_grad:
+        assert "_SparseSDDMM" in {name for name, _, _ in seen}
+    # and what the caller receives is the Function's output itself, not a view of it
+    assert first._base is None and out._base is None
+
+    d64 = d.double()
+    raw64 = raw.detach().double().requires_grad_()
+    dense64 = raw64.t() if layout == "transposed" else raw64
+    ref = d64 @ dense64 if left else dense64 @ d64
+    tol = tolerance(dtype)
+    torch.testing.assert_close(first.detach().double(), ref.detach(), **tol)
+    torch.testing.assert_close(out.detach().double(), ref.detach(), **tol)
+    (g64,) = torch.autograd.grad(ref.pow(2).sum(), (raw64,))
+    torch.testing.assert_close(grads[-1].detach().double(), g64, **tol)
+    out.relu_()
+    grads[-1].relu_()
+
+
+@pytest.mark.parametrize("kind", sorted(OPERANDS))
+@pytest.mark.parametrize("dtype", [torch.float32, torch.float64])
+@pytest.mark.parametrize("side", ["left", "right"])
+@pytest.mark.parametrize("layout", ["matrix", "transposed", "vector"])
+@pytest.mark.parametrize("shape", list(SHAPES))
+def test_a_product_without_a_gradient_is_not_a_view(kind, dtype, side, layout, shape):
+    """With no gradient wanted, the product a call returns is a tensor of its own too, as
+    torch.matmul's is: on the first call (for a torch CSR operand, the C entry's unplanned
+    product; else the prebuilt kernel's route or a generated kernel's), on the calls a plan
+    serves after it, for a transposed dense operand and for a vector.  Each is written in
+    place, and the next call's product is unchanged by it."""
+    rows, cols, free = SHAPES[shape]
+    make, _ = OPERANDS[kind]
+    d = dense_matrix(rows, cols, density=0.8, dtype=dtype)
+    a = make(d)
+    left = side == "left"
+    inner = cols if left else rows
+    if layout == "vector":
+        dense = rand(inner, dtype=dtype) - 0.5
+    else:
+        shaped = (inner, free) if left else (free, inner)
+        raw = rand(*(shaped[::-1] if layout == "transposed" else shaped), dtype=dtype)
+        dense = (raw - 0.5).t() if layout == "transposed" else raw - 0.5
+    ref = d.double() @ dense.double() if left else dense.double() @ d.double()
+    with torch.no_grad():
+        for _ in range(3):  # the first call, then calls a plan it installed serves
+            out = scorch.matmul(a, dense) if left else scorch.matmul(dense, a)
+            assert type(out) is torch.Tensor and out._base is None
+            torch.testing.assert_close(out.double(), ref, **tolerance(dtype))
+            out.add_(1.0)
+
+
+@pytest.mark.parametrize("side", ["left", "right"])
+def test_a_parameter_operand_s_product_is_not_a_view(side):
+    """A product with an nn.Parameter dense operand, twice, each checked at the Function and
+    written in place after.  On the left the Function gets the Parameter, which is not a
+    plain tensor, so no plan serves the product and each call takes the prebuilt kernel's
+    route; on the right it gets the Parameter's transpose, a plain tensor."""
+    d = dense_matrix()
+    a = d.to_sparse_csr()
+    left = side == "left"
+    w = torch.nn.Parameter(rand(*((5, 3) if left else (4, 7))) - 0.5)
+    with _recorded_by("python"), _function_outputs() as seen:
+        outs = [scorch.matmul(a, w) if left else scorch.matmul(w, a) for _ in range(2)]
+    _owned(seen, ["_SparseMM" if left else "_SparseXA"])
+    ref = d @ w.detach() if left else w.detach() @ d
+    for out in outs:
+        torch.testing.assert_close(out.detach(), ref)
+        out.relu_()
+
+
+@pytest.mark.parametrize("recorded", [True, False], ids=["recorded", "unrecorded"])
+def test_the_prebuilt_route_s_result_is_its_own_buffer(recorded, monkeypatch):
+    """The prebuilt kernel allocates its product as the [rows, k] matrix it is (csrc/spmm.h),
+    and the prebuilt route returns that tensor: the result is the kernel's own buffer, not a
+    copy and not a view.  Nothing else holds it: after the call the result is its buffer's
+    one handle, two calls with the same operands give two buffers, and writing the first
+    result in place changes neither the second nor a third call's.  An nn.Parameter dense
+    operand is not a plain tensor, so no plan serves the product and every call takes that
+    route: in _SparseMM's forward (recorded) or in an ordinary call; the spy on the kernel's
+    call fails the test where a call does not."""
+    from scorch import ops
+
+    taken = []
+    execute = ops.execute_prebuilt_binary_kernel
+
+    def spy(*args, **kwargs):
+        result_cpp, shape = execute(*args, **kwargs)
+        value = result_cpp.storage.value
+        taken.append((value.data_ptr(), tuple(value.shape)))
+        del value
+        return result_cpp, shape
+
+    monkeypatch.setattr(ops, "execute_prebuilt_binary_kernel", spy)
+    d = dense_matrix()
+    a = d.to_sparse_csr() if recorded else STensor.from_csr(d.to_sparse_csr())
+    w = torch.nn.Parameter(rand(5, 3) - 0.5, requires_grad=recorded)
+    ref = d @ w.detach()
+    with _recorded_by("python"):
+        first, second = [scorch.matmul(a, w) for _ in range(2)]
+    assert taken == [(first.data_ptr(), (7, 3)), (second.data_ptr(), (7, 3))]
+    for out in (first, second):
+        assert out._base is None and out._use_count() == 1
+        assert out.shape == (7, 3) and out.is_contiguous()
+        assert (out.grad_fn is not None) == recorded
+    assert first.data_ptr() != second.data_ptr()
+    with torch.no_grad():
+        first.add_(1.0)
+    with _recorded_by("python"):
+        third = scorch.matmul(a, w)
+    assert len(taken) == 3 and taken[2] == (third.data_ptr(), (7, 3))
+    torch.testing.assert_close(first.detach(), ref + 1.0)
+    torch.testing.assert_close(second.detach(), ref)
+    torch.testing.assert_close(third.detach(), ref)
+    if recorded:
+        (g,) = torch.autograd.grad(second.sum(), (w,))
+        torch.testing.assert_close(g, d.t() @ torch.ones(7, 3, dtype=d.dtype))
+
+
+def test_the_uncovered_products_function_returns_no_input():
+    """_NotDifferentiable returns ``result.detach()``: a new tensor, which costs less than
+    returning ``result`` itself (torch then makes a view of it).  The caller's leaf keeps
+    its version and stays a leaf."""
+    d = dense_matrix()
+    a = d.to_sparse_csr()
+    w = (rand(5, 3) - 0.5).requires_grad_()
+    version = w._version
+    with _function_outputs() as seen:
+        out = scorch.matmul(a, w, use_cache=False)
+    _owned(seen, ["_NotDifferentiable"])
+    assert w._version == version and w.grad_fn is None and w.is_leaf
+    out.relu_()
+    torch.testing.assert_close(out.detach(), (d @ w.detach()).relu())
 
 
 def test_sparse_times_sparse_is_unchanged():

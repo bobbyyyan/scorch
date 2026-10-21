@@ -268,7 +268,8 @@ def test_native_coo_spmm_owns_residual_and_tile_boundary_outputs(width: int) -> 
         b_values_2d.reshape(-1),
     )
 
-    expected = torch.stack((2 * b_values_2d[0], 3 * b_values_2d[2])).reshape(-1)
+    # the [2, width] product itself: the kernel allocates it in that shape (spmm.h)
+    expected = torch.stack((2 * b_values_2d[0], 3 * b_values_2d[2]))
     assert torch.equal(result.storage.value, expected)
     retained = _owned_native_buffers(result)
     snapshots = [buffer.clone() for buffer in retained]

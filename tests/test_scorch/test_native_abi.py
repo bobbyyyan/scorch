@@ -225,7 +225,8 @@ def test_native_extreme_tile_is_safely_normalized_to_runtime_extent():
         k_tile_size=1,
     )
 
-    assert result.storage.value.tolist() == [1.0] * rows
+    # the [rows, 1] product itself: the kernel allocates it in that shape (spmm.h)
+    assert result.storage.value.tolist() == [[1.0]] * rows
 
 
 def test_jit_abi_rejects_noncanonical_coo_order_on_cached_entry():

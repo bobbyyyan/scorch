@@ -2289,11 +2289,33 @@ def _dense_result_as_tensor(
     product: a prebuilt kernel and a generated one that both produce a dense result
     hand back the same type.  A separate function so ``matmul`` has one statement
     of the rule and stays within the project's complexity bound.
+
+    The tensor is not a view (``_not_a_view``) unless it records a gradient, as
+    torch.matmul's product is not: ``to_torch`` lays the stored values out as a view of
+    their flat buffer.
     """
 
     if isinstance(result, STensor) and result.format.is_dense():
-        return result.to_torch()
+        return _not_a_view(result.to_torch())
     return result
+
+
+def _not_a_view(t: torch.Tensor) -> torch.Tensor:
+    """``t``, or a new tensor over its memory when it is a view that records no gradient.
+
+    A product a custom autograd Function returns must not be a view: torch refuses an
+    in-place write in grad mode to a view made inside the Function's forward, which a
+    product of torch's never is.  autograd.py's Functions call ``matmul`` only with a CSR
+    operand of float32 or float64 and a dense matrix (``autograd.serve``; a vector is
+    unsqueezed), which the prebuilt CSR kernel covers, so the product they get is the
+    kernel's own ``[rows, k]`` tensor (spmm.h allocates it in that shape, for a plan too),
+    which is not a view.  This is for a product made elsewhere: every dense result
+    ``matmul`` builds as an STensor passes through it (``_dense_result_as_tensor``).
+    A view that records a gradient is returned as it is: detaching it would drop the
+    gradient, and an ordinary autograd view takes in-place writes (only a view made inside
+    a custom Function's forward, or under ``no_grad``, refuses them).
+    """
+    return t if t._base is None or t.requires_grad else t.detach()
 
 
 # The einsum expression of each pair of operand ranks under torch.matmul's rules: a
@@ -2811,14 +2833,15 @@ def matmul(
                     nthreads=nthreads,
                     atparallel=atparallel,
                 )
-            # Fast path: a dense output kernel already produced a contiguous
-            # row-major value buffer. Return it reshaped directly, skipping the
+            # Fast path: a dense output kernel already produced the contiguous
+            # row-major [rows, k] product, allocated in that shape (spmm.h), so it
+            # is returned as it is: no reshape, and not a view. This skips the
             # STensor/TensorIndex construction and the to_dense()/to_torch()
             # round-trip — all pure per-call Python overhead here, since the
             # result is default mode order with matching dtype (exactly what
             # to_torch() would have reconstructed).
             if resolved.output_format.is_dense():
-                out = result_cpp.storage.value.reshape(result_shape)
+                out = result_cpp.storage.value
                 # Everything above is a function of the operands' structure and
                 # the free dimension, so a second call with the same pair need not
                 # repeat it: hand the resolution and the kernel that actually ran to
@@ -3260,7 +3283,9 @@ def sparse_linear_fm(
         nthreads,
         atparallel,
     )
-    return result_cpp.storage.value.reshape(result_shape)
+    # The kernel allocates the [out, batch] product in that shape (spmm.h): it is
+    # returned as it is, not as a view of a flat buffer.
+    return result_cpp.storage.value
 
 
 def sparse_linear(

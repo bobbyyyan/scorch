@@ -5542,8 +5542,10 @@ def test_kernel_cache_prebuilt_and_noop_paths_do_not_fabricate_records(
 
     sparse = scorch.STensor.from_torch(torch.eye(2).to_sparse_csr())
     dense = scorch.STensor.from_torch(torch.ones(2, 2))
+    # The prebuilt kernel's product as it allocates it: the [rows, k] matrix itself, a
+    # tensor of its own (csrc/spmm.h), which the prebuilt route returns as it is.
     fake_result = SimpleNamespace(
-        storage=SimpleNamespace(value=torch.arange(4, dtype=torch.float32))
+        storage=SimpleNamespace(value=torch.tensor([[0.0, 1.0], [2.0, 3.0]]))
     )
     resolved = SimpleNamespace(
         fn=object(),
@@ -5568,6 +5570,7 @@ def test_kernel_cache_prebuilt_and_noop_paths_do_not_fabricate_records(
         _compile_options=prebuilt_options,
         _compilation_context=prebuilt_context,
     )
+    assert output is fake_result.storage.value and output._base is None
     assert tuple(output.shape) == (2, 2)
     assert prebuilt_context.stage_run_records == ()
 

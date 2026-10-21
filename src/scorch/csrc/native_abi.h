@@ -1247,7 +1247,7 @@ inline torch::Tensor abi_panel_positions(const torch::Tensor& slice, int64_t bas
 
 // Runs `run(result_shape, a_shape, a_levels, a_values, into)` -- the ordinary validation and
 // kernel of a CSR x dense product, writing the product's rows into `into` -- on each row panel of
-// A, and returns the output's flat values, which the panels fill in place. The checks here are the
+// A, and returns the [rows, k] output, which the panels fill in place. The checks here are the
 // ones a panel's own validation cannot see: that the panels tile A (positions length, first and
 // last offset, nondecreasing at every cut). Everything inside a panel is the validator's.
 template <typename Run>
@@ -1276,7 +1276,7 @@ inline torch::Tensor abi_csr_row_panels(const char* op, const std::vector<int64_
               " vs ", crd.numel(), " and ", a_values.numel(), ")");
 
   const int64_t limit = abi_csr_panel_limit();
-  torch::Tensor out = torch::empty({rows * k}, a_values.options());
+  torch::Tensor out = torch::empty({rows, k}, a_values.options());  // the [rows, k] product, as spmm.h's
   for (int64_t r0 = 0; r0 < rows;) {
     // The last row whose offset is within `limit` of this panel's first. Binary search assumes
     // nondecreasing positions; where they are not, the cut below or the panel's validator says
@@ -1294,7 +1294,7 @@ inline torch::Tensor abi_csr_row_panels(const char* op, const std::vector<int64_
     std::vector<std::vector<torch::Tensor>> levels{
         {}, {abi_panel_positions(pos.narrow(0, r0, r1 - r0 + 1), base),
              crd.narrow(0, base, end - base)}};
-    torch::Tensor into = out.narrow(0, r0 * k, (r1 - r0) * k);
+    torch::Tensor into = out.narrow(0, r0, r1 - r0);  // rows [r0, r1): contiguous
     run(std::vector<int64_t>{r1 - r0, result_shape[1]}, std::vector<int64_t>{r1 - r0, a_shape[1]},
         std::move(levels), a_values.narrow(0, base, end - base), into);
     r0 = r1;

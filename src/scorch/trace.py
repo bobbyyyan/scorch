@@ -440,7 +440,8 @@ def _try_tiled_fused(
         return kernel_fn(*_fused_kernel_args(result_shape, a, b, bias))
 
     def _tail(result_cpp):
-        return tail(result_cpp.storage.value.view(n, k), bias)
+        # Both kernels allocate the [n, k] product in that shape (spmm.h).
+        return tail(result_cpp.storage.value, bias)
 
     served, _shape, _kind, _param = ops.dispatch_tiled_fused(
         a, b, spmm_resolved, _fused_baseline, baseline_tag, _tail, gate
@@ -520,7 +521,8 @@ def _try_prebuilt_fused(spec: FusionSpec, args: tuple) -> Optional[Callable]:
             result_cpp = kernel_fn(
                 *_fused_kernel_args(result_shape, a_arg, b_arg, bias)
             )
-            return result_cpp.storage.value.view(n, k)
+            # The [n, k] product as the kernel allocated it (spmm.h), not a view.
+            return result_cpp.storage.value
         except Exception:
             # A failed optimization must not turn a supported eager graph into
             # a compile-only failure.
