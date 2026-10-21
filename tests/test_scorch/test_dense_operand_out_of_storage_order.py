@@ -30,7 +30,10 @@ child (1380 s with the node to itself), which ran past the child's 3600 s
 timeout when 15 pytest-xdist workers shared the node.
 
 Every result is judged by ``test_dense_below_compressed_result._judge``:
-canonical level arrays, values against a float64 ``torch.einsum``, and stored
+canonical level arrays, float64 values within 1e-12 times max(1, the largest
+reference magnitude) of a float64 ``torch.einsum`` (until 2026-10-17 the bound
+was 1e-3, which cannot see a result computed at float32 precision; that file's
+controls show the bound fails a NaN and float32 rounding), and stored
 coordinates equal to what the operands' stored entries imply.  Until
 senior-engineer-dennis's relayout fix (eefc9c04), 22 program-and-result pairs
 into ``ss`` and ``ds`` missed the last check, with values right, because
@@ -247,6 +250,7 @@ def _child(expr, result_fmt, programs):
                     result_fmt,
                     torch.einsum(expr, *denses),
                     torch.einsum(expr, *indicators) > 0,
+                    dtype=torch.float64,
                 )
             except Exception as error:  # every input is reported, not the first
                 failures.append(f"{kind}: {type(error).__name__}: {str(error)[:300]}")

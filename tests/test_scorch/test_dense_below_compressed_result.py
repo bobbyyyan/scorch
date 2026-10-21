@@ -38,7 +38,9 @@ the result's own arrays, read here rather than through the library:
 ``canonical``  every compressed level has ``parents + 1`` positions that start
                at 0 and never decrease, coordinates strictly increasing and in
                range inside each segment, and one value per leaf position;
-``values``     the arrays, made dense here, equal a float64 ``torch.einsum``;
+``values``     the arrays, made dense here, equal a float64 ``torch.einsum``:
+               within 1e-12 times max(1, its largest magnitude) for float64
+               operands (a NaN fails), to 1e-3 for float32 ones;
 ``structure``  the stored coordinates are the ones the operands' STORED
                structure implies: a compressed result coordinate is stored
                exactly when a stored operand cell lies under it, whatever the
@@ -75,6 +77,7 @@ from scorch.ops import _lower_generated_llir
 from scorch.stensor import STensor
 
 ATOL = RTOL = 1e-3
+FLOAT64_TOLERANCE = 1e-12
 EXTENT = {"i": 5, "j": 4, "k": 3, "l": 6}
 
 # One kernel serves every input of a cell, so each cell costs one build.
@@ -251,18 +254,35 @@ def _read(result, fmt, shape):
     return parents, levels
 
 
-def _judge(result, result_fmt, reference, structural):
-    """Canonical arrays, float64 values, and the stored-structure rule."""
+def _judge(result, result_fmt, reference, structural, *, dtype):
+    """Canonical arrays, values, and the stored-structure rule.
+
+    ``dtype`` is the operands' scalar type; the result's values must have it.
+    Float64 values must lie within ``FLOAT64_TOLERANCE`` times max(1, the largest
+    reference magnitude) of the float64 ``reference``, the bound
+    ``test_high_rank_programs`` uses: ``ATOL`` and ``RTOL`` cannot tell a result
+    computed at float32 precision from a float64 one.  The comparison is written
+    so that a NaN fails it.  Values of other types keep ``ATOL`` and ``RTOL``.
+    """
 
     assert str(result.format) == ",".join(result_fmt)
+    values = result.storage.value
+    assert values.dtype == dtype, f"values are {values.dtype}, the operands {dtype}"
     order = tuple(int(mode) for mode in result.mode_order)
     assert sorted(order) == list(range(reference.dim()))
     shape = tuple(reference.shape[mode] for mode in order)
     leaves, levels = _read(result, result_fmt, shape)
     got = torch.zeros(shape, dtype=torch.float64)
-    for cell, value in zip(leaves, result.storage.value.reshape(-1).tolist()):
+    for cell, value in zip(leaves, values.reshape(-1).tolist()):
         got[cell] = value
-    torch.testing.assert_close(got, reference.permute(order), atol=ATOL, rtol=RTOL)
+    want = reference.permute(order)
+    if dtype == torch.float64:
+        scale = max(1.0, float(want.abs().max())) if want.numel() else 1.0
+        error = float((got - want).abs().max()) if want.numel() else 0.0
+        bound = FLOAT64_TOLERANCE * scale
+        assert error <= bound, f"max error {error:.3e}, bound {bound:.3e}"
+    else:
+        torch.testing.assert_close(got, want, atol=ATOL, rtol=RTOL)
     expected = _stored(structural.permute(order), result_fmt)[1]
     assert levels == expected, f"stored {levels}, the operands imply {expected}"
 
@@ -282,6 +302,7 @@ def _run(expr, operand_fmts, result_fmt, kind, seed):
         result_fmt,
         torch.einsum(expr, *denses),
         torch.einsum(expr, *indicators) > 0,
+        dtype=pairs[0][0].dtype,
     )
 
 
@@ -379,10 +400,35 @@ def test_to_sparse_from_a_dense_tensor_reaches_these_layouts(fmt):
         try:
             tensor = STensor.from_torch(dense.clone(), "A")
             tensor.to_sparse(fmt)
-            _judge(tensor, fmt, dense.to(torch.float64), dense != 0)
+            _judge(tensor, fmt, dense.to(torch.float64), dense != 0, dtype=dense.dtype)
         except Exception as error:  # every input is reported, not the first
             failures.append(f"{kind}: {type(error).__name__}: {str(error)[:400]}")
     assert not failures, "\n".join(failures)
+
+
+def test_the_judge_fails_a_nan_float32_precision_and_another_dtype():
+    """Controls of ``_judge``'s value comparison, on one ``sd`` tensor."""
+
+    reference = torch.tensor(
+        [[1 / 3, 0.0, 2 / 7], [0.0, 3 / 11, 0.0]], dtype=torch.float64
+    )
+    planted = reference.clone()
+    planted[1, 1] = float("nan")
+
+    def failure(values, dtype):
+        tensor = STensor.from_torch(values.clone(), "A").to_sparse("sd")
+        try:
+            _judge(tensor, "sd", reference, reference != 0, dtype=dtype)
+        except AssertionError as error:
+            return str(error)
+        return None
+
+    assert failure(reference, torch.float64) is None
+    assert failure(planted, torch.float64) is not None
+    # Rounded through float32, about 1e-8 off: the float64 bound sees it.
+    assert failure(reference.float().double(), torch.float64) is not None
+    assert failure(reference.float(), torch.float32) is None
+    assert failure(reference.float(), torch.float64) is not None
 
 
 # -- the mechanisms, read from the emitted source (no kernel is built) --------

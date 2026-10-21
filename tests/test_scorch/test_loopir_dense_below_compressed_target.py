@@ -116,9 +116,8 @@ def _refusal(expr, operand_fmts, result_fmt, arm):
 def _run(expr, operand_fmts, result_fmt, kind, seed, arm):
     terms = expr.split("->")[0].split(",")
     operands, indicators, denses = [], [], []
-    for (dense, pattern, ghosts), fmt, name in zip(
-        _inputs(kind, terms, seed), operand_fmts, "ABD"
-    ):
+    pairs = _inputs(kind, terms, seed)
+    for (dense, pattern, ghosts), fmt, name in zip(pairs, operand_fmts, "ABD"):
         operand, indicator = _operand(dense, pattern, fmt, name, ghosts)
         operands.append(operand)
         indicators.append(indicator)
@@ -131,7 +130,8 @@ def _run(expr, operand_fmts, result_fmt, kind, seed, arm):
         compile_options=auto_options(arm, jit=True),
     )
     result = result[0] if isinstance(result, tuple) else result
-    _judge(result, result_fmt, reference, torch.einsum(expr, *indicators) > 0)
+    structural = torch.einsum(expr, *indicators) > 0
+    _judge(result, result_fmt, reference, structural, dtype=pairs[0][0].dtype)
 
 
 def assert_statement_matches_pytorch(statement, arm, seed=0):
