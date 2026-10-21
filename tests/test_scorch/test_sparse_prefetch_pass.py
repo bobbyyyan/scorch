@@ -2042,12 +2042,14 @@ def test_malformed_typed_factor_materialization_fails_at_its_owning_stage(
         sequence_index: int,
         context: factor_module.LoopInvariantFactorHoistContext,
         path: Tuple[str, ...],
+        preceding: object,
     ) -> Tuple[llir.VarInit, llir.Assign, int, llir.Expr] | None:
         emitted = original_materialization(
             loop,
             sequence_index,
             context,
             path,
+            preceding,
         )
         if emitted is not None:
             events.append("factor_materialization")

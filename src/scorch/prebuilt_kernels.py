@@ -17,6 +17,7 @@ from typing import (
 import torch
 import scorch_ops as native_ops
 
+from .exceptions import raise_if_native_repeat
 from .format import TensorFormat
 from .utils import parse_format
 
@@ -313,18 +314,27 @@ def execute_prebuilt_binary_kernel(
     # The clock is read only when someone asked for the timing. Two time.time() calls
     # per matmul are not free next to a kernel that can finish in a couple of
     # microseconds, and every caller that does not pass time_dict was paying them.
-    if time_dict is None:
-        if nthreads is not None:
-            return (
-                kernel_fn(*args, nthreads_override=nthreads, atparallel=atparallel),
-                result_shape,
-            )
-        return kernel_fn(*args), result_shape
+    #
+    # A COO operand's index check refuses a repeated coordinate as text; it leaves here as
+    # RepeatedCoordinateError (exceptions.raise_if_native_repeat).
+    try:
+        if time_dict is None:
+            if nthreads is not None:
+                return (
+                    kernel_fn(*args, nthreads_override=nthreads, atparallel=atparallel),
+                    result_shape,
+                )
+            return kernel_fn(*args), result_shape
 
-    start_time = time.time()
-    if nthreads is not None:
-        result_cpp = kernel_fn(*args, nthreads_override=nthreads, atparallel=atparallel)
-    else:
-        result_cpp = kernel_fn(*args)
+        start_time = time.time()
+        if nthreads is not None:
+            result_cpp = kernel_fn(
+                *args, nthreads_override=nthreads, atparallel=atparallel
+            )
+        else:
+            result_cpp = kernel_fn(*args)
+    except RuntimeError as error:
+        raise_if_native_repeat(error)
+        raise
     time_dict["eval_time"] = time.time() - start_time
     return result_cpp, result_shape

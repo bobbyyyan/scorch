@@ -142,40 +142,60 @@ def test_direct_string_encoded_var_expression_budget_is_explicit() -> None:
         # Vars all carry plain identifiers -- the drain iterator, the drained
         # key components and value, the result's position counters and
         # pos/crd/values arrays -- and add no string-encoded expression.
-        "cin_lowerer.py": 172,
+        # 202 after results with a dense level below a compressed one (and a
+        # compressed level below two dense ones) were assembled correctly: the
+        # dense-block leaf store, the copy of a dense workspace into a block,
+        # the drain of a sorted workspace whose key has a dense level, and the
+        # row index handed to the two-pass assembly under a stored outer loop.
+        # Its 30 new Vars are position counters, extents, value/pos/crd arrays
+        # and drained keys under plain identifiers; ``totals`` below, which is
+        # what this test protects, is unchanged.
+        # 203 after a workspace consumer inside a reduction adds into the
+        # result's cell (one more read of the result's position counter);
+        # ``iter_lattice.py`` is 44 after a dense result's cell position is
+        # computed in one place.  Both are position counters under plain
+        # identifiers, and both sums below are unchanged.
+        "cin_lowerer.py": 203,
         "compressed_where_openmp_pass.py": 32,
         "dense_pointer_hoist_pass.py": 7,
         "dynamic_vector_access_pass.py": 1,
-        "iter_lattice.py": 35,
+        # 45 after the same change: the dense position under a compressed
+        # parent, the catch-up of a compressed level below a dense one, and
+        # the commit of a compressed coordinate above a written dense block.
+        "iter_lattice.py": 44,
         "iterator.py": 23,
         "llir_traversal.py": 1,
         "loop_invariant_factor_pass.py": 3,
-        "parallel_marking_pass.py": 13,
+        # 15: a serial kernel now declares its dense workspace, which only a
+        # parallel loop used to place.
+        "parallel_marking_pass.py": 15,
         "result_write_pass.py": 3,
         "schedule_lowerer.py": 106,
         "single_iteration_loop_pass.py": 1,
         "sparse_prefetch_pass.py": 1,
-        "torch_cpp_abi.py": 81,
+        # 85: ``emit_position_tail_close`` (the cell count, the position
+        # cursor and the position array of an append-built level).
+        "torch_cpp_abi.py": 85,
     }
-    assert sum(constructor_counts.values()) == 488
+    assert sum(constructor_counts.values()) == 534
     assert unclassified_counts == {
         "cin.py": 9,
-        "cin_lowerer.py": 164,
+        "cin_lowerer.py": 195,
         "compressed_where_openmp_pass.py": 32,
         "dense_pointer_hoist_pass.py": 7,
         "dynamic_vector_access_pass.py": 1,
-        "iter_lattice.py": 35,
+        "iter_lattice.py": 44,
         "iterator.py": 21,
         "llir_traversal.py": 1,
         "loop_invariant_factor_pass.py": 3,
-        "parallel_marking_pass.py": 13,
+        "parallel_marking_pass.py": 15,
         "result_write_pass.py": 3,
         "schedule_lowerer.py": 106,
         "single_iteration_loop_pass.py": 1,
         "sparse_prefetch_pass.py": 1,
-        "torch_cpp_abi.py": 81,
+        "torch_cpp_abi.py": 85,
     }
-    assert sum(unclassified_counts.values()) == 478
+    assert sum(unclassified_counts.values()) == 524
     assert known_indirect == {
         ("cin_lowerer.py", "actual_size"): 2,
         ("cin_lowerer.py", "expr.name.replace(old, new)"): 1,
@@ -191,7 +211,8 @@ def test_direct_string_encoded_var_expression_budget_is_explicit() -> None:
         ("compressed_where_openmp_pass.py", "sparse_pos"): 1,
         ("parallel_marking_pass.py", "bound_name"): 4,
         ("parallel_marking_pass.py", "sparse_pos"): 2,
-        ("parallel_marking_pass.py", "spec.extent"): 1,
+        ("parallel_marking_pass.py", "spec.extent"): 2,
+        ("iter_lattice.py", "name"): 1,
         ("dense_pointer_hoist_pass.py", "candidate.base"): 1,
         ("dense_pointer_hoist_pass.py", "candidate.stride"): 1,
         ("dense_pointer_hoist_pass.py", "name"): 1,
@@ -209,7 +230,7 @@ def test_direct_string_encoded_var_expression_budget_is_explicit() -> None:
         ("torch_cpp_abi.py", "pointer_name"): 4,
         ("torch_cpp_abi.py", "bound_name"): 1,
     }
-    assert sum(known_indirect.values()) == 49
+    assert sum(known_indirect.values()) == 51
 
     assert totals == {
         "subscript": 9,
@@ -696,8 +717,10 @@ def test_workspace_clear_mutations_are_structured() -> None:
     assert "llir.RawStmt(" not in fill_body
     assert clear_helper.count("llir.MemberCallStmt(") == 1
     assert 'member="clear"' in clear_helper
+    # The receiver is the hoisted workspace's name, read through the one accessor
+    # that refuses a context naming no workspace.
     assert (
-        "base=llir.Var(name=context.workspace_name, type=llir.DataType.NO_TYPE)"
+        "name=_hoisted_workspace_name(context), type=llir.DataType.NO_TYPE"
         in clear_helper
     )
     assert count_body.count("body.append(_workspace_clear_statement(context))") == 1
@@ -782,10 +805,13 @@ def test_dense_workspace_zero_fill_is_structured() -> None:
     )
     sizeof_constructors += Counter()
     assert sizeof_constructors == {
-        "cin_lowerer.py": 2,
+        # 3 with the copy of a dense workspace into a dense block of the
+        # result (``_dense_block_workspace_copy_out``), typed like the two
+        # before it.
+        "cin_lowerer.py": 3,
         "llir_traversal.py": 1,
     }
-    assert sum(sizeof_constructors.values()) == 3
+    assert sum(sizeof_constructors.values()) == 4
 
     lowerer_path = _COMPILER_ROOT / "cin_lowerer.py"
     lowerer_source = lowerer_path.read_text()
@@ -846,14 +872,15 @@ def test_dense_workspace_write_back_copy_is_structured() -> None:
     )
     address_of_constructors += Counter()
     assert address_of_constructors == {
-        "cin_lowerer.py": 2,
+        # 3 with ``_dense_block_workspace_copy_out``'s memcpy destination.
+        "cin_lowerer.py": 3,
         "dense_pointer_hoist_pass.py": 2,
         "llir_traversal.py": 1,
         "schedule_lowerer.py": 1,
         "single_iteration_loop_pass.py": 1,
         "sparse_prefetch_pass.py": 1,
     }
-    assert sum(address_of_constructors.values()) == 8
+    assert sum(address_of_constructors.values()) == 9
 
     lowerer_path = _COMPILER_ROOT / "cin_lowerer.py"
     lowerer_source = lowerer_path.read_text()
@@ -1248,11 +1275,12 @@ def test_known_nnz_coordinate_torch_allocation_is_structured() -> None:
             len(_llir_constructor_calls(path, constructor))
             for constructor in ("VarInit", "Array", "FunctionCall", "QualifiedName")
         )
-        == 64
+        == 65
     )
     assert len(_llir_constructor_calls(path, "VarInit")) == 29
     assert len(_llir_constructor_calls(path, "Array")) == 10
-    assert len(_llir_constructor_calls(path, "FunctionCall")) == 13
+    # 14 with the coordinate count ``emit_position_tail_close`` reads.
+    assert len(_llir_constructor_calls(path, "FunctionCall")) == 14
     assert len(_llir_constructor_calls(path, "QualifiedName")) == 12
 
 

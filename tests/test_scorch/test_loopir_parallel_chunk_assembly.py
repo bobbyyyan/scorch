@@ -5,8 +5,19 @@ pipeline emits a PARALLEL two-phase one.  A three-column source-level ablation
 (``~/.cache/scorch-codex/ttm-density-mechanism/ABLATION.md``) measured that the
 whole gap is parallelism: with legacy's two pragmas deleted the typed single
 pass is 1.18-1.47x FASTER, so adopting the two-phase strategy would buy
-parallelism by surrendering a real advantage.  Production instead parallelizes
-the single pass over per-chunk output buffers concatenated in outer-loop order.
+parallelism by surrendering a real advantage.  The chunked strategy instead
+parallelizes the single pass over per-chunk output buffers concatenated in
+outer-loop order.
+
+**The strategy is reached by request** (``Schedule(assembly=
+"single_pass_chunk_parallel")``).  Where a program can also be assembled in two
+parallel passes, which is the shipped compiler's strategy, that is what an
+automatic plan records from ``2 * ROWS_PER_THREAD`` rows
+(``loopir/assembly_rule.py``): the chunked form's two-host runtime measurement
+(review section 59.9) has it faster than the two-pass on some shapes and slower
+than the serial kernel on others, and no condition separates them yet.  The
+tests below therefore request it, and the execution tests hold the automatic
+plan's kernel to the same storage.
 
 Four properties are locked here, and each one is a thing that would otherwise be
 a claim rather than a fact.
@@ -22,15 +33,17 @@ original inline nest, and the shared body is used by the parallel arm only,
 which pays the escape either way.  The locks pin that arm byte-for-byte against
 the ungated emission and require no pragma on it.
 
-**A gate that can never open is never emitted.**  An outer extent below
-``2 * ROWS_PER_THREAD`` cannot reach two threads for any operand, so those
-programs are declined at COMPILE time and keep today's kernel byte for byte.
-That is the only way the cost is exactly zero rather than small: an unexecuted
-arm is not free.
+**A gate that can never open is never emitted unasked.**  An outer extent below
+``2 * ROWS_PER_THREAD`` cannot reach two threads for any operand, so an
+automatic plan records the serial single pass there and the kernel is the
+serial nest byte for byte.  That is the only way the cost is exactly zero
+rather than small: an unexecuted arm is not free.  A request at that extent is
+legal and is honoured.
 
-**Declining is byte-neutral.**  Every receiver the transformation does not admit
-emits exactly what it emitted before, including the dense-prefix-deeper-than-one
-case that is deliberately out of scope.
+**A receiver the transformation does not admit is refused it.**  A request for
+the chunked strategy on such a receiver raises, including the
+dense-prefix-deeper-than-one case that is deliberately out of scope, and the
+automatic plan's kernel for it is the serial one.
 
 **Ordering survives the chunk boundary.**  Concatenating per-chunk buffers is
 only correct because the outer loop binds result level 0; the locks execute at
@@ -59,10 +72,12 @@ from scorch.compiler.cin import (
     TensorVar,
 )
 from scorch.compiler.compile_options import CompileOptions
+from scorch.compiler.diagnostics import InvalidSchedule, UnsupportedFeature
 from scorch.compiler.loopir import lower_llir as lower_llir_module
 from scorch.compiler.loopir.parallel_chunk_assembly import (
     GENERATED_NAMES,
     PARALLEL_CHUNK_RUNTIME_SPELLINGS,
+    ROWS_PER_THREAD,
     ParallelChunkAssemblyContext,
     build_parallel_chunk_assembly,
     chunked_vector_names,
@@ -79,7 +94,20 @@ from scorch.stensor import STensor
 _F32 = torch.float32
 
 
-def auto_options(regblock_enabled=False, *, jit=False):
+CHUNKED = "single_pass_chunk_parallel"
+
+#: What a request for a strategy the program cannot be assembled with raises.
+REFUSALS = (lower_llir_module.LoopIRTargetError, UnsupportedFeature, InvalidSchedule)
+
+
+def auto_options(regblock_enabled=False, *, jit=False, assembly=None):
+    """The automatic schedule, with an assembly strategy requested or not.
+
+    The chunked single pass is reached by request: where a program can also be
+    assembled in two parallel passes, the shipped compiler's strategy, that is
+    what the automatic rule records (``loopir/assembly_rule.py``).
+    """
+
     base = (
         CompileOptions.from_environment()
         if jit
@@ -87,8 +115,12 @@ def auto_options(regblock_enabled=False, *, jit=False):
     )
     return replace(
         base.with_regblock_enabled(regblock_enabled),
-        requested_schedule=Schedule(),
+        requested_schedule=Schedule(assembly=assembly),
     )
+
+
+def chunked_options(regblock_enabled=False, *, jit=False):
+    return auto_options(regblock_enabled, jit=jit, assembly=CHUNKED)
 
 
 def ttm_cin(a_fmt, b_fmt, c_fmt, dtype=_F32, names=("i", "j", "k", "l")):
@@ -137,15 +169,21 @@ def emit(statement, result_shape, bindings, options=None):
     ).cpp_source
 
 
-def emit_ungated(monkeypatch, statement, result_shape, bindings, options=None):
-    """The same program with admission forced off -- the pre-change emission."""
+def emit_chunked(statement, result_shape, bindings, regblock_enabled=False):
+    """The program with the chunked single pass requested."""
 
-    monkeypatch.setattr(
-        lower_llir_module._OrderedKeySparseWorkspaceLowering,
-        "parallel_chunk_context",
-        lambda self: None,
+    return emit(statement, result_shape, bindings, chunked_options(regblock_enabled))
+
+
+def emit_ungated(statement, result_shape, bindings):
+    """The same program with the serial single pass requested: the nest alone."""
+
+    return emit(
+        statement,
+        result_shape,
+        bindings,
+        auto_options(assembly="single_pass_serial"),
     )
-    return emit(statement, result_shape, bindings, options)
 
 
 # The outer extent must clear 2 * ROWS_PER_THREAD or the gate is declined at
@@ -203,19 +241,15 @@ def base_nest(source):
 
 @pytest.mark.parametrize("arm", [False, True])
 def test_dense_prefix_receiver_is_gated_in_both_arms(arm):
-    source = emit(
-        ttm_cin("dss", "dd", "dss"), TTM_RESULT, TTM_BINDINGS, auto_options(arm)
-    )
+    source = emit_chunked(ttm_cin("dss", "dd", "dss"), TTM_RESULT, TTM_BINDINGS, arm)
     assert "int _assembly_threads = scorch_nthreads(" in source
     assert "if (_assembly_threads > 1) {" in source
     assert source.count("#pragma omp") == 1
 
 
 def test_arms_generate_identical_gated_sources():
-    off = emit(
-        ttm_cin("dss", "ss", "dss"), TTM_RESULT, TTM_BINDINGS, auto_options(False)
-    )
-    on = emit(ttm_cin("dss", "ss", "dss"), TTM_RESULT, TTM_BINDINGS, auto_options(True))
+    off = emit_chunked(ttm_cin("dss", "ss", "dss"), TTM_RESULT, TTM_BINDINGS, False)
+    on = emit_chunked(ttm_cin("dss", "ss", "dss"), TTM_RESULT, TTM_BINDINGS, True)
     assert off == on
 
 
@@ -229,9 +263,13 @@ def test_arms_generate_identical_gated_sources():
     ],
 )
 def test_receivers_without_a_dense_prefix_are_untouched(
-    monkeypatch, operand_fmt, result_fmt, operand_indices, result_indices, shape
+    operand_fmt, result_fmt, operand_indices, result_indices, shape
 ):
-    """No dense level 0 means no outer loop that partitions the result."""
+    """No dense level 0 means no outer loop that partitions the result.
+
+    The automatic plan records the serial single pass for it, and a request for
+    the chunked one is refused, not answered with the serial kernel.
+    """
 
     statement = reduction_cin(operand_fmt, result_fmt, operand_indices, result_indices)
     result_shape = tuple(shape[operand_indices.index(name)] for name in result_indices)
@@ -240,15 +278,20 @@ def test_receivers_without_a_dense_prefix_are_untouched(
     assert "_assembly_threads" not in gated
     assert "#pragma omp" not in gated
     ungated = emit_ungated(
-        monkeypatch,
         reduction_cin(operand_fmt, result_fmt, operand_indices, result_indices),
         result_shape,
         bindings,
     )
     assert gated == ungated
+    with pytest.raises(REFUSALS):
+        emit_chunked(
+            reduction_cin(operand_fmt, result_fmt, operand_indices, result_indices),
+            result_shape,
+            bindings,
+        )
 
 
-def test_dense_prefix_deeper_than_one_is_declined_and_byte_neutral(monkeypatch):
+def test_dense_prefix_deeper_than_one_is_declined_and_byte_neutral():
     """``dds`` indexes its first compressed level by a FLATTENED dense cell.
 
     The mechanism generalizes to it; the index derivation does not come for
@@ -259,22 +302,20 @@ def test_dense_prefix_deeper_than_one_is_declined_and_byte_neutral(monkeypatch):
     gated = emit(ttm_cin("dss", "dd", "dds"), TTM_RESULT, TTM_BINDINGS)
     assert "_assembly_threads" not in gated
     assert "#pragma omp" not in gated
-    ungated = emit_ungated(
-        monkeypatch, ttm_cin("dss", "dd", "dds"), TTM_RESULT, TTM_BINDINGS
-    )
+    ungated = emit_ungated(ttm_cin("dss", "dd", "dds"), TTM_RESULT, TTM_BINDINGS)
     assert gated == ungated
+    with pytest.raises(REFUSALS):
+        emit_chunked(ttm_cin("dss", "dd", "dds"), TTM_RESULT, TTM_BINDINGS)
 
 
 # -- the shape of the gate ---------------------------------------------------
 
 
-def test_serial_arm_is_the_ungated_nest_verbatim(monkeypatch):
+def test_serial_arm_is_the_ungated_nest_verbatim():
     """The arm that runs at one thread must be the base's, character for character."""
 
-    gated = emit(ttm_cin("dss", "ss", "dss"), TTM_RESULT, TTM_BINDINGS)
-    ungated = emit_ungated(
-        monkeypatch, ttm_cin("dss", "ss", "dss"), TTM_RESULT, TTM_BINDINGS
-    )
+    gated = emit_chunked(ttm_cin("dss", "ss", "dss"), TTM_RESULT, TTM_BINDINGS)
+    ungated = emit_ungated(ttm_cin("dss", "ss", "dss"), TTM_RESULT, TTM_BINDINGS)
     header = re.search(
         r"^  for \(int64_t (\w+) = 0; \1 < (\w+); \1\+\+\) \{$", ungated, re.M
     )
@@ -285,11 +326,9 @@ def test_serial_arm_is_the_ungated_nest_verbatim(monkeypatch):
     assert serial_arm(gated) == base_nest(ungated).replace("<HEADER>", spelling)
 
 
-def test_the_parallel_arm_calls_one_shared_body_holding_the_same_nest(monkeypatch):
-    source = emit(ttm_cin("dss", "dd", "dss"), TTM_RESULT, TTM_BINDINGS)
-    ungated = emit_ungated(
-        monkeypatch, ttm_cin("dss", "dd", "dss"), TTM_RESULT, TTM_BINDINGS
-    )
+def test_the_parallel_arm_calls_one_shared_body_holding_the_same_nest():
+    source = emit_chunked(ttm_cin("dss", "dd", "dss"), TTM_RESULT, TTM_BINDINGS)
+    ungated = emit_ungated(ttm_cin("dss", "dd", "dss"), TTM_RESULT, TTM_BINDINGS)
     assert source.count("auto _assembly_body = [&](") == 1
     # Called once per chunk from inside the region, and nowhere else.  The
     # definition spells "_assembly_body = [&](", so it is not a call match.
@@ -298,7 +337,9 @@ def test_the_parallel_arm_calls_one_shared_body_holding_the_same_nest(monkeypatc
 
 
 def test_the_serial_arm_carries_no_pragma_and_no_buffer_construction():
-    arm = serial_arm(emit(ttm_cin("dss", "dd", "dss"), TTM_RESULT, TTM_BINDINGS))
+    arm = serial_arm(
+        emit_chunked(ttm_cin("dss", "dd", "dss"), TTM_RESULT, TTM_BINDINGS)
+    )
     assert "#pragma" not in arm
     assert "scorch_chunk_buffers" not in arm
     assert "scorch_presize_positions" not in arm
@@ -306,26 +347,47 @@ def test_the_serial_arm_carries_no_pragma_and_no_buffer_construction():
 
 
 @pytest.mark.parametrize("extent", [1, 8, 31])
-def test_an_extent_that_cannot_reach_two_threads_is_declined(monkeypatch, extent):
-    """Below 2 * ROWS_PER_THREAD the gate could only ever cost, never pay."""
+def test_an_extent_that_cannot_reach_two_threads_is_declined(extent):
+    """Below 2 * ROWS_PER_THREAD a parallel assembly could only cost, never pay.
+
+    The automatic plan records the serial single pass there, and its kernel is
+    the serial nest alone.  The chunked strategy is still legal at that extent,
+    so a request for it is honoured.
+    """
 
     result_shape = (extent, 5, 7)
     bindings = (((extent, 5, 6), _F32), ((6, 7), _F32))
-    gated = emit(ttm_cin("dss", "dd", "dss"), result_shape, bindings)
-    assert "_assembly_threads" not in gated
-    assert "#pragma omp" not in gated
-    ungated = emit_ungated(
-        monkeypatch, ttm_cin("dss", "dd", "dss"), result_shape, bindings
+    automatic = emit(ttm_cin("dss", "dd", "dss"), result_shape, bindings)
+    assert "_assembly_threads" not in automatic
+    assert "#pragma omp" not in automatic
+    ungated = emit_ungated(ttm_cin("dss", "dd", "dss"), result_shape, bindings)
+    assert automatic == ungated
+    assert "_assembly_threads" in emit_chunked(
+        ttm_cin("dss", "dd", "dss"), result_shape, bindings
     )
-    assert gated == ungated
 
 
-def test_an_extent_that_can_reach_two_threads_is_gated():
-    """The threshold is a real boundary, not a blanket refusal."""
+def test_an_extent_that_can_reach_two_threads_gets_a_parallel_assembly():
+    """The threshold is a real boundary, and the chunked pass is not its default.
 
-    result_shape = (2 * lower_llir_module.PARALLEL_CHUNK_ROWS_PER_THREAD, 5, 7)
+    From ``2 * ROWS_PER_THREAD`` rows the automatic plan records a parallel
+    strategy: the two-pass assembly, which this program can be emitted with and
+    which is the shipped compiler's.  The chunked single pass is the kernel a
+    request for it emits.
+    """
+
+    result_shape = (2 * ROWS_PER_THREAD, 5, 7)
     bindings = (((result_shape[0], 5, 6), _F32), ((6, 7), _F32))
-    assert "_assembly_threads" in emit(
+    automatic = emit(ttm_cin("dss", "dd", "dss"), result_shape, bindings)
+    assert "#pragma omp" in automatic
+    assert "_assembly_threads" not in automatic
+    assert automatic == emit(
+        ttm_cin("dss", "dd", "dss"),
+        result_shape,
+        bindings,
+        auto_options(assembly="two_pass_parallel"),
+    )
+    assert "_assembly_threads" in emit_chunked(
         ttm_cin("dss", "dd", "dss"), result_shape, bindings
     )
 
@@ -333,7 +395,7 @@ def test_an_extent_that_can_reach_two_threads_is_gated():
 def test_the_pragma_carries_no_if_clause():
     """A false ``if()`` clause still enters the runtime and outlines the body."""
 
-    source = emit(ttm_cin("dss", "dd", "dss"), TTM_RESULT, TTM_BINDINGS)
+    source = emit_chunked(ttm_cin("dss", "dd", "dss"), TTM_RESULT, TTM_BINDINGS)
     pragma = next(
         line for line in source.splitlines() if line.strip().startswith("#pragma omp")
     )
@@ -342,7 +404,7 @@ def test_the_pragma_carries_no_if_clause():
 
 
 def test_buffers_are_constructed_only_inside_the_taken_branch():
-    source = emit(ttm_cin("dss", "dd", "dss"), TTM_RESULT, TTM_BINDINGS)
+    source = emit_chunked(ttm_cin("dss", "dd", "dss"), TTM_RESULT, TTM_BINDINGS)
     branch = source.index("if (_assembly_threads > 1) {")
     otherwise = source.index("\n  } else {\n")
     for spelling in ("scorch_chunk_buffers", "scorch_presize_positions", "#pragma omp"):
@@ -354,7 +416,7 @@ def test_thread_count_is_spelled_from_the_same_derivation_as_legacy():
     """Both kernels must open on the SAME gate at the same operands."""
 
     statement = ttm_cin("dss", "ss", "dss")
-    typed = emit(statement, TTM_RESULT, TTM_BINDINGS)
+    typed = emit_chunked(statement, TTM_RESULT, TTM_BINDINGS)
     legacy = legacy_generated_cpp(
         ttm_cin("dss", "ss", "dss"),
         TTM_RESULT,
@@ -371,7 +433,7 @@ def test_thread_count_is_spelled_from_the_same_derivation_as_legacy():
 def test_the_shared_body_takes_every_chunked_vector_under_its_own_spelling():
     """The nest is edit-free only because the parameters keep the names."""
 
-    source = emit(ttm_cin("dss", "dd", "dss"), TTM_RESULT, TTM_BINDINGS)
+    source = emit_chunked(ttm_cin("dss", "dd", "dss"), TTM_RESULT, TTM_BINDINGS)
     assert (
         "auto _assembly_body = [&](int64_t _assembly_lo, int64_t _assembly_hi, "
         "auto& C1_crd, auto& C2_pos, auto& C2_crd, auto& C_values) {" in source
@@ -384,7 +446,7 @@ def test_the_shared_body_takes_every_chunked_vector_under_its_own_spelling():
 
 
 def test_the_merge_runs_in_chunk_order_over_every_chunked_vector():
-    source = emit(ttm_cin("dss", "dd", "dss"), TTM_RESULT, TTM_BINDINGS)
+    source = emit_chunked(ttm_cin("dss", "dd", "dss"), TTM_RESULT, TTM_BINDINGS)
     assert "scorch_shift_chunk_positions(C1_pos, _chunk_C1_crd," in source
     # Every merge helper takes the assembly thread count: the concatenation is
     # itself parallel over chunks, because once the compute term has been divided
@@ -540,7 +602,7 @@ def test_codegen_emits_the_lambda_and_walks_its_body():
 def test_the_dynamic_vector_rewrite_reaches_inside_the_shared_body():
     """``C_values[pC2] = v`` must still become ``emplace_back`` in the lambda."""
 
-    source = emit(ttm_cin("dss", "dd", "dss"), TTM_RESULT, TTM_BINDINGS)
+    source = emit_chunked(ttm_cin("dss", "dd", "dss"), TTM_RESULT, TTM_BINDINGS)
     body = source[source.index("auto _assembly_body") : source.index("\n  };\n")]
     assert "auto& C_values" in body
     assert "C_values.emplace_back(" in body
@@ -582,46 +644,39 @@ def _storage(result):
 
 @pytest.mark.parametrize("b_fmt", ["ss", "dd"])
 @pytest.mark.parametrize("density", [0.001, 0.05])
-def test_parallel_assembly_matches_the_serial_assembly_exactly(
-    monkeypatch, b_fmt, density
-):
+def test_parallel_assembly_matches_the_serial_assembly_exactly(b_fmt, density):
     """Bit-identical storage, not merely allclose values.
 
     Values agreeing proves the arithmetic; only the index arrays prove that the
     concatenation preserved lexicographic order across the chunk boundaries,
-    which is the one thing this design could get wrong.
+    which is the one thing this design could get wrong.  The automatic plan's
+    kernel at this extent (two parallel passes) is held to the same storage.
     """
 
     operands, reference = _operands("dss", b_fmt, _PARALLEL_SHAPE, density)
-    options = auto_options(jit=True)
-    parallel = execute_cin_via_loopir(
-        ttm_cin("dss", b_fmt, "dss"),
-        (_PARALLEL_SHAPE[0], _PARALLEL_SHAPE[1], _PARALLEL_SHAPE[3]),
-        *operands,
-        compile_options=options,
-    )[0]
+    result_shape = (_PARALLEL_SHAPE[0], _PARALLEL_SHAPE[1], _PARALLEL_SHAPE[3])
+
+    def run(options):
+        return execute_cin_via_loopir(
+            ttm_cin("dss", b_fmt, "dss"),
+            result_shape,
+            *operands,
+            compile_options=options,
+        )[0]
+
+    parallel = run(chunked_options(jit=True))
     assert torch.allclose(
         parallel.to_torch(in_place=False).to(torch.float64),
         reference,
         atol=1e-3,
         rtol=1e-3,
     )
-
-    monkeypatch.setattr(
-        lower_llir_module._OrderedKeySparseWorkspaceLowering,
-        "parallel_chunk_context",
-        lambda self: None,
-    )
-    serial = execute_cin_via_loopir(
-        ttm_cin("dss", b_fmt, "dss"),
-        (_PARALLEL_SHAPE[0], _PARALLEL_SHAPE[1], _PARALLEL_SHAPE[3]),
-        *operands,
-        compile_options=options,
-    )[0]
+    serial = run(auto_options(jit=True, assembly="single_pass_serial"))
     assert _storage(parallel) == _storage(serial)
+    assert _storage(run(auto_options(jit=True))) == _storage(serial)
 
 
-def test_three_compressed_levels_assemble_in_parallel(monkeypatch):
+def test_three_compressed_levels_assemble_in_parallel():
     """The strategy is rank-general, so its execution lock has to be too.
 
     Every other execution lock here uses a ``dss`` receiver, whose two
@@ -640,43 +695,40 @@ def test_three_compressed_levels_assemble_in_parallel(monkeypatch):
     assert min(shape[0] // 16, stored // 500) > 1, "the gate must actually open"
 
     result_shape = (64, 32, 8, 8)
-    options = auto_options(jit=True)
-    parallel = execute_cin_via_loopir(
-        reduction_cin("dssss", "dsss", "ijklm", "ijkm"),
-        result_shape,
-        operand,
-        compile_options=options,
-    )[0]
+
+    def run(options):
+        return execute_cin_via_loopir(
+            reduction_cin("dssss", "dsss", "ijklm", "ijkm"),
+            result_shape,
+            operand,
+            compile_options=options,
+        )[0]
+
+    parallel = run(chunked_options(jit=True))
     assert torch.allclose(
         parallel.to_torch(in_place=False).to(torch.float64),
         dense.to(torch.float64).sum(dim=3),
         atol=1e-3,
         rtol=1e-3,
     )
-
-    monkeypatch.setattr(
-        lower_llir_module._OrderedKeySparseWorkspaceLowering,
-        "parallel_chunk_context",
-        lambda self: None,
-    )
-    serial = execute_cin_via_loopir(
-        reduction_cin("dssss", "dsss", "ijklm", "ijkm"),
-        result_shape,
-        operand,
-        compile_options=options,
-    )[0]
+    serial = run(auto_options(jit=True, assembly="single_pass_serial"))
     assert _storage(parallel) == _storage(serial)
+    assert _storage(run(auto_options(jit=True))) == _storage(serial)
 
 
-def test_an_empty_operand_assembles_the_same_empty_result(monkeypatch):
-    """The chunk whose rows are all empty must contribute nothing, not a gap."""
+@pytest.mark.parametrize("assembly", [CHUNKED, None])
+def test_an_empty_operand_assembles_the_same_empty_result(assembly):
+    """The chunk whose rows are all empty must contribute nothing, not a gap.
+
+    Asked of the chunked strategy and of the automatic plan's (``None``).
+    """
 
     shape = _PARALLEL_SHAPE
     i, j, k, l = shape  # noqa: E741 -- the contraction's own index names
     a_dense = torch.zeros((i, j, k), dtype=_F32)
     b_dense = random_dense((k, l), 3, 0.5)
     operands = (sparse(a_dense, "dss", "A"), sparse(b_dense, "dd", "B"))
-    options = auto_options(jit=True)
+    options = auto_options(jit=True, assembly=assembly)
     result = execute_cin_via_loopir(
         ttm_cin("dss", "dd", "dss"), (i, j, l), *operands, compile_options=options
     )[0]

@@ -362,7 +362,29 @@ inline bool abi_screen_compressed(const int32_t* pos, const int32_t* crd,
                                               require_sorted);
 }
 
-// "COO coordinates ascend lexicographically across levels"
+// "COO coordinates ascend strictly lexicographically across levels": no entry's coordinate
+// tuple is smaller than the one before it, and none is equal to it. An equal tuple is one
+// coordinate stored twice, which the kernels do not sum (2026-10-12: refused, and the
+// caller calls coalesce()), so it is as much a violation as a descent.
+//
+// Positions are taken kLexBlock at a time and levels first to last; tie[i] says that
+// position i still equals its predecessor on every level read so far. A level is read only
+// while some position of the block is still tied, so a block reads no level that a
+// position-by-position comparison would not read for one of its positions. The data
+// decides a branch once per level of a block (read the next level or not) and once per
+// block (stop at the first block with a violation), never per position: each pass inside
+// a block is a fixed-count loop over adjacent elements, which the compiler vectorizes.
+//
+// The loop this replaces compared one position at a time, leaving at the first level that
+// differed; it could not be vectorized, and making it strict (`cmp < 0` to `cmp <= 0`)
+// cost about 0.25 ns more per entry under gcc (mkt1, 65,536 entries: +16 us). On the
+// standalone loops (int32 and int64, 1 to 4 levels, 8,192 to 1,048,576 entries, the first
+// level deciding at every entry, at 1 in 8, at random and never: 78 cells) this form takes
+// 0.09x to 0.64x the time of the non-strict loop it replaces under gcc 13.4 on Broadwell
+// and 0.13x to 0.62x under Apple clang 21 on an M5 Max, and is slower in no cell on
+// either. 256 was the fastest of 256, 512 and 1024 on Broadwell.
+constexpr int64_t kLexBlock = 256;
+
 template <typename T>
 inline bool abi_screen_lex_typed(const std::vector<const T*>& levels, int64_t n,
                                  int64_t grain = SCORCH_ABI_VALIDATE_GRAIN) {
@@ -372,13 +394,28 @@ inline bool abi_screen_lex_typed(const std::vector<const T*>& levels, int64_t n,
   const int bad = at::parallel_reduce(
       (int64_t)1, n, abi_split(n - 1, grain), 0,
       [&](int64_t begin, int64_t end, int partial) {
-        for (int64_t p = begin; p < end; ++p) {
-          int cmp = 0;  // first level that differs decides, as the serial loop does
-          for (size_t l = 0; l < depth && cmp == 0; ++l) {
-            const T a = lv[l][p - 1], b = lv[l][p];
-            cmp = (b > a) - (b < a);
+        T tie[kLexBlock];
+        for (int64_t first = begin; first < end && partial == 0; first += kLexBlock) {
+          const int64_t count = std::min<int64_t>(kLexBlock, end - first);
+          T below = 0;  // some position is smaller at the first level where it differs
+          T tied = 0;   // some position equals its predecessor on every level so far
+          const T* level = lv[0] + first;
+          for (int64_t i = 0; i < count; ++i) {
+            below |= level[i] < level[i - 1];
+            tie[i] = level[i] == level[i - 1];
+            tied |= tie[i];
           }
-          partial |= (cmp < 0);
+          for (size_t l = 1; l < depth && tied != 0; ++l) {
+            level = lv[l] + first;
+            tied = 0;
+            for (int64_t i = 0; i < count; ++i) {
+              below |= tie[i] & (level[i] < level[i - 1]);
+              tie[i] &= level[i] == level[i - 1];
+              tied |= tie[i];
+            }
+          }
+          // Still tied after the last level: the same tuple twice.
+          partial |= (below | tied) != 0;
         }
         return partial;
       },
@@ -484,9 +521,10 @@ inline uint32_t abi_version_of(const torch::Tensor& t) {
 // The memo's documented trade above covers the same ground.
 //
 // The table lives in ONE module, scorch_ops (SCORCH_ABI_WATCH_OWNER), because the
-// witnesses are registered there. A JIT-compiled kernel module, which carries its own
-// copy of this header and of the memo, reads epochs through a capsule scorch_ops
-// exports (abi_epoch_of below), so its memo sees the same writes.
+// witnesses are registered there. A JIT-compiled kernel module, which compiles its own
+// copy of this header, reads epochs through a capsule scorch_ops exports (abi_epoch_of
+// below), so its lookups see the same writes. (Whether that module also has a memo of
+// its own depends on the platform: see the note on abi_memo_clear.)
 //
 // The two builds of this header must not define one external symbol two ways: macOS's
 // loader merges weak (inline) definitions across loaded images, and an owner's `static
@@ -850,8 +888,13 @@ enum AbiCheckKind : int64_t {
   AbiCheckBounds = 1,      // every coordinate in [0, extent)
   AbiCheckCompressed = 2,  // spans partition [0, nnz], coordinates in range and,
                            // when required, strictly increasing inside each span
-  AbiCheckLex = 3,         // coordinate levels ascend lexicographically
+  // 3 was the order check WITHOUT strictness ("coordinate levels ascend
+  // lexicographically"), which admitted one coordinate tuple stored twice. Retired, name
+  // and value: never reuse 3, so that no verdict recorded under that rule can ever satisfy
+  // the strict check. (A test searches this file for the retired name; keep it out.)
   AbiCheckSpans = 4,       // positions alone: non-decreasing and within [0, nnz]
+  AbiCheckLexStrict = 5,   // coordinate levels ascend strictly lexicographically: no
+                           // tuple is smaller than, or equal to, the one before it
 };
 
 // A verdict that some arrays are structurally valid, together with the shape
@@ -1065,12 +1108,27 @@ inline AbiMemoSweep& abi_panel_positions_sweep() {
   return s;
 }
 
-// Drops every cached verdict, narrowed copy and rebased panel held by THIS module. The maps
-// are inline function-local statics and Python dlopens extension modules with
-// RTLD_LOCAL, so the prebuilt extension and each JIT-compiled kernel carry their own.
-// Every module amortizes over its own calls, which is all that is needed; the cost is
-// that a tensor used on both paths is narrowed once per module. Exposed so tests can
-// force the cold path and so a caller under memory pressure can reclaim the copies.
+// Drops every cached verdict, narrowed copy and rebased panel this module can reach.
+// Exposed so tests can force the cold path and so a caller under memory pressure can
+// reclaim the copies.
+//
+// How many memos a process has depends on the platform, and nothing may rely on either
+// answer. The maps are function-local statics of inline functions. Under gcc on Linux
+// such a static is a GNU unique symbol, which the dynamic linker binds to one object for
+// the whole process whatever the dlopen flags: there, ONE memo per process, shared by
+// the prebuilt extension and every JIT-compiled kernel module (nm -D shows `u` for these
+// maps in scorch_ops and in a kernel module; measured 2026-10-12). Where the loader
+// keeps the statics apart, each module has its own, and a tensor used on both paths is
+// narrowed once per module. macOS has not been measured.
+//
+// With one memo per process, a generated kernel never rescans an operand that STensor
+// construction already scanned through the extension: it finds that verdict. So the
+// trade documented under "Validation memo" reaches past a kernel's own calls: a write
+// through a raw buffer that does not move the version counter (numpy) is accepted by
+// every kernel, one never called on that operand included, until a torch write or a
+// write-witness epoch change invalidates the verdict. Sharing is sound only because a
+// verdict is specific to its rule: the key and the match carry the check kind and its
+// parameters (AbiCheckKind), so a weaker check's verdict cannot satisfy a stricter one.
 inline void abi_memo_clear() {
   std::lock_guard<std::mutex> guard(abi_memo_mutex());
   abi_narrow_map().clear();
@@ -1755,6 +1813,37 @@ inline CsrInputView checked_csr_view(
   return CsrInputView(logical_shape, positions, coordinates, values);
 }
 
+// The serial check behind abi_screen_lex: run only when the screen says "go and look", so
+// that the first violation by position is the one reported, as it always was. A descent and
+// a repeat are reported apart. A repeat's text is parsed back into a structured
+// RepeatedCoordinateError by scorch.exceptions.raise_if_native_repeat at every Python call
+// site of a kernel, so its wording is a contract: change both or neither.
+inline void check_coo_strictly_ascending(const std::vector<const int32_t*>& levels,
+                                         int64_t n, const char* op,
+                                         const char* argument) {
+  for (int64_t p = 1; p < n; ++p) {
+    int cmp = 0;
+    for (size_t level = 0; level < levels.size() && cmp == 0; ++level) {
+      const int32_t a = levels[level][p - 1], b = levels[level][p];
+      cmp = (b > a) - (b < a);
+    }
+    TORCH_CHECK(cmp >= 0, argument_name(op, argument),
+                " COO coordinates must be lexicographically ordered; order ",
+                "decreases at position ", p);
+    if (cmp == 0) {
+      std::string tuple;
+      for (size_t level = 0; level < levels.size(); ++level) {
+        if (level > 0) tuple += ", ";
+        tuple += std::to_string(levels[level][p]);
+      }
+      TORCH_CHECK(false, argument_name(op, argument), " COO coordinate (", tuple,
+                  ") is stored at positions ", p - 1, " and ", p,
+                  "; call coalesce() to sum repeated coordinates "
+                  "[coo_repeated_coordinate]");
+    }
+  }
+}
+
 template <typename Dim>
 inline CooInputView checked_coo_view(
     const std::vector<Dim>& shape,
@@ -1814,7 +1903,7 @@ inline CooInputView checked_coo_view(
 
   if (require_lexicographic_order && nnz > 1) {
     AbiStructEntry lex_memo;
-    lex_memo.params.push_back(AbiCheckLex);
+    lex_memo.params.push_back(AbiCheckLexStrict);
     std::vector<const int32_t*> crd_levels;
     crd_levels.reserve(coordinates.size());
     for (const auto& coordinate : coordinates) {
@@ -1824,21 +1913,7 @@ inline CooInputView checked_coo_view(
     lex_memo.params.push_back(nnz);
     const bool lex_known = abi_struct_hit(lex_memo);
     if (!lex_known && abi_screen_lex(crd_levels, nnz)) {
-      for (int64_t p = 1; p < nnz; ++p) {
-        bool greater = false;
-        bool different = false;
-        for (size_t level = 0; level < coordinates.size(); ++level) {
-          const int32_t* crd = coordinates[level].data_ptr<int32_t>();
-          if (crd[p] != crd[p - 1]) {
-            greater = crd[p] > crd[p - 1];
-            different = true;
-            break;
-          }
-        }
-        TORCH_CHECK(!different || greater, argument_name(op, argument),
-                    " COO coordinates must be lexicographically ordered; order ",
-                    "decreases at position ", p);
-      }
+      check_coo_strictly_ascending(crd_levels, nnz, op, argument);
     }
     if (!lex_known) abi_struct_store(std::move(lex_memo));
   }
@@ -2205,8 +2280,8 @@ inline void validate_jit_tensor(
                 " compressed level ", level, " must start at position 0");
     // Same three checks the CSR view runs — spans partition [0, nnz], coordinates in
     // range, coordinates strictly increasing within a span — so the same screen and memo
-    // family serve both. (Sharing is within one module: see the note on abi_memo_clear
-    // for why each loaded kernel carries its own maps.)
+    // family serve both. (Which modules share a memo depends on the platform: see the
+    // note on abi_memo_clear.)
     AbiStructEntry level_memo;
     level_memo.add(coordinates);
     level_memo.add(positions);
@@ -2246,7 +2321,7 @@ inline void validate_jit_tensor(
   AbiStructEntry lex_memo;
   bool lex_known = true;  // nothing to record unless the check below actually runs
   if (all_coordinate && storage_count > 1) {
-    lex_memo.params.push_back(AbiCheckLex);
+    lex_memo.params.push_back(AbiCheckLexStrict);
     std::vector<const int32_t*> crd_levels;
     crd_levels.reserve(coordinate_levels.size());
     for (const auto& coordinate : coordinate_levels) {
@@ -2256,21 +2331,7 @@ inline void validate_jit_tensor(
     lex_memo.params.push_back(storage_count);
     lex_known = abi_struct_hit(lex_memo);
     if (!lex_known && abi_screen_lex(crd_levels, storage_count)) {
-      for (int64_t p = 1; p < storage_count; ++p) {
-        bool greater = false;
-        bool different = false;
-        for (const auto& coordinate : coordinate_levels) {
-          const int32_t* crd = coordinate.data_ptr<int32_t>();
-          if (crd[p] != crd[p - 1]) {
-            greater = crd[p] > crd[p - 1];
-            different = true;
-            break;
-          }
-        }
-        TORCH_CHECK(!different || greater, argument_name(op, argument),
-                    " COO coordinates must be lexicographically ordered; order ",
-                    "decreases at position ", p);
-      }
+      check_coo_strictly_ascending(crd_levels, storage_count, op, argument);
     }
   }
   TORCH_CHECK(values.numel() == storage_count, argument_name(op, argument),

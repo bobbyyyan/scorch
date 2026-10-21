@@ -3,7 +3,7 @@ from __future__ import annotations
 from array import array as _Array
 from collections import deque as _Deque
 from collections.abc import Mapping as _AbcMapping, Sequence
-from dataclasses import dataclass
+from dataclasses import FrozenInstanceError, dataclass
 from enum import Enum
 import json
 
@@ -19,11 +19,15 @@ from typing import (
     Any,
     cast,
     ClassVar,
+    Dict,
     List,
     Optional,
     Tuple,
     Union,
 )
+
+import torch  # noqa: F401  -- loads libtorch, which scorch_ops links against
+import scorch_ops as _native  # type: ignore[import-not-found]
 
 from .exceptions import TensorFormatError, TensorTypeError
 
@@ -101,6 +105,38 @@ _STR_TO_LEVEL_TYPE = {
     "coord": LevelType.COORDINATE,
     "o": LevelType.COORDINATE,
 }
+
+
+# The two functions below read only a letter string, one letter per storage
+# level ("d" dense, "s" compressed).  Both compilers use them: the release
+# einsum's operand relayout (scorch.ops._einsum_operand_relayout) and the new
+# compiler's operand conversion module, which imports them from here so that a
+# release module never has to import that compiler's package.  (The new
+# compiler's package is not named here: the neutrality suite searches release
+# modules for its name.)
+
+
+def stores_only_its_entries(format_letters: str) -> bool:
+    """Whether a tensor in this layout stores no cell beyond the entries put in it.
+
+    A dense level stores every cell under each stored parent.  Above every
+    compressed level that adds parents with nothing under them and no entry;
+    below a compressed level it adds entries.
+    """
+
+    return "sd" not in format_letters
+
+
+def conversion_format(format_letters: str) -> str:
+    """The layout of an operand of this layout after a conversion.
+
+    Its own layout on the new level order when that stores only the operand's
+    entries (CSR becomes CSC), and every level compressed otherwise.
+    """
+
+    if stores_only_its_entries(format_letters):
+        return format_letters
+    return "s" * len(format_letters)
 
 
 def _actual_type_name(value: object) -> str:
@@ -190,8 +226,130 @@ def _parse_level_type(s: str) -> LevelType:
         ) from error
 
 
+# --------------------------------------------------------------------------- #
+# Read-only stored state
+#
+# LevelFormat and TensorFormat here, and TensorLayout and TensorMetadata in layout.py, keep
+# their fields in a base made by ``scorch_ops._sealed_type`` (csrc/sealed_values.cpp, which
+# says why this has to be C). Each field is read-only -- ``object.__setattr__`` and
+# ``object.__delattr__`` refuse it -- and an instance has no ``__dict__`` to take any other
+# attribute. The constructor validates its arguments and then sets every field at once with
+# ``_seal``, which refuses an object whose fields are already set. So a value object cannot
+# change once it is built, and any number of tensors and caches may share one.
+#
+# The value classes stay dataclasses (init=False, with the base's descriptors as the
+# fields), so equality, hashing, repr and ``dataclasses.fields``/``replace`` are generated
+# exactly as before. Pickling and copying rebuild through the public constructor.
+# --------------------------------------------------------------------------- #
+_seal = _native._seal
+_sealed_new = _native._sealed_new
+_sealed_type = _native._sealed_type
+
+
+def _field_unset(value: object, descriptor: Any) -> bool:
+    """Whether the field ``descriptor`` reads is unset: an object made by ``__new__``
+    without its constructor, which only unpickling does on purpose."""
+    try:
+        descriptor.__get__(value)
+    except AttributeError:
+        return True
+    return False
+
+
+def _reduce_value(value: object, args: Tuple[Any, ...]) -> Tuple[Any, ...]:
+    """``__reduce__`` of a value type: rebuild through the public constructor, which
+    validates what the pickle holds again. A subclass's own instance state goes along.
+    """
+    state = getattr(value, "__dict__", None)
+    if state:
+        return (type(value), args, dict(state))
+    return (type(value), args)
+
+
+def _same_derived(stored: Any, derived: Any) -> bool:
+    """Whether a derived field an older pickle stored equals the one the constructor
+    derived. The derived fields are tuples of LevelType members, bools and strs."""
+    if type(stored) is not type(derived):
+        return False
+    if type(derived) is tuple:
+        return len(stored) == len(derived) and all(
+            a is b for a, b in zip(stored, derived)
+        )
+    return bool(stored == derived)
+
+
+def _restore_value(
+    value: object,
+    state: Any,
+    init: Any,
+    descriptors: Tuple[Tuple[str, Any], ...],
+    error: type,
+    derived: Tuple[Tuple[str, Any], ...] = (),
+) -> None:
+    """``__setstate__`` of a value type. ``state`` is a subclass's instance state, or, in a
+    pickle written before the fields were read-only, the fields themselves: those go
+    through the base class's constructor (``descriptors`` names its arguments). Trees
+    before that also memoized derived fields in the instance state; ``derived`` names
+    them, and each one the pickle holds must equal what the constructor derived, so a
+    pickle of a value whose memo had gone stale fails closed. The fields of an existing
+    value are never changed, so a field in the state of an object already built is
+    refused."""
+    if state is None:
+        return
+    if type(state) is not dict:
+        raise error("pickled value has malformed state")
+    names = tuple(name for name, _ in descriptors)
+    derived_names = tuple(name for name, _ in derived)
+    if _field_unset(value, descriptors[0][1]):
+        try:
+            arguments = [state[name] for name in names]
+        except KeyError as missing:
+            raise error(f"pickled value is missing {missing.args[0]!r}") from None
+        init(value, *arguments)
+        for name, descriptor in derived:
+            if name in state and not _same_derived(
+                state[name], descriptor.__get__(value)
+            ):
+                raise error(f"pickled value's {name!r} disagrees with its other fields")
+        state = {
+            key: item
+            for key, item in state.items()
+            if key not in names and key not in derived_names
+        }
+    if not state:
+        return
+    instance_state = getattr(value, "__dict__", None)
+    if type(instance_state) is not dict or any(
+        name in state for name in names + derived_names
+    ):
+        raise error("pickled value holds state its type does not")
+    instance_state.update(state)
+
+
+if TYPE_CHECKING:
+    # The bases are made at import time, so a type checker sees stand-ins: these name
+    # the fields the base holds beyond the declared ones, which must not be annotated
+    # on the dataclass itself (they would become dataclass fields).
+    _LevelFormatFields = object
+
+    class _TensorFormatFields:
+        _level_types: Tuple[LevelType, ...]
+        _is_dense: bool
+        _str: str
+        _canonical: bool
+
+else:
+    _LevelFormatFields = _sealed_type("LevelFormatFields", ("_mode", "_bit_width"))
+    _TensorFormatFields = _sealed_type(
+        "TensorFormatFields",
+        ("_level_formats", "_level_types", "_is_dense", "_str", "_canonical"),
+    )
+_LEVEL_MODE = _LevelFormatFields.__dict__["_mode"]
+_LEVEL_BIT_WIDTH = _LevelFormatFields.__dict__["_bit_width"]
+
+
 @dataclass(frozen=True, init=False)
-class LevelFormat:
+class LevelFormat(_LevelFormatFields):
     """The format of a single tensor mode: a level type plus optional bit width.
 
     A ``LevelFormat`` bundles one :class:`LevelType` -- ``DENSE``,
@@ -231,6 +389,9 @@ class LevelFormat:
     TensorFormat : The ordered per-mode list for a whole tensor.
     """
 
+    # Read-only fields held by LevelFormatFields: see "Read-only stored state" above.
+    __slots__ = ()
+
     _mode: LevelType
     _bit_width: Optional[int]
 
@@ -266,8 +427,8 @@ class LevelFormat:
                 canonical_bit_width = int.__int__(bit_width)
             if canonical_bit_width <= 0:
                 raise TensorFormatError("level format bit_width must be positive")
-        object.__setattr__(self, "_mode", parsed_mode)
-        object.__setattr__(self, "_bit_width", bit_width)
+        if not _seal(self, parsed_mode, bit_width):
+            raise FrozenInstanceError("cannot assign to field '_mode'")
 
     def get_level_type(self) -> LevelType:
         return self._mode
@@ -288,6 +449,18 @@ class LevelFormat:
     def __repr__(self):
         return str(self)
 
+    def __reduce__(self):
+        return _reduce_value(self, (self._mode, self._bit_width))
+
+    def __setstate__(self, state):
+        _restore_value(
+            self,
+            state,
+            LevelFormat.__init__,
+            (("_mode", _LEVEL_MODE), ("_bit_width", _LEVEL_BIT_WIDTH)),
+            TensorFormatError,
+        )
+
 
 class LevelPack:
     def __init__(self, level_type: LevelType, tensor: llir.Expr, mode: int, level: int):
@@ -305,8 +478,66 @@ class LevelPack:
         raise NotImplementedError
 
 
+_FORMAT_LEVELS = _TensorFormatFields.__dict__["_level_formats"]
+# The derived fields that trees before the read-only fields memoized in a format's instance
+# state on first use, and so wrote into its pickles (864745d did; 154320f kept them out).
+_FORMAT_MEMOS = tuple(
+    (name, _TensorFormatFields.__dict__[name])
+    for name in ("_level_types", "_is_dense", "_str")
+)
+
+# str(LevelFormat(t)) for each level type, so a format derives its string without a call
+# per level.
+_LEVEL_TEXT = {level_type: str(level_type.value) for level_type in LevelType}
+
+
+def _format_fields(levels: Tuple[LevelFormat, ...]) -> Tuple[Any, ...]:
+    """A format's stored state: its levels, and what the op layer asks of them on every
+    call (the level types, whether every mode is dense, the string form), derived once
+    here because nothing can change them afterwards. The last field says whether the
+    format is already what ``owned_format`` would make of it: exact LevelFormat levels
+    with exact-int (or no) bit widths."""
+    canonical = True
+    level_types = []
+    texts = []
+    for level in levels:
+        if type(level) is LevelFormat:
+            mode = level._mode
+            level_types.append(mode)
+            texts.append(_LEVEL_TEXT[mode])
+            bit_width = level._bit_width
+            if bit_width is not None and type(bit_width) is not int:
+                canonical = False
+        else:
+            # A subclass answers for itself, as it did when these were derived lazily.
+            level_types.append(level.get_level_type())
+            texts.append(str(level))
+            canonical = False
+    derived = tuple(level_types)
+    return (
+        levels,
+        derived,
+        all(level_type == LevelType.DENSE for level_type in derived),
+        ",".join(texts),
+        canonical,
+    )
+
+
+# Formats parsed from text, keyed by the exact string: the fields the constructor derives,
+# and the instance parse_format hands out. Nothing in a format can change once it is built
+# (see "Read-only stored state"), so every format made from one string may hold the same
+# levels, and every caller naming the string may hold the same format. Deriving the fields
+# at construction made TensorFormat("ds") cost 2.10 us against 1.53 us when they were
+# derived lazily (mkt1, job 17813665); a hit here skips the parse and the derivation.
+# Bounded like the layout cache (layout.py): a program names a handful of format strings,
+# and one that names more is served the ordinary way.
+_TEXT_FIELDS: Dict[str, Tuple[Any, ...]] = {}
+_TEXT_FORMATS: Dict[str, "TensorFormat"] = {}
+_TEXT_CACHE_MAX = 1024
+
+
 @dataclass(frozen=True, init=False)
-class TensorFormat:
+class TensorFormat(_TensorFormatFields):
     """The whole-tensor physical layout: an ordered list of per-mode formats.
 
     A ``TensorFormat`` is the central format abstraction -- an ordered list of
@@ -368,11 +599,10 @@ class TensorFormat:
     LevelFormat : One mode's format.
     """
 
-    # The derived values memoized below (level types, density, the string form) live in
-    # slots, so the instance __dict__ holds exactly the declared state, {_level_formats}:
-    # what audit_format_state inspects at every ownership boundary. A memo never crosses
-    # that boundary -- owned_format builds a fresh format, which derives its own.
-    __slots__ = ("_level_types", "_is_dense", "_str", "__dict__", "__weakref__")
+    # Read-only fields held by TensorFormatFields: see "Read-only stored state" above. The
+    # only declared field, and so the only one equality and hashing see, is _level_formats;
+    # the others are derived from it at construction (_format_fields).
+    __slots__ = ()
 
     _level_formats: Tuple[LevelFormat, ...]
 
@@ -391,17 +621,31 @@ class TensorFormat:
             ]
         ] = None,
     ):
-        try:
-            normalized = _normalize_level_formats(level_formats)
-        except (TensorFormatError, TensorTypeError):
-            raise
-        except Exception as error:
-            # A genuine user-defined Sequence has to be consumed to obtain
-            # its levels.  Its iteration/indexing hooks are outside the
-            # callback-free *recognition* contract, but their exceptions must
-            # not escape this public constructor as arbitrary builtins.
-            raise TensorFormatError("tensor format sequence is malformed") from error
-        object.__setattr__(self, "_level_formats", normalized)
+        # Only an exact str is looked up: a str subclass could answer __hash__ and __eq__.
+        text = level_formats if type(level_formats) is str else None
+        fields = None if text is None else _TEXT_FIELDS.get(text)
+        if fields is None:
+            try:
+                normalized = _normalize_level_formats(level_formats)
+            except (TensorFormatError, TensorTypeError):
+                raise
+            except Exception as error:
+                # A genuine user-defined Sequence has to be consumed to obtain
+                # its levels.  Its iteration/indexing hooks are outside the
+                # callback-free *recognition* contract, but their exceptions must
+                # not escape this public constructor as arbitrary builtins.
+                raise TensorFormatError(
+                    "tensor format sequence is malformed"
+                ) from error
+            try:
+                fields = _format_fields(normalized)
+            except Exception as error:
+                # Only a LevelFormat subclass's own accessors run here.
+                raise TensorFormatError("tensor format levels are malformed") from error
+            if text is not None and len(_TEXT_FIELDS) < _TEXT_CACHE_MAX:
+                _TEXT_FIELDS[text] = fields
+        if not _seal(self, *fields):
+            raise FrozenInstanceError("cannot assign to field '_level_formats'")
 
     def get_level_formats(self) -> Tuple[LevelFormat, ...]:
         """Return immutable per-mode :class:`LevelFormat` values in storage order.
@@ -426,18 +670,12 @@ class TensorFormat:
 
     @property
     def level_types(self) -> Tuple[LevelType, ...]:
-        """The per-mode level types as a tuple, derived once (see ``is_dense``).
+        """The per-mode level types as a tuple, derived at construction.
 
         For the construction paths, which ask for them several times per tensor;
         ``get_level_types`` returns a fresh list for callers that may modify it.
         """
-        cached = getattr(self, "_level_types", None)
-        if cached is None:
-            cached = tuple(
-                level_format.get_level_type() for level_format in self._level_formats
-            )
-            object.__setattr__(self, "_level_types", cached)
-        return cached
+        return self._level_types
 
     def get_order(self) -> int:
         """Return the tensor's order (rank) -- the number of modes.
@@ -460,36 +698,38 @@ class TensorFormat:
             ``True`` only when all modes are ``DENSE`` (an empty format is
             vacuously dense).
         """
-        # Derived once and stashed: a TensorFormat is immutable, and the op layer asks
-        # this three times per matmul. Written through object.__setattr__ because the
-        # dataclass is frozen; the field is not declared, so it takes no part in
-        # __eq__ or __hash__.
-        cached = getattr(self, "_is_dense", None)
-        if cached is None:
-            cached = all(
-                level_format.get_level_type() == LevelType.DENSE
-                for level_format in self._level_formats
-            )
-            object.__setattr__(self, "_is_dense", cached)
-        return cached
+        # Derived at construction: the op layer asks this three times per matmul. Not a
+        # declared field, so it takes no part in __eq__ or __hash__.
+        return self._is_dense
 
     def __str__(self):
-        # Memoized for the same reason as is_dense: immutable object, and this is on a
-        # per-call path (kernel resolution keys on it). A cached str is also cheaper to
-        # hash than the underlying tuple of LevelFormat, since CPython caches string
-        # hashes and hashing the tuple recurses through every level.
-        cached = getattr(self, "_str", None)
-        if cached is None:
-            cached = ",".join(
-                [str(level_format) for level_format in self._level_formats]
-            )
-            object.__setattr__(self, "_str", cached)
-        return cached
+        # Derived at construction for the same reason as is_dense: this is on a per-call
+        # path (kernel resolution keys on it). A str is also cheaper to hash than the
+        # underlying tuple of LevelFormat, since CPython caches string hashes and hashing
+        # the tuple recurses through every level.
+        return self._str
 
-    def __getstate__(self):
-        # Only the declared state: the memos are slots and are derived again on use. A
-        # frozen dataclass could not have them restored through setattr anyway.
-        return dict(self.__dict__)
+    def __reduce__(self):
+        # A format of exact levels without bit widths is pickled as its text, which parses
+        # back to it: loading one then costs a lookup in _TEXT_FIELDS rather than a
+        # LevelType, a LevelFormat and a validation per level, and the pickle is smaller.
+        if (
+            type(self) is TensorFormat
+            and self._canonical
+            and all(level._bit_width is None for level in self._level_formats)
+        ):
+            return (TensorFormat, (self._str,))
+        return _reduce_value(self, (self._level_formats,))
+
+    def __setstate__(self, state):
+        _restore_value(
+            self,
+            state,
+            TensorFormat.__init__,
+            (("_level_formats", _FORMAT_LEVELS),),
+            TensorFormatError,
+            _FORMAT_MEMOS,
+        )
 
     def __repr__(self):
         return f"TensorFormat({str(self)!r})"
@@ -632,20 +872,15 @@ def _normalize_level_formats(
     return tuple(result)
 
 
-# No parse memo here, deliberately. One was added on the performance line because
-# "`matmul` alone parses a format three times per call, always on the same constant
-# strings". That premise does not hold on this tree: measured on the merged dispatch,
-# a warm `matmul` constructs ZERO formats whether a memo is present or not, with or
-# without a `format=` kwarg, because the plan path and the compile-options policy hold
-# parsed formats upstream. The only path that still benefits is tensor construction,
-# where `from_torch(...).to_sparse("ds")` goes from 6.0 constructions to 5.1 -- about
-# 750 ns on a path that also walks every nonzero.
-#
-# Against that, sharing one instance is unsafe here in a way it was not there. A
-# retained format can be mutated through `object.__setattr__`, and `TensorVar` retains
-# what `parse_format` returns without rebuilding it through `owned_format`. With a
-# process-wide memo, one corrupted format becomes every later caller's format. That
-# cost 1300 test failures when the two sides were first combined.
+# parse_format shares one format per string (_TEXT_FORMATS above). The performance line
+# had such a memo, because "`matmul` alone parses a format three times per call, always on
+# the same constant strings". On this tree a warm `matmul` constructs no formats either
+# way (the plan path and the compile-options policy hold parsed formats upstream); the
+# memo serves tensor construction, where `from_torch(...).to_sparse("ds")` parses about
+# five times. The refactor had removed it because a retained format could be rewritten
+# through `object.__setattr__`, and `TensorVar` retains what `parse_format` returns, so
+# one corrupted format became every later caller's (1300 test failures when the two sides
+# were first combined). A format's fields are read-only now, so that cannot happen.
 
 
 def parse_format(fmt: FormatInput) -> TensorFormat:
@@ -657,107 +892,83 @@ def parse_format(fmt: FormatInput) -> TensorFormat:
     # should not tax every ordinary dispatch by running an MRO walk.
     if type(fmt) is TensorFormat:
         return fmt
+    text = fmt if type(fmt) is str else None
+    if text is not None:
+        shared = _TEXT_FORMATS.get(text)
+        if shared is not None:
+            return shared
     try:
         if issubclass(type(fmt), TensorFormat):
             return cast(TensorFormat, fmt)
-        return TensorFormat(cast(Any, fmt))
+        parsed = TensorFormat(cast(Any, fmt))
     except (TensorFormatError, TensorTypeError):
         raise
     except Exception as error:
         raise TensorFormatError("tensor format is malformed") from error
+    if text is not None and len(_TEXT_FORMATS) < _TEXT_CACHE_MAX:
+        _TEXT_FORMATS[text] = parsed
+    return parsed
 
 
 def audit_format_state(tensor_format: object) -> Optional[List["LevelFormat"]]:
-    """Structurally audit one format's stored state; rebuild its levels.
+    """The levels of a format, each an exact ``LevelFormat`` with an exact-int (or no)
+    bit width; ``None`` when the argument is not a ``TensorFormat``, or is one that was
+    never constructed (made by ``__new__`` alone, so its fields are unset).
 
-    ``TensorFormat`` and ``LevelFormat`` are frozen value objects, but
-    ``object.__setattr__`` still forges or mutates their stored state, and a
-    caller who keeps a reference to a format an object retained can change
-    that object's declared layout after the fact.  This inspects the exact
-    stored fields without invoking any overridable accessor -- key types are
-    proven to be exact ``str`` before any comparison or hashing, so a hostile
-    ``str`` subclass cannot run overloaded equality here -- and returns a
-    freshly built level list.
-
-    Returns ``None`` when the argument is not a ``TensorFormat`` or when its
-    stored state is not exactly the expected base-value shape.  A subclass
-    with that exact state is safe to canonicalize as a fresh base value; no
-    subclass methods are invoked while inspecting it.
+    A format's fields are read-only and set only by its constructor, after validation
+    (see "Read-only stored state"), so there is no stored state to audit any more: this
+    only reads it. It reads through the base's own descriptors, so a subclass's accessors
+    are not consulted and none of its code runs. A level that is a ``LevelFormat``
+    subclass, or whose bit width is an ``int`` subclass (``LevelFormat`` accepts an
+    ``IntEnum`` width), is rebuilt as an exact value; the base ``int`` descriptor yields an
+    exact ``int`` without running an overridden ``__int__``.
     """
 
     if not issubclass(type(tensor_format), TensorFormat):
         return None
-    # Read the base class's actual instance dictionary through its descriptor.
-    # ``object.__getattribute__(value, "__dict__")`` still honors a subclass's
-    # overriding ``__dict__`` data descriptor, which could run caller code or
-    # conceal extra state at this ownership boundary.
-    state = TensorFormat.__dict__["__dict__"].__get__(tensor_format, TensorFormat)
-    state_keys = tuple(state) if type(state) is dict else ()
-    if (
-        type(state) is not dict
-        or len(state_keys) != 1
-        or type(state_keys[0]) is not str
-        or state_keys[0] != "_level_formats"
-    ):
+    try:
+        levels = _FORMAT_LEVELS.__get__(tensor_format)
+    except AttributeError:
         return None
-    levels = state["_level_formats"]
-    if type(levels) is not tuple:
-        return None
-
     owned_levels: List[LevelFormat] = []
     for level_format in levels:
-        if not issubclass(type(level_format), LevelFormat):
+        try:
+            mode = _LEVEL_MODE.__get__(level_format)
+            bit_width = _LEVEL_BIT_WIDTH.__get__(level_format)
+        except AttributeError:
             return None
-        level_state = LevelFormat.__dict__["__dict__"].__get__(
-            level_format, LevelFormat
-        )
-        level_keys = tuple(level_state) if type(level_state) is dict else ()
-        if (
-            type(level_state) is not dict
-            or len(level_keys) != 2
-            or any(type(key) is not str for key in level_keys)
-            or set(level_keys) != {"_mode", "_bit_width"}
+        if type(level_format) is LevelFormat and (
+            bit_width is None or type(bit_width) is int
         ):
-            return None
-        mode = level_state["_mode"]
-        bit_width = level_state["_bit_width"]
-        if type(mode) is not LevelType:
-            return None
-        if bit_width is not None:
-            bit_width_type = type(bit_width)
-            if bit_width_type is bool or not issubclass(bit_width_type, int):
-                return None
-            # ``LevelFormat.__init__`` accepts any non-bool ``int`` subclass,
-            # so an ``IntEnum`` width is a legally constructed format and must
-            # survive this boundary rather than becoming a construction error.
-            # Canonicalize it exactly the way every other retained scalar is
-            # canonicalized: the base descriptor bypasses an overridden
-            # ``__int__`` and yields an exact ``int``, so no caller arithmetic
-            # is retained or executed past this point.
-            bit_width = int.__int__(bit_width)
-            if bit_width <= 0:
-                return None
-        owned_levels.append(LevelFormat(mode, bit_width=bit_width))
+            owned_levels.append(level_format)
+        else:
+            owned_levels.append(
+                LevelFormat(
+                    mode,
+                    bit_width=None if bit_width is None else int.__int__(bit_width),
+                )
+            )
     return owned_levels
 
 
 def owned_format(tensor_format: TensorFormat) -> TensorFormat:
-    """Detach one format on the way *in* to a retaining object.
+    """The format an object retains when it is handed ``tensor_format``.
 
-    This is the construction-side half of the format-ownership boundary: an
-    object that will retain a format rebuilds it, so a caller who keeps the
-    original cannot mutate the retained metadata afterwards.  It also breaks
-    the sharing that let one process-global memoized format become several
-    unrelated tensors' declared layout.
-
-    Structurally canonical subclasses remain accepted, but are normalized to
-    the base value type.  Anything malformed fails closed: retaining it would
-    preserve mutable caller-owned state at the ownership boundary.
-
-    The read side is deliberately untouched -- rebuilding on every ``.format``
-    access measured as a double-digit regression on the live dispatch path.
+    A format cannot change once built (see "Read-only stored state"), so an exact
+    ``TensorFormat`` of exact levels is retained as it is, and any number of objects may
+    share it. A subclass, or a format with subclass levels or an ``int``-subclass bit
+    width, is normalized to an exact value of the base type, so that no retained format
+    carries caller-defined behaviour. A format that was never constructed fails closed.
     """
 
+    if type(tensor_format) is TensorFormat:
+        try:
+            if tensor_format._canonical:
+                return tensor_format
+        except AttributeError:
+            raise TensorFormatError(
+                "tensor format has malformed stored state"
+            ) from None
     owned_levels = audit_format_state(tensor_format)
     if owned_levels is None:
         raise TensorFormatError("tensor format has malformed stored state")

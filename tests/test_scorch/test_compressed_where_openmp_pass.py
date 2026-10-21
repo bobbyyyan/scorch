@@ -4817,3 +4817,45 @@ def test_the_refusal_surface_is_exactly_the_documented_set():
         assert type(resolved) is str, name
         found.add(resolved)
     assert found == COMPRESSED_WHERE_REFUSAL_CODES
+
+
+def test_a_context_that_names_no_workspace_hoists_and_pools_nothing() -> None:
+    """``workspace_name=None``: no declaration is looked for.
+
+    A loop nest that appends one scalar reduction per result entry accumulates
+    through no workspace.  The pass then counts and fills the same body and
+    builds no per-worker pool, view, ``clear()`` or renamed insert.  Asked of a
+    body that DOES declare something called ``wksp``, the answer is the text a
+    caller gets by naming the workspace and asking for it to stay declared where
+    it is: the declaration is ordinary work in both phases.
+    """
+
+    unnamed = transform_compressed_where_for_openmp(
+        [_compatible_loop(_ds_work_body())],
+        replace(_context(), workspace_name=None),
+    )
+    declared = transform_compressed_where_for_openmp(
+        [_compatible_loop(_ds_work_body())],
+        replace(_context(), accumulator="coordinate_list"),
+    )
+    hoisted = transform_compressed_where_for_openmp(
+        [_compatible_loop(_ds_work_body())], _context()
+    )
+
+    assert unnamed.applied is True
+    text = _emitted_cpp(unnamed)
+    assert text == _emitted_cpp(declared)
+    assert "wksp_pool" not in text and "make_view" not in text
+    assert "insert_unchecked" not in text and "wksp.clear()" not in text
+    assert text.count("coo_workspace_1d<float, 1>(1024)") == 2
+    assert "wksp_pool" in _emitted_cpp(hoisted)
+
+
+def test_the_chained_structure_is_refused_where_no_workspace_is_named() -> None:
+    with pytest.raises(LLIRTraversalError) as refusal:
+        transform_compressed_where_for_openmp(
+            [_compatible_loop(_ds_work_body())],
+            replace(_context(), workspace_name=None, accumulator="linked_list"),
+        )
+    assert refusal.value.diagnostic.code == "unsupported_accumulator_structure"
+    assert "accumulates through no workspace" in refusal.value.diagnostic.message

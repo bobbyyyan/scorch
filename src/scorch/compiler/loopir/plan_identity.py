@@ -80,7 +80,7 @@ from ..compile_options import (
     SchedulerPolicy,
     VerificationPolicy,
 )
-from ..diagnostics import VerificationError
+from ..diagnostics import InvalidSchedule, UnsupportedFeature, VerificationError
 from ..identity import IndexId, SymbolId
 from ..llir_pass_manager import LLIRPassOptions
 from ..loop_plan import (
@@ -107,9 +107,15 @@ CANONICAL_PLAN_SCHEMA = "scorch.loopplan.canonical.v3"
 CANONICAL_REQUEST_SCHEMA = "scorch.loopir.request.v2"
 _MAX_RUNTIME_EXTENT = 2**63 - 1
 _MAX_CANONICAL_CIN_DEPTH = 512
+# One token per element type the lowering accepts (``lower_cin._TORCH_TO_SCALAR``).
+# Adding a token leaves every existing request's bytes unchanged.
 _DTYPE_TOKENS = {
     torch.float32: "float32",
     torch.float64: "float64",
+    torch.int64: "int64",
+    torch.int32: "int32",
+    torch.int8: "int8",
+    torch.uint8: "uint8",
 }
 
 
@@ -450,7 +456,9 @@ def _plan_payload(
     *,
     provenance_free: bool,
 ) -> object:
-    verified = verify_loop_plan(cin, plan)
+    # Identity, not legality: accept every plan the LoopIR route can produce,
+    # including one that visits an all-dense result out of storage order.
+    verified = verify_loop_plan(cin, plan, dense_results_any_order=True)
     index_map, symbol_map = _entity_maps(cin)
 
     def index_payload(index_id: IndexId) -> int:
@@ -547,6 +555,17 @@ def _plan_payload(
             }
         ),
     }
+    if verified.conversions:
+        # Present only when non-empty, so every plan without one keeps its
+        # identity bytes.
+        payload["conversions"] = [
+            {
+                "operand": _symbol_payload(conversion.operand_id, symbol_map),
+                "mode_order": list(conversion.mode_order),
+                "format": conversion.format,
+            }
+            for conversion in verified.conversions
+        ]
     if not provenance_free:
         payload["provenance"] = verified.provenance
     return payload
@@ -621,13 +640,24 @@ def loopir_request_dump(
         raise VerificationError(
             "loopir request input bindings must cover every declared input exactly"
         )
+    plan_payload = None
+    if plan is not None:
+        # Serializing the plan verifies it (``verify_loop_plan``).  A plan the
+        # verifier refuses is a refused request, not malformed request state:
+        # its InvalidSchedule or UnsupportedFeature keeps its type and code
+        # whichever stage verifies the plan first, as it would if
+        # ``verify_loop_plan`` had run before this boundary.  Only a foreign
+        # exception becomes the boundary's VerificationError.
+        try:
+            plan_payload = _plan_payload(verified_cin, plan, provenance_free=False)
+        except (VerificationError, InvalidSchedule, UnsupportedFeature):
+            raise
+        except Exception as exc:
+            raise VerificationError(
+                "loopir request identity could not serialize verified request state"
+            ) from exc
     try:
         cin_dump = canonical_cin_dump(verified_cin)
-        plan_payload = (
-            None
-            if plan is None
-            else _plan_payload(verified_cin, plan, provenance_free=False)
-        )
         options_payload = _compile_options_payload(compile_options)
     except VerificationError:
         raise

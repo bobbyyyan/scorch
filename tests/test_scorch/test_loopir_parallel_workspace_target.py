@@ -1386,17 +1386,21 @@ _SEALED_ROWSCOPE_SHA256 = (
 
 
 @torch.no_grad()
-def test_rowscope_legacy_comparand_is_failure_evidence_only():
-    """The sealed ss@ss->ds comparand is sound only on full row support.
+def test_rowscope_shipped_kernel_no_longer_matches_the_sealed_defect():
+    """The sealed ss@ss->ds comparand was sound only on full row support.
 
-    Its ``C1_pos`` is sized by the first operand's *stored* row count, not
+    Its ``C1_pos`` was sized by the first operand's *stored* row count, not
     the result's dense row extent, so any input whose first operand has an
-    empty row returns malformed storage that silently associates later
-    rows' values with earlier rows.  The sound typed route is now admitted
-    under the no-parity discipline: it sizes ``C1_pos`` from the logical
-    result row extent rather than reproducing this defect.  This test keeps
-    the sealed legacy kernel as hermetic failure evidence and locks its
-    full-row-support control separately.
+    empty row returned malformed storage that silently associated later
+    rows' values with earlier rows.  The typed route was admitted under the
+    no-parity discipline with ``C1_pos`` sized from the logical row extent.
+
+    The shipped compiler has since been repaired the same way: its two-pass
+    assembly numbers rows by the coordinate the stored outer loop resolves
+    and sizes them by the result's extent
+    (``test_dense_below_compressed_result.py`` executes it on operands with
+    empty rows).  The sealed hash stays here as the record of the defective
+    text, which neither compiler may emit again.
     """
 
     def rowscope_cin():
@@ -1418,25 +1422,33 @@ def test_rowscope_legacy_comparand_is_failure_evidence_only():
         (((4, 6), torch.float32), ((6, 5), torch.float32)),
         compile_options=options,
     )
-    assert hashlib.sha256(legacy_cpp.encode("utf-8")).hexdigest() == (
+    assert hashlib.sha256(legacy_cpp.encode("utf-8")).hexdigest() != (
         _SEALED_ROWSCOPE_SHA256
     )
     comparand_path = _SEALED_COMPARAND_DIR / "rowscope_ss_ss_ds_armBASE.cpp"
     if comparand_path.exists():
-        assert comparand_path.read_text() == legacy_cpp
+        sealed = comparand_path.read_text()
+        assert sealed != legacy_cpp
+        # What the defect looked like, read off the sealed text itself.
+        assert "_count1[pA0] = _cnt1;" in sealed
+    assert "std::vector<int> _count1((size_t)C0_size, 0);" in legacy_cpp
+    assert "_count1[A0_crd[pA0]] = _cnt1;" in legacy_cpp
+    assert "int64_t _base1 = _offset1[A0_crd[pA0]];" in legacy_cpp
+    assert "_count1[pA0]" not in legacy_cpp
+    assert "_count1((size_t)pA0_end" not in legacy_cpp
 
-    # The sound typed route (test_loopir_rowscope_workspace_target.py) now
-    # admits this family with logical-row-extent sizing; the defective
-    # comparand below remains hermetic failure evidence, and the typed
-    # source must never byte-match it.
+    # The typed route (test_loopir_rowscope_workspace_target.py) assembles
+    # this family in one serial pass, closing unvisited rows up to the
+    # logical row extent.
     typed = compile_cin_via_loopir(
         rowscope_cin(),
         (4, 5),
         (((4, 6), torch.float32), ((6, 5), torch.float32)),
         compile_options=auto_options(False),
     )
-    assert typed.cpp_source != legacy_cpp
     assert "for (; C1_pos_index < C0_size; C1_pos_index++)" in typed.cpp_source
+    if comparand_path.exists():
+        assert typed.cpp_source != comparand_path.read_text()
 
     torch.manual_seed(20260805)
     dense_a = torch.zeros(4, 6)
@@ -1448,36 +1460,41 @@ def test_rowscope_legacy_comparand_is_failure_evidence_only():
     def sparse_ss(dense, name):
         return STensor.from_torch(dense.clone(), name).to_sparse("ss")
 
-    malformed = execute_legacy_module(
+    def checked_ds_storage(result, dense_expected):
+        modes = result.storage.index.mode_indices
+        assert list(modes[0]) == []
+        storage = (
+            modes[1][0].tolist(),
+            modes[1][1].tolist(),
+            result.storage.value.tolist(),
+        )
+        assert len(storage[0]) == 5, "ds storage carries one position per row + 1"
+        assert storage[0][0] == 0
+        assert storage[0] == sorted(storage[0])
+        assert storage[0][-1] == len(storage[1]) == len(storage[2])
+        for row in range(4):
+            columns = storage[1][storage[0][row] : storage[0][row + 1]]
+            assert columns == sorted(set(columns))
+            assert all(0 <= column < 5 for column in columns)
+        dense = dense_from_ds_storage(storage, (4, 5), torch.float32)
+        assert torch.allclose(dense, dense_expected, atol=1e-3, rtol=1e-3)
+        return storage
+
+    # The input that broke the sealed comparand: row 2 of A is empty, so the
+    # stored outer loop visits three rows.  The repaired kernel numbers them
+    # 0, 1 and 3 and leaves row 2's segment empty.
+    repaired = execute_legacy_module(
         legacy_cpp,
         (4, 5),
         sparse_ss(dense_a, "A"),
         sparse_ss(dense_b, "B"),
         auto_options(False, jit=True),
     )
-    malformed_modes = malformed.storage.index.mode_indices
-    malformed_pos = malformed_modes[1][0].tolist()
-    malformed_crd = malformed_modes[1][1].tolist()
-    malformed_values = malformed.storage.value.tolist()
-    assert malformed_pos == [0, 5, 8, 11]
-    assert len(malformed_pos) == 4, "honest ds storage would carry 5 positions"
-    assert malformed_pos[-1] == len(malformed_crd) == len(malformed_values)
+    repaired_storage = checked_ds_storage(repaired, dense_a @ dense_b)
+    assert repaired_storage[0][2] == repaired_storage[0][3], "row 2 is empty"
 
-    expected = dense_a @ dense_b
-    interpreted = torch.zeros_like(expected)
-    for stored_row in range(len(malformed_pos) - 1):
-        for position in range(malformed_pos[stored_row], malformed_pos[stored_row + 1]):
-            interpreted[stored_row, malformed_crd[position]] = malformed_values[
-                position
-            ]
-    assert torch.allclose(interpreted[0], expected[0])
-    assert torch.allclose(interpreted[1], expected[1])
-    assert torch.count_nonzero(expected[2]) == 0
-    assert torch.allclose(interpreted[2], expected[3])
-    assert not torch.allclose(interpreted, expected)
-
-    # Full row support is the comparand's sound sub-domain: the same
-    # kernel then produces complete, honest positions.
+    # Full row support, the only inputs the sealed comparand handled, still
+    # produces the same honest storage.
     full_a = dense_a.clone()
     full_a[2, 0] = 4.0
     sound = execute_legacy_module(
@@ -1487,23 +1504,7 @@ def test_rowscope_legacy_comparand_is_failure_evidence_only():
         sparse_ss(dense_b, "B"),
         auto_options(False, jit=True),
     )
-    sound_modes = sound.storage.index.mode_indices
-    assert list(sound_modes[0]) == []
-    sound_storage = (
-        sound_modes[1][0].tolist(),
-        sound_modes[1][1].tolist(),
-        sound.storage.value.tolist(),
-    )
-    assert len(sound_storage[0]) == 5
-    assert sound_storage[0][0] == 0
-    assert sound_storage[0] == sorted(sound_storage[0])
-    assert sound_storage[0][-1] == len(sound_storage[1]) == len(sound_storage[2])
-    for row in range(4):
-        columns = sound_storage[1][sound_storage[0][row] : sound_storage[0][row + 1]]
-        assert columns == sorted(set(columns))
-        assert all(0 <= column < 5 for column in columns)
-    sound_dense = dense_from_ds_storage(sound_storage, (4, 5), torch.float32)
-    assert torch.allclose(sound_dense, full_a @ dense_b, atol=1e-3, rtol=1e-3)
+    checked_ds_storage(sound, full_a @ dense_b)
 
 
 # -- adjacent seams stay fail-closed --------------------------------------------
@@ -1563,54 +1564,61 @@ def test_adjacent_seams_stay_fail_closed():
         "for (; C1_pos_index < C0_size; C1_pos_index++)" in rowscope_admitted.cpp_source
     )
 
-    # A dense reduction domain keeps the old seam code.  The automatic
-    # scheduler rejects this cell before lowering can classify it, so the
-    # lowering boundary is probed on the unscheduled route.
+    # A dense reduction domain (``dd @ ds -> ds``).  It exited with
+    # ``unsupported_sparse_output_reduction`` until 2026-10-12; the ordered
+    # split now classifies it (the column is a key bound below the reduced
+    # loop), so the automatic schedule emits it and the unscheduled route
+    # stops at the target, which reduces into sparse storage only under the
+    # verified workspace schedule.
+    from tests.test_scorch.test_loopir_dense_below_compressed_target import (
+        assert_statement_matches_pytorch,
+    )
+
     i2, j2, k2 = IndexVar("i"), IndexVar("j"), IndexVar("k")
-    a2 = TensorVar("A", fmt="dd")
-    b2 = TensorVar("B", fmt="ds")
-    c2 = TensorVar("C", fmt="ds")
-    _expect_lowering_code(
-        "unsupported_sparse_output_reduction",
+    a2 = TensorVar("A", fmt="dd", dtype=torch.float32)
+    b2 = TensorVar("B", fmt="ds", dtype=torch.float32)
+    c2 = TensorVar("C", fmt="ds", dtype=torch.float32)
+    dense_reduction = ForAll(
+        i2,
         ForAll(
-            i2,
+            j2,
             ForAll(
-                j2,
-                ForAll(
-                    k2,
-                    TensorAssign(
-                        c2[i2, k2],
-                        CINBinaryOp(Operation.MUL, a2[i2, j2], b2[j2, k2]),
-                        op=Operation.ADD,
-                    ),
+                k2,
+                TensorAssign(
+                    c2[i2, k2],
+                    CINBinaryOp(Operation.MUL, a2[i2, j2], b2[j2, k2]),
+                    op=Operation.ADD,
                 ),
             ),
         ),
+    )
+    _expect_lowering_code(
+        "unsupported_program_shape",
+        dense_reduction,
         (((4, 6), torch.float32), ((6, 5), torch.float32)),
         auto=False,
     )
+    for arm in (False, True):
+        assert_statement_matches_pytorch(dense_reduction, arm)
 
-    # A trailing-level reduction below the column coordinate keeps the
-    # old seam code.
+    # A trailing-level reduction below the column coordinate
+    # (``C[i,j] = sum_k A[i,j,k]``, ``dss`` into CSR) exited with the same
+    # code until 2026-10-12.  Both result coordinates are bound above the
+    # reduced loop, so each stored ``(i, j)`` is one scalar accumulation, on
+    # the unscheduled route as on the automatic one.
     i3, j3, k3 = IndexVar("i"), IndexVar("j"), IndexVar("k")
-    a3 = TensorVar("A", fmt="dss")
-    c3 = TensorVar("C", fmt="ds")
-    _expect_lowering_code(
-        "unsupported_sparse_output_reduction",
-        ForAll(
-            i3,
+    a3 = TensorVar("A", fmt="dss", dtype=torch.float32)
+    c3 = TensorVar("C", fmt="ds", dtype=torch.float32)
+    for arm in (False, True):
+        assert_statement_matches_pytorch(
             ForAll(
-                j3,
+                i3,
                 ForAll(
-                    k3,
-                    TensorAssign(
-                        c3[i3, j3],
-                        a3[i3, j3, k3],
-                        op=Operation.ADD,
+                    j3,
+                    ForAll(
+                        k3, TensorAssign(c3[i3, j3], a3[i3, j3, k3], op=Operation.ADD)
                     ),
                 ),
             ),
-        ),
-        (((4, 5, 6), torch.float32),),
-        auto=False,
-    )
+            arm,
+        )

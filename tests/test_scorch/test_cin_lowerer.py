@@ -3105,7 +3105,7 @@ def test_canonical_coo_workspace_type_zero_dimension_is_the_scalar(
     assert llir.DataType.coo_workspace_type_with_dim(scalar_type, 0) is scalar_type
 
 
-@pytest.mark.parametrize("dimension", (-1, 6), ids=("negative", "too-large"))
+@pytest.mark.parametrize("dimension", (-1,), ids=("negative",))
 @pytest.mark.parametrize(
     "scalar_type",
     (
@@ -3121,6 +3121,7 @@ def test_canonical_coo_workspace_types_fail_closed_outside_supported_dimensions(
     scalar_type: llir.DataType,
     dimension: int,
 ) -> None:
+    # A rank above 5 is supported: test_coo_workspace_rank_general.py.
     with pytest.raises(ValueError, match="is not a valid DataType"):
         llir.DataType.coo_workspace_type_with_dim(scalar_type, dimension)
 
@@ -4661,7 +4662,7 @@ def test_nested_workspace_reads_use_structured_pair_members(
 ) -> None:
     index_vars = tuple(IndexVar(name) for name in index_names)
     result = TensorVar("Result", fmt=result_format)
-    workspace = Workspace("wksp", dim=len(index_vars))
+    workspace = Workspace("wksp", dim=len(index_vars), dtype=result.dtype)
     access_key = index_vars[0] if len(index_vars) == 1 else index_vars
     consumer = TensorAssign(result[access_key], workspace[access_key])
     original = str(consumer)
@@ -5863,7 +5864,7 @@ def test_generic_workspace_reads_fail_closed_before_llir_construction(
     dense: bool,
     index_names: tuple[str, ...],
 ) -> None:
-    workspace = Workspace("wksp", dim=dim, dense=dense)
+    workspace = Workspace("wksp", dim=dim, dtype=torch.float32, dense=dense)
     index_vars = tuple(IndexVar(name) for name in index_names)
     if not index_vars:
         access = workspace.get_default_access()
@@ -5889,7 +5890,7 @@ def test_generic_workspace_reads_fail_closed_before_llir_construction(
 def test_direct_workspace_rhs_fails_before_an_invalid_kernel_is_built() -> None:
     index = IndexVar("i")
     result = TensorVar("Result", fmt="d")
-    workspace = Workspace("wksp", dim=1, dense=True)
+    workspace = Workspace("wksp", dim=1, dtype=result.dtype, dense=True)
     statement = ForAll(
         index,
         TensorAssign(result[index], workspace[index]),
@@ -6041,7 +6042,7 @@ def _dense_workspace_zero_fill_cin() -> ForAll:
     c = TensorVar("C", fmt="dd")
     a = TensorVar("A", fmt="dd")
     b = TensorVar("B", fmt="dd")
-    wksp = Workspace("wksp", dim=1, dense=True)
+    wksp = Workspace("wksp", dim=1, dtype=c.dtype, dense=True)
 
     return ForAll(
         i,
@@ -6395,7 +6396,7 @@ def _dense_workspace_pool_cin(a_fmt: str = "dd") -> ForAll:
     c = TensorVar("C", fmt="dd")
     a = TensorVar("A", fmt=a_fmt)
     b = TensorVar("B", fmt="dd")
-    wksp = Workspace("wksp", dim=1, dense=True)
+    wksp = Workspace("wksp", dim=1, dtype=c.dtype, dense=True)
 
     return ForAll(
         i,
@@ -6955,7 +6956,10 @@ def test_atomic_counter_is_emitted_once_by_codegen_without_a_dead_decl() -> None
     lowered = lowerer.lower_IndexStmt(_dense_workspace_pool_cin("ds"))
 
     cpp = LLIRLowerer().lower_llir(lowered)
-    assert cpp.count("std::atomic<int> _next_row{0};") == 1
+    # int64_t: the chunk bounds read from the counter are compared with the
+    # int64_t extent (``std::min(_start + _chunk, A0_size)``), which did not
+    # build against an ``int`` counter.
+    assert cpp.count("std::atomic<int64_t> _next_row{0};") == 1
     # The lowerer no longer constructs a shadow counter declaration: codegen
     # owns the emission from the loop's _atomic_counter_var marker alone.
     assert not hasattr(lowerer, "_atomic_counter_decl")

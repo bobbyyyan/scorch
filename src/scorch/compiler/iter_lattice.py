@@ -1,11 +1,21 @@
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, fields, is_dataclass
 from itertools import product
-from typing import List, Optional, Dict, TYPE_CHECKING, Iterable, Sequence, Union
+from typing import (
+    List,
+    Optional,
+    Dict,
+    TYPE_CHECKING,
+    Iterable,
+    Sequence,
+    Set,
+    Tuple,
+    Union,
+)
 
 from . import llir
-from ..utils import flatten_2d_list
+from ..utils import dtype_to_c_datatype, flatten_2d_list
 
 if TYPE_CHECKING:
     from src.scorch.compiler.cin_lowerer import CINLowerer
@@ -24,6 +34,8 @@ from .cin import (
     Where,
 )
 from ..format import LevelType
+from .cin_analysis import CINDiagnostic
+from .diagnostics import UnsupportedFeature
 from .iterator import ModeIterator
 
 # Short names for the statement-level result-storage marker's vocabulary.  Spelled
@@ -34,6 +46,225 @@ RESULT_POS = llir.ResultStorageArray.POS
 RESULT_CRD = llir.ResultStorageArray.CRD
 STORAGE_READ = llir.ResultStorageDirection.READ
 STORAGE_WRITE = llir.ResultStorageDirection.WRITE
+
+# How a zero of each floating-point element type is spelled in a scalar
+# declaration; every integer element type spells it ``0``.
+_SCALAR_ZERO_SPELLINGS = {
+    llir.DataType.FLOAT32: "0.0f",
+    llir.DataType.FLOAT64: "0.0",
+}
+
+
+def compressed_child_catch_up(
+    cin_lowerer: Optional["CINLowerer"],
+    result_tensor_access: TensorAccess,
+    child_level: int,
+    target: llir.Expr,
+) -> List[llir.Stmt]:
+    """Close the position entries of every cell skipped before ``target``.
+
+    ``child_level`` is a compressed result level below a dense one.  Its
+    position array has one entry per cell of the dense level, and a loop that
+    visits only some cells closes the ones it skipped when it reaches the
+    next: ``for (; pos_index < target; pos_index++) pos[pos_index + 1] =
+    crd.size();``.  ``target`` is the visited cell's POSITION in the dense
+    level.
+    """
+
+    result_tensor_name = result_tensor_access.get_tensor().get_name()
+    pos_index_var_llir = llir.Var(
+        name=f"{result_tensor_name}{child_level}_pos_index",
+        type=llir.DataType.INT,
+    )
+    # Built here rather than spelled inline: the callers read their result
+    # access off an optional attribute, and one typed call site is easier to
+    # keep right than two.
+    catch_up_marker = (
+        None
+        if cin_lowerer is None or result_tensor_access is None
+        else cin_lowerer._result_storage(
+            result_tensor_access,
+            (RESULT_POS, child_level, STORAGE_WRITE),
+            (RESULT_CRD, child_level, STORAGE_READ),
+        )
+    )
+    return [
+        llir.Comment("Assemble COMPRESSED level"),
+        llir.ForLoop(
+            init=None,
+            cond=llir.BinOp(
+                op="<",
+                left=pos_index_var_llir,
+                right=target,
+            ),
+            update=llir.Increment(var=pos_index_var_llir),
+            body=[
+                llir.Assign(
+                    var=llir.ArrayAccess(
+                        array=llir.Var(
+                            name=f"{result_tensor_name}{child_level}_pos",
+                            type=llir.DataType.STD_VECTOR_C_INT,
+                        ),
+                        index=llir.Add(
+                            llir.Var(
+                                name=pos_index_var_llir.name,
+                                type=llir.DataType.INT,
+                            ),
+                            llir.Literal(1),
+                        ),
+                    ),
+                    value=llir.FunctionCall(
+                        name=f"{result_tensor_name}{child_level}_crd.size",
+                        args=[],
+                    ),
+                    result_storage=catch_up_marker,
+                )
+            ],
+        ),
+    ]
+
+
+def dense_block_commit(
+    cin_lowerer: "CINLowerer",
+    result_tensor_access: TensorAccess,
+    level: int,
+    coordinate: llir.Expr,
+) -> List[llir.Stmt]:
+    """Commit a compressed coordinate whose dense block below was written.
+
+    ``coordinate`` is the coordinate to record at level ``level - 1``: the
+    enclosing loop's variable, or a drained key's previous value.
+
+    ``level`` is a dense result level directly below a compressed level L.
+    The dense levels from here down form one block of ``B`` cells (the
+    product of their extents) per stored coordinate of L, at ``q * B`` where
+    ``q`` is the coordinate's pending position -- the count of coordinates
+    stored so far, which the dense position resolve already multiplies.
+    Below the block is either the value array or a compressed level K.
+
+    The subtree wrote exactly when the operands store something under the
+    coordinate, because the leaf writes only for stored structure:
+    structure, never value.  Written means the value array grew past the
+    block's start, or K appended a coordinate since the block opened.
+    ``K_pos[q * B]`` is the coordinate count at the block's start, because
+    every earlier block was padded to its end when it committed.
+
+    Committed: pad the block to its full width (zero values, or K's
+    position entries closed at K's current count), append the coordinate,
+    advance ``q``.  Not committed: nothing was appended, and K's position
+    entries the visited cells closed are dropped again.
+    """
+
+    level_types = result_tensor_access.level_types()
+    if level == 0 or level_types[level - 1] != LevelType.COMPRESSED:
+        return []
+    block_end = level
+    while block_end < len(level_types) and level_types[block_end] == LevelType.DENSE:
+        block_end += 1
+    if block_end < len(level_types) and (
+        level_types[block_end] != LevelType.COMPRESSED
+    ):
+        return []
+    result_name = result_tensor_access.get_tensor().get_name()
+
+    def int64(name: str) -> llir.Var:
+        return llir.Var(name=name, type=llir.DataType.INT64)
+
+    def storage(
+        *references: Tuple[
+            llir.ResultStorageArray, Optional[int], llir.ResultStorageDirection
+        ]
+    ) -> Optional[llir.ResultStorageMetadata]:
+        return cin_lowerer._result_storage(result_tensor_access, *references)
+
+    block: llir.Expr = int64(f"{result_name}{level}_size")
+    for inner in range(level + 1, block_end):
+        block = llir.Mul(left=block, right=int64(f"{result_name}{inner}_size"))
+    parent_position = int64(f"p{result_name}{level - 1}")
+    block_start = llir.Mul(left=parent_position, right=block)
+    block_stop = llir.Mul(left=llir.Add(parent_position, llir.Literal(1)), right=block)
+
+    rollback: List[llir.Stmt] = []
+    if block_end == len(level_types):
+        values_name = f"{result_name}_values"
+        written: llir.Expr = llir.BinOp(
+            op=">",
+            left=llir.FunctionCall(name=f"{values_name}.size", args=[]),
+            right=block_start,
+        )
+        written_marker = storage((RESULT_VALUES, None, STORAGE_READ))
+        pad: List[llir.Stmt] = [
+            llir.FunctionCallStmt(
+                name=f"{values_name}.resize",
+                args=[block_stop, llir.Literal(0)],
+                result_storage=storage((RESULT_VALUES, None, STORAGE_WRITE)),
+            )
+        ]
+    else:
+        below = block_end
+        pos_name = f"{result_name}{below}_pos"
+        crd_size = llir.FunctionCall(name=f"{result_name}{below}_crd.size", args=[])
+        pos_index = int64(f"{result_name}{below}_pos_index")
+        written = llir.BinOp(
+            op=">",
+            left=crd_size,
+            right=llir.ArrayAccess(
+                array=llir.Var(name=pos_name, type=llir.DataType.STD_VECTOR_C_INT),
+                index=block_start,
+            ),
+        )
+        written_marker = storage(
+            (RESULT_CRD, below, STORAGE_READ), (RESULT_POS, below, STORAGE_READ)
+        )
+        pad = [
+            llir.ForLoop(
+                init=None,
+                cond=llir.BinOp(op="<", left=pos_index, right=block_stop),
+                update=llir.Increment(var=pos_index),
+                body=[
+                    llir.Assign(
+                        var=llir.ArrayAccess(
+                            array=llir.Var(
+                                name=pos_name,
+                                type=llir.DataType.STD_VECTOR_C_INT,
+                            ),
+                            index=llir.Add(pos_index, llir.Literal(1)),
+                        ),
+                        value=crd_size,
+                        result_storage=storage(
+                            (RESULT_POS, below, STORAGE_WRITE),
+                            (RESULT_CRD, below, STORAGE_READ),
+                        ),
+                    )
+                ],
+            )
+        ]
+        rollback = [
+            llir.FunctionCallStmt(
+                name=f"{pos_name}.resize",
+                args=[llir.Add(block_start, llir.Literal(1))],
+                result_storage=storage((RESULT_POS, below, STORAGE_WRITE)),
+            ),
+            llir.Assign(var=pos_index, value=block_start),
+        ]
+    return [
+        llir.BlankLine(),
+        llir.Comment("Commit the compressed coordinate above a written dense block"),
+        llir.IfThenElse(
+            cond=written,
+            then_body=[
+                *pad,
+                llir.FunctionCallStmt(
+                    name=f"{result_name}{level - 1}_crd.push_back",
+                    args=[coordinate],
+                    result_storage=storage((RESULT_CRD, level - 1, STORAGE_WRITE)),
+                ),
+                llir.Increment(var=parent_position),
+            ],
+            else_body=rollback or None,
+            result_storage=written_marker,
+        ),
+    ]
 
 
 @dataclass(frozen=False)
@@ -634,73 +865,63 @@ class LatticePoint:
             stmts.append(llir.BlankLine())
 
         result_tensor_access = lattice.cin_lowerer.result_tensor_access
-        result_tensor_var = lattice.cin_lowerer.result_tensor_var
-        result_tensor_name = result_tensor_var.name
-
         index_var = self.get_index_var()
-        index_var_llir = self.get_index_var_llir()
 
         if result_tensor_access.has_index_var(index_var):
             child_level = result_tensor_access.level_of_index_var(index_var) + 1
             curr_level_type = result_tensor_access.level_type_of_index_var(index_var)
+            if (
+                curr_level_type == LevelType.DENSE
+                and lattice.cin_lowerer is not None
+                and not result_tensor_access.is_workspace()
+            ):
+                if lattice.dense_index_var_llir is None and all(
+                    above == LevelType.DENSE
+                    for above in result_tensor_access.level_types()[:child_level]
+                ):
+                    # This loop visits only the coordinates its operands
+                    # store, so positions of this dense result level can go
+                    # unvisited -- the ones after the last visited coordinate
+                    # among them, which no later catch-up reaches.  See
+                    # ``emit_position_tail_close``.  Only a level of the dense
+                    # prefix above the first compressed level owes it: below a
+                    # compressed level, the commit pads each block to its end.
+                    lattice.cin_lowerer.result_dense_level_sparse_driven = True
+                elif lattice.dense_index_var_end_var_llir is not None:
+                    # The extent this level's loop actually runs to, by the
+                    # name the loop header uses, for every expression that
+                    # counts this level's cells.
+                    lattice.cin_lowerer.result_dense_level_bound_names[
+                        child_level - 1
+                    ] = lattice.dense_index_var_end_var_llir.name
             child_level_type = result_tensor_access.child_level_type_of_index_var(
                 index_var
             )
             if (
                 curr_level_type == LevelType.DENSE
                 and child_level_type == LevelType.COMPRESSED
+                and (
+                    child_level == 1
+                    or lattice.dense_index_var_llir is not None
+                    or result_tensor_access.is_workspace()
+                    or (index_var.tile_size_var and index_var.is_outer)
+                    or result_tensor_access in self.get_dense_tensor_accesses()
+                )
             ):
-                stmts.append(llir.Comment("Assemble COMPRESSED level"))
-                pos_index_var_llir = llir.Var(
-                    name=f"{result_tensor_name}{child_level}_pos_index",
-                    type=llir.DataType.INT,
-                )
-                # Hoisted and narrowed rather than spelled inline, because this
-                # method reads its result access off an optional attribute and
-                # the surrounding code does so unnarrowed; building the marker
-                # here keeps the new call site typed without changing the
-                # existing lines' shape.
-                catch_up_lowerer = lattice.cin_lowerer
-                catch_up_marker = (
-                    None
-                    if catch_up_lowerer is None or result_tensor_access is None
-                    else catch_up_lowerer._result_storage(
+                # A loop over STORED coordinates of a dense level below another
+                # level is caught up after its position is resolved, by
+                # ``get_lattice_loops``.  Every other loop is caught up here,
+                # before its body: level 0, whose position is its coordinate;
+                # a dense loop, whose coordinate is its loop variable; and the
+                # loops that resolve no result position of their own.
+                stmts.extend(
+                    compressed_child_catch_up(
+                        lattice.cin_lowerer,
                         result_tensor_access,
-                        (RESULT_POS, child_level, STORAGE_WRITE),
-                        (RESULT_CRD, child_level, STORAGE_READ),
-                    )
-                )
-                stmts.append(
-                    llir.ForLoop(
-                        init=None,
-                        cond=llir.BinOp(
-                            op="<",
-                            left=pos_index_var_llir,
-                            right=index_var_llir,
+                        child_level,
+                        lattice.dense_level_position(
+                            result_tensor_access, child_level - 1
                         ),
-                        update=llir.Increment(var=pos_index_var_llir),
-                        body=[
-                            llir.Assign(
-                                var=llir.ArrayAccess(
-                                    array=llir.Var(
-                                        name=f"{result_tensor_name}{child_level}_pos",
-                                        type=llir.DataType.STD_VECTOR_C_INT,
-                                    ),
-                                    index=llir.Add(
-                                        llir.Var(
-                                            name=pos_index_var_llir.name,
-                                            type=llir.DataType.INT,
-                                        ),
-                                        llir.Literal(1),
-                                    ),
-                                ),
-                                value=llir.FunctionCall(
-                                    name=f"{result_tensor_name}{child_level}_crd.size",
-                                    args=[],
-                                ),
-                                result_storage=catch_up_marker,
-                            )
-                        ],
                     )
                 )
 
@@ -795,15 +1016,13 @@ class LatticePoint:
 
         defined_index_vars = set(cin_lowerer.defined_index_vars)
 
-        d_copy = d.copy()
-        for stmt, dep_index_vars in d_copy.items():
-            if set(dep_index_vars).issubset(defined_index_vars):
-                dense_iterators_resolve_stmts.append(stmt)
-                del d[stmt]
+        for stmt in _declarable_now(d, defined_index_vars):
+            dense_iterators_resolve_stmts.append(stmt)
+            del d[stmt]
 
         if dense_iterators_resolve_stmts:
             stmts.append(llir.Comment("Resolve dense coordinates"))
-            stmts.extend(dense_iterators_resolve_stmts)
+            stmts.extend(_parents_first(dense_iterators_resolve_stmts))
 
         return stmts
 
@@ -815,6 +1034,95 @@ class LatticePoint:
         return set(self.get_sparse_tensor_accesses()).issubset(
             set(other.get_sparse_tensor_accesses())
         )
+
+
+def _names_read(expr: object) -> List[str]:
+    """The name of every variable an LLIR expression reads."""
+
+    if isinstance(expr, llir.Var):
+        return [expr.name]
+    if not is_dataclass(expr):
+        return []
+    names: List[str] = []
+    for part in fields(expr):
+        names.extend(_names_read(getattr(expr, part.name)))
+    return names
+
+
+def _declarable_now(
+    pending: Dict[llir.VarInit, List[IndexVar]], bound: Set[IndexVar]
+) -> List[llir.VarInit]:
+    """The pending dense position declarations that can be emitted here, in table order.
+
+    A dense level's position is its parent's position times its extent plus
+    its coordinate.  Its declaration lists two index variables, its own and
+    its parent's, and used to be emitted as soon as both were bound.  But it
+    reads the parent's *position*, and when the parent level is dense as well,
+    that position has a declaration of its own, which waits for the
+    grandparent's index variable.  A dense ``A`` stored ``(k, i, j)`` under
+    loops ``j, i, k`` got ``int pA2 = pA1 * A2_size + j;`` in the loop over
+    ``i`` and ``int pA1 = pA0 * A1_size + i;`` in the loop over ``k``, which
+    does not compile.  Two dense levels never showed it: the list of the
+    second names every index variable there is.
+
+    So a declaration whose index variables are bound still waits while a
+    position it reads has a pending declaration that cannot be emitted here.
+    A position with no pending declaration has been declared by an earlier
+    release, or is the iterator of an enclosing loop over a compressed or
+    coordinate level, which never enters the table.  A declaration that reads
+    no waiting position is emitted where it always was, so a kernel whose
+    declarations were already in a valid order is emitted as before.
+    """
+
+    ready = [stmt for stmt, needed in pending.items() if set(needed).issubset(bound)]
+    waiting = {stmt.var.name for stmt in pending} - {stmt.var.name for stmt in ready}
+    while True:
+        held = {
+            stmt.var.name
+            for stmt in ready
+            if not waiting.isdisjoint(_names_read(stmt.value))
+        }
+        if not held:
+            return ready
+        waiting |= held
+        ready = [stmt for stmt in ready if stmt.var.name not in held]
+
+
+def _parents_first(resolve_stmts: List[llir.Stmt]) -> List[llir.Stmt]:
+    """Dense position declarations, each after the one whose variable it reads.
+
+    A dense level's position is its parent's position times its extent plus
+    its coordinate, so its declaration reads the parent's.  The declarations
+    wait until the loops have bound their index variables and are then emitted
+    in the order they were first met.  A loop order that binds a tensor's
+    levels inner level first -- ``B[a,c]`` under loops ``c, a`` -- meets the
+    inner level's declaration first, and the two came out in that order:
+    ``int pB1 = pB0 * B1_size + c; int pB0 = a;``, which does not compile.
+
+    The order is otherwise kept, so a kernel whose declarations were already
+    in a valid order is emitted as before.
+    """
+
+    declared = {
+        stmt.var.name: stmt for stmt in resolve_stmts if isinstance(stmt, llir.VarInit)
+    }
+    ordered: List[llir.Stmt] = []
+    placed: set = set()
+
+    def place(stmt: llir.Stmt) -> None:
+        if id(stmt) in placed:
+            return
+        placed.add(id(stmt))
+        if isinstance(stmt, llir.VarInit):
+            for name in _names_read(stmt.value):
+                parent = declared.get(name)
+                if parent is not None and parent is not stmt:
+                    place(parent)
+        ordered.append(stmt)
+
+    for stmt in resolve_stmts:
+        place(stmt)
+    return ordered
 
 
 @dataclass(frozen=False)
@@ -892,6 +1200,35 @@ class IterationLattice:
                         left_lattice_points, right_lattice_points
                     )
                 elif op == Operation.ADD:
+                    if bool(left_lattice_points) != bool(right_lattice_points):
+                        # One addend has this loop's variable and the other
+                        # has no access with it.  The addend without it is
+                        # defined at every coordinate of the loop, so the sum
+                        # is too, but the union below would visit only what
+                        # the other addend stores, and ``get_simplified_cin``
+                        # would then drop the addend from the body as one that
+                        # had run out of values: ``A[i,j] + x[j]`` returned
+                        # ``A``.  A loop over the whole extent for such an
+                        # addend is not written.
+                        diagnostic = CINDiagnostic(
+                            code="unsupported_sum_addend_without_loop_variable",
+                            message=(
+                                "one side of a sum has no tensor indexed by "
+                                f"{parsed_index_var.name!r} and the other side "
+                                "has; the sum is defined over the whole extent "
+                                f"of {parsed_index_var.name!r}, which this "
+                                "lowering does not iterate"
+                            ),
+                            path=("root",),
+                            stage="legacy_cin_lowering",
+                            pass_name="gen_lattice_points",
+                        )
+                        raise UnsupportedFeature(
+                            "stage=legacy CIN lowering: "
+                            "unsupported_sum_addend_without_loop_variable "
+                            f"(loop {parsed_index_var.name!r})",
+                            diagnostics=(diagnostic,),
+                        )
                     return union_lattice_points(
                         left_lattice_points, right_lattice_points
                     )
@@ -1045,6 +1382,14 @@ class IterationLattice:
             iterator_init_stmts.extend(
                 [*[mode_iterator.get_init_stmts() for mode_iterator in all_mode_iterators]]  # type: ignore
             )
+            if self.dense_index_var_llir is not None:
+                # Several iterators merged under a dense extent lower to a
+                # ``while`` loop that advances the dense variable together with
+                # the iterators (``get_iterators_advance_stmts``).  A ``for``
+                # loop declares that variable in its header; a ``while`` loop
+                # has to be given it, or the kernel names a variable nothing
+                # declares (a sum of two compressed operands and a dense one).
+                iterator_init_stmts.append(self.get_dense_iterator_init_stmt())
 
         if len(all_mode_iterators) == 1:
             iterator = all_mode_iterators[0]
@@ -1119,6 +1464,10 @@ class IterationLattice:
 
         use_scalar_accum = self._should_use_scalar_accum(index_var)
         if use_scalar_accum:
+            assert result_tensor_access is not None
+            self.cin_lowerer._require_scalar_accumulation_driver(
+                result_tensor_access, self.for_all_stmt
+            )
             self.cin_lowerer._scalar_accum_mode = True
 
         child_subregion = list(
@@ -1136,10 +1485,19 @@ class IterationLattice:
             n_levels = result_tensor_var.levels
             pos_var = f"p{result_name}{n_levels - 1}"
 
-            # Pre: float _accum = 0.0f;
+            # Pre: <element type> _accum = 0;  for example float _accum = 0.0f;
+            # or int64_t _accum = 0;.  The accumulator is declared with the
+            # result's element type, the type its value array stores, so a
+            # partial sum is never rounded to a narrower type than the result
+            # holds.  An integer result accumulates exactly, modulo the width
+            # of its type, as its value array would.
+            accum_type = dtype_to_c_datatype(result_tensor_var.dtype)
             accum_init = llir.VarInit(
-                var=llir.Var(name="_accum", type=llir.DataType.FLOAT32),
-                value=llir.Literal(value="0.0f", data_type=llir.DataType.FLOAT32),
+                var=llir.Var(name="_accum", type=accum_type),
+                value=llir.Literal(
+                    value=_SCALAR_ZERO_SPELLINGS.get(accum_type, "0"),
+                    data_type=accum_type,
+                ),
             )
 
             # Post: D_values[pD1] = _accum; D0_crd[pD1] = i; D1_crd[pD1] = j; pD1++;
@@ -1234,6 +1592,139 @@ class IterationLattice:
                 ):
                     stmt.simd = True
 
+    def _dense_result_levels_resolved_at(
+        self, result_tensor_access: TensorAccess, level: int
+    ) -> List[int]:
+        """The dense result levels whose position the loop over ``level`` resolves.
+
+        A dense level's position is its parent's position times its own extent
+        plus its own coordinate.  So it can be computed once its own index
+        variable is bound and its parent's position exists.  A parent that is not
+        dense keeps its position in a counter declared for the whole kernel; a
+        dense parent's position exists only inside the loop that resolved it.  A
+        dense level therefore waits for the variable of every level of the run of
+        dense levels that ends at it.
+
+        Loops normally bind a result's levels outermost first, and the loop over
+        a level then resolves that level and nothing else -- the one statement
+        this lowering always emitted there.  A result that is dense in every level
+        is not held to that order: the scheduler leaves an all-dense tensor out of
+        its mode-order constraints because it is addressed by index arithmetic
+        (``Scheduler._build_mode_order_graph``), and public ``einsum`` rebinds its
+        dense operands to the selected loop order but not its result.
+        ``einsum('ab,ca->cb')`` over a compressed ``A`` loops ``a, b, c`` and
+        stores ``(c, b)``.  Emitting level 1's position in the loop over ``b``
+        read level 0's position before the loop over ``c`` declared it, and the
+        kernel did not compile.
+
+        The loop that binds the last variable a level waits for resolves it, and
+        with it every deeper level of the same run that waited only for that
+        variable.  They are returned outermost level first, the order in which
+        each statement reads the one before it.  Empty when ``level`` still waits
+        for a variable an inner loop binds.
+        """
+
+        assert self.cin_lowerer is not None, "cin_lowerer must be set"
+        bound = [
+            enclosing.parent if enclosing.has_parent else enclosing
+            for enclosing in self.cin_lowerer._enclosing_forall_vars
+            if not (enclosing.tile_size_var and enclosing.is_outer)
+        ]
+        level_vars = result_tensor_access.get_sorted_index_vars()
+        level_types = result_tensor_access.level_types()
+        run_start = level
+        while run_start > 0 and level_types[run_start - 1] == LevelType.DENSE:
+            run_start -= 1
+        resolved: List[int] = []
+        for candidate in range(level, len(level_types)):
+            if level_types[candidate] != LevelType.DENSE:
+                break
+            if any(
+                level_var not in bound
+                for level_var in level_vars[run_start : candidate + 1]
+            ):
+                break
+            resolved.append(candidate)
+        return resolved
+
+    def dense_level_position(
+        self, result_tensor_access: TensorAccess, level: int
+    ) -> llir.Expr:
+        """The position of the cell this lattice's loop is at, in a dense result level.
+
+        Level 0: the coordinate.  Under dense levels only: the flattened
+        coordinate ``((i0 * E1) + i1) * E2 + i2 ...``, each extent under the
+        name its own loop runs to -- the spelling the typed lowering uses
+        (``_assembly_catch_up_bound``), so both compilers emit one text.
+        Under a compressed level: that level's pending position times this
+        level's extent plus the coordinate, which is what the dense position
+        resolve assigns.
+        """
+
+        assert self.cin_lowerer is not None, "cin_lowerer must be set"
+        result_name = result_tensor_access.get_tensor().get_name()
+        level_vars = result_tensor_access.get_sorted_index_vars()
+        coordinate = llir.Var(name=level_vars[level].name, type=llir.DataType.INT)
+        if level == 0:
+            return coordinate
+        if self.dense_index_var_end_var_llir is not None:
+            self.cin_lowerer.result_dense_level_bound_names[level] = (
+                self.dense_index_var_end_var_llir.name
+            )
+        level_types = result_tensor_access.level_types()
+        if any(above != LevelType.DENSE for above in level_types[:level]):
+            return llir.Add(
+                llir.Mul(
+                    left=llir.Var(
+                        name=f"p{result_name}{level - 1}", type=llir.DataType.INT64
+                    ),
+                    right=llir.Var(
+                        name=f"{result_name}{level}_size", type=llir.DataType.INT64
+                    ),
+                ),
+                coordinate,
+            )
+        position: llir.Expr = llir.Var(name=level_vars[0].name, type=llir.DataType.INT)
+        for inner in range(1, level + 1):
+            position = llir.Add(
+                left=llir.Mul(
+                    left=position,
+                    right=llir.Var(
+                        name=self.cin_lowerer.result_dense_level_extent_name(
+                            result_name, inner
+                        ),
+                        type=llir.DataType.INT64,
+                    ),
+                ),
+                right=llir.Var(name=level_vars[inner].name, type=llir.DataType.INT),
+            )
+        return position
+
+    def _dense_block_commit_stmts(
+        self,
+        result_tensor_access: TensorAccess,
+        index_var: IndexVar,
+        level: int,
+    ) -> List[llir.Stmt]:
+        """The commit of the coordinate above ``index_var``'s dense block.
+
+        Emitted after the loop over a dense result level that sits directly
+        below a compressed one; see :func:`dense_block_commit`.
+        """
+
+        assert self.cin_lowerer is not None, "cin_lowerer must be set"
+        if level == 0:
+            return []
+        parent_index_var = result_tensor_access.get_parent_index_var(index_var)
+        if parent_index_var is None:
+            return []
+        return dense_block_commit(
+            self.cin_lowerer,
+            result_tensor_access,
+            level,
+            llir.Var(name=parent_index_var.name, type=llir.DataType.INT),
+        )
+
     def get_lattice_loops(self) -> List[llir.Stmt]:
         """
         Generate the outermost loops, one for each lattice point.
@@ -1258,6 +1749,12 @@ class IterationLattice:
             level = result_tensor_access.level_of_index_var(current_index_var)
             level_type = result_tensor_access.level_type_of_index_var(current_index_var)
 
+            if level_type == LevelType.DENSE:
+                stmts.extend(
+                    self._dense_block_commit_stmts(
+                        result_tensor_access, current_index_var, level
+                    )
+                )
             if level_type == LevelType.COMPRESSED:
                 stmts.extend(
                     [
@@ -1468,6 +1965,7 @@ class IterationLattice:
                 result_tensor_access in lattice_point.get_dense_tensor_accesses()
             )
 
+            result_value_index_stmts: List[llir.Stmt] = []
             if (
                 not result_tensor_access.is_workspace()
                 and not (index_var.tile_size_var and index_var.is_outer)
@@ -1479,29 +1977,33 @@ class IterationLattice:
                     logical_index_var
                 )
 
-                result_value_index_stmts: List[llir.Stmt] = []
-                # Index into result value array: p<result tensor var name><_level>
-                result_index_var = llir.Var(
-                    name=f"p{result_tensor_var.name}{level}",
-                    type=llir.DataType.INT,
-                )
-
-                # Initialize the result index var, if this _level is dense
+                # Initialize the result index vars this loop resolves, if this
+                # _level is dense: p<result tensor var name><_level>, the index
+                # into the result value array.
                 # If is _level 0, then p<result tensor var name><_level> = index var
                 # If _level > 0, then p<result tensor var name><_level> =
                 # p<result tensor var name><parent _level> * <size of this _level> + index var
                 if level_type == LevelType.DENSE:
-                    if level == 0:
-                        result_value_index_stmts.append(
-                            llir.VarInit(
-                                var=result_index_var,
-                                value=llir.Var(
-                                    name=logical_index_var.name,
-                                    type=llir.DataType.INT,
-                                ),
-                            )
+                    result_level_vars = result_tensor_access.get_sorted_index_vars()
+                    for resolved_level in self._dense_result_levels_resolved_at(
+                        result_tensor_access, level
+                    ):
+                        result_index_var = llir.Var(
+                            name=f"p{result_tensor_var.name}{resolved_level}",
+                            type=llir.DataType.INT,
                         )
-                    else:
+                        resolved_coordinate = llir.Var(
+                            name=result_level_vars[resolved_level].name,
+                            type=llir.DataType.INT,
+                        )
+                        if resolved_level == 0:
+                            result_value_index_stmts.append(
+                                llir.VarInit(
+                                    var=result_index_var,
+                                    value=resolved_coordinate,
+                                )
+                            )
+                            continue
                         result_value_index_stmts.append(
                             llir.VarInit(
                                 var=result_index_var,
@@ -1510,19 +2012,22 @@ class IterationLattice:
                                     left=llir.BinOp(
                                         op="*",
                                         left=llir.Var(
-                                            name=f"p{result_tensor_var.name}{level - 1}",
+                                            name=(
+                                                f"p{result_tensor_var.name}"
+                                                f"{resolved_level - 1}"
+                                            ),
                                             type=llir.DataType.INT,
                                         ),
                                         # <result tensor name><level>_size
                                         right=llir.Var(
-                                            name=f"{result_tensor_var.name}{level}_size",
+                                            name=(
+                                                f"{result_tensor_var.name}"
+                                                f"{resolved_level}_size"
+                                            ),
                                             type=llir.DataType.INT,
                                         ),
                                     ),
-                                    right=llir.Var(
-                                        name=logical_index_var.name,
-                                        type=llir.DataType.INT,
-                                    ),
+                                    right=resolved_coordinate,
                                 ),
                             )
                         )
@@ -1531,157 +2036,133 @@ class IterationLattice:
                     result_value_index_stmts = [
                         llir.Comment("Resolve index into dense level of values array")
                     ] + result_value_index_stmts
-
-                if len(iterators) == 0:
-                    for_loop = llir.ForLoop(
-                        init=self.get_dense_iterator_init_stmt(),
-                        cond=lattice_point.get_for_loop_condition(lattice=self),
-                        update=lattice_point.get_single_iterator_advance_stmt(
-                            lattice=self
-                        ),
-                        body=[
-                            *tiled_index_var_resolve_stmts,
-                            *lattice_point.get_candidate_coordinate_stmts(lattice=self),
-                            *result_value_index_stmts,
-                            *self._wrap_child_subregion(lattice_point, index_var),
-                        ],
-                        unroll=should_unroll_loop,
+                if (
+                    level_type == LevelType.DENSE
+                    and level > 0
+                    and self.dense_index_var_llir is None
+                    and level + 1 < result_tensor_access.num_levels
+                    and result_tensor_access.level_types()[level + 1]
+                    == LevelType.COMPRESSED
+                ):
+                    # The catch-up a loop over stored coordinates owes for the
+                    # compressed level below, placed after the coordinate and
+                    # the position it reads are resolved.
+                    result_value_index_stmts.extend(
+                        compressed_child_catch_up(
+                            self.cin_lowerer,
+                            result_tensor_access,
+                            level + 1,
+                            self.dense_level_position(result_tensor_access, level),
+                        )
                     )
-                    stmts.append(for_loop)
 
-                elif len(iterators) == 1 and not lattice_point.parent_lattice_point:
-                    # Note: we don't want to do this for a child lattice point
-                    # because we don't want to re-initialize the iterator(s)
-                    it = iterators[0]
+            # One emission for every loop.  A loop that resolves no result level --
+            # over a reduced index, into a workspace, or the outer loop of a tile
+            # -- differs only in having no result positions to resolve.  It used to
+            # be a second copy of the three cases below, and the copy had fallen
+            # behind: for a single iterator it always re-initialized the iterator,
+            # so the loop over one operand's remaining entries that follows a merge
+            # of two operands started again at the segment's first entry and added
+            # what the merge had already added (a sum reduced over a compressed
+            # index, wrong values), and under a dense extent it put the iterator's
+            # declaration where the dense variable's belongs (did not build).
+            if len(iterators) == 0:
+                for_loop = llir.ForLoop(
+                    init=self.get_dense_iterator_init_stmt(),
+                    cond=lattice_point.get_for_loop_condition(lattice=self),
+                    update=lattice_point.get_single_iterator_advance_stmt(lattice=self),
+                    body=[
+                        *tiled_index_var_resolve_stmts,
+                        *lattice_point.get_candidate_coordinate_stmts(lattice=self),
+                        *result_value_index_stmts,
+                        *self._wrap_child_subregion(lattice_point, index_var),
+                    ],
+                    unroll=should_unroll_loop,
+                )
+                stmts.append(for_loop)
 
-                    # When domain is dense but we have a sparse iterator,
-                    # use the dense variable for the loop and init the
-                    # sparse iterator separately before the loop.
-                    # Also generate coordinate iterator advancement in the
-                    # loop body (the for-loop update only advances the dense var).
-                    coord_advance_stmts: List[llir.Stmt] = []
-                    if self.dense_index_var_llir:
-                        loop_init = self.get_dense_iterator_init_stmt()
-                        stmts.append(it.get_init_stmt())
-                        # Advance coordinate iterator: conditional on match
-                        if (
-                            it.level_type == LevelType.COORDINATE
-                            and it.level + 1 < it.tensor_var.levels
-                        ):
-                            coord_advance_stmts = [
-                                llir.IfThenElse(
-                                    cond=llir.BinOp(
-                                        op="==",
-                                        left=it.get_coord_var_llir(),
-                                        right=lattice_point.get_index_var_llir(),
-                                    ),
-                                    then_body=[
-                                        llir.Assign(
-                                            var=it.get_iterator_var_llir(),
-                                            value=llir.Var(
-                                                name=f"p{it.tensor_var.name}{it.level + 1}_end",
-                                                type=llir.DataType.INT,
-                                            ),
-                                        )
-                                    ],
-                                )
-                            ]
-                        else:
-                            coord_advance_stmts = [
-                                llir.Assign(
-                                    var=it.get_iterator_var_llir(),
-                                    value=llir.BinOp(
-                                        op="==",
-                                        left=it.get_coord_var_llir(),
-                                        right=lattice_point.get_index_var_llir(),
-                                    ),
-                                    op=llir.AssignOp.ADD_ASSIGN,
-                                    cast=True,
-                                )
-                            ]
+            elif len(iterators) == 1 and not lattice_point.parent_lattice_point:
+                # Note: we don't want to do this for a child lattice point
+                # because we don't want to re-initialize the iterator(s)
+                it = iterators[0]
+
+                # When domain is dense but we have a sparse iterator,
+                # use the dense variable for the loop and init the
+                # sparse iterator separately before the loop.
+                # Also generate coordinate iterator advancement in the
+                # loop body (the for-loop update only advances the dense var).
+                coord_advance_stmts: List[llir.Stmt] = []
+                if self.dense_index_var_llir:
+                    loop_init = self.get_dense_iterator_init_stmt()
+                    stmts.append(it.get_init_stmt())
+                    # Advance coordinate iterator: conditional on match
+                    if (
+                        it.level_type == LevelType.COORDINATE
+                        and it.level + 1 < it.tensor_var.levels
+                    ):
+                        coord_advance_stmts = [
+                            llir.IfThenElse(
+                                cond=llir.BinOp(
+                                    op="==",
+                                    left=it.get_coord_var_llir(),
+                                    right=lattice_point.get_index_var_llir(),
+                                ),
+                                then_body=[
+                                    llir.Assign(
+                                        var=it.get_iterator_var_llir(),
+                                        value=llir.Var(
+                                            name=f"p{it.tensor_var.name}{it.level + 1}_end",
+                                            type=llir.DataType.INT,
+                                        ),
+                                    )
+                                ],
+                            )
+                        ]
                     else:
-                        loop_init = it.get_init_stmt()
-
-                    for_loop = llir.ForLoop(
-                        init=loop_init,
-                        cond=lattice_point.get_while_condition(lattice=self),
-                        update=lattice_point.get_single_iterator_advance_stmt(
-                            lattice=self
-                        ),
-                        body=[
-                            *tiled_index_var_resolve_stmts,
-                            *lattice_point.get_candidate_coordinate_stmts(lattice=self),
-                            *result_value_index_stmts,
-                            *self._wrap_child_subregion(lattice_point, index_var),
-                            *coord_advance_stmts,
-                        ],
-                        unroll=should_unroll_loop,
-                    )
-
-                    stmts.append(for_loop)
-
+                        coord_advance_stmts = [
+                            llir.Assign(
+                                var=it.get_iterator_var_llir(),
+                                value=llir.BinOp(
+                                    op="==",
+                                    left=it.get_coord_var_llir(),
+                                    right=lattice_point.get_index_var_llir(),
+                                ),
+                                op=llir.AssignOp.ADD_ASSIGN,
+                                cast=True,
+                            )
+                        ]
                 else:
-                    while_loop = llir.WhileLoop(
-                        cond=lattice_point.get_while_condition(lattice=self),
-                        body=[
-                            *tiled_index_var_resolve_stmts,
-                            *lattice_point.get_candidate_coordinate_stmts(lattice=self),
-                            *result_value_index_stmts,
-                            *self._wrap_child_subregion(lattice_point, index_var),
-                            *lattice_point.get_iterators_advance_stmts(lattice=self),
-                        ],
-                    )
+                    loop_init = it.get_init_stmt()
 
-                    stmts.append(while_loop)
+                for_loop = llir.ForLoop(
+                    init=loop_init,
+                    cond=lattice_point.get_while_condition(lattice=self),
+                    update=lattice_point.get_single_iterator_advance_stmt(lattice=self),
+                    body=[
+                        *tiled_index_var_resolve_stmts,
+                        *lattice_point.get_candidate_coordinate_stmts(lattice=self),
+                        *result_value_index_stmts,
+                        *self._wrap_child_subregion(lattice_point, index_var),
+                        *coord_advance_stmts,
+                    ],
+                    unroll=should_unroll_loop,
+                )
+
+                stmts.append(for_loop)
 
             else:
-                # TODO: generate workspace for the index vars below
+                while_loop = llir.WhileLoop(
+                    cond=lattice_point.get_while_condition(lattice=self),
+                    body=[
+                        *tiled_index_var_resolve_stmts,
+                        *lattice_point.get_candidate_coordinate_stmts(lattice=self),
+                        *result_value_index_stmts,
+                        *self._wrap_child_subregion(lattice_point, index_var),
+                        *lattice_point.get_iterators_advance_stmts(lattice=self),
+                    ],
+                )
 
-                if len(iterators) == 0:
-                    for_loop = llir.ForLoop(
-                        init=self.get_dense_iterator_init_stmt(),
-                        cond=lattice_point.get_for_loop_condition(lattice=self),
-                        update=lattice_point.get_single_iterator_advance_stmt(
-                            lattice=self
-                        ),
-                        body=[
-                            *tiled_index_var_resolve_stmts,
-                            *lattice_point.get_candidate_coordinate_stmts(lattice=self),
-                            *self._wrap_child_subregion(lattice_point, index_var),
-                        ],
-                        unroll=should_unroll_loop,
-                    )
-                    stmts.append(for_loop)
-
-                elif len(iterators) == 1:
-                    it = iterators[0]
-                    for_loop = llir.ForLoop(
-                        init=it.get_init_stmt(),
-                        cond=lattice_point.get_while_condition(lattice=self),
-                        update=lattice_point.get_single_iterator_advance_stmt(
-                            lattice=self
-                        ),
-                        body=[
-                            *lattice_point.get_candidate_coordinate_stmts(lattice=self),
-                            *self._wrap_child_subregion(lattice_point, index_var),
-                        ],
-                        unroll=should_unroll_loop,
-                    )
-
-                    stmts.append(for_loop)
-
-                else:
-                    while_loop = llir.WhileLoop(
-                        cond=lattice_point.get_while_condition(lattice=self),
-                        body=[
-                            *tiled_index_var_resolve_stmts,
-                            *lattice_point.get_candidate_coordinate_stmts(lattice=self),
-                            *self._wrap_child_subregion(lattice_point, index_var),
-                            *lattice_point.get_iterators_advance_stmts(lattice=self),
-                        ],
-                    )
-
-                    stmts.append(while_loop)
+                stmts.append(while_loop)
 
             return stmts
 

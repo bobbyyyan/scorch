@@ -109,13 +109,16 @@ def test_exact_requested_sparse_format_metadata_is_preserved(kind):
     assert tensor.format.serialize() == requested.serialize()
 
 
-def test_requested_format_and_nested_level_are_deeply_detached():
+def test_requested_format_and_nested_level_cannot_change_the_result():
+    """The result may hold the requested format itself: it cannot change."""
     level = LevelFormat("s", bit_width=64)
     requested = TensorFormat([level])
     tensor = STensor.from_torch(torch.tensor(VECTOR), "A").to_sparse(requested)
 
-    object.__setattr__(level, "_mode", LevelType.DENSE)
-    object.__setattr__(requested, "_level_formats", (LevelFormat("o"),))
+    with pytest.raises(AttributeError):
+        object.__setattr__(level, "_mode", LevelType.DENSE)
+    with pytest.raises(AttributeError):
+        object.__setattr__(requested, "_level_formats", (LevelFormat("o"),))
 
     assert str(tensor.format) == "s"
     assert tensor.format.get_level_formats()[0].bit_width == 64
@@ -123,10 +126,11 @@ def test_requested_format_and_nested_level_are_deeply_detached():
     tensor.storage.validate()
 
 
-def test_level_sequence_input_is_deeply_detached():
+def test_level_sequence_input_cannot_change_the_result():
     level = LevelFormat("o", bit_width=32)
     tensor = STensor.from_torch(torch.tensor(VECTOR), "A").to_sparse([level])
-    object.__setattr__(level, "_mode", LevelType.DENSE)
+    with pytest.raises(AttributeError):
+        object.__setattr__(level, "_mode", LevelType.DENSE)
     assert str(tensor.format) == "o"
     assert tensor.format.get_level_formats()[0].bit_width == 32
     assert tensor.to_torch().tolist() == VECTOR
@@ -146,30 +150,46 @@ def test_tensor_format_subclass_fails_closed_without_mutating_receiver():
     "malformation",
     ["missing_levels", "list_levels", "foreign_level", "missing_mode", "bad_mode"],
 )
-def test_forged_format_structure_fails_closed(malformation):
+def test_format_structure_cannot_be_forged(malformation):
     requested = TensorFormat([LevelFormat("s")])
     level = requested.get_level_formats()[0]
-    if malformation == "missing_levels":
-        object.__delattr__(requested, "_level_formats")
-    elif malformation == "list_levels":
-        object.__setattr__(requested, "_level_formats", [level])
-    elif malformation == "foreign_level":
-        object.__setattr__(requested, "_level_formats", (object(),))
-    elif malformation == "missing_mode":
-        object.__delattr__(level, "_mode")
-    else:
-        object.__setattr__(level, "_mode", "s")
+    with pytest.raises(AttributeError):
+        if malformation == "missing_levels":
+            object.__delattr__(requested, "_level_formats")
+        elif malformation == "list_levels":
+            object.__setattr__(requested, "_level_formats", [level])
+        elif malformation == "foreign_level":
+            object.__setattr__(requested, "_level_formats", (object(),))
+        elif malformation == "missing_mode":
+            object.__delattr__(level, "_mode")
+        else:
+            object.__setattr__(level, "_mode", "s")
 
+    tensor = STensor.from_torch(torch.tensor(VECTOR), "A").to_sparse(requested)
+    assert str(tensor.format) == "s"
+    assert tensor.to_torch().tolist() == VECTOR
+
+
+def test_a_format_that_was_never_built_fails_closed():
     tensor = STensor.from_torch(torch.tensor(VECTOR), "A")
     with pytest.raises(TensorFormatError, match="to_sparse format"):
-        tensor.to_sparse(requested)
+        tensor.to_sparse(TensorFormat.__new__(TensorFormat))
     assert str(tensor.format) == "d"
 
 
-@pytest.mark.parametrize("bit_width", [True, 0, -1, "64", 1 << 63])
-def test_forged_format_bit_width_fails_closed(bit_width):
+@pytest.mark.parametrize("bit_width", [True, 0, -1, "64"])
+def test_an_invalid_bit_width_can_be_neither_built_nor_forged(bit_width):
+    with pytest.raises((TensorTypeError, TensorFormatError)):
+        LevelFormat("s", bit_width=bit_width)
     requested = TensorFormat([LevelFormat("s")])
-    object.__setattr__(requested.get_level_formats()[0], "_bit_width", bit_width)
+    with pytest.raises(AttributeError):
+        object.__setattr__(requested.get_level_formats()[0], "_bit_width", bit_width)
+    assert requested.get_level_formats()[0].bit_width is None
+
+
+def test_a_bit_width_past_int64_fails_closed():
+    """The constructor accepts any positive width; to_sparse allows a signed int64."""
+    requested = TensorFormat([LevelFormat("s", bit_width=1 << 63)])
     tensor = STensor.from_torch(torch.tensor(VECTOR), "A")
     with pytest.raises(TensorFormatError, match="positive signed-int64 exact int"):
         tensor.to_sparse(requested)
@@ -177,24 +197,16 @@ def test_forged_format_bit_width_fails_closed(bit_width):
 
 
 @pytest.mark.parametrize("owner", ["format", "level"])
-def test_hostile_stored_field_keys_fail_closed(owner):
-    class HostileKey(str):
-        __hash__ = str.__hash__
-
-        def __eq__(self, other):
-            raise RuntimeError("stored-key equality must not execute")
-
+def test_no_stored_field_keys_exist_to_poison(owner):
+    """A format and a level have no instance dict whose keys could be replaced with a
+    hostile ``str`` subclass."""
     requested = TensorFormat([LevelFormat("s")])
     target = requested if owner == "format" else requested.get_level_formats()[0]
-    state = object.__getattribute__(target, "__dict__")
-    key = next(iter(state))
-    value = state.pop(key)
-    state[HostileKey(key)] = value
+    with pytest.raises(AttributeError):
+        object.__getattribute__(target, "__dict__")
 
-    tensor = STensor.from_torch(torch.tensor(VECTOR), "A")
-    with pytest.raises(TensorFormatError, match="malformed stored state"):
-        tensor.to_sparse(requested)
-    assert str(tensor.format) == "d"
+    tensor = STensor.from_torch(torch.tensor(VECTOR), "A").to_sparse(requested)
+    assert str(tensor.format) == "s"
 
 
 @pytest.mark.parametrize(

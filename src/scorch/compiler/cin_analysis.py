@@ -282,6 +282,12 @@ def _preflight_cin_structure_impl(  # noqa: C901
     name.  The adapter does not consume node identity and canonicalizes the
     index aliases before lowering. Normalization, analysis, LoopIR, and request
     identity never enable this compatibility mode.
+
+    Once the structure is valid, every assignment that reads a workspace must
+    write a tensor of the workspace's element type (``workspace_type_mismatch``).
+    The check lives here rather than in the full analysis because this
+    preflight runs on every ``normalize_cin``, release included, and a
+    mismatch is otherwise a silent narrowing in the emitted kernel.
     """
 
     if type(allow_legacy_schedule_aliases) is not bool:
@@ -328,6 +334,7 @@ def _preflight_cin_structure_impl(  # noqa: C901
     ] = {}
     tensor_ranks: Dict[int, int] = {}
     pending_accesses: List[Tuple[TensorAccess, Tuple[str, ...]]] = []
+    pending_assignments: List[Tuple[TensorAssign, Tuple[str, ...]]] = []
     stack: List[Tuple[bool, object, Tuple[str, ...], int]] = [
         (False, cin, ("root",), 0)
     ]
@@ -805,6 +812,7 @@ def _preflight_cin_structure_impl(  # noqa: C901
         elif type(node) is TensorAssign:
             typed_child(node, "lhs", TensorAccess, path, children)
             expression_child(node, "rhs", path, children)
+            pending_assignments.append((cast(TensorAssign, node), path))
             op = stored_field(node, "op", path)
             if op is not _MISSING_CIN_FIELD and op is not None:
                 if type(op) is not Operation:
@@ -1092,110 +1100,58 @@ def _preflight_cin_structure_impl(  # noqa: C901
                         path + ("_format",),
                     )
                 elif type(tensor_format) is TensorFormat:
-                    format_state = object.__getattribute__(
-                        tensor_format,
-                        "__dict__",
-                    )
-                    if type(format_state) is not dict:
-                        diagnose(
-                            "invalid_cin_field",
-                            "TensorVar._format stored state must be an exact dict",
-                            path + ("_format",),
-                        )
-                    else:
-                        format_keys = tuple(format_state)
-                    if type(format_state) is dict and (
-                        len(format_keys) != 1
-                        or type(format_keys[0]) is not str
-                        or format_keys[0] != "_level_formats"
-                    ):
+                    # A TensorFormat's fields are read-only and set only by its
+                    # constructor, after validation (format.py, "Read-only stored
+                    # state"): its levels are a tuple of LevelFormat values with
+                    # LevelType modes and positive bit widths, and nothing can change
+                    # them afterwards. Reading an exact TensorFormat's fields runs no
+                    # caller code. What is left to check is what CIN requires beyond
+                    # the constructor: exact LevelFormat levels, a supported rank, and
+                    # bit widths that fit a signed int64. A format made by __new__
+                    # alone holds no levels.
+                    try:
+                        level_formats = tensor_format._level_formats
+                    except AttributeError:
+                        level_formats = None
                         diagnose(
                             "invalid_cin_field",
                             "TensorVar._format has malformed stored state",
                             path + ("_format",),
                         )
-                    elif type(format_state) is dict:
-                        level_formats = format_state["_level_formats"]
-                        if type(level_formats) is not tuple:
+                    if level_formats is not None:
+                        format_rank = len(level_formats)
+                        if format_rank > _MAX_CIN_TENSOR_RANK:
                             diagnose(
                                 "invalid_cin_field",
-                                "TensorVar._format levels must be an exact tuple",
-                                path + ("_format", "_level_formats"),
+                                "TensorVar._format exceeds the supported rank",
+                                path + ("_format",),
                             )
-                        else:
-                            format_rank = len(level_formats)
-                            if format_rank > _MAX_CIN_TENSOR_RANK:
+                        for level, level_format in enumerate(
+                            level_formats[:_MAX_CIN_TENSOR_RANK],
+                        ):
+                            level_path = path + (
+                                "_format",
+                                f"_level_formats[{level}]",
+                            )
+                            if type(level_format) is not LevelFormat:
                                 diagnose(
                                     "invalid_cin_field",
-                                    "TensorVar._format exceeds the supported rank",
-                                    path + ("_format",),
+                                    "TensorFormat levels must be exact "
+                                    "LevelFormat values",
+                                    level_path,
                                 )
-                            for level, level_format in enumerate(
-                                level_formats[:_MAX_CIN_TENSOR_RANK],
+                                continue
+                            bit_width = level_format._bit_width
+                            if (
+                                bit_width is not None
+                                and int.__int__(bit_width) > _MAX_RUNTIME_EXTENT
                             ):
-                                level_path = path + (
-                                    "_format",
-                                    f"_level_formats[{level}]",
+                                diagnose(
+                                    "invalid_cin_field",
+                                    "LevelFormat._bit_width must be a positive "
+                                    "signed-int64 integer or None",
+                                    level_path + ("_bit_width",),
                                 )
-                                if type(level_format) is not LevelFormat:
-                                    diagnose(
-                                        "invalid_cin_field",
-                                        "TensorFormat levels must be exact "
-                                        "LevelFormat values",
-                                        level_path,
-                                    )
-                                    continue
-                                level_state = object.__getattribute__(
-                                    level_format,
-                                    "__dict__",
-                                )
-                                if type(level_state) is not dict:
-                                    diagnose(
-                                        "invalid_cin_field",
-                                        "LevelFormat stored state must be an exact dict",
-                                        level_path,
-                                    )
-                                    continue
-                                level_keys = tuple(level_state)
-                                if (
-                                    len(level_keys) != 2
-                                    or any(type(key) is not str for key in level_keys)
-                                    or set(level_keys) != {"_mode", "_bit_width"}
-                                ):
-                                    diagnose(
-                                        "invalid_cin_field",
-                                        "LevelFormat has malformed stored state",
-                                        level_path,
-                                    )
-                                    continue
-                                mode = level_state["_mode"]
-                                bit_width = level_state["_bit_width"]
-                                if type(mode) is not LevelType:
-                                    diagnose(
-                                        "invalid_cin_field",
-                                        "LevelFormat._mode must be an exact LevelType",
-                                        level_path + ("_mode",),
-                                    )
-                                invalid_bit_width = False
-                                if bit_width is not None:
-                                    bit_width_type = type(bit_width)
-                                    if bit_width_type is bool or not issubclass(
-                                        bit_width_type, int
-                                    ):
-                                        invalid_bit_width = True
-                                    else:
-                                        canonical_bit_width = int.__int__(bit_width)
-                                        invalid_bit_width = (
-                                            canonical_bit_width <= 0
-                                            or canonical_bit_width > _MAX_RUNTIME_EXTENT
-                                        )
-                                if invalid_bit_width:
-                                    diagnose(
-                                        "invalid_cin_field",
-                                        "LevelFormat._bit_width must be a positive "
-                                        "signed-int64 integer or None",
-                                        level_path + ("_bit_width",),
-                                    )
             shape = stored_field(node, "shape", path)
             shape_rank: Optional[int] = None
             if shape is not _MISSING_CIN_FIELD and shape is not None:
@@ -1907,6 +1863,49 @@ def _preflight_cin_structure_impl(  # noqa: C901
                 f"{identity_type.__name__} belongs to distinct CIN entities",
                 path,
             )
+
+    if not diagnostics:
+        # Every field read below was admitted by the walk above. Expression
+        # objects are never shared, so each right-hand side is walked once.
+        for assignment, path in pending_assignments:
+            target = _safe_exact_dict_value(
+                _safe_exact_dict_value(assignment, "lhs"), "tensor"
+            )
+            target_dtype = _safe_exact_dict_value(target, "dtype")
+            expressions: List[Tuple[object, Tuple[str, ...]]] = [
+                (_safe_exact_dict_value(assignment, "rhs"), path + ("rhs",))
+            ]
+            while expressions:
+                expression, expression_path = expressions.pop()
+                expression_type = type(expression)
+                if expression_type is BinaryOp:
+                    for field_name in ("right", "left"):
+                        expressions.append(
+                            (
+                                _safe_exact_dict_value(expression, field_name),
+                                expression_path + (field_name,),
+                            )
+                        )
+                elif expression_type is UnaryOp:
+                    expressions.append(
+                        (
+                            _safe_exact_dict_value(expression, "expr"),
+                            expression_path + ("expr",),
+                        )
+                    )
+                elif expression_type is WorkspaceAccess:
+                    workspace = _safe_exact_dict_value(expression, "tensor")
+                    workspace_dtype = _safe_exact_dict_value(workspace, "dtype")
+                    if workspace_dtype is not target_dtype:
+                        diagnose(
+                            "workspace_type_mismatch",
+                            f"{_safe_exact_dict_value(target, '_name')} "
+                            f"({target_dtype}) is assigned from workspace "
+                            f"{_safe_exact_dict_value(workspace, '_name')} "
+                            f"({workspace_dtype}); a workspace must have the "
+                            "element type of every tensor assigned from it",
+                            expression_path,
+                        )
 
     return tuple(diagnostics), legacy_aliases_used
 

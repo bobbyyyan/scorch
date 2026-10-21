@@ -17,14 +17,57 @@ intentionally non-symbolic compatibility behavior.  Successful output
 materialization stays structured for the canonical LLIR emitter.  Exact
 generated declaration/post pairs remain invisible to the legacy definition
 name scan, matching their former opaque-statement behavior.
+
+The rewrite replaces ``acc += s * x`` inside a loop by ``acc += x`` and a
+multiplication ``acc *= s`` after the loop.  That is the same sum only when
+the accumulator is zero on entry to the loop and the loop uses the
+accumulator nowhere else.  The pass hoists only when it can show both, by a
+sufficient condition:
+
+* a ``VarInit`` of the accumulator with a zero literal precedes the loop in
+  the loop's own statement sequence, and no statement between that
+  declaration and the loop spells the accumulator's name; and
+* the matched accumulation is the only statement of the loop that spells the
+  accumulator's name, and its right-hand side does not spell it.
+
+Nested statement lists are emitted inline and count as part of the sequence
+that holds them.  A name is searched for as a whole C++ identifier in every
+string of a statement: typed fields, composite spellings and raw code alike.
+The condition assumes control enters that stretch of the sequence only from
+its top: LLIR has no jump statement, and raw code is assumed to hold no label.
+An accumulator that is declared in an enclosing sequence, declared without an
+initializer or with a nonzero one, declared as raw code, read or written
+between its declaration and the loop, or not declared at all is not shown to
+be zero, and its loop is left unchanged.  That is a legal miss, not an error.
+
+The hoisted temporary takes the accumulator's scalar type, read from the
+zero-initializing declaration; the pass never chooses a scalar type of its
+own.  It declares a factor only with an element type a kernel's result
+values can have (``scorch.utils.PYTORCH_DTYPE_TO_C_DATATYPE``: float,
+double, int8_t, uint8_t, int32_t, int64_t), so a loop whose accumulator is
+declared with any other type, or with no type, is left unchanged: one more
+legal miss.  A typed accumulator reference that carries a different type
+from its typed declaration is malformed IR and raises a structured error.
+The validation boundary judges a generated pair that already exists, so
+there both cases raise.
+
+For an integer accumulator the rewrite computes the same value: integer
+addition and multiplication are associative and distributive, and int8_t
+and uint8_t wrap modulo 256 in both forms alike.  For a signed type of int
+width or wider, a partial sum of the rewritten loop is the original's
+partial sum divided by the factor, so it overflows only where the
+original's does, with one exception: when the factor is zero, every term
+of the original is zero and only the rewritten sum can overflow.
 """
 
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass
-from typing import List, NoReturn, Sequence, Tuple, cast
+from typing import List, NoReturn, Optional, Pattern, Sequence, Tuple, cast
 
 from . import llir
+from ..utils import PYTORCH_DTYPE_TO_C_DATATYPE
 from .llir_traversal import (
     LLIRPath,
     LLIRRewriter,
@@ -54,6 +97,11 @@ LOOP_INVARIANT_FACTOR_HOIST_CONTEXT = LoopInvariantFactorHoistContext()
 
 _BINOP_FAMILY = (llir.BinOp, llir.Add, llir.Mul)
 _Factor = Tuple[llir.Expr, LLIRPath]
+# The scalar types a hoisted factor may be declared with: the element types a
+# kernel's result values can have.
+_FACTOR_SCALAR_TYPES = tuple(PYTORCH_DTYPE_TO_C_DATATYPE.values())
+# A literal that initializes a scalar to zero, as C++ spells it.
+_ZERO_LITERAL = re.compile(r"[+-]?(?:0+\.?0*|\.0+)(?:[eE][+-]?[0-9]+)?[fFlL]?")
 
 
 def _diagnostic_context(context: object) -> LLIRTraversalContext:
@@ -302,25 +350,34 @@ def _matches_materialization_var(
     )
 
 
-def _matches_generated_factor_declaration(
+def _is_factor_scalar_type(data_type: object) -> bool:
+    return any(data_type is scalar_type for scalar_type in _FACTOR_SCALAR_TYPES)
+
+
+def _generated_factor_declaration_type(
     statement: object,
     sequence_index: int,
-) -> bool:
+) -> llir.DataType | None:
+    """The scalar type of an exact generated declaration, else ``None``."""
+
     if type(statement) is not llir.VarInit:
-        return False
+        return None
     initializer = cast(llir.VarInit, statement)
-    return (
+    if (
         _matches_materialization_var(
             initializer.var,
             expected_name=f"_inv_{sequence_index}",
-            expected_type=llir.DataType.FLOAT32,
+            expected_type=None,
             expected_is_ptr=False,
             expected_is_restrict=False,
         )
+        and _is_factor_scalar_type(initializer.var.type)
         and isinstance(initializer.value, llir.Expr)
         and initializer.op == "="
         and initializer.cast is False
-    )
+    ):
+        return initializer.var.type
+    return None
 
 
 def _same_materialization_target(left: object, right: object) -> bool:
@@ -363,16 +420,20 @@ def _is_materialized_factor_declaration(
 ) -> bool:
     """Recognize an exact generated declaration/loop/post wrapper block."""
 
-    if not _matches_generated_factor_declaration(
-        statements[declaration_index],
-        declaration_index,
+    if (
+        _generated_factor_declaration_type(
+            statements[declaration_index],
+            declaration_index,
+        )
+        is None
     ):
         return False
 
     loop_index = declaration_index + 1
-    while loop_index < len(statements) and _matches_generated_factor_declaration(
-        statements[loop_index],
-        loop_index,
+    while (
+        loop_index < len(statements)
+        and _generated_factor_declaration_type(statements[loop_index], loop_index)
+        is not None
     ):
         loop_index += 1
     if (
@@ -394,13 +455,20 @@ def _is_materialized_factor_declaration(
         ):
             return False
         assignment = cast(llir.Assign, statements[post_index])
+        # The post multiplies in the factor its own declaration declared, so
+        # the pair carries one scalar type.
+        factor_type = _generated_factor_declaration_type(
+            statements[generated_index],
+            generated_index,
+        )
         if (
-            assignment.op is not llir.AssignOp.MUL_ASSIGN
+            factor_type is None
+            or assignment.op is not llir.AssignOp.MUL_ASSIGN
             or assignment.cast is not False
             or not _matches_materialization_var(
                 assignment.value,
                 expected_name=f"_inv_{generated_index}",
-                expected_type=llir.DataType.FLOAT32,
+                expected_type=factor_type,
                 expected_is_ptr=False,
                 expected_is_restrict=False,
             )
@@ -408,6 +476,150 @@ def _is_materialized_factor_declaration(
         ):
             return False
     return True
+
+
+def _identifier_pattern(name: str) -> Pattern[str]:
+    """Match ``name`` where it stands as a whole C++ identifier."""
+
+    return re.compile(rf"(?<![A-Za-z0-9_]){re.escape(name)}(?![A-Za-z0-9_])")
+
+
+def _spelling_count(value: object, identifier: Pattern[str]) -> int:
+    """How often the strings reachable from ``value`` spell the identifier.
+
+    Variable names, composite spellings such as ``values[position]`` and raw
+    code are all strings of the tree, so one search covers a read, a write and
+    a declaration, typed or not.  Only strings, statement sequences and LLIR
+    nodes are entered; any other field value, a statement's result-storage
+    marker among them, spells nothing.
+    """
+
+    if isinstance(value, str):
+        return len(identifier.findall(value))
+    if isinstance(value, (list, tuple)):
+        return sum(_spelling_count(member, identifier) for member in value)
+    if isinstance(value, llir.Node):
+        return sum(_spelling_count(child, identifier) for child in vars(value).values())
+    return 0
+
+
+def _is_zero_literal(value: object) -> bool:
+    if type(value) is not llir.Literal:
+        return False
+    literal = cast(llir.Literal, value)
+    if type(literal.value) is str:
+        # A string literal without a numeric type is emitted in quotes.
+        return (
+            literal.data_type is not llir.DataType.STRING
+            and _ZERO_LITERAL.fullmatch(literal.value) is not None
+        )
+    return type(literal.value) in (int, float) and literal.value == 0
+
+
+def _straight_line_statements(
+    statements: Sequence[LLIRStatementValue],
+) -> List[LLIRStatementValue]:
+    """``statements`` with nested sequences, which are emitted inline, expanded."""
+
+    flat: List[LLIRStatementValue] = []
+    for statement in statements:
+        if type(statement) is list or type(statement) is tuple:
+            flat.extend(
+                _straight_line_statements(cast(Sequence[LLIRStatementValue], statement))
+            )
+        else:
+            flat.append(statement)
+    return flat
+
+
+def _zero_initialization(
+    preceding: Sequence[LLIRStatementValue],
+    name: str,
+) -> llir.VarInit | None:
+    """The declaration that shows ``name`` is zero where ``preceding`` ends.
+
+    ``preceding`` holds the statements of one sequence that come before a
+    loop.  The result is the ``VarInit`` of ``name`` with a zero literal that
+    no later statement of ``preceding`` follows with a spelling of ``name``,
+    or ``None`` when there is no such declaration.  ``None`` means only that
+    zero was not shown.
+    """
+
+    identifier = _identifier_pattern(name)
+    for statement in reversed(_straight_line_statements(preceding)):
+        if type(statement) is llir.VarInit:
+            initializer = cast(llir.VarInit, statement)
+            if (
+                _matches_materialization_var(
+                    initializer.var,
+                    expected_name=name,
+                    expected_type=None,
+                    expected_is_ptr=False,
+                    expected_is_restrict=False,
+                )
+                and initializer.op == "="
+                and initializer.cast is False
+                and _is_zero_literal(initializer.value)
+            ):
+                return initializer
+        if _spelling_count(statement, identifier):
+            return None
+    return None
+
+
+def _accumulation_is_the_only_use(
+    loop: llir.ForLoop,
+    body_index: int,
+    name: str,
+) -> bool:
+    """Whether ``loop`` spells ``name`` only as the target of one statement.
+
+    A second write, a read, or the accumulator on its own right-hand side
+    would each see the partial sum before the hoisted factor is applied.  The
+    whole loop is searched, its header and every auxiliary field included, so
+    the spellings in the loop must be exactly those in the matched target.
+    """
+
+    identifier = _identifier_pattern(name)
+    target = cast(llir.Assign, loop.body[body_index]).var
+    return _spelling_count(loop, identifier) == _spelling_count(target, identifier)
+
+
+def _accumulator_scalar_type(
+    target: llir.Var,
+    declaration: llir.VarInit,
+    context: LoopInvariantFactorHoistContext,
+    path: LLIRPath,
+) -> Optional[llir.DataType]:
+    """The scalar type a factor hoisted out of ``target`` is declared with.
+
+    ``declaration`` is the accumulator's zero-initializing declaration and the
+    source of the type.  ``None`` means the declaration is neither FLOAT32 nor
+    FLOAT64, so no factor can be declared for this accumulator.  A typed
+    reference that carries a different type from a typed declaration is
+    malformed IR and raises.
+    """
+
+    declared_type = declaration.var.type
+    referenced_type = target.type
+    if (
+        referenced_type is not llir.DataType.NO_TYPE
+        and declared_type is not llir.DataType.NO_TYPE
+        and declared_type is not referenced_type
+    ):
+        _raise_factor_hoist_error(
+            context,
+            code="inconsistent_loop_invariant_factor_accumulator_type",
+            message=(
+                "the accumulator reference and its zero-initializing declaration "
+                "carry different scalar types"
+            ),
+            path=path,
+            value=target,
+        )
+    if not _is_factor_scalar_type(declared_type):
+        return None
+    return declared_type
 
 
 def _collect_mul_factors(
@@ -557,8 +769,15 @@ def _validate_materialization(
     sequence_index: int,
     context: LoopInvariantFactorHoistContext,
     path: LLIRPath,
+    preceding: Sequence[LLIRStatementValue],
 ) -> Tuple[llir.VarInit, llir.Assign]:
-    """Validate the complete generated pair at its owning pass boundary."""
+    """Validate the complete generated pair at its owning pass boundary.
+
+    The expected target, the proof that it is zero on entry and the expected
+    scalar type are all derived here from the loop's own source assignment
+    and ``preceding``, the statements of the loop's sequence that come before
+    it, never taken from the pair under validation.
+    """
 
     if type(declaration) is not llir.VarInit:
         _raise_factor_hoist_error(
@@ -569,11 +788,70 @@ def _validate_materialization(
             value=declaration,
         )
     typed_declaration = cast(llir.VarInit, declaration)
+
+    if (
+        type(body_index) is not int
+        or body_index < 0
+        or body_index >= len(loop.body)
+        or type(loop.body[body_index]) is not llir.Assign
+    ):
+        _raise_factor_hoist_error(
+            context,
+            code="invalid_loop_invariant_factor_materialization_source",
+            message="generated factor materialization requires its source assignment",
+            path=path,
+            value=body_index,
+        )
+    source_assignment = cast(llir.Assign, loop.body[body_index])
+    source_target_path = path + (f"source_body[{body_index}]", "var")
+    expected_target = _validate_materialization_var(
+        source_assignment.var,
+        expected_name=None,
+        expected_type=None,
+        expected_is_ptr=None,
+        expected_is_restrict=None,
+        context=context,
+        path=source_target_path,
+    )
+    zero_initialization = _zero_initialization(preceding, expected_target.name)
+    if zero_initialization is None or not _accumulation_is_the_only_use(
+        loop,
+        cast(int, body_index),
+        expected_target.name,
+    ):
+        _raise_factor_hoist_error(
+            context,
+            code="invalid_loop_invariant_factor_materialization_source",
+            message=(
+                "generated factor materialization requires an accumulator that "
+                "is zero on entry to its loop and used nowhere else in it"
+            ),
+            path=source_target_path,
+            value=expected_target,
+        )
+    accumulator_type = _accumulator_scalar_type(
+        expected_target,
+        cast(llir.VarInit, zero_initialization),
+        context,
+        source_target_path,
+    )
+    if accumulator_type is None:
+        _raise_factor_hoist_error(
+            context,
+            code="unsupported_loop_invariant_factor_accumulator_type",
+            message=(
+                "a hoisted loop-invariant factor requires an accumulator "
+                "declared with a result element type"
+            ),
+            path=source_target_path,
+            value=zero_initialization,
+        )
+
     invariant_name = f"_inv_{sequence_index}"
     _validate_materialization_var(
         typed_declaration.var,
         expected_name=invariant_name,
-        expected_type=llir.DataType.FLOAT32,
+        expected_type=accumulator_type,
         expected_is_ptr=False,
         expected_is_restrict=False,
         context=context,
@@ -595,30 +873,6 @@ def _validate_materialization(
             path=path + ("value",),
             value=typed_declaration.value,
         )
-
-    if (
-        type(body_index) is not int
-        or body_index < 0
-        or body_index >= len(loop.body)
-        or type(loop.body[body_index]) is not llir.Assign
-    ):
-        _raise_factor_hoist_error(
-            context,
-            code="invalid_loop_invariant_factor_materialization_source",
-            message="generated factor materialization requires its source assignment",
-            path=path,
-            value=body_index,
-        )
-    source_assignment = cast(llir.Assign, loop.body[body_index])
-    expected_target = _validate_materialization_var(
-        source_assignment.var,
-        expected_name=None,
-        expected_type=None,
-        expected_is_ptr=None,
-        expected_is_restrict=None,
-        context=context,
-        path=path + (f"source_body[{body_index}]", "var"),
-    )
 
     post_path = path[:-1] + (f"[{sequence_index + 2}]",)
     if type(post) is not llir.Assign:
@@ -642,7 +896,7 @@ def _validate_materialization(
     _validate_materialization_var(
         typed_post.value,
         expected_name=invariant_name,
-        expected_type=llir.DataType.FLOAT32,
+        expected_type=accumulator_type,
         expected_is_ptr=False,
         expected_is_restrict=False,
         context=context,
@@ -666,6 +920,7 @@ def _try_hoist_from_loop(
     sequence_index: int,
     context: LoopInvariantFactorHoistContext,
     path: LLIRPath,
+    preceding: Sequence[LLIRStatementValue],
 ) -> Tuple[llir.VarInit, llir.Assign, int, llir.Expr] | None:
     if type(loop.update) is not llir.Increment:
         return None
@@ -740,6 +995,29 @@ def _try_hoist_from_loop(
         if not invariant or not variant:
             continue
 
+        # ``acc += s * x`` equals ``acc += x`` followed by ``acc *= s`` only
+        # for an accumulator that is zero on entry and that the loop uses
+        # nowhere else.  A loop for which that is not shown is left as it is.
+        zero_initialization = _zero_initialization(preceding, accumulator_name)
+        if zero_initialization is None or not _accumulation_is_the_only_use(
+            loop,
+            body_index,
+            accumulator_name,
+        ):
+            continue
+
+        # Resolved before the loop is rewritten: the factor multiplies into
+        # this accumulator only, so it is declared with the accumulator's
+        # scalar type and never with a type the pass picks.  An accumulator
+        # of any other type keeps its loop: unchanged is always correct.
+        factor_type = _accumulator_scalar_type(
+            target,
+            zero_initialization,
+            context,
+            assignment_path + ("var",),
+        )
+        if factor_type is None:
+            continue
         invariant_expression = _rebuild_product(invariant)
         variant_expression = _rebuild_product(variant)
         _replace_body_assignment(
@@ -754,7 +1032,7 @@ def _try_hoist_from_loop(
             llir.VarInit(
                 var=llir.Var(
                     name=invariant_name,
-                    type=llir.DataType.FLOAT32,
+                    type=factor_type,
                 ),
                 value=invariant_expression,
             ),
@@ -768,7 +1046,7 @@ def _try_hoist_from_loop(
                 ),
                 value=llir.Var(
                     name=invariant_name,
-                    type=llir.DataType.FLOAT32,
+                    type=factor_type,
                 ),
                 op=llir.AssignOp.MUL_ASSIGN,
             ),
@@ -833,11 +1111,14 @@ def _hoist_in_sequence(
             index += 1
             continue
         loop = cast(llir.ForLoop, statement)
+        # The statements before the loop: read before ``working`` gains the pair.
+        preceding = working[:index]
         emitted = _try_hoist_from_loop(
             loop,
             index,
             context,
             path + (f"[{index}]",),
+            preceding,
         )
         if emitted is None:
             index += 1
@@ -852,6 +1133,7 @@ def _hoist_in_sequence(
             index,
             context,
             path + (f"[{index}]",),
+            preceding,
         )
         working[index : index + 1] = [before, loop, after]
         index += 2
@@ -869,9 +1151,14 @@ def hoist_loop_invariant_factors(
 
     The root must be an exact statement list.  Unknown subclasses, malformed
     typed children, consumed malformed scalar fields, and invalid contexts fail
-    through structured :class:`LLIRTraversalError` diagnostics.  The pass stops
-    on the first failure and performs no retry, skip, or failure-to-no-op
-    conversion.
+    through structured :class:`LLIRTraversalError` diagnostics, and so does a
+    zero-initialized accumulator whose typed reference and typed declaration
+    carry different scalar types.  A loop whose accumulator is not shown to
+    be zero on entry, is used elsewhere in the loop, or is declared with a
+    type that is not a result element type is a legal miss and is left
+    unchanged.
+    The pass stops on the first failure and performs no retry, skip, or
+    failure-to-no-op conversion.
     """
 
     checked_context = _validate_context(context)

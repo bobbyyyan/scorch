@@ -11,6 +11,7 @@ from dataclasses import dataclass
 from enum import Enum
 from typing import TYPE_CHECKING, Dict, Optional, Tuple, cast
 
+from ..format import LevelType, parse_format
 from .cin_analysis import CINAnalysis, analyze_cin
 from .diagnostics import VerificationError
 from .identity import IndexId, SymbolId
@@ -18,7 +19,7 @@ from .sparse_accumulator import is_accumulator_structure
 from .sparse_assembly import is_assembly_strategy
 
 if TYPE_CHECKING:
-    from .cin import IndexStmt
+    from .cin import IndexStmt, TensorVar
 
 
 MAX_AFFINE_TILE_WIDTH = 2**31 - 1
@@ -110,6 +111,42 @@ class OperandRelayout:
             cast(
                 Tuple[IndexId, ...],
                 _tuple_snapshot(self.access_indices, "OperandRelayout.access_indices"),
+            ),
+        )
+
+
+@dataclass(frozen=True)
+class OperandConversion:
+    """Convert one operand to another level order before the main kernel runs.
+
+    ``mode_order`` is the converted tensor's mode order (storage level ->
+    logical mode) and ``format`` its layout, one ``"d"`` (dense) or ``"s"``
+    (compressed) per storage level.  The conversion is a copy of every entry
+    the operand stores, whatever its value, and the converted tensor stores
+    exactly those entries, so the kernel that reads it produces the stored
+    coordinates the operand's own entries imply.  A dense level below a
+    compressed one stores every cell under each stored parent, which after a
+    permutation would be cells the operand does not hold; so ``format`` has
+    its dense levels, if any, above every compressed one.  A CSR operand
+    (``"ds"``) converted to mode order ``(1, 0)`` is CSC (``"ds"``); an
+    operand stored ``"sd"`` converts to ``"ss"``.
+
+    The loop order determines which operands a plan converts: every operand
+    with a compressed level whose storage order the loops do not follow, into
+    the loop order restricted to its own indices.
+    """
+
+    operand_id: SymbolId
+    mode_order: Tuple[int, ...]
+    format: str
+
+    def __post_init__(self) -> None:
+        object.__setattr__(
+            self,
+            "mode_order",
+            cast(
+                Tuple[int, ...],
+                _tuple_snapshot(self.mode_order, "OperandConversion.mode_order"),
             ),
         )
 
@@ -234,6 +271,11 @@ class LoopPlan:
     it chooses today; it is not a synonym for ``coordinate_list``.  This field is
     distinct from ``workspace``, which records WHERE the automatic scheduler
     inserted an accumulation workspace rather than WHICH structure holds it.
+
+    ``conversions`` records the operands converted to another level order
+    before the main kernel runs (:class:`OperandConversion`); every other
+    decision of the plan is verified against the program with those operands
+    converted.  It is empty on every plan the legacy scheduler originates.
     """
 
     loop_order: Tuple[IndexId, ...]
@@ -248,6 +290,7 @@ class LoopPlan:
     auto_policy: Optional[AutoOriginPolicy] = None
     provenance: str = "explicit"
     tag: str = ""
+    conversions: Tuple[OperandConversion, ...] = ()
 
     def __post_init__(self) -> None:
         object.__setattr__(
@@ -256,6 +299,14 @@ class LoopPlan:
             cast(
                 Tuple[IndexId, ...],
                 _tuple_snapshot(self.loop_order, "LoopPlan.loop_order"),
+            ),
+        )
+        object.__setattr__(
+            self,
+            "conversions",
+            cast(
+                Tuple[OperandConversion, ...],
+                _tuple_snapshot(self.conversions, "LoopPlan.conversions"),
             ),
         )
         object.__setattr__(
@@ -497,6 +548,7 @@ def _validate_loop_plan_structure(plan: object) -> LoopPlan:
             "auto_policy",
             "provenance",
             "tag",
+            "conversions",
         ),
     )
     typed_plan = cast(LoopPlan, plan)
@@ -653,7 +705,39 @@ def _validate_loop_plan_structure(plan: object) -> LoopPlan:
         raise VerificationError("LoopPlan.provenance must be a non-empty string")
     if type(typed_plan.tag) is not str:
         raise VerificationError("LoopPlan.tag must be a string")
+    _validate_conversions_structure(typed_plan.conversions)
     return typed_plan
+
+
+def _validate_conversions_structure(conversions: object) -> None:
+    """Reject malformed stored operand conversions exactly."""
+
+    if type(conversions) is not tuple:
+        raise VerificationError("LoopPlan.conversions must be a tuple")
+    for position, conversion in enumerate(conversions):
+        if type(conversion) is not OperandConversion:
+            raise VerificationError(
+                f"LoopPlan conversions[{position}] must be an OperandConversion"
+            )
+        _validate_stored_fields(
+            conversion,
+            f"conversions[{position}]",
+            ("operand_id", "mode_order", "format"),
+        )
+        if type(conversion.format) is not str or set(conversion.format) - {"d", "s"}:
+            raise VerificationError(
+                f"LoopPlan conversions[{position}].format must be a string of "
+                "'d' (dense) and 's' (compressed) levels"
+            )
+        _validate_symbol_id(
+            conversion.operand_id, f"conversions[{position}].operand_id"
+        )
+        if type(conversion.mode_order) is not tuple or not all(
+            _is_non_bool_int(mode) for mode in conversion.mode_order
+        ):
+            raise VerificationError(
+                "LoopPlan conversion mode orders must be tuples of integers"
+            )
 
 
 def _validate_auto_policy_structure(auto_policy: object) -> None:
@@ -723,11 +807,226 @@ def _verify_complete_loop_order(plan: LoopPlan, indices: Dict[IndexId, str]) -> 
         )
 
 
-def verify_loop_plan(cin: object, plan: LoopPlan) -> LoopPlan:
-    """Verify structural and semantic legality at the scheduling boundary."""
+def converted_cin(
+    cin: "IndexStmt", conversions: Tuple[OperandConversion, ...]
+) -> "IndexStmt":
+    """An owned copy of ``cin`` with each converted operand in its new order.
+
+    A tensor stored in mode order ``m`` and accessed ``A[x_0, ..., x_n]`` holds
+    the same arrays as the tensor stored in identity order, of shape
+    ``(extent of mode m_0, ..., extent of mode m_n)``, accessed
+    ``A[x_{m_0}, ..., x_{m_n}]``: a CSC matrix is the CSR form of its
+    transpose.  Each converted operand is written in that second form, so
+    every compressed tensor of the converted program keeps identity mode
+    order, and the arrays a conversion produces at run time bind to it
+    unchanged (``TensorVar.shape`` and a runtime tensor's shape are both in
+    storage order).  The copy (``normalize_cin``) keeps every stable
+    identity, so the plan's other decisions name the same loops and tensors
+    in it.  An operand already stored in its target order is rewritten the
+    same way.  The converted operand takes the conversion's layout.
+    """
+
+    from .cin_analysis import normalize_cin
+
+    converted = normalize_cin(cin)
+    if not conversions:
+        return converted
+    by_operand = {conversion.operand_id: conversion for conversion in conversions}
+    rewritten = set()
+    for access in converted.get_rhs_tensor_accesses():
+        tensor = access.tensor
+        conversion = by_operand.get(tensor.symbol_id)
+        if conversion is None:
+            continue
+        target = conversion.mode_order
+        rank = len(access.indices)
+        if sorted(target) != list(range(rank)):
+            raise VerificationError(
+                "LoopPlan conversion mode order must permute the operand's modes"
+            )
+        if len(conversion.format) != rank:
+            raise VerificationError(
+                "LoopPlan conversion format must name one level per operand mode"
+            )
+        if id(tensor) not in rewritten:
+            tensor.format = parse_format(conversion.format)
+            current = list(tensor.mode_order or range(rank))
+            if tensor.shape is not None:
+                logical = [0] * rank
+                for level, mode in enumerate(current):
+                    logical[mode] = tensor.shape[level]
+                tensor.shape = tuple(logical[mode] for mode in target)
+            tensor.mode_order = list(range(rank))
+            rewritten.add(id(tensor))
+        access.indices = [access.indices[mode] for mode in target]
+        access.index_ids = tuple(index.index_id for index in access.indices)
+    return converted
+
+
+def out_of_order_modes(access: object) -> Optional[Tuple[int, ...]]:
+    """The mode order of a tensor :func:`storage_order_form` rewrites, or ``None``.
+
+    That is a stored tensor (not a workspace) with a non-dense level whose
+    mode order is a permutation of its modes other than the identity.
+    """
+
+    from .cin import TensorAccess, TensorVar
+
+    if type(access) is not TensorAccess or type(access.tensor) is not TensorVar:
+        return None
+    tensor = access.tensor
+    if tensor.mode_order is None or tensor.format is None:
+        return None
+    modes = tuple(tensor.mode_order)
+    rank = len(access.indices)
+    if modes == tuple(range(rank)):
+        return None
+    if any(type(mode) is not int for mode in modes) or sorted(modes) != list(
+        range(rank)
+    ):
+        return None
+    levels = tensor.get_level_types()
+    if len(levels) != rank or all(level is LevelType.DENSE for level in levels):
+        return None
+    return modes
+
+
+def storage_order_form(cin: "IndexStmt") -> "IndexStmt":
+    """``cin`` with every tensor that has a non-dense level in identity mode order.
+
+    The identity :func:`converted_cin` uses for a converted operand holds for
+    any stored tensor: one stored in mode order ``m`` and accessed
+    ``A[x_0, ..., x_n]`` holds the same arrays as the tensor stored in
+    identity order, of the same storage-order shape, accessed
+    ``A[x_{m_0}, ..., x_{m_n}]``.  The lowering descends a tensor's
+    compressed levels in storage order, so it is given that second form: a
+    caller's CSC matrix is lowered as the CSR form of its transpose, and a
+    result declared in a permuted order is assembled level by level in that
+    order.  The arrays, the shapes (``TensorVar.shape`` is in storage order)
+    and the kernel's arguments are unchanged.  The kernel's result arrays are
+    in the declared storage order, so whoever wraps them needs the declared
+    mode order (:func:`out_of_order_modes` of the result's access in ``cin``).
+
+    Every access to a rewritten tensor is rewritten from the same mode order.
+    An all-dense tensor keeps its mode order (the lowering addresses it by
+    coordinate), and so does a tensor whose mode order is not a permutation
+    of its modes (the lowering refuses it).  Returns ``cin`` itself when
+    nothing is rewritten, and otherwise an owned copy (``normalize_cin``,
+    which keeps every stable identity, so a plan made on ``cin`` names the
+    same loops and tensors in it).
+    """
+
+    from .cin_analysis import normalize_cin
+
+    def accesses_of(statement: "IndexStmt") -> list:
+        return [
+            *statement.get_rhs_tensor_accesses(),
+            *statement.get_result_tensor_accesses(),
+        ]
+
+    if all(out_of_order_modes(access) is None for access in accesses_of(cin)):
+        return cin
+    rewritten = normalize_cin(cin)
+    # The mode order is read from the tensor before any access resets it; one
+    # tensor object may be reached through several accesses.
+    modes_of: Dict[int, Tuple["TensorVar", Tuple[int, ...]]] = {}
+    for access in accesses_of(rewritten):
+        modes = out_of_order_modes(access)
+        if modes is not None:
+            modes_of.setdefault(id(access.tensor), (access.tensor, modes))
+    seen = set()
+    for access in accesses_of(rewritten):
+        entry = modes_of.get(id(access.tensor))
+        if entry is None or id(access) in seen:
+            continue
+        seen.add(id(access))
+        _, modes = entry
+        if len(access.indices) != len(modes):
+            raise VerificationError(
+                "every access to a tensor must name one index per mode"
+            )
+        access.indices = [access.indices[mode] for mode in modes]
+        access.index_ids = tuple(index.index_id for index in access.indices)
+    for tensor, modes in modes_of.values():
+        tensor.mode_order = list(range(len(modes)))
+    return rewritten
+
+
+def _verify_conversions(cin: object, plan: LoopPlan) -> None:
+    """Each conversion names a compressed operand, a new permutation and a
+    layout that stores exactly the operand's entries."""
+
+    rhs = {
+        tensor.symbol_id: tensor
+        for tensor in cast("IndexStmt", cin).get_rhs_tensor_vars()
+    }
+    seen = set()
+    for position, conversion in enumerate(plan.conversions):
+        path = f"conversions[{position}]"
+        tensor = rhs.get(conversion.operand_id)
+        if tensor is None:
+            raise VerificationError(
+                f"LoopPlan {path} must name a right-hand-side tensor"
+            )
+        if conversion.operand_id in seen:
+            raise VerificationError("LoopPlan converts one operand twice")
+        seen.add(conversion.operand_id)
+        levels = tensor.get_level_types()
+        if sorted(conversion.mode_order) != list(range(len(levels))):
+            raise VerificationError(
+                f"LoopPlan {path} mode order must permute the operand's modes"
+            )
+        current = tuple(tensor.mode_order or range(len(levels)))
+        if conversion.mode_order == current:
+            raise VerificationError(
+                f"LoopPlan {path} must change the operand's mode order"
+            )
+        if all(level is LevelType.DENSE for level in levels):
+            # An all-dense operand is addressed by its coordinates in any
+            # loop order, so converting one is never needed.
+            raise VerificationError(
+                f"LoopPlan {path} must name an operand with a compressed level"
+            )
+        if any(
+            level not in (LevelType.DENSE, LevelType.COMPRESSED) for level in levels
+        ):
+            raise VerificationError(
+                f"LoopPlan {path} must name an operand of dense and compressed levels"
+            )
+        if len(conversion.format) != len(levels):
+            raise VerificationError(
+                f"LoopPlan {path} format must name one level per operand mode"
+            )
+        if "sd" in conversion.format:
+            # A dense level below a compressed one stores every cell under
+            # each stored parent: cells the operand does not hold.
+            raise VerificationError(
+                f"LoopPlan {path} format must store only the operand's entries: "
+                "no dense level below a compressed one"
+            )
+        if "s" not in conversion.format:
+            raise VerificationError(
+                f"LoopPlan {path} format must keep a compressed level"
+            )
+
+
+def verify_loop_plan(
+    cin: object, plan: LoopPlan, *, dense_results_any_order: bool = False
+) -> LoopPlan:
+    """Verify structural and semantic legality at the scheduling boundary.
+
+    ``dense_results_any_order``: see
+    :func:`loop_plan_legality.verify_loop_plan_semantics`.  A plan with
+    ``conversions`` is verified against ``cin`` with those operands converted
+    (:func:`converted_cin`).
+    """
 
     plan = _validate_loop_plan_structure(plan)
     analysis = _analyze_loop_plan_cin(cin)
+    if plan.conversions:
+        _verify_conversions(cin, plan)
+        cin = converted_cin(cast("IndexStmt", cin), plan.conversions)
+        analysis = _analyze_loop_plan_cin(cin)
     indices = {
         index_id: definition.display_name
         for index_id, definition in analysis.index_definitions.items()
@@ -741,7 +1040,9 @@ def verify_loop_plan(cin: object, plan: LoopPlan) -> LoopPlan:
         _verify_empty_loop_plan(plan)
         from .loop_plan_legality import verify_loop_plan_semantics
 
-        verify_loop_plan_semantics(analysis, plan)
+        verify_loop_plan_semantics(
+            analysis, plan, dense_results_any_order=dense_results_any_order
+        )
         return plan
 
     def check_loop(loop: LoopRef, path: str) -> None:
@@ -866,7 +1167,9 @@ def verify_loop_plan(cin: object, plan: LoopPlan) -> LoopPlan:
 
     from .loop_plan_legality import verify_loop_plan_semantics
 
-    verify_loop_plan_semantics(analysis, plan)
+    verify_loop_plan_semantics(
+        analysis, plan, dense_results_any_order=dense_results_any_order
+    )
     return plan
 
 

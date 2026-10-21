@@ -16,7 +16,14 @@ For each cell:
   result);
 * the refactor's LoopIR route must return the same result, or refuse with a
   structured defect code -- never a wrong answer, never an unclassified error;
-* where both return, their sparse storage must be identical.
+* each compiler's level arrays must be the ones the operand's stored entries
+  imply: a compressed result coordinate is stored exactly when the operand
+  stores an entry under it, whatever its value (structure decides, never
+  values).  The reference is computed from the operand's own levels, not from
+  either compiler, so a defect in one compiler cannot pass as the standard
+  the other is held to;
+* where both store the implied structure, their values must agree to float32
+  rounding.
 """
 
 from dataclasses import replace
@@ -117,6 +124,52 @@ def _sparse(dense, fmt):
     )
 
 
+def _stored_coordinates(dense, fmt):
+    """Every coordinate the operand's levels hold: a dense level holds every
+    coordinate under each stored parent, a compressed one only the nonzeros'
+    coordinates (``_sparse`` builds the levels the same way)."""
+
+    nonzeros = {tuple(int(t) for t in index) for index in dense.nonzero()}
+    parents = [()]
+    for level, kind in enumerate(fmt):
+        if kind == "d":
+            parents = [p + (c,) for p in parents for c in range(dense.shape[level])]
+        else:
+            parents = [
+                p + (c,)
+                for p in parents
+                for c in sorted({c[level] for c in nonzeros if c[:level] == p})
+            ]
+    return parents
+
+
+def _implied_levels(operand, result, operand_fmt, result_fmt, dense):
+    """The result's level arrays, in ``_storage``'s form, that the operand's
+    stored coordinates imply: the stored result coordinates are the projections
+    of the operand's stored coordinates onto the result indices."""
+
+    projected = {
+        tuple(coordinate[operand.index(c)] for c in result)
+        for coordinate in _stored_coordinates(dense, operand_fmt)
+    }
+    shape = [dense.shape[operand.index(c)] for c in result]
+    levels, parents = [], [()]
+    for level, kind in enumerate(result_fmt):
+        if kind == "d":
+            levels.append(())
+            parents = [p + (c,) for p in parents for c in range(shape[level])]
+            continue
+        positions, coordinates, children = [0], [], []
+        for parent in parents:
+            stored = sorted({c[level] for c in projected if c[:level] == parent})
+            coordinates += stored
+            children += [parent + (c,) for c in stored]
+            positions.append(len(coordinates))
+        levels.append((tuple(positions), tuple(coordinates)))
+        parents = children
+    return tuple(levels)
+
+
 def _reduction_cin(operand, result, operand_fmt, result_fmt):
     ivars = {name: IndexVar(name) for name in operand}
     source = TensorVar("A", fmt=operand_fmt, dtype=torch.float32)[
@@ -139,9 +192,23 @@ def _storage(result):
     return levels, tuple(float(v) for v in result.storage.value.tolist())
 
 
-@pytest.mark.parametrize(
-    "cell", CELLS, ids=[f"{c[2]} {c[0]}->{c[1]} as {c[3]}" for c in CELLS]
-)
+def _cell_id(cell):
+    return f"{cell[2]} {cell[0]}->{cell[1]} as {cell[3]}"
+
+
+# Cells whose shipped result stores coordinates the operand does not imply,
+# each with what the shipped compiler does instead.  Values are right in every
+# one (each is held to the float64 reference); only the stored structure is
+# wrong.  Strict: a listed cell whose shipped structure becomes the implied one
+# fails until it leaves this table.
+SHIPPED_STRUCTURE_DEFECTS: dict = {}
+
+
+def test_the_defect_table_names_only_cells_of_this_sweep():
+    assert set(SHIPPED_STRUCTURE_DEFECTS) <= {_cell_id(cell) for cell in CELLS}
+
+
+@pytest.mark.parametrize("cell", CELLS, ids=[_cell_id(cell) for cell in CELLS])
 def test_sparse_result_reduction_is_correct_on_both_compilers(cell):
     operand, result, operand_fmt, result_fmt = cell
     dense = _operand(operand, seed=len(CELLS) + CELLS.index(cell))
@@ -161,6 +228,16 @@ def test_sparse_result_reduction_is_correct_on_both_compilers(cell):
         rtol=RTOL,
     )
 
+    implied = _implied_levels(operand, result, operand_fmt, result_fmt, dense)
+    shipped_known_wrong = _cell_id(cell) in SHIPPED_STRUCTURE_DEFECTS
+    if shipped_known_wrong:
+        assert _storage(shipped)[0] != implied, (
+            "the shipped structure is the implied one now; remove the cell from "
+            "SHIPPED_STRUCTURE_DEFECTS"
+        )
+    else:
+        assert _storage(shipped)[0] == implied, "the shipped stored structure"
+
     result_shape = tuple(SHAPES[len(operand)][operand.index(c)] for c in result)
     try:
         loopir, _ = execute_cin_via_loopir(
@@ -178,4 +255,17 @@ def test_sparse_result_reduction_is_correct_on_both_compilers(cell):
         atol=ATOL,
         rtol=RTOL,
     )
-    assert _storage(loopir) == _storage(shipped)
+    loopir_levels, loopir_values = _storage(loopir)
+    assert loopir_levels == implied, "the new compiler's stored structure"
+    if shipped_known_wrong:
+        return
+    # The values are sums of the same float32 terms, but the two compilers
+    # need not add them in the same order (a scalar accumulator against a
+    # workspace), so they agree to float32 rounding rather than bit for bit;
+    # each was already held to the float64 reference above.
+    torch.testing.assert_close(
+        torch.tensor(loopir_values, dtype=torch.float64),
+        torch.tensor(_storage(shipped)[1], dtype=torch.float64),
+        atol=0.0,
+        rtol=1e-5,
+    )

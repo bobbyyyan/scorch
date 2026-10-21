@@ -85,7 +85,7 @@ def _assignment(
     right_associated: bool = False,
 ) -> llir.Assign:
     if target is None:
-        target = _var("_accum")
+        target = _var("_accum", llir.DataType.FLOAT32)
     value = (
         _right_associated_multiply(factors)
         if right_associated
@@ -132,12 +132,26 @@ def _activating_loop(
         [
             _assignment(
                 [invariant, variant],
-                target=_var(accumulator),
+                target=_var(accumulator, llir.DataType.FLOAT32),
             ),
             *tail,
         ],
         loop_variable=loop_variable,
     )
+
+
+def _zeroed(
+    name: str = "_accum",
+    data_type: llir.DataType = llir.DataType.FLOAT32,
+) -> llir.VarInit:
+    """``<type> <name> = 0.0f;``, the declaration a hoist out of ``name`` needs.
+
+    The pass hoists only out of a loop whose accumulator is zero on entry,
+    which it reads off a zero-initializing declaration earlier in the loop's
+    own statement sequence.
+    """
+
+    return llir.VarInit(_var(name, data_type), llir.Literal("0.0f", data_type))
 
 
 def _snapshot(value: object) -> object:
@@ -331,7 +345,10 @@ def test_direct_pass_requires_an_exact_statement_list_root(root: object) -> None
 def test_nested_root_sequences_are_detached_and_semantically_omitted() -> None:
     source = cast(
         List[llir.Stmt],
-        [[_activating_loop()], (_activating_loop(invariant=_var("other")),)],
+        [
+            [_zeroed(), _activating_loop()],
+            (_zeroed(), _activating_loop(invariant=_var("other"))),
+        ],
     )
     before = _snapshot(source)
 
@@ -348,7 +365,7 @@ def test_nested_root_sequences_are_detached_and_semantically_omitted() -> None:
 
 
 def test_success_is_fully_detached_and_does_not_mutate_the_input() -> None:
-    source = [_activating_loop()]
+    source = [_zeroed(), _activating_loop()]
     before = _snapshot(source)
 
     output = hoist_loop_invariant_factors(
@@ -359,13 +376,13 @@ def test_success_is_fully_detached_and_does_not_mutate_the_input() -> None:
     assert _snapshot(source) == before
     assert _mutable_ir_ids(source).isdisjoint(_mutable_ir_ids(output))
     assert _compatibility_codes(output) == [
-        "float _inv_0 = scale",
-        "_accum *= _inv_0",
+        "float _inv_1 = scale",
+        "_accum *= _inv_1",
     ]
-    rewritten_loop = cast(llir.ForLoop, output[1])
+    rewritten_loop = cast(llir.ForLoop, output[2])
     rewritten_assignment = cast(llir.Assign, rewritten_loop.body[0])
     assert _factor_names(rewritten_assignment.value) == ["_values_ptr[k]"]
-    assert rewritten_assignment.var is not cast(llir.ForLoop, source[0]).body[0].var
+    assert rewritten_assignment.var is not cast(llir.ForLoop, source[1]).body[0].var
 
 
 def test_success_constructs_exact_owned_structural_materialization_nodes() -> None:
@@ -387,6 +404,7 @@ def test_success_constructs_exact_owned_structural_materialization_nodes() -> No
         is_restrict=True,
     )
     source = [
+        _zeroed(target.name, llir.DataType.FLOAT64),
         _activating_loop(
             loop_variable="q",
             accumulator=target.name,
@@ -395,9 +413,9 @@ def test_success_constructs_exact_owned_structural_materialization_nodes() -> No
                 _var("values", llir.DataType.PTR_FLOAT64),
                 _var("q", llir.DataType.INT64),
             ),
-        )
+        ),
     ]
-    cast(llir.Assign, source[0].body[0]).var = target
+    cast(llir.Assign, cast(llir.ForLoop, source[1]).body[0]).var = target
     before = _snapshot(source)
 
     first = hoist_loop_invariant_factors(
@@ -413,16 +431,18 @@ def test_success_constructs_exact_owned_structural_materialization_nodes() -> No
         LOOP_INVARIANT_FACTOR_HOIST_CONTEXT,
     )
 
-    declaration = cast(llir.VarInit, first[0])
-    rewritten_loop = cast(llir.ForLoop, first[1])
+    declaration = cast(llir.VarInit, first[1])
+    rewritten_loop = cast(llir.ForLoop, first[2])
     rewritten_assignment = cast(llir.Assign, rewritten_loop.body[0])
-    post = cast(llir.Assign, first[2])
+    post = cast(llir.Assign, first[3])
     assert [type(statement) for statement in first] == [
+        llir.VarInit,
         llir.VarInit,
         llir.ForLoop,
         llir.Assign,
     ]
-    assert declaration.var == _var("_inv_0", llir.DataType.FLOAT32)
+    # The accumulator reference is FLOAT64, so the factor is declared FLOAT64.
+    assert declaration.var == _var("_inv_1", llir.DataType.FLOAT64)
     assert declaration.var.is_ptr is False
     assert declaration.var.is_restrict is False
     assert declaration.var.tensor_access is None
@@ -441,15 +461,15 @@ def test_success_constructs_exact_owned_structural_materialization_nodes() -> No
     assert hash(declaration.var) == hash(cast(llir.Var, post.value))
     assert hash(declaration) == hash(declaration.var)
     assert hash(cast(llir.ArrayAccess, declaration.value)) == hash(
-        cast(llir.ArrayAccess, cast(llir.VarInit, independent[0]).value)
+        cast(llir.ArrayAccess, cast(llir.VarInit, independent[1]).value)
     )
     with pytest.raises(TypeError):
         hash(post)
     assert _snapshot(source) == before
     assert _snapshot(independent) == _snapshot(first)
     assert _snapshot(repeated) == _snapshot(first)
-    assert cast(llir.VarInit, independent[0]) == declaration
-    assert cast(llir.Assign, independent[2]) == post
+    assert cast(llir.VarInit, independent[1]) == declaration
+    assert cast(llir.Assign, independent[3]) == post
     assert _mutable_ir_ids(source).isdisjoint(_mutable_ir_ids(first))
     assert _mutable_ir_ids(first).isdisjoint(_mutable_ir_ids(independent))
     assert _mutable_ir_ids(first).isdisjoint(_mutable_ir_ids(repeated))
@@ -490,7 +510,10 @@ def test_structured_access_factors_preserve_exact_all_coo_hoist_behavior() -> No
         _var("q"),
         tensor_access=key_metadata,
     )
-    source = [_loop([_assignment([mask, query, key])], loop_variable="q")]
+    source = [
+        _zeroed(),
+        _loop([_assignment([mask, query, key])], loop_variable="q"),
+    ]
     before = _snapshot(source)
 
     first = hoist_loop_invariant_factors(
@@ -507,10 +530,10 @@ def test_structured_access_factors_preserve_exact_all_coo_hoist_behavior() -> No
     assert _mutable_ir_ids(source).isdisjoint(_mutable_ir_ids(first))
     assert _mutable_ir_ids(first).isdisjoint(_mutable_ir_ids(second))
     assert _compatibility_codes(first) == [
-        "float _inv_0 = Mask_val[pMask0]",
-        "_accum *= _inv_0",
+        "float _inv_1 = Mask_val[pMask0]",
+        "_accum *= _inv_1",
     ]
-    assignment = cast(llir.Assign, cast(llir.ForLoop, first[1]).body[0])
+    assignment = cast(llir.Assign, cast(llir.ForLoop, first[2]).body[0])
     product = cast(llir.BinOp, assignment.value)
     rewritten_query = cast(llir.ArrayAccess, product.left)
     rewritten_key = cast(llir.ArrayAccess, product.right)
@@ -603,21 +626,22 @@ def test_arbitrary_loop_accumulator_and_factor_names(
 ) -> None:
     output = hoist_loop_invariant_factors(
         [
+            _zeroed(accumulator),
             _activating_loop(
                 loop_variable=loop_variable,
                 accumulator=accumulator,
                 invariant=_var(invariant),
                 variant=_var(variant),
-            )
+            ),
         ],
         LOOP_INVARIANT_FACTOR_HOIST_CONTEXT,
     )
 
     assert _compatibility_codes(output) == [
-        f"float _inv_0 = {invariant}",
-        f"{accumulator} *= _inv_0",
+        f"float _inv_1 = {invariant}",
+        f"{accumulator} *= _inv_1",
     ]
-    assignment = cast(llir.Assign, cast(llir.ForLoop, output[1]).body[0])
+    assignment = cast(llir.Assign, cast(llir.ForLoop, output[2]).body[0])
     assert _factor_names(assignment.value) == [variant]
 
 
@@ -628,7 +652,7 @@ def test_loop_identity_comes_only_from_increment_and_init_condition_are_ignored(
         [
             _assignment(
                 [_var("outside"), _var("value[actual_driver]")],
-                target=_var("total"),
+                target=_var("total", llir.DataType.FLOAT32),
             )
         ],
         loop_variable="actual_driver",
@@ -637,15 +661,15 @@ def test_loop_identity_comes_only_from_increment_and_init_condition_are_ignored(
     )
 
     output = hoist_loop_invariant_factors(
-        [loop],
+        [_zeroed("total"), loop],
         LOOP_INVARIANT_FACTOR_HOIST_CONTEXT,
     )
 
     assert _compatibility_codes(output) == [
-        "float _inv_0 = outside",
-        "total *= _inv_0",
+        "float _inv_1 = outside",
+        "total *= _inv_1",
     ]
-    assignment = cast(llir.Assign, cast(llir.ForLoop, output[1]).body[0])
+    assignment = cast(llir.Assign, cast(llir.ForLoop, output[2]).body[0])
     assert _factor_names(assignment.value) == ["value[actual_driver]"]
 
 
@@ -658,16 +682,24 @@ def test_every_exact_multiply_node_can_be_a_root_multiply(
         if binary_type is llir.BinOp
         else llir.Mul(_var("scale"), _var("value[k]"))
     )
-    loop = _loop([llir.Assign(_var("acc"), value, llir.AssignOp.ADD_ASSIGN)])
+    loop = _loop(
+        [
+            llir.Assign(
+                _var("acc", llir.DataType.FLOAT32),
+                value,
+                llir.AssignOp.ADD_ASSIGN,
+            )
+        ]
+    )
 
     output = hoist_loop_invariant_factors(
-        [loop],
+        [_zeroed("acc"), loop],
         LOOP_INVARIANT_FACTOR_HOIST_CONTEXT,
     )
 
     assert _compatibility_codes(output) == [
-        "float _inv_0 = scale",
-        "acc *= _inv_0",
+        "float _inv_1 = scale",
+        "acc *= _inv_1",
     ]
 
 
@@ -716,7 +748,8 @@ def _legal_miss_loops() -> Tuple[llir.ForLoop, ...]:
 
 @pytest.mark.parametrize("loop", _legal_miss_loops())
 def test_all_legal_structural_misses_are_detached_noops(loop: llir.ForLoop) -> None:
-    source = [loop]
+    # Declared zero, so each loop is a miss for its own structural reason.
+    source = [_zeroed(), _zeroed("acc"), loop]
     before = _snapshot(source)
 
     output = hoist_loop_invariant_factors(
@@ -795,15 +828,15 @@ def test_flatten_partition_and_rebuild_orders_are_exact() -> None:
     )
 
     output = hoist_loop_invariant_factors(
-        [loop],
+        [_zeroed(), loop],
         LOOP_INVARIANT_FACTOR_HOIST_CONTEXT,
     )
 
     assert _compatibility_codes(output) == [
-        "float _inv_0 = inv_a * inv_b * inv_c",
-        "_accum *= _inv_0",
+        "float _inv_1 = inv_a * inv_b * inv_c",
+        "_accum *= _inv_1",
     ]
-    assignment = cast(llir.Assign, cast(llir.ForLoop, output[1]).body[0])
+    assignment = cast(llir.Assign, cast(llir.ForLoop, output[2]).body[0])
     assert _factor_names(assignment.value) == [
         "variant_a[k]",
         "_variant_b_ptr[k]",
@@ -834,15 +867,15 @@ def test_ptr_marker_loop_name_and_raw_substring_collisions_are_variant() -> None
     )
 
     output = hoist_loop_invariant_factors(
-        [loop],
+        [_zeroed(), loop],
         LOOP_INVARIANT_FACTOR_HOIST_CONTEXT,
     )
 
     assert _compatibility_codes(output) == [
-        "float _inv_0 = outside",
-        "_accum *= _inv_0",
+        "float _inv_1 = outside",
+        "_accum *= _inv_1",
     ]
-    assignment = cast(llir.Assign, cast(llir.ForLoop, output[1]).body[1])
+    assignment = cast(llir.Assign, cast(llir.ForLoop, output[2]).body[1])
     assert _factor_names(assignment.value) == [
         "_unrelated_ptr[index]",
         "arrow_value",
@@ -861,11 +894,11 @@ def test_supported_non_var_leaves_are_invariant_and_preserve_order() -> None:
         ]
     )
     output = hoist_loop_invariant_factors(
-        [loop],
+        [_zeroed(), loop],
         LOOP_INVARIANT_FACTOR_HOIST_CONTEXT,
     )
 
-    declaration = cast(llir.VarInit, output[0])
+    declaration = cast(llir.VarInit, output[1])
     invariant = cast(llir.BinOp, declaration.value)
     assert type(declaration) is llir.VarInit
     assert type(invariant.left) is llir.Literal
@@ -873,10 +906,10 @@ def test_supported_non_var_leaves_are_invariant_and_preserve_order() -> None:
     assert cast(llir.Literal, invariant.left).value == 2.5
     assert cast(llir.FunctionCall, invariant.right).name == "scale"
     assert _compatibility_codes(output) == [
-        "float _inv_0 = 2.5 * scale(argument)",
-        "_accum *= _inv_0",
+        "float _inv_1 = 2.5 * scale(argument)",
+        "_accum *= _inv_1",
     ]
-    assignment = cast(llir.Assign, cast(llir.ForLoop, output[1]).body[0])
+    assignment = cast(llir.Assign, cast(llir.ForLoop, output[2]).body[0])
     assert _factor_names(assignment.value) == ["value[k]"]
 
 
@@ -893,16 +926,16 @@ def test_structured_function_call_ignores_expression_str_override(
     )
 
     output = hoist_loop_invariant_factors(
-        [loop],
+        [_zeroed(), loop],
         LOOP_INVARIANT_FACTOR_HOIST_CONTEXT,
     )
 
-    declaration = cast(llir.VarInit, output[0])
+    declaration = cast(llir.VarInit, output[1])
     assert type(declaration.value) is llir.FunctionCall
     assert cast(llir.FunctionCall, declaration.value).name == "scale"
     assert _compatibility_codes(output) == [
-        "float _inv_0 = scale(x)",
-        "_accum *= _inv_0",
+        "float _inv_1 = scale(x)",
+        "_accum *= _inv_1",
     ]
 
 
@@ -916,15 +949,15 @@ def test_declarations_after_use_and_duplicate_definitions_are_visible() -> None:
     )
 
     output = hoist_loop_invariant_factors(
-        [loop],
+        [_zeroed(), loop],
         LOOP_INVARIANT_FACTOR_HOIST_CONTEXT,
     )
 
     assert _compatibility_codes(output) == [
-        "float _inv_0 = outside",
-        "_accum *= _inv_0",
+        "float _inv_1 = outside",
+        "_accum *= _inv_1",
     ]
-    output_loop = cast(llir.ForLoop, output[1])
+    output_loop = cast(llir.ForLoop, output[2])
     assignment = cast(llir.Assign, output_loop.body[0])
     assert _factor_names(assignment.value) == ["late_value", "late_again"]
 
@@ -946,7 +979,7 @@ def test_fixed_stack_array_declaration_marks_workspace_reads_variant() -> None:
         variant=_var("_values_ptr[q]"),
         tail=[declaration],
     )
-    source: List[llir.Stmt] = [loop]
+    source: List[llir.Stmt] = [_zeroed(), loop]
     source_snapshot = _snapshot(source)
 
     output = hoist_loop_invariant_factors(
@@ -956,10 +989,10 @@ def test_fixed_stack_array_declaration_marks_workspace_reads_variant() -> None:
 
     assert _snapshot(source) == source_snapshot
     assert _compatibility_codes(output) == [
-        "float _inv_0 = outside",
-        "_accum *= _inv_0",
+        "float _inv_1 = outside",
+        "_accum *= _inv_1",
     ]
-    output_loop = cast(llir.ForLoop, output[1])
+    output_loop = cast(llir.ForLoop, output[2])
     assignment = cast(llir.Assign, output_loop.body[0])
     assert assignment.value == llir.BinOp(
         "*",
@@ -1014,15 +1047,15 @@ def test_defined_variable_analysis_recurses_through_legacy_supported_bodies() ->
     )
 
     output = hoist_loop_invariant_factors(
-        [loop],
+        [_zeroed(), loop],
         LOOP_INVARIANT_FACTOR_HOIST_CONTEXT,
     )
 
     assert _compatibility_codes(output) == [
-        "float _inv_0 = outside",
-        "_accum *= _inv_0",
+        "float _inv_1 = outside",
+        "_accum *= _inv_1",
     ]
-    output_loop = cast(llir.ForLoop, output[1])
+    output_loop = cast(llir.ForLoop, output[2])
     assignment = cast(llir.Assign, output_loop.body[0])
     assert _factor_names(assignment.value) == [
         "direct_value",
@@ -1102,33 +1135,42 @@ def test_definition_analysis_omits_every_surviving_unsupported_container() -> No
     loop = _loop(body)
 
     output = hoist_loop_invariant_factors(
-        [loop],
+        [_zeroed(), loop],
         LOOP_INVARIANT_FACTOR_HOIST_CONTEXT,
     )
 
     expected_invariant = _factor_names(
         cast(llir.BinOp, cast(llir.Assign, loop.body[0]).value)
     )[:-1]
-    declaration = LLIRLowerer().lower_llir(cast(llir.VarInit, output[0]))
+    declaration = LLIRLowerer().lower_llir(cast(llir.VarInit, output[1]))
     for name in expected_invariant:
         assert name in declaration
-    output_loop = cast(llir.ForLoop, output[1])
+    output_loop = cast(llir.ForLoop, output[2])
     assignment = cast(llir.Assign, output_loop.body[0])
     assert _factor_names(assignment.value) == ["value[k]"]
 
 
 def _omitted_transform_roots() -> Tuple[List[llir.Stmt], ...]:
     parallel_owner = _loop([], loop_variable="parallel_owner")
-    parallel_owner.before_parallel_body = [_activating_loop(invariant=_var("before"))]
-    parallel_owner.pre_parallel_body = [_activating_loop(invariant=_var("pre"))]
-    parallel_owner.post_parallel_body = [_activating_loop(invariant=_var("post"))]
+    parallel_owner.before_parallel_body = [
+        _zeroed(),
+        _activating_loop(invariant=_var("before")),
+    ]
+    parallel_owner.pre_parallel_body = [
+        _zeroed(),
+        _activating_loop(invariant=_var("pre")),
+    ]
+    parallel_owner.post_parallel_body = [
+        _zeroed(),
+        _activating_loop(invariant=_var("post")),
+    ]
     return (
-        [llir.WhileLoop(_var("condition"), [_activating_loop()])],
+        [llir.WhileLoop(_var("condition"), [_zeroed(), _activating_loop()])],
         [
             llir.ForLoopAuto(
                 _var("item"),
                 _var("items"),
-                [_activating_loop()],
+                [_zeroed(), _activating_loop()],
             )
         ],
         [
@@ -1136,22 +1178,22 @@ def _omitted_transform_roots() -> Tuple[List[llir.Stmt], ...]:
                 llir.DataType.VOID,
                 "function",
                 [],
-                [_activating_loop()],
+                [_zeroed(), _activating_loop()],
             )
         ],
         [
             llir.IfThenElse(
                 cond_list=[_var("first_condition"), _var("final_condition")],
                 then_body_list=[
-                    [_activating_loop(invariant=_var("first_branch"))],
-                    [_activating_loop(invariant=_var("final_branch"))],
+                    [_zeroed(), _activating_loop(invariant=_var("first_branch"))],
+                    [_zeroed(), _activating_loop(invariant=_var("final_branch"))],
                 ],
                 make_last_case_else=True,
             )
         ],
         [parallel_owner],
-        cast(List[llir.Stmt], [[_activating_loop()]]),
-        cast(List[llir.Stmt], [(_activating_loop(),)]),
+        cast(List[llir.Stmt], [[_zeroed(), _activating_loop()]]),
+        cast(List[llir.Stmt], [(_zeroed(), _activating_loop())]),
     )
 
 
@@ -1180,31 +1222,32 @@ def test_nested_for_loop_transform_is_postorder_with_independent_indices() -> No
     outer = _loop(
         [
             llir.RawStmt("prefix"),
+            _zeroed("inner_accum"),
             inner,
             _assignment(
                 [_var("top_scale"), _var("outer_value[outer]")],
-                target=_var("outer_accum"),
+                target=_var("outer_accum", llir.DataType.FLOAT32),
             ),
         ],
         loop_variable="outer",
     )
 
     output = hoist_loop_invariant_factors(
-        [outer],
+        [_zeroed("outer_accum"), outer],
         LOOP_INVARIANT_FACTOR_HOIST_CONTEXT,
     )
 
     assert _compatibility_codes(output) == [
-        "float _inv_0 = top_scale",
-        "outer_accum *= _inv_0",
+        "float _inv_1 = top_scale",
+        "outer_accum *= _inv_1",
     ]
-    output_outer = cast(llir.ForLoop, output[1])
+    output_outer = cast(llir.ForLoop, output[2])
     assert _compatibility_codes(output_outer.body) == [
         "prefix",
-        "float _inv_1 = child_scale",
-        "inner_accum *= _inv_1",
+        "float _inv_2 = child_scale",
+        "inner_accum *= _inv_2",
     ]
-    assert type(output_outer.body[2]) is llir.ForLoop
+    assert type(output_outer.body[3]) is llir.ForLoop
 
 
 def test_nested_typed_materialization_remains_invisible_to_legacy_name_analysis() -> (
@@ -1218,17 +1261,18 @@ def test_nested_typed_materialization_remains_invisible_to_legacy_name_analysis(
     )
     outer = _loop(
         [
+            _zeroed("inner_accum"),
             inner,
             _assignment(
-                [_var("_inv_0_scale"), _var("outer_value[outer]")],
-                target=_var("outer_accum"),
+                [_var("_inv_1_scale"), _var("outer_value[outer]")],
+                target=_var("outer_accum", llir.DataType.FLOAT32),
             ),
         ],
         loop_variable="outer",
     )
 
     first = hoist_loop_invariant_factors(
-        [outer],
+        [_zeroed("outer_accum"), outer],
         LOOP_INVARIANT_FACTOR_HOIST_CONTEXT,
     )
     second = hoist_loop_invariant_factors(
@@ -1237,13 +1281,13 @@ def test_nested_typed_materialization_remains_invisible_to_legacy_name_analysis(
     )
 
     assert _compatibility_codes(first) == [
-        "float _inv_0 = _inv_0_scale",
-        "outer_accum *= _inv_0",
+        "float _inv_1 = _inv_1_scale",
+        "outer_accum *= _inv_1",
     ]
-    output_outer = cast(llir.ForLoop, first[1])
+    output_outer = cast(llir.ForLoop, first[2])
     assert _compatibility_codes(output_outer.body) == [
-        "float _inv_0 = scale",
-        "inner_accum *= _inv_0",
+        "float _inv_1 = scale",
+        "inner_accum *= _inv_1",
     ]
     assert _snapshot(second) == _snapshot(first)
     assert _mutable_ir_ids(first).isdisjoint(_mutable_ir_ids(second))
@@ -1260,7 +1304,7 @@ def test_ordinary_materialization_lookalike_remains_a_visible_definition() -> No
         _var("_inv_0", llir.DataType.FLOAT32),
         llir.AssignOp.MUL_ASSIGN,
     )
-    source = [_loop([declaration, candidate, unrelated_post])]
+    source = [_zeroed(), _loop([declaration, candidate, unrelated_post])]
     snapshot = _snapshot(source)
 
     output = hoist_loop_invariant_factors(
@@ -1271,7 +1315,7 @@ def test_ordinary_materialization_lookalike_remains_a_visible_definition() -> No
     assert _snapshot(output) == snapshot
     assert _mutable_ir_ids(source).isdisjoint(_mutable_ir_ids(output))
     assert _compatibility_codes(output) == []
-    output_loop = cast(llir.ForLoop, output[0])
+    output_loop = cast(llir.ForLoop, output[1])
     assert _factor_names(cast(llir.Assign, output_loop.body[1]).value) == [
         "_inv_0",
         "value[k]",
@@ -1283,17 +1327,17 @@ def test_nested_generated_wrapper_block_remains_invisible_after_reapplication() 
         [
             _assignment(
                 [_var("first_scale"), _var("first_value[inner]")],
-                target=_var("first_accumulator"),
+                target=_var("first_accumulator", llir.DataType.FLOAT32),
             ),
             _assignment(
                 [_var("second_scale"), _var("second_value[inner]")],
-                target=_var("second_accumulator"),
+                target=_var("second_accumulator", llir.DataType.FLOAT32),
             ),
         ],
         loop_variable="inner",
     )
     first = hoist_loop_invariant_factors(
-        [inner],
+        [_zeroed("first_accumulator"), _zeroed("second_accumulator"), inner],
         LOOP_INVARIANT_FACTOR_HOIST_CONTEXT,
     )
     wrapped_inner = hoist_loop_invariant_factors(
@@ -1304,28 +1348,28 @@ def test_nested_generated_wrapper_block_remains_invisible_after_reapplication() 
         [
             *wrapped_inner,
             _assignment(
-                [_var("_inv_0_scale"), _var("outer_value[outer]")],
-                target=_var("outer_accumulator"),
+                [_var("_inv_2_scale"), _var("outer_value[outer]")],
+                target=_var("outer_accumulator", llir.DataType.FLOAT32),
             ),
         ],
         loop_variable="outer",
     )
 
     output = hoist_loop_invariant_factors(
-        [outer],
+        [_zeroed("outer_accumulator"), outer],
         LOOP_INVARIANT_FACTOR_HOIST_CONTEXT,
     )
 
     assert _compatibility_codes(output) == [
-        "float _inv_0 = _inv_0_scale",
-        "outer_accumulator *= _inv_0",
+        "float _inv_1 = _inv_2_scale",
+        "outer_accumulator *= _inv_1",
     ]
-    output_outer = cast(llir.ForLoop, output[1])
+    output_outer = cast(llir.ForLoop, output[2])
     assert _compatibility_codes(output_outer.body) == [
-        "float _inv_0 = first_scale",
-        "float _inv_1 = second_scale",
-        "second_accumulator *= _inv_1",
-        "first_accumulator *= _inv_0",
+        "float _inv_2 = first_scale",
+        "float _inv_3 = second_scale",
+        "second_accumulator *= _inv_3",
+        "first_accumulator *= _inv_2",
     ]
 
 
@@ -1336,6 +1380,7 @@ def test_if_then_else_transform_is_postorder_and_branches_number_independently()
         cond=_var("condition"),
         then_body=[
             llir.RawStmt("then_prefix"),
+            _zeroed("then_accum"),
             _activating_loop(
                 loop_variable="then_lane",
                 accumulator="then_accum",
@@ -1344,12 +1389,13 @@ def test_if_then_else_transform_is_postorder_and_branches_number_independently()
             ),
         ],
         else_body=[
+            _zeroed("else_accum"),
             _activating_loop(
                 loop_variable="else_lane",
                 accumulator="else_accum",
                 invariant=_var("else_scale"),
                 variant=_var("else_value[else_lane]"),
-            )
+            ),
         ],
     )
 
@@ -1363,12 +1409,12 @@ def test_if_then_else_transform_is_postorder_and_branches_number_independently()
     assert output_conditional.else_body is not None
     assert _compatibility_codes(output_conditional.then_body) == [
         "then_prefix",
-        "float _inv_1 = then_scale",
-        "then_accum *= _inv_1",
+        "float _inv_2 = then_scale",
+        "then_accum *= _inv_2",
     ]
     assert _compatibility_codes(output_conditional.else_body) == [
-        "float _inv_0 = else_scale",
-        "else_accum *= _inv_0",
+        "float _inv_1 = else_scale",
+        "else_accum *= _inv_1",
     ]
 
 
@@ -1382,38 +1428,39 @@ def test_typed_materialization_uses_float_mul_assign_and_canonical_precedence() 
         [
             _assignment(
                 [invariant, _var("value[k]")],
-                target=_var("acc"),
+                target=_var("acc", llir.DataType.FLOAT32),
             )
         ]
     )
 
     output = hoist_loop_invariant_factors(
-        [loop],
+        [_zeroed("acc"), loop],
         LOOP_INVARIANT_FACTOR_HOIST_CONTEXT,
     )
 
-    declaration = cast(llir.VarInit, output[0])
-    post = cast(llir.Assign, output[2])
+    declaration = cast(llir.VarInit, output[1])
+    post = cast(llir.Assign, output[3])
     assert type(declaration) is llir.VarInit
-    assert declaration.var == _var("_inv_0", llir.DataType.FLOAT32)
+    assert declaration.var == _var("_inv_1", llir.DataType.FLOAT32)
     assert type(declaration.value) is llir.BinOp
     assert declaration.value == invariant
     assert declaration.op == "="
     assert declaration.cast is False
     assert type(post) is llir.Assign
-    assert post.var == _var("acc")
-    assert post.value == _var("_inv_0", llir.DataType.FLOAT32)
+    assert post.var == _var("acc", llir.DataType.FLOAT32)
+    assert post.value == _var("_inv_1", llir.DataType.FLOAT32)
     assert post.op is llir.AssignOp.MUL_ASSIGN
     assert post.cast is False
     assert LLIRLowerer().lower_llir(declaration) == (
-        "float _inv_0 = left + middle * 3;"
+        "float _inv_1 = left + middle * 3;"
     )
-    assert LLIRLowerer().lower_llir(post) == "acc *= _inv_0;"
+    assert LLIRLowerer().lower_llir(post) == "acc *= _inv_1;"
 
 
 def test_generated_name_uses_current_index_without_collision_checks() -> None:
     source: List[llir.Stmt] = [
-        llir.RawStmt("float _inv_1 = existing"),
+        llir.RawStmt("float _inv_2 = existing"),
+        _zeroed(),
         _activating_loop(),
     ]
 
@@ -1423,19 +1470,22 @@ def test_generated_name_uses_current_index_without_collision_checks() -> None:
     )
 
     assert _compatibility_codes(output) == [
-        "float _inv_1 = existing",
-        "float _inv_1 = scale",
-        "_accum *= _inv_1",
+        "float _inv_2 = existing",
+        "float _inv_2 = scale",
+        "_accum *= _inv_2",
     ]
-    assert type(output[2]) is llir.ForLoop
+    assert type(output[3]) is llir.ForLoop
 
 
 def test_successful_siblings_shift_later_suffixes_by_two_and_scanning_continues() -> (
     None
 ):
     source = [
+        _zeroed("first_accum"),
         _activating_loop(invariant=_var("first"), accumulator="first_accum"),
+        _zeroed("second_accum"),
         _activating_loop(invariant=_var("second"), accumulator="second_accum"),
+        _zeroed("third_accum"),
         _activating_loop(invariant=_var("third"), accumulator="third_accum"),
     ]
 
@@ -1445,26 +1495,26 @@ def test_successful_siblings_shift_later_suffixes_by_two_and_scanning_continues(
     )
 
     assert _compatibility_codes(output) == [
-        "float _inv_0 = first",
-        "first_accum *= _inv_0",
-        "float _inv_3 = second",
-        "second_accum *= _inv_3",
-        "float _inv_6 = third",
-        "third_accum *= _inv_6",
+        "float _inv_1 = first",
+        "first_accum *= _inv_1",
+        "float _inv_5 = second",
+        "second_accum *= _inv_5",
+        "float _inv_9 = third",
+        "third_accum *= _inv_9",
     ]
     assert [
         index for index, value in enumerate(output) if type(value) is llir.ForLoop
     ] == [
-        1,
-        4,
-        7,
+        2,
+        6,
+        10,
     ]
 
 
 def test_earlier_accumulation_misses_do_not_hide_first_success() -> None:
     miss_op = _assignment(
         [_var("miss_scale"), _var("miss_value[k]")],
-        target=_var("miss"),
+        target=_var("miss", llir.DataType.FLOAT32),
         op=llir.AssignOp.ASSIGN,
     )
     miss_target = _assignment(
@@ -1473,24 +1523,24 @@ def test_earlier_accumulation_misses_do_not_hide_first_success() -> None:
     )
     first = _assignment(
         [_var("first_scale"), _var("first_value[k]")],
-        target=_var("first_accum"),
+        target=_var("first_accum", llir.DataType.FLOAT32),
     )
     second = _assignment(
         [_var("second_scale"), _var("second_value[k]")],
-        target=_var("second_accum"),
+        target=_var("second_accum", llir.DataType.FLOAT32),
     )
     loop = _loop([miss_op, miss_target, first, second])
 
     output = hoist_loop_invariant_factors(
-        [loop],
+        [_zeroed("first_accum"), _zeroed("second_accum"), loop],
         LOOP_INVARIANT_FACTOR_HOIST_CONTEXT,
     )
 
     assert _compatibility_codes(output) == [
-        "float _inv_0 = first_scale",
-        "first_accum *= _inv_0",
+        "float _inv_2 = first_scale",
+        "first_accum *= _inv_2",
     ]
-    output_loop = cast(llir.ForLoop, output[1])
+    output_loop = cast(llir.ForLoop, output[3])
     assert _snapshot(output_loop.body[0]) == _snapshot(miss_op)
     assert _snapshot(output_loop.body[1]) == _snapshot(miss_target)
     assert _factor_names(cast(llir.Assign, output_loop.body[2]).value) == [
@@ -1501,7 +1551,7 @@ def test_earlier_accumulation_misses_do_not_hide_first_success() -> None:
 
 def test_one_match_reapplication_is_structurally_stable_but_fully_detached() -> None:
     first = hoist_loop_invariant_factors(
-        [_activating_loop()],
+        [_zeroed(), _activating_loop()],
         LOOP_INVARIANT_FACTOR_HOIST_CONTEXT,
     )
     second = hoist_loop_invariant_factors(
@@ -1515,18 +1565,20 @@ def test_one_match_reapplication_is_structurally_stable_but_fully_detached() -> 
 
 def test_multiple_accumulations_transform_one_per_application() -> None:
     source = [
+        _zeroed("first_accum"),
+        _zeroed("second_accum"),
         _loop(
             [
                 _assignment(
                     [_var("first_scale"), _var("first_value[k]")],
-                    target=_var("first_accum"),
+                    target=_var("first_accum", llir.DataType.FLOAT32),
                 ),
                 _assignment(
                     [_var("second_scale"), _var("second_value[k]")],
-                    target=_var("second_accum"),
+                    target=_var("second_accum", llir.DataType.FLOAT32),
                 ),
             ]
-        )
+        ),
     ]
 
     first = hoist_loop_invariant_factors(
@@ -1543,14 +1595,14 @@ def test_multiple_accumulations_transform_one_per_application() -> None:
     )
 
     assert _compatibility_codes(first) == [
-        "float _inv_0 = first_scale",
-        "first_accum *= _inv_0",
+        "float _inv_2 = first_scale",
+        "first_accum *= _inv_2",
     ]
     assert _compatibility_codes(second) == [
-        "float _inv_0 = first_scale",
-        "float _inv_1 = second_scale",
-        "second_accum *= _inv_1",
-        "first_accum *= _inv_0",
+        "float _inv_2 = first_scale",
+        "float _inv_3 = second_scale",
+        "second_accum *= _inv_3",
+        "first_accum *= _inv_2",
     ]
     assert _snapshot(second) != _snapshot(first)
     assert _snapshot(third) == _snapshot(second)
@@ -1580,14 +1632,14 @@ def test_successful_replacement_preserves_target_fields_factor_metadata_and_cast
     )
     assignment = _assignment([_var("scale"), variant], target=target)
     assignment.cast = True
-    source = [_loop([assignment])]
+    source = [_zeroed(target.name, llir.DataType.FLOAT64), _loop([assignment])]
 
     output = hoist_loop_invariant_factors(
         source,
         LOOP_INVARIANT_FACTOR_HOIST_CONTEXT,
     )
 
-    rewritten = cast(llir.Assign, cast(llir.ForLoop, output[1]).body[0])
+    rewritten = cast(llir.Assign, cast(llir.ForLoop, output[2]).body[0])
     rewritten_target = cast(llir.Var, rewritten.var)
     rewritten_variant = cast(llir.Var, rewritten.value)
     assert rewritten.op is llir.AssignOp.ADD_ASSIGN
@@ -1910,7 +1962,7 @@ def test_malformed_consumed_scalars_use_the_owning_boundary_diagnostics(
 
 
 def test_manager_matches_direct_output_and_returns_one_ordered_record() -> None:
-    source = [_activating_loop()]
+    source = [_zeroed(), _activating_loop()]
     context = LOOP_INVARIANT_FACTOR_HOIST_CONTEXT
     direct = hoist_loop_invariant_factors(source, context)
 
@@ -1938,7 +1990,7 @@ def test_production_skips_manager_walks_and_debug_verifies_both_boundaries(
             super().walk(value)
 
     monkeypatch.setattr(pass_manager_module, "LLIRWalker", RecordingWalker)
-    artifact = LLIRStatementListArtifact([_activating_loop()])
+    artifact = LLIRStatementListArtifact([_zeroed(), _activating_loop()])
     spec = LoopInvariantFactorHoistPassSpec()
 
     production = LLIRPassManager(PRODUCTION_LLIR_PASS_OPTIONS)
@@ -2005,16 +2057,17 @@ def test_failure_adds_no_run_record_and_stops_without_retry(
 def test_generated_materialization_walk_order_is_deterministic() -> None:
     output = hoist_loop_invariant_factors(
         [
+            _zeroed(),
             _activating_loop(
                 invariant=llir.ArrayAccess(
                     _var("weights", llir.DataType.PTR_FLOAT32),
                     _var("row", llir.DataType.INT64),
                 )
-            )
+            ),
         ],
         LOOP_INVARIANT_FACTOR_HOIST_CONTEXT,
     )
-    materialization = [output[0], output[2]]
+    materialization = [output[1], output[3]]
 
     def record_walk() -> List[Tuple[str, Tuple[str, ...]]]:
         entered: List[Tuple[str, Tuple[str, ...]]] = []
@@ -2046,10 +2099,10 @@ def test_generated_materialization_identity_and_replacement_rewrites_are_owned()
     None
 ):
     output = hoist_loop_invariant_factors(
-        [_activating_loop()],
+        [_zeroed(), _activating_loop()],
         LOOP_INVARIANT_FACTOR_HOIST_CONTEXT,
     )
-    materialization = [output[0], output[2]]
+    materialization = [output[1], output[3]]
     context = LOOP_INVARIANT_FACTOR_HOIST_TRAVERSAL_CONTEXT
 
     first = cast(List[llir.Stmt], LLIRRewriter(context).rewrite(materialization))
@@ -2060,7 +2113,7 @@ def test_generated_materialization_identity_and_replacement_rewrites_are_owned()
     assert _mutable_ir_ids(first).isdisjoint(_mutable_ir_ids(repeated))
 
     replacement = llir.VarInit(
-        _var("_inv_0", llir.DataType.FLOAT32),
+        _var("_inv_1", llir.DataType.FLOAT32),
         llir.ArrayAccess(
             _var("replacement", llir.DataType.PTR_FLOAT32),
             _var("offset", llir.DataType.INT64),
@@ -2111,12 +2164,12 @@ class _GeneratedUnknownExpression(llir.Expr):
 def _valid_generated_materialization() -> Tuple[llir.VarInit, llir.Assign]:
     return (
         llir.VarInit(
-            _var("_inv_0", llir.DataType.FLOAT32),
+            _var("_inv_1", llir.DataType.FLOAT32),
             _var("scale", llir.DataType.FLOAT32),
         ),
         llir.Assign(
-            _var("accumulator"),
-            _var("_inv_0", llir.DataType.FLOAT32),
+            _var("accumulator", llir.DataType.FLOAT32),
+            _var("_inv_1", llir.DataType.FLOAT32),
             llir.AssignOp.MUL_ASSIGN,
         ),
     )
@@ -2124,14 +2177,14 @@ def _valid_generated_materialization() -> Tuple[llir.VarInit, llir.Assign]:
 
 def _forged_declaration_node() -> Tuple[object, object]:
     _, post = _valid_generated_materialization()
-    return llir.RawStmt("float _inv_0 = scale"), post
+    return llir.RawStmt("float _inv_1 = scale"), post
 
 
 def _forged_declaration_subclass() -> Tuple[object, object]:
     _, post = _valid_generated_materialization()
     return (
         _GeneratedVarInitSubclass(
-            _var("_inv_0", llir.DataType.FLOAT32),
+            _var("_inv_1", llir.DataType.FLOAT32),
             _var("scale", llir.DataType.FLOAT32),
         ),
         post,
@@ -2140,7 +2193,7 @@ def _forged_declaration_subclass() -> Tuple[object, object]:
 
 def _forged_assignment_node() -> Tuple[object, object]:
     declaration, _ = _valid_generated_materialization()
-    return declaration, llir.RawStmt("accumulator *= _inv_0")
+    return declaration, llir.RawStmt("accumulator *= _inv_1")
 
 
 def _forged_assignment_subclass() -> Tuple[object, object]:
@@ -2148,8 +2201,8 @@ def _forged_assignment_subclass() -> Tuple[object, object]:
     return (
         declaration,
         _GeneratedAssignSubclass(
-            _var("accumulator"),
-            _var("_inv_0", llir.DataType.FLOAT32),
+            _var("accumulator", llir.DataType.FLOAT32),
+            _var("_inv_1", llir.DataType.FLOAT32),
             llir.AssignOp.MUL_ASSIGN,
         ),
     )
@@ -2159,7 +2212,7 @@ def _forged_declaration_var_subclass() -> Tuple[object, object]:
     _, post = _valid_generated_materialization()
     return (
         llir.VarInit(
-            _GeneratedVarSubclass("_inv_0", llir.DataType.FLOAT32),
+            _GeneratedVarSubclass("_inv_1", llir.DataType.FLOAT32),
             _var("scale", llir.DataType.FLOAT32),
         ),
         post,
@@ -2214,72 +2267,74 @@ def _forged_unknown_declaration_child() -> Tuple[object, object]:
         (
             _forged_declaration_node,
             "invalid_loop_invariant_factor_materialization_declaration",
-            ("root", "[0]"),
+            ("root", "[1]"),
             "RawStmt",
         ),
         (
             _forged_declaration_subclass,
             "invalid_loop_invariant_factor_materialization_declaration",
-            ("root", "[0]"),
+            ("root", "[1]"),
             "_GeneratedVarInitSubclass",
         ),
         (
             _forged_assignment_node,
             "invalid_loop_invariant_factor_materialization_assignment",
-            ("root", "[2]"),
+            ("root", "[3]"),
             "RawStmt",
         ),
         (
             _forged_assignment_subclass,
             "invalid_loop_invariant_factor_materialization_assignment",
-            ("root", "[2]"),
+            ("root", "[3]"),
             "_GeneratedAssignSubclass",
         ),
         (
             _forged_declaration_var_subclass,
             "invalid_loop_invariant_factor_materialization_var",
-            ("root", "[0]", "var"),
+            ("root", "[1]", "var"),
             "_GeneratedVarSubclass",
         ),
         (
             _forged_declaration_var_field,
             "invalid_loop_invariant_factor_materialization_var",
-            ("root", "[0]", "var"),
+            ("root", "[1]", "var"),
             "Var",
         ),
         (
             _forged_declaration_fields,
             "invalid_loop_invariant_factor_materialization_declaration_fields",
-            ("root", "[0]"),
+            ("root", "[1]"),
             "VarInit",
         ),
         (
             _forged_assignment_target_field,
             "invalid_loop_invariant_factor_materialization_var",
-            ("root", "[2]", "var"),
+            ("root", "[3]", "var"),
             "Var",
         ),
         (
             _forged_assignment_target_name,
             "invalid_loop_invariant_factor_materialization_var",
-            ("root", "[2]", "var"),
+            ("root", "[3]", "var"),
             "Var",
         ),
         (
             _forged_assignment_reference_field,
             "invalid_loop_invariant_factor_materialization_var",
-            ("root", "[2]", "value"),
+            ("root", "[3]", "value"),
             "Var",
         ),
         (
             _forged_assignment_fields,
             "invalid_loop_invariant_factor_materialization_assignment_fields",
-            ("root", "[2]"),
+            ("root", "[3]"),
             "Assign",
         ),
         (
             _forged_unknown_declaration_child,
             "unknown_llir_node",
+            # Reported by the walk over the generated pair alone, so the path
+            # is relative to that pair and not to the loop's sequence.
             ("root", "[0]", "value"),
             "_GeneratedUnknownExpression",
         ),
@@ -2299,11 +2354,12 @@ def test_forged_generated_materialization_fails_at_the_owning_boundary(
         sequence_index: int,
         context: LoopInvariantFactorHoistContext,
         path: Tuple[str, ...],
+        preceding: object,
     ) -> Tuple[llir.VarInit, llir.Assign, int, llir.Expr]:
         nonlocal calls
         calls += 1
-        assert sequence_index == 0
-        assert path == ("root", "[0]")
+        assert sequence_index == 1
+        assert path == ("root", "[1]")
         declaration, post = factory()
         invariant_expression = (
             cast(llir.VarInit, declaration).value
@@ -2318,7 +2374,7 @@ def test_forged_generated_materialization_fails_at_the_owning_boundary(
     monkeypatch.setattr(factor_pass_module, "_try_hoist_from_loop", forge_once)
     with pytest.raises(LLIRTraversalError) as raised:
         hoist_loop_invariant_factors(
-            [_activating_loop(accumulator="accumulator")],
+            [_zeroed("accumulator"), _activating_loop(accumulator="accumulator")],
             LOOP_INVARIANT_FACTOR_HOIST_CONTEXT,
         )
 
@@ -2339,8 +2395,9 @@ def test_forged_generated_declaration_value_fails_at_the_owning_boundary(
         sequence_index: int,
         context: LoopInvariantFactorHoistContext,
         path: Tuple[str, ...],
+        preceding: object,
     ) -> Tuple[llir.VarInit, llir.Assign, int, llir.Expr]:
-        del loop, sequence_index, context, path
+        del loop, sequence_index, context, path, preceding
         declaration, post = _valid_generated_materialization()
         selected_invariant = declaration.value
         declaration.value = _var("wrong_scale", llir.DataType.FLOAT32)
@@ -2353,7 +2410,7 @@ def test_forged_generated_declaration_value_fails_at_the_owning_boundary(
     )
     with pytest.raises(LLIRTraversalError) as raised:
         hoist_loop_invariant_factors(
-            [_activating_loop(accumulator="accumulator")],
+            [_zeroed("accumulator"), _activating_loop(accumulator="accumulator")],
             LOOP_INVARIANT_FACTOR_HOIST_CONTEXT,
         )
 
@@ -2361,7 +2418,7 @@ def test_forged_generated_declaration_value_fails_at_the_owning_boundary(
     assert diagnostic.code == (
         "invalid_loop_invariant_factor_materialization_declaration_value"
     )
-    assert diagnostic.path == ("root", "[0]", "value")
+    assert diagnostic.path == ("root", "[1]", "value")
     assert diagnostic.node_type == "Var"
     assert diagnostic.stage == "LLIR transformation"
     assert diagnostic.pass_name == "hoist_loop_invariant_factors"
@@ -2378,6 +2435,7 @@ def test_managed_forged_materialization_adds_no_record_and_is_not_retried(
         sequence_index: int,
         context: LoopInvariantFactorHoistContext,
         path: Tuple[str, ...],
+        preceding: object,
     ) -> Tuple[llir.VarInit, llir.Assign, int, llir.Expr]:
         nonlocal calls
         calls += 1
@@ -2397,7 +2455,9 @@ def test_managed_forged_materialization_adds_no_record_and_is_not_retried(
     monkeypatch.setattr(pass_manager_module, "_record", record_attempt)
     with pytest.raises(LLIRTraversalError) as raised:
         LLIRPassManager().run_loop_invariant_factor_hoist(
-            LLIRStatementListArtifact([_activating_loop(accumulator="accumulator")]),
+            LLIRStatementListArtifact(
+                [_zeroed("accumulator"), _activating_loop(accumulator="accumulator")]
+            ),
             LoopInvariantFactorHoistPassSpec(),
         )
 
@@ -2478,3 +2538,1148 @@ def test_empty_and_factor_pass_incremental_plumbing_p95_is_below_one_ms() -> Non
 
     assert _p95(empty_ns) <= 1_000_000
     assert _p95(incremental_ns) <= 1_000_000
+
+
+# -- the hoisted factor's scalar type ----------------------------------------
+#
+# ...and, first, whether a factor may be hoisted at all.  ``acc += s * x`` in a
+# loop equals ``acc += x`` in the loop and ``acc *= s`` after it only when the
+# accumulator is zero on entry to the loop and the loop uses it nowhere else.
+# The pass shows the first by a zero-initializing declaration earlier in the
+# loop's own statement sequence that nothing after it names, and the second by
+# finding the accumulator's name nowhere else in the loop.  A loop for which
+# either is not shown is emitted unchanged.
+#
+# The factor then takes the accumulator's scalar type: from the accumulator
+# reference when the reference carries FLOAT32 or FLOAT64, and from the
+# zero-initializing declaration when the reference is NO_TYPE, which is how
+# CINLowerer and the LoopIR lowering both emit their accumulations.
+
+_FACTOR_SCALAR_SPELLINGS = (
+    (llir.DataType.FLOAT32, "float"),
+    (llir.DataType.FLOAT64, "double"),
+)
+
+
+def _untyped_accumulation(
+    accumulator: str = "acc",
+    *,
+    loop_variable: str = "k",
+    invariant: str = "scale",
+) -> llir.ForLoop:
+    """``acc += scale * _values_ptr[k]`` with the reference left NO_TYPE."""
+
+    return _loop(
+        [
+            _assignment(
+                [_var(invariant), _var(f"_values_ptr[{loop_variable}]")],
+                target=_var(accumulator),
+            )
+        ],
+        loop_variable=loop_variable,
+    )
+
+
+def _typed_accumulation(scalar_type: llir.DataType) -> llir.ForLoop:
+    """``acc += scale * _values_ptr[k]`` with the reference carrying a type."""
+
+    return _loop(
+        [
+            _assignment(
+                [_var("scale"), _var("_values_ptr[k]")],
+                target=_var("acc", scalar_type),
+            )
+        ]
+    )
+
+
+def _hoist(source: List[llir.Stmt]) -> List[llir.Stmt]:
+    return hoist_loop_invariant_factors(source, LOOP_INVARIANT_FACTOR_HOIST_CONTEXT)
+
+
+def _assert_emitted_unchanged(source: List[llir.Stmt]) -> None:
+    before = _snapshot(source)
+
+    output = _hoist(source)
+
+    assert _snapshot(source) == before
+    assert _snapshot(output) == before
+    assert len(output) == len(source)
+    assert _mutable_ir_ids(source).isdisjoint(_mutable_ir_ids(output))
+
+
+def _hoist_diagnostic(source: List[llir.Stmt]) -> LLIRTraversalDiagnostic:
+    before = _snapshot(source)
+    with pytest.raises(LLIRTraversalError) as raised:
+        _hoist(source)
+    diagnostic = raised.value.diagnostic
+    assert _snapshot(source) == before
+    assert diagnostic.stage == "LLIR transformation"
+    assert diagnostic.pass_name == "hoist_loop_invariant_factors"
+    return diagnostic
+
+
+# -- the accumulator is zero on entry to the loop ------------------------------
+
+
+def test_loop_after_a_zero_initialized_declaration_of_its_accumulator_is_hoisted() -> (
+    None
+):
+    # The positive control for every "emitted unchanged" case below: the same
+    # loop, with the declaration the pass asks for, is rewritten.
+    source = [_zeroed("acc", llir.DataType.FLOAT64), _untyped_accumulation()]
+
+    output = _hoist(source)
+
+    assert [type(statement) for statement in output] == [
+        llir.VarInit,
+        llir.VarInit,
+        llir.ForLoop,
+        llir.Assign,
+    ]
+    assert [
+        LLIRLowerer().lower_llir(cast(llir.Node, output[index])) for index in (0, 1, 3)
+    ] == [
+        "double acc = 0.0f;",
+        "double _inv_1 = scale;",
+        "acc *= _inv_1;",
+    ]
+    rewritten = cast(llir.Assign, cast(llir.ForLoop, output[2]).body[0])
+    assert LLIRLowerer().lower_llir(rewritten) == "acc += _values_ptr[k];"
+
+
+@pytest.mark.parametrize(
+    ("scalar_type", "pointer_type", "spelling", "zero"),
+    (
+        (llir.DataType.FLOAT64, llir.DataType.CONST_PTR_FLOAT64, "double", "0.0"),
+        (llir.DataType.FLOAT32, llir.DataType.CONST_PTR_FLOAT32, "float", "0.0f"),
+    ),
+    ids=("float64", "float32"),
+)
+def test_row_pointers_declared_between_the_zero_declaration_and_the_loop_do_not_block(
+    scalar_type: llir.DataType,
+    pointer_type: llir.DataType,
+    spelling: str,
+    zero: str,
+) -> None:
+    # The dense-pointer pass runs before this one and declares a read-only
+    # row pointer per dense operand directly before the loop, in the typed
+    # form below.  An SDDMM reduction into a scalar reaches this pass so:
+    # zero declaration, two row pointers, loop.  The pointers spell the
+    # operands and the row, never the accumulator, so the factor is hoisted.
+    def row_pointer(operand: str) -> llir.VarInit:
+        return llir.VarInit(
+            _var(f"_{operand}_val_ptr", pointer_type, is_restrict=True),
+            llir.AddressOf(
+                llir.ArrayAccess(_var(f"{operand}_val"), llir.Mul(_var("i"), _var("K")))
+            ),
+        )
+
+    source = [
+        llir.VarInit(_var("C_reduction", scalar_type), llir.Literal(zero, scalar_type)),
+        row_pointer("B"),
+        row_pointer("D"),
+        _loop(
+            [
+                _assignment(
+                    [_var("A_val[pA1]"), _var("_B_val_ptr[k]"), _var("_D_val_ptr[k]")],
+                    target=_var("C_reduction"),
+                )
+            ]
+        ),
+    ]
+
+    output = _hoist(source)
+
+    assert [type(statement) for statement in output] == [
+        llir.VarInit,
+        llir.VarInit,
+        llir.VarInit,
+        llir.VarInit,
+        llir.ForLoop,
+        llir.Assign,
+    ]
+    assert [
+        LLIRLowerer().lower_llir(cast(llir.Node, output[index]))
+        for index in (0, 1, 2, 3, 5)
+    ] == [
+        f"{spelling} C_reduction = {zero};",
+        f"const {spelling}* __restrict__ _B_val_ptr = &B_val[i * K];",
+        f"const {spelling}* __restrict__ _D_val_ptr = &D_val[i * K];",
+        f"{spelling} _inv_3 = A_val[pA1];",
+        "C_reduction *= _inv_3;",
+    ]
+    rewritten = cast(llir.Assign, cast(llir.ForLoop, output[4]).body[0])
+    assert (
+        LLIRLowerer().lower_llir(rewritten)
+        == "C_reduction += _B_val_ptr[k] * _D_val_ptr[k];"
+    )
+
+
+def _nested_accumulation() -> llir.ForLoop:
+    """``for (k) { acc += weights[j] * _values_ptr[k]; }``, to sit in a ``j`` loop."""
+
+    return _loop(
+        [
+            _assignment(
+                [_var("weights[j]"), _var("_values_ptr[k]")],
+                target=_var("acc"),
+            )
+        ],
+        loop_variable="k",
+    )
+
+
+def test_accumulator_zero_initialized_outside_an_enclosing_loop_is_not_hoisted() -> (
+    None
+):
+    # acc = 0; for (j) { for (k) { acc += weights[j] * x[k]; } }
+    # On entry to the k loop the accumulator holds the sums of every earlier j,
+    # so multiplying it by weights[j] after the loop would rescale those too.
+    # This is the shape of the LoopIR program C[i] = sum_jk A[i,j,k] B[j] D[k].
+    outer = _loop([_nested_accumulation()], loop_variable="j")
+
+    _assert_emitted_unchanged([_zeroed("acc", llir.DataType.FLOAT64), outer])
+
+
+def test_accumulator_zero_initialized_inside_the_enclosing_loop_is_hoisted() -> None:
+    # for (j) { acc = 0; for (k) { acc += weights[j] * x[k]; } ... }
+    outer = _loop(
+        [_zeroed("acc", llir.DataType.FLOAT64), _nested_accumulation()],
+        loop_variable="j",
+    )
+
+    output = _hoist([outer])
+
+    assert _compatibility_codes(output) == []
+    assert _compatibility_codes(cast(llir.ForLoop, output[0]).body) == [
+        "double _inv_1 = weights[j]",
+        "acc *= _inv_1",
+    ]
+
+
+def _not_shown_zero_on_entry() -> Tuple[Tuple[str, List[llir.Stmt]], ...]:
+    def declared(value: llir.Expr) -> llir.VarInit:
+        return llir.VarInit(_var("acc", llir.DataType.FLOAT64), value)
+
+    zero = _zeroed("acc", llir.DataType.FLOAT64)
+    own_body = _untyped_accumulation()
+    own_body.body.insert(0, _zeroed("acc", llir.DataType.FLOAT64))
+    cases: List[Tuple[str, List[llir.Stmt]]] = [
+        ("no declaration", [llir.BlankLine(), _untyped_accumulation()]),
+        (
+            "typed reference and no declaration",
+            [_typed_accumulation(llir.DataType.FLOAT32)],
+        ),
+        (
+            "zero-initialized declaration of another variable",
+            [_zeroed("other", llir.DataType.FLOAT64), _untyped_accumulation()],
+        ),
+        (
+            "nonzero initializer",
+            [
+                declared(llir.Literal("1.0", llir.DataType.FLOAT64)),
+                _untyped_accumulation(),
+            ],
+        ),
+        (
+            "initialized from a variable",
+            [declared(_var("seed")), _untyped_accumulation()],
+        ),
+        (
+            "declared without an initializer",
+            [
+                llir.VarDecl(_var("acc", llir.DataType.FLOAT64)),
+                _untyped_accumulation(),
+            ],
+        ),
+        (
+            "declared as raw code",
+            [llir.RawStmt("double acc = 0"), _untyped_accumulation()],
+        ),
+        (
+            "declared as a pointer",
+            [
+                llir.VarInit(
+                    _var("acc", llir.DataType.FLOAT64, is_ptr=True),
+                    llir.Literal(0),
+                ),
+                _untyped_accumulation(),
+            ],
+        ),
+        (
+            "fixed stack array of that name",
+            [
+                llir.FixedStackArrayDecl(
+                    name="acc",
+                    element_type=llir.DataType.FLOAT64,
+                    extent=llir.Literal(8),
+                    initializer=llir.Array(values=[], data_type=llir.DataType.FLOAT64),
+                ),
+                _untyped_accumulation(),
+            ],
+        ),
+        (
+            "std::vector of that name",
+            [
+                llir.DirectInit(
+                    _var("acc", llir.DataType.STD_VECTOR_FLOAT64),
+                    [llir.Literal(8)],
+                ),
+                _untyped_accumulation(),
+            ],
+        ),
+        (
+            "redeclared nonzero after a zero-initialized declaration",
+            [
+                zero,
+                declared(llir.Literal("2.0", llir.DataType.FLOAT64)),
+                _untyped_accumulation(),
+            ],
+        ),
+        (
+            "assigned between the declaration and the loop",
+            [zero, llir.Assign(_var("acc"), _var("seed")), _untyped_accumulation()],
+        ),
+        (
+            "accumulated into between the declaration and the loop",
+            [
+                zero,
+                llir.Assign(_var("acc"), _var("seed"), llir.AssignOp.ADD_ASSIGN),
+                _untyped_accumulation(),
+            ],
+        ),
+        (
+            "read between the declaration and the loop",
+            [zero, llir.VarInit(_var("copy"), _var("acc")), _untyped_accumulation()],
+        ),
+        (
+            "declared after the loop",
+            [llir.BlankLine(), _untyped_accumulation(), zero],
+        ),
+        ("declared only inside the loop's own body", [own_body]),
+        (
+            "declared inside an earlier loop's body",
+            [_loop([zero], loop_variable="row"), _untyped_accumulation()],
+        ),
+        (
+            "declared inside an earlier conditional's branch",
+            [
+                llir.IfThenElse(cond=_var("condition"), then_body=[zero]),
+                _untyped_accumulation(),
+            ],
+        ),
+        (
+            "declared before an enclosing conditional",
+            [
+                zero,
+                llir.IfThenElse(
+                    cond=_var("condition"),
+                    then_body=[_untyped_accumulation(loop_variable="then_lane")],
+                    else_body=[
+                        llir.BlankLine(),
+                        _untyped_accumulation(loop_variable="else_lane"),
+                    ],
+                ),
+            ],
+        ),
+        (
+            "declared before an enclosing loop",
+            [zero, _loop([_untyped_accumulation()], loop_variable="row")],
+        ),
+    ]
+    for home in ("init", "before_parallel_body", "pre_parallel_body"):
+        declaration = _zeroed("acc", llir.DataType.FLOAT64)
+        earlier = _loop([llir.BlankLine()], loop_variable="row")
+        setattr(earlier, home, declaration if home == "init" else [declaration])
+        cases.append(
+            (
+                f"declared by an earlier loop's {home}",
+                [earlier, _untyped_accumulation()],
+            )
+        )
+        declaration = _zeroed("acc", llir.DataType.FLOAT64)
+        enclosing = _loop([_untyped_accumulation()], loop_variable="row")
+        setattr(enclosing, home, declaration if home == "init" else [declaration])
+        cases.append((f"declared by the enclosing loop's {home}", [enclosing]))
+    return tuple(cases)
+
+
+@pytest.mark.parametrize(
+    "source",
+    [source for _, source in _not_shown_zero_on_entry()],
+    ids=[label for label, _ in _not_shown_zero_on_entry()],
+)
+def test_loop_is_emitted_unchanged_when_its_accumulator_is_not_shown_zero_on_entry(
+    source: List[llir.Stmt],
+) -> None:
+    _assert_emitted_unchanged(source)
+
+
+def test_zero_initialized_declaration_inside_a_nested_statement_list_is_accepted() -> (
+    None
+):
+    # A nested statement list is emitted inline, so it is part of the sequence
+    # that holds it and opens no C++ block.
+    source = cast(
+        List[llir.Stmt],
+        [
+            [llir.BlankLine(), (_zeroed("acc", llir.DataType.FLOAT64),)],
+            _untyped_accumulation(),
+        ],
+    )
+
+    output = _hoist(source)
+
+    assert _compatibility_codes(output) == [
+        "double _inv_1 = scale",
+        "acc *= _inv_1",
+    ]
+
+
+def test_statement_naming_the_accumulator_inside_a_nested_statement_list_blocks() -> (
+    None
+):
+    _assert_emitted_unchanged(
+        cast(
+            List[llir.Stmt],
+            [
+                _zeroed("acc", llir.DataType.FLOAT64),
+                [llir.BlankLine(), (llir.Assign(_var("acc"), _var("seed")),)],
+                _untyped_accumulation(),
+            ],
+        )
+    )
+
+
+@pytest.mark.parametrize(
+    "zero",
+    ("0.0f", "0.0", "0", 0, 0.0, "-0.0", "0.f", ".0", "0e0", "0.0F"),
+    ids=repr,
+)
+def test_every_spelling_of_a_zero_literal_initializes_the_accumulator_to_zero(
+    zero: object,
+) -> None:
+    # A string value is given the scalar type: with no type a string literal
+    # is a std::string, which is emitted in quotes.
+    declaration = llir.VarInit(
+        _var("acc", llir.DataType.FLOAT64),
+        llir.Literal(zero, llir.DataType.FLOAT64),
+    )
+    assert LLIRLowerer().lower_llir(declaration) == f"double acc = {zero};"
+
+    output = _hoist([declaration, _untyped_accumulation()])
+
+    assert _compatibility_codes(output) == [
+        "double _inv_1 = scale",
+        "acc *= _inv_1",
+    ]
+
+
+_NOT_A_DECIMAL_ZERO_LITERAL = (
+    ("1.0", llir.Literal("1.0", llir.DataType.FLOAT64)),
+    ("1", llir.Literal(1, llir.DataType.FLOAT64)),
+    ("0.5f", llir.Literal("0.5f", llir.DataType.FLOAT64)),
+    ("1e-30", llir.Literal("1e-30", llir.DataType.FLOAT64)),
+    ("true", llir.Literal(True)),
+    ("a variable", llir.Var("zero", llir.DataType.FLOAT64)),
+    ("1 - 1", llir.BinOp("-", llir.Literal(1), llir.Literal(1))),
+    # Zero in C++, in a spelling the pass does not read as zero.  A hoist is
+    # missed; no wrong one is made.
+    ("0x0p0", llir.Literal("0x0p0", llir.DataType.FLOAT64)),
+    ("false", llir.Literal(False)),
+    # A string literal with no numeric type is emitted in quotes.
+    ("quoted 0.0", llir.Literal("0.0")),
+)
+
+
+@pytest.mark.parametrize(
+    "initializer",
+    [initializer for _, initializer in _NOT_A_DECIMAL_ZERO_LITERAL],
+    ids=[label for label, _ in _NOT_A_DECIMAL_ZERO_LITERAL],
+)
+def test_initializer_not_spelled_as_a_decimal_zero_literal_does_not_show_zero(
+    initializer: llir.Expr,
+) -> None:
+    declaration = llir.VarInit(_var("acc", llir.DataType.FLOAT64), initializer)
+
+    _assert_emitted_unchanged([declaration, _untyped_accumulation()])
+
+
+def test_second_loop_into_the_same_accumulator_is_emitted_unchanged() -> None:
+    # After the first loop and its post-loop multiply the accumulator is no
+    # longer zero, so only the first loop's factor is hoisted.
+    second = _untyped_accumulation(loop_variable="m", invariant="second_scale")
+    source = [
+        _zeroed("acc"),
+        _untyped_accumulation(invariant="first_scale"),
+        second,
+    ]
+
+    first_application = _hoist(source)
+    second_application = _hoist(first_application)
+
+    assert _compatibility_codes(first_application) == [
+        "float _inv_1 = first_scale",
+        "acc *= _inv_1",
+    ]
+    assert [type(statement) for statement in first_application] == [
+        llir.VarInit,
+        llir.VarInit,
+        llir.ForLoop,
+        llir.Assign,
+        llir.ForLoop,
+    ]
+    assert _snapshot(first_application[4]) == _snapshot(second)
+    assert _snapshot(second_application) == _snapshot(first_application)
+
+
+def test_accumulation_not_shown_zero_does_not_hide_a_later_one_that_is() -> None:
+    loop = _loop(
+        [
+            _assignment(
+                [_var("first_scale"), _var("first_value[k]")],
+                target=_var("undeclared_accum"),
+            ),
+            _assignment(
+                [_var("second_scale"), _var("second_value[k]")],
+                target=_var("declared_accum"),
+            ),
+        ]
+    )
+
+    output = _hoist([_zeroed("declared_accum"), loop])
+
+    assert _compatibility_codes(output) == [
+        "float _inv_1 = second_scale",
+        "declared_accum *= _inv_1",
+    ]
+    output_loop = cast(llir.ForLoop, output[2])
+    assert _snapshot(output_loop.body[0]) == _snapshot(loop.body[0])
+    assert _factor_names(cast(llir.Assign, output_loop.body[1]).value) == [
+        "second_value[k]"
+    ]
+
+
+# -- the loop uses the accumulator nowhere else --------------------------------
+
+
+def _accumulator_used_elsewhere_in_its_loop() -> Tuple[Tuple[str, llir.ForLoop], ...]:
+    second_write = _untyped_accumulation()
+    second_write.body.append(
+        llir.Assign(_var("acc"), _var("offset[k]"), llir.AssignOp.ADD_ASSIGN)
+    )
+    overwrite = _untyped_accumulation()
+    overwrite.body.insert(0, llir.Assign(_var("acc"), _var("restart")))
+    read = _untyped_accumulation()
+    read.body.append(llir.VarInit(_var("copy"), _var("acc")))
+    read_in_raw_code = _untyped_accumulation()
+    read_in_raw_code.body.append(llir.RawStmt("trace(acc)"))
+    read_in_a_nested_block = _untyped_accumulation()
+    read_in_a_nested_block.body.append(
+        llir.IfThenElse(
+            cond=_var("condition"),
+            then_body=[llir.Assign(_var("peak"), _var("acc"))],
+        )
+    )
+    own_right_hand_side = _loop(
+        [_assignment([_var("acc"), _var("_values_ptr[k]")], target=_var("acc"))]
+    )
+    condition = _loop(
+        [
+            _assignment(
+                [_var("scale"), _var("_values_ptr[k]")],
+                target=_var("acc"),
+            )
+        ],
+        condition=llir.BinOp("<", _var("acc"), _var("limit")),
+    )
+    init = _untyped_accumulation()
+    init.init = llir.VarInit(_var("ignored_init"), _var("acc"))
+    cases = [
+        ("a second accumulation into it", second_write),
+        ("an assignment to it", overwrite),
+        ("a read of it", read),
+        ("a read of it in raw code", read_in_raw_code),
+        ("a read of it in a nested block", read_in_a_nested_block),
+        ("the accumulator on its own right-hand side", own_right_hand_side),
+        ("the loop's condition", condition),
+        ("the loop's initializer", init),
+    ]
+    for field in ("before_parallel_body", "pre_parallel_body", "post_parallel_body"):
+        loop = _untyped_accumulation()
+        setattr(loop, field, [llir.RawStmt("publish(acc)")])
+        cases.append((f"the loop's {field}", loop))
+    for field in ("omp_num_threads", "omp_chunk_expr"):
+        loop = _untyped_accumulation()
+        setattr(loop, field, "acc")
+        cases.append((f"the loop's {field}", loop))
+    return tuple(cases)
+
+
+@pytest.mark.parametrize(
+    "loop",
+    [loop for _, loop in _accumulator_used_elsewhere_in_its_loop()],
+    ids=[label for label, _ in _accumulator_used_elsewhere_in_its_loop()],
+)
+def test_loop_that_uses_its_accumulator_outside_the_accumulation_is_emitted_unchanged(
+    loop: llir.ForLoop,
+) -> None:
+    # Each would see the partial sum before the hoisted factor is applied.
+    _assert_emitted_unchanged([_zeroed("acc"), loop])
+
+
+# -- the accumulator's name is matched as a whole identifier -------------------
+
+_OTHER_IDENTIFIERS_CONTAINING_THE_ACCUMULATOR_NAME = (
+    "acc2",
+    "my_acc",
+    "_acc",
+    "acc_values[k]",
+    "accumulate(other)",
+)
+_SPELLINGS_THAT_NAME_THE_ACCUMULATOR = (
+    "acc.member",
+    "buffer[acc]",
+    "use(acc)",
+    "other + acc",
+    "&acc",
+)
+
+
+def _uses_of(spellings: Tuple[str, ...]) -> List[Tuple[str, str, str]]:
+    """Every (spelling, use, place) an LLIR statement can state.
+
+    A write needs a name the assignment target grammar admits, an identifier
+    or a member path; a read and raw code take any spelling.
+    """
+
+    cases: List[Tuple[str, str, str]] = []
+    for spelling in spellings:
+        writable = all(part.isidentifier() for part in spelling.split("."))
+        for use in ("write", "read", "raw code"):
+            if use == "write" and not writable:
+                continue
+            for place in ("before the loop", "in the loop"):
+                cases.append((spelling, use, place))
+    return cases
+
+
+def _zeroed_accumulation_with(spelling: str, use: str, place: str) -> List[llir.Stmt]:
+    """``float acc = 0.0f;`` and the accumulation, with one statement added."""
+
+    statement: llir.Stmt
+    if use == "write":
+        statement = llir.Assign(_var(spelling), _var("unrelated"))
+    elif use == "read":
+        statement = llir.Assign(_var("unrelated"), _var(spelling))
+    else:
+        statement = llir.RawStmt(f"touch({spelling});")
+    loop = _untyped_accumulation()
+    if place == "in the loop":
+        loop.body.append(statement)
+        return [_zeroed("acc"), loop]
+    return [_zeroed("acc"), statement, loop]
+
+
+@pytest.mark.parametrize(
+    ("spelling", "use", "place"),
+    _uses_of(_OTHER_IDENTIFIERS_CONTAINING_THE_ACCUMULATOR_NAME),
+)
+def test_other_identifier_that_contains_the_accumulator_name_does_not_block_the_hoist(
+    spelling: str,
+    use: str,
+    place: str,
+) -> None:
+    source = _zeroed_accumulation_with(spelling, use, place)
+
+    output = _hoist(source)
+
+    suffix = len(source) - 1
+    assert len(output) == len(source) + 2
+    assert _compatibility_codes(output)[-2:] == [
+        f"float _inv_{suffix} = scale",
+        f"acc *= _inv_{suffix}",
+    ]
+
+
+@pytest.mark.parametrize(
+    ("spelling", "use", "place"),
+    _uses_of(_SPELLINGS_THAT_NAME_THE_ACCUMULATOR),
+)
+def test_composite_spelling_that_names_the_accumulator_blocks_the_hoist(
+    spelling: str,
+    use: str,
+    place: str,
+) -> None:
+    _assert_emitted_unchanged(_zeroed_accumulation_with(spelling, use, place))
+
+
+@pytest.mark.parametrize(
+    ("accumulator", "other_identifier"),
+    (("a.c", "abc"), ("state.acc", "state_acc")),
+)
+def test_member_dot_in_an_accumulator_name_is_matched_literally(
+    accumulator: str,
+    other_identifier: str,
+) -> None:
+    # The dot is the one regular-expression character the assignment target
+    # grammar admits in a name.  Read as "any character" it would find the
+    # accumulator in the other identifier and leave the loop unchanged.
+    loop = _untyped_accumulation(accumulator)
+    loop.body.append(llir.Assign(_var(other_identifier), _var("unrelated")))
+
+    output = _hoist(
+        [
+            _zeroed(accumulator),
+            llir.Assign(_var(other_identifier), _var("unrelated")),
+            loop,
+        ]
+    )
+
+    assert _compatibility_codes(output) == [
+        "float _inv_2 = scale",
+        f"{accumulator} *= _inv_2",
+    ]
+
+
+# -- the scalar type the factor takes ------------------------------------------
+
+
+@pytest.mark.parametrize(("scalar_type", "spelling"), _FACTOR_SCALAR_SPELLINGS)
+def test_factor_takes_the_scalar_type_of_a_typed_accumulator_reference(
+    scalar_type: llir.DataType,
+    spelling: str,
+) -> None:
+    output = _hoist([_zeroed("acc", scalar_type), _typed_accumulation(scalar_type)])
+
+    assert _compatibility_codes(output) == [
+        f"{spelling} _inv_1 = scale",
+        "acc *= _inv_1",
+    ]
+    declaration = cast(llir.VarInit, output[1])
+    post = cast(llir.Assign, output[3])
+    assert declaration.var == _var("_inv_1", scalar_type)
+    assert post.value == _var("_inv_1", scalar_type)
+    assert post.var == _var("acc", scalar_type)
+
+
+@pytest.mark.parametrize(("scalar_type", "spelling"), _FACTOR_SCALAR_SPELLINGS)
+def test_factor_takes_the_declared_scalar_type_of_an_untyped_accumulator_reference(
+    scalar_type: llir.DataType,
+    spelling: str,
+) -> None:
+    source = [_zeroed("acc", scalar_type), _untyped_accumulation()]
+    before = _snapshot(source)
+
+    first = _hoist(source)
+    second = _hoist(first)
+
+    assert _snapshot(source) == before
+    assert [type(statement) for statement in first] == [
+        llir.VarInit,
+        llir.VarInit,
+        llir.ForLoop,
+        llir.Assign,
+    ]
+    assert _compatibility_codes(first) == [
+        f"{spelling} _inv_1 = scale",
+        "acc *= _inv_1",
+    ]
+    post = cast(llir.Assign, first[3])
+    assert cast(llir.VarInit, first[1]).var == _var("_inv_1", scalar_type)
+    assert post.value == _var("_inv_1", scalar_type)
+    # The reference is copied as the producer wrote it; only the factor is typed.
+    assert post.var == _var("acc")
+    assert _snapshot(second) == _snapshot(first)
+
+
+def test_sibling_blocks_each_take_the_scalar_type_of_their_own_declaration() -> None:
+    first = _loop(
+        [
+            _zeroed("_accum", llir.DataType.FLOAT32),
+            _untyped_accumulation("_accum", loop_variable="k"),
+        ],
+        loop_variable="first_row",
+    )
+    second = _loop(
+        [
+            _zeroed("_accum", llir.DataType.FLOAT64),
+            _untyped_accumulation("_accum", loop_variable="m"),
+        ],
+        loop_variable="second_row",
+    )
+
+    output = _hoist([first, second])
+
+    assert _compatibility_codes(cast(llir.ForLoop, output[0]).body) == [
+        "float _inv_1 = scale",
+        "_accum *= _inv_1",
+    ]
+    assert _compatibility_codes(cast(llir.ForLoop, output[1]).body) == [
+        "double _inv_1 = scale",
+        "_accum *= _inv_1",
+    ]
+
+
+def test_declaration_in_the_loop_own_sequence_decides_and_an_outer_one_does_not() -> (
+    None
+):
+    row_loop = _loop(
+        [
+            _zeroed("acc", llir.DataType.FLOAT64),
+            _untyped_accumulation(loop_variable="k"),
+        ],
+        loop_variable="row",
+    )
+    after_the_row_loop = _untyped_accumulation(loop_variable="m")
+    source = [_zeroed("acc", llir.DataType.FLOAT32), row_loop, after_the_row_loop]
+
+    output = _hoist(source)
+
+    # Inside the row loop the float64 declaration is the one the loop follows.
+    assert _compatibility_codes(cast(llir.ForLoop, output[1]).body) == [
+        "double _inv_1 = scale",
+        "acc *= _inv_1",
+    ]
+    # The outer float32 declaration is followed by the row loop, which names
+    # the accumulator, so the loop after it is not shown to start from zero.
+    assert _compatibility_codes(output) == []
+    assert len(output) == len(source)
+    assert _snapshot(output[2]) == _snapshot(after_the_row_loop)
+
+
+def _zero_declared(data_type: llir.DataType, name: str = "acc") -> llir.VarInit:
+    """``<type> <name> = 0;`` for any declared type, an integer or none included."""
+
+    return llir.VarInit(_var(name, data_type), llir.Literal(0))
+
+
+@pytest.mark.parametrize(
+    ("referenced_type", "declared_type"),
+    (
+        (llir.DataType.FLOAT32, llir.DataType.FLOAT64),
+        (llir.DataType.FLOAT64, llir.DataType.FLOAT32),
+        # One side is a type no factor is declared in.  The two still
+        # contradict each other, which is malformed IR before it is a miss.
+        (llir.DataType.INT64, llir.DataType.FLOAT32),
+        (llir.DataType.FLOAT32, llir.DataType.INT64),
+        (llir.DataType.PTR_FLOAT64, llir.DataType.FLOAT64),
+        (llir.DataType.INT32, llir.DataType.INT64),
+    ),
+)
+def test_typed_reference_that_contradicts_its_declaration_fails_closed(
+    referenced_type: llir.DataType,
+    declared_type: llir.DataType,
+) -> None:
+    diagnostic = _hoist_diagnostic(
+        [_zero_declared(declared_type), _typed_accumulation(referenced_type)]
+    )
+
+    assert diagnostic.code == "inconsistent_loop_invariant_factor_accumulator_type"
+    assert diagnostic.path == ("root", "[1]", "body", "[0]", "var")
+    assert diagnostic.node_type == "Var"
+
+
+def _accumulators_no_factor_is_declared_for() -> (
+    Tuple[Tuple[str, List[llir.Stmt]], ...]
+):
+    # int16_t and bool are C++ scalar types, but no kernel's result values
+    # have either, so neither is a type the pass declares a factor with.
+    return (
+        (
+            "int16_t declaration",
+            [_zero_declared(llir.DataType.INT16), _untyped_accumulation()],
+        ),
+        (
+            "int16_t declaration and int16_t reference",
+            [
+                _zero_declared(llir.DataType.INT16),
+                _typed_accumulation(llir.DataType.INT16),
+            ],
+        ),
+        (
+            "bool declaration",
+            [_zero_declared(llir.DataType.BOOL), _untyped_accumulation()],
+        ),
+        (
+            "declaration that carries no type",
+            [_zero_declared(llir.DataType.NO_TYPE), _untyped_accumulation()],
+        ),
+        (
+            "typed reference, declaration that carries no type",
+            [
+                _zero_declared(llir.DataType.NO_TYPE),
+                _typed_accumulation(llir.DataType.FLOAT64),
+            ],
+        ),
+    )
+
+
+@pytest.mark.parametrize(
+    "source",
+    [source for _, source in _accumulators_no_factor_is_declared_for()],
+    ids=[label for label, _ in _accumulators_no_factor_is_declared_for()],
+)
+def test_accumulator_declared_with_no_result_element_type_is_emitted_unchanged(
+    source: List[llir.Stmt],
+) -> None:
+    # Zero on entry and used nowhere else, so only the type stands in the way.
+    # Unchanged is always correct; an error here would turn a program that
+    # compiles into one that does not.
+    _assert_emitted_unchanged(source)
+
+
+_INTEGER_ELEMENT_TYPES = (
+    (llir.DataType.INT64, "int64_t"),
+    (llir.DataType.INT32, "int32_t"),
+    (llir.DataType.INT8, "int8_t"),
+    (llir.DataType.UINT8, "uint8_t"),
+)
+
+
+@pytest.mark.parametrize(
+    ("scalar_type", "spelling"),
+    _INTEGER_ELEMENT_TYPES,
+    ids=[spelling for _, spelling in _INTEGER_ELEMENT_TYPES],
+)
+def test_zero_initialized_integer_accumulator_hoists_a_factor_of_its_type(
+    scalar_type: llir.DataType, spelling: str
+) -> None:
+    # ``int64_t n = 0;`` directly before ``n += stride * _values_ptr[k]``.
+    # Integer addition and multiplication are associative and distributive,
+    # so the rewrite computes the same value, and the factor is declared with
+    # the accumulator's integer type, never as a float.
+    source = [
+        _zero_declared(scalar_type, "n"),
+        _untyped_accumulation("n", invariant="stride"),
+    ]
+
+    output = _hoist(source)
+
+    assert _compatibility_codes(output) == [
+        f"{spelling} _inv_1 = stride",
+        "n *= _inv_1",
+    ]
+    assert cast(llir.VarInit, output[1]).var == _var("_inv_1", scalar_type)
+    assert cast(llir.Assign, output[3]).value == _var("_inv_1", scalar_type)
+
+
+@pytest.mark.parametrize("declared", (True, False), ids=("declared", "undeclared"))
+def test_accumulation_without_a_hoistable_factor_needs_no_scalar_type(
+    declared: bool,
+) -> None:
+    # No factor is hoisted, so nothing is declared and no type is looked up:
+    # an integer accumulator, or an undeclared one, stays a legal miss.
+    loop = _loop(
+        [
+            _assignment(
+                [_var("_left_ptr[k]"), _var("_right_ptr[k]")],
+                target=_var("count"),
+            )
+        ]
+    )
+    source: List[llir.Stmt] = [loop]
+    if declared:
+        source.insert(
+            0,
+            llir.VarInit(_var("count", llir.DataType.INT64), llir.Literal(0)),
+        )
+
+    _assert_emitted_unchanged(source)
+
+
+# -- the generated pair is checked against the same conditions -----------------
+
+
+def _well_formed_pair(index: int) -> Tuple[llir.VarInit, llir.Assign]:
+    return (
+        llir.VarInit(
+            _var(f"_inv_{index}", llir.DataType.FLOAT32),
+            _var("scale", llir.DataType.FLOAT32),
+        ),
+        llir.Assign(
+            _var("acc"),
+            _var(f"_inv_{index}", llir.DataType.FLOAT32),
+            llir.AssignOp.MUL_ASSIGN,
+        ),
+    )
+
+
+def _hoist_regardless(
+    loop: llir.ForLoop,
+    sequence_index: int,
+    context: LoopInvariantFactorHoistContext,
+    path: Tuple[str, ...],
+    preceding: object,
+) -> Tuple[llir.VarInit, llir.Assign, int, llir.Expr]:
+    """A producer that returns a well-formed pair for every loop it is given."""
+
+    del loop, context, path, preceding
+    declaration, post = _well_formed_pair(sequence_index)
+    return declaration, post, 0, declaration.value
+
+
+def _sources_no_hoist_is_valid_for() -> Tuple[Tuple[str, List[llir.Stmt]], ...]:
+    read_elsewhere = _untyped_accumulation()
+    read_elsewhere.body.append(llir.VarInit(_var("copy"), _var("acc")))
+    return (
+        (
+            "accumulator not zero-initialized",
+            [llir.BlankLine(), _untyped_accumulation()],
+        ),
+        ("accumulator read elsewhere in the loop", [_zeroed("acc"), read_elsewhere]),
+    )
+
+
+@pytest.mark.parametrize(
+    "source",
+    [source for _, source in _sources_no_hoist_is_valid_for()],
+    ids=[label for label, _ in _sources_no_hoist_is_valid_for()],
+)
+def test_generated_pair_for_a_loop_that_must_not_be_hoisted_fails_at_validation(
+    monkeypatch: pytest.MonkeyPatch,
+    source: List[llir.Stmt],
+) -> None:
+    # The pair is well formed; what is wrong is that it was produced at all.
+    # Validation derives the two conditions again from the loop and the
+    # statements before it, and does not take the producer's word for them.
+    monkeypatch.setattr(factor_pass_module, "_try_hoist_from_loop", _hoist_regardless)
+
+    diagnostic = _hoist_diagnostic(source)
+
+    assert diagnostic.code == "invalid_loop_invariant_factor_materialization_source"
+    assert diagnostic.path == ("root", "[1]", "source_body[0]", "var")
+    assert diagnostic.node_type == "Var"
+
+
+def test_generated_pair_for_a_zero_initialized_accumulator_passes_validation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # The control for the test above: the same stub, a source the hoist is
+    # valid for, and the pair is accepted.
+    monkeypatch.setattr(factor_pass_module, "_try_hoist_from_loop", _hoist_regardless)
+
+    output = _hoist([_zeroed("acc"), _untyped_accumulation()])
+
+    assert _compatibility_codes(output) == [
+        "float _inv_1 = scale",
+        "acc *= _inv_1",
+    ]
+
+
+def _sources_no_factor_type_exists_for() -> (
+    Tuple[Tuple[str, List[llir.Stmt], str, str], ...]
+):
+    unsupported = "unsupported_loop_invariant_factor_accumulator_type"
+    inconsistent = "inconsistent_loop_invariant_factor_accumulator_type"
+    return (
+        (
+            "int16_t declaration",
+            [_zero_declared(llir.DataType.INT16), _untyped_accumulation()],
+            unsupported,
+            "VarInit",
+        ),
+        (
+            "declaration that carries no type",
+            [_zero_declared(llir.DataType.NO_TYPE), _untyped_accumulation()],
+            unsupported,
+            "VarInit",
+        ),
+        (
+            "typed reference that contradicts its declaration",
+            [
+                _zero_declared(llir.DataType.FLOAT32),
+                _typed_accumulation(llir.DataType.FLOAT64),
+            ],
+            inconsistent,
+            "Var",
+        ),
+    )
+
+
+@pytest.mark.parametrize(
+    ("source", "code", "node_type"),
+    [
+        (source, code, node_type)
+        for _, source, code, node_type in _sources_no_factor_type_exists_for()
+    ],
+    ids=[label for label, _, _, _ in _sources_no_factor_type_exists_for()],
+)
+def test_generated_pair_for_an_accumulator_without_a_factor_type_fails_at_validation(
+    monkeypatch: pytest.MonkeyPatch,
+    source: List[llir.Stmt],
+    code: str,
+    node_type: str,
+) -> None:
+    # The pass itself leaves the first two loops unchanged.  A pair that
+    # exists for one of them anyway did not come from that rule, and the
+    # boundary that judges an existing pair raises.
+    monkeypatch.setattr(factor_pass_module, "_try_hoist_from_loop", _hoist_regardless)
+
+    diagnostic = _hoist_diagnostic(source)
+
+    assert diagnostic.code == code
+    assert diagnostic.path == ("root", "[1]", "source_body[0]", "var")
+    assert diagnostic.node_type == node_type
+
+
+@pytest.mark.parametrize(
+    ("declared_type", "multiplied_type", "recognized"),
+    (
+        (llir.DataType.FLOAT32, llir.DataType.FLOAT32, True),
+        (llir.DataType.FLOAT64, llir.DataType.FLOAT64, True),
+        (llir.DataType.FLOAT64, llir.DataType.FLOAT32, False),
+        (llir.DataType.FLOAT32, llir.DataType.FLOAT64, False),
+        (llir.DataType.INT64, llir.DataType.INT64, True),
+        (llir.DataType.INT64, llir.DataType.INT32, False),
+        (llir.DataType.INT16, llir.DataType.INT16, False),
+    ),
+)
+def test_generated_pair_is_recognized_only_when_it_carries_one_factor_scalar_type(
+    declared_type: llir.DataType,
+    multiplied_type: llir.DataType,
+    recognized: bool,
+) -> None:
+    # An exact generated declaration/loop/post block is invisible to the
+    # definition-name scan.  ``_inv_0_scale`` contains the substring ``_inv_0``,
+    # so it is an invariant factor of the outer loop exactly when the block
+    # inside that loop is recognized as generated.
+    inner = _loop(
+        [
+            llir.Assign(
+                _var("inner_accum", llir.DataType.FLOAT64),
+                _var("inner_value[inner]"),
+                llir.AssignOp.ADD_ASSIGN,
+            )
+        ],
+        loop_variable="inner",
+    )
+    outer = _loop(
+        [
+            llir.VarInit(_var("_inv_0", declared_type), _var("scale")),
+            inner,
+            llir.Assign(
+                _var("inner_accum", llir.DataType.FLOAT64),
+                _var("_inv_0", multiplied_type),
+                llir.AssignOp.MUL_ASSIGN,
+            ),
+            _assignment(
+                [_var("_inv_0_scale"), _var("outer_value[outer]")],
+                target=_var("outer_accum", llir.DataType.FLOAT64),
+            ),
+        ],
+        loop_variable="outer",
+    )
+    source = [_zeroed("outer_accum", llir.DataType.FLOAT64), outer]
+
+    output = _hoist(source)
+
+    if recognized:
+        assert _compatibility_codes(output) == [
+            "double _inv_1 = _inv_0_scale",
+            "outer_accum *= _inv_1",
+        ]
+    else:
+        assert _compatibility_codes(output) == []
+        assert _snapshot(output) == _snapshot(source)

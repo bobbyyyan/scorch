@@ -955,14 +955,24 @@ def apply_stack_tile(program: LoopProgram, tile: LoopTile) -> LoopProgram:
                 node.coord_index,
                 builder.block((producer_stmt,)),
             )
+        elif type(node) is MergedSparseFor:
+            # A merged reduction loop (an intersection of the operands that
+            # store the summed coordinate) accumulates into the workspace
+            # exactly like a single-cursor one; the merge is kept as it is.
+            producer_stmt = builder.merged_sparse_for(
+                node.mode,
+                node.cursors,
+                node.coord_index,
+                builder.block((producer_stmt,)),
+                node.positions,
+            )
         else:
-            # Merged reductions are analysis-rejected upstream, and a split
-            # loop between the last reduction and the target is impossible
-            # (the target immediately follows the last reduction).
+            # A split loop between the last reduction and the target is
+            # impossible (the target immediately follows the last reduction).
             _fail(
                 "stack_tile_target_invalid",
-                "stack accumulation supports dense and single-cursor sparse "
-                "reduction loops only",
+                "stack accumulation supports dense, single-cursor sparse and "
+                "merged reduction loops only",
             )
 
     copy_out = builder.store_reduce(
@@ -1043,10 +1053,11 @@ def apply_sparse_workspace(
 ) -> LoopProgram:
     """Materialize the automatic serial sparse workspace as a typed region.
 
-    Consumes one ``WorkspaceInsertion`` fact with ``dense=False`` on a
-    semantic sparse ADD-reduction chain and materializes the ordered-key
-    region the fact describes.  Placement is derived from two identities and
-    nothing else:
+    Consumes one ``WorkspaceInsertion`` fact on a semantic sparse
+    ADD-reduction chain and materializes the ordered-key region the fact
+    describes.  A ``dense=True`` fact (one dense drained level) builds the
+    same region: the container is a target decision made from the drained
+    levels.  Placement is derived from two identities and nothing else:
 
     - the **key** is exactly the recorded ``axis_loops``, which the automatic
       origin defines as every free variable inside the region, and which must
@@ -1079,7 +1090,7 @@ def apply_sparse_workspace(
         _validate_loop_plan_structure(LoopPlan(loop_order=(), workspace=workspace))
     except (VerificationError, AttributeError, TypeError, ValueError) as error:
         _fail("invalid_schedule_plan", str(error))
-    if workspace.dense or not workspace.axis_loops:
+    if not workspace.axis_loops:
         _fail(
             "sparse_workspace_target_invalid",
             "the serial sparse workspace consumes exactly one sparse "
@@ -1114,11 +1125,23 @@ def apply_sparse_workspace(
             "sparse_workspace_target_invalid",
             "the sparse workspace requires an identity-ordered result",
         )
-    if not any(level.kind is LevelKind.COMPRESSED for level in result_decl.levels):
+    if not any(
+        level.kind in (LevelKind.COMPRESSED, LevelKind.COORDINATE)
+        for level in result_decl.levels
+    ):
+        if workspace.dense:
+            # A dense result's dense workspace without tiles: the reduce-out
+            # and stack families own dense results, both with tiles.
+            _fail(
+                "unsupported_schedule_auto_family",
+                "automatic plans are migrated for the tile-free, serial sparse "
+                "workspace, stack, row-tiled stack and dense reduce-out replay "
+                "contracts only",
+            )
         _fail(
             "sparse_workspace_target_invalid",
             "the sparse workspace assembles a result with at least one "
-            "compressed level",
+            "compressed or coordinate level",
         )
     reduction_index = workspace.reduction_loop.index_id
     if type(leaf.indices) is not tuple or not leaf.indices:
@@ -2764,8 +2787,8 @@ def _check_auto_plan_family(plan: LoopPlan) -> None:
     ):
         _fail(
             "unsupported_schedule_auto_family",
-            "automatic plans are migrated for the tile-free and "
-            "regblock stack-form replay contracts only",
+            "automatic plans record no panel, relayout, result tile or "
+            "explicit parallel loop",
         )
     if not plan.tiles and plan.workspace is None:
         return
@@ -2794,7 +2817,9 @@ def _check_auto_plan_family(plan: LoopPlan) -> None:
         plan.auto_policy is not None
         and not plan.tiles
         and plan.workspace is not None
-        and not plan.workspace.dense
+        # A dense fact without tiles is the same contract for a result with a
+        # compressed level: ``apply_sparse_workspace`` builds the same region,
+        # and the target chooses the container from the drained levels.
         # An ordered key domain of any rank is the same replay contract: the
         # automatic origin records every free variable below the innermost
         # reduction, and ``apply_sparse_workspace`` derives the region's
@@ -2806,7 +2831,6 @@ def _check_auto_plan_family(plan: LoopPlan) -> None:
         return
     stack_form = (
         plan.auto_policy is not None
-        and plan.auto_policy.regblock_enabled
         and len(plan.tiles) == 1
         and plan.workspace is not None
         and plan.workspace.dense
@@ -2824,12 +2848,61 @@ def _check_auto_plan_family(plan: LoopPlan) -> None:
         and sum(tile.loop == plan.workspace.axis_loops[0] for tile in plan.tiles) == 1
         and sum(tile.loop == plan.workspace.reduction_loop for tile in plan.tiles) == 1
     )
-    if not stack_form and not reduce_out_form:
+    # The row-tiled stack form: the stack form's workspace and axis tile (or
+    # no axis tile), plus arm-uniform tiles that strip-mine distinct loops
+    # above the reduction -- the shipped compiler's row tiles.  Each row tile
+    # is a plain affine split; only the axis tile carries the workspace.
+    row_tiled_form = (
+        plan.auto_policy is not None
+        and plan.workspace is not None
+        and plan.workspace.dense
+        and len(plan.workspace.axis_loops) == 1
+        and len(plan.tiles) >= 1
+        and all(_auto_tile_shape(tile) for tile in plan.tiles)
+        and len({tile.loop for tile in plan.tiles}) == len(plan.tiles)
+        and not any(tile.loop == plan.workspace.reduction_loop for tile in plan.tiles)
+        and all(
+            plan.loop_order.index(tile.loop.index_id)
+            < plan.loop_order.index(plan.workspace.reduction_loop.index_id)
+            for tile in plan.tiles
+            if tile.loop != plan.workspace.axis_loops[0]
+        )
+    )
+    # The reduction-tiled form: the row-tiled form with no axis tile, whose
+    # tiles also strip-mine the reduction loop itself.  The automatic origin
+    # records it when the workspace axis is a sparse loop, which no affine
+    # tile can split (``ij,ik,jk->k`` over ``dd,dd,ds``: the tile is on ``j``
+    # and the key ``k`` walks the compressed level).  Every tile is a plain
+    # affine split, and as in the row-tiled form with no axis tile no
+    # workspace is materialized: the producer accumulates into the dense
+    # result directly.
+    reduction_tiled_form = (
+        plan.auto_policy is not None
+        and plan.workspace is not None
+        and plan.workspace.dense
+        and len(plan.workspace.axis_loops) == 1
+        and len(plan.tiles) >= 1
+        and all(_auto_tile_shape(tile) for tile in plan.tiles)
+        and len({tile.loop for tile in plan.tiles}) == len(plan.tiles)
+        and not any(tile.loop == plan.workspace.axis_loops[0] for tile in plan.tiles)
+        and sum(tile.loop == plan.workspace.reduction_loop for tile in plan.tiles) == 1
+        and all(
+            plan.loop_order.index(tile.loop.index_id)
+            <= plan.loop_order.index(plan.workspace.reduction_loop.index_id)
+            for tile in plan.tiles
+        )
+    )
+    if (
+        not stack_form
+        and not reduce_out_form
+        and not row_tiled_form
+        and not reduction_tiled_form
+    ):
         _fail(
             "unsupported_schedule_auto_family",
             "automatic plans are migrated for the tile-free, serial sparse "
-            "workspace, regblock stack-form, and dense reduce-out replay "
-            "contracts only",
+            "workspace, stack, row-tiled stack, reduction-tiled and dense "
+            "reduce-out replay contracts only",
         )
     return
 
@@ -2845,13 +2918,18 @@ def _check_plan_families(plan: LoopPlan) -> None:
     can prove a supported dense logical or affine-origin anchor and its race
     and work contracts.
 
-    Automatic plans are admitted for three measured auto-replay contracts:
-    the tile-free family (one already verified logical order and no other
-    decision), the regblock-arm stack form (one dense workspace over a
-    single trailing free axis plus exactly one direct serial ``CHILD_OF``
-    tile of that axis under the row loop), and the dense reduce-out form
-    (the same dense workspace plus arm-uniform candidate tiles that split
-    the last reduction loop and the workspace axis exactly once each).
+    Automatic plans are admitted for five auto-replay contracts: the
+    tile-free family (one already verified logical order and no other
+    decision); the serial workspace family (one workspace fact and no
+    tiles, materialized as a producer/consumer region); the stack form (one
+    dense workspace over a single trailing free axis plus exactly one direct
+    serial tile of that axis, placed as the arm places it: ``CHILD_OF`` the
+    row loop on the regblock arm, ``OUTERMOST`` on the other); the row-tiled
+    stack form (the same workspace, with or without the axis tile, plus
+    arm-placed tiles that strip-mine distinct loops above the reduction);
+    and the dense reduce-out form (the same dense workspace plus arm-uniform
+    candidate tiles that split the last reduction loop and the workspace
+    axis exactly once each).
     ``provenance="auto"`` identifies those replay contracts; the verified
     ``auto_policy`` origin fact ties every recorded tile and workspace
     decision to its re-derivation, but the cost-model order itself remains
@@ -3351,7 +3429,6 @@ def _apply_schedule_decisions(program: LoopProgram, plan: LoopPlan) -> LoopProgr
     if (
         checked.provenance == "auto"
         and checked.workspace is not None
-        and not checked.workspace.dense
         and not checked.tiles
     ):
         # The serial sparse-workspace automatic family: one workspace fact,
@@ -3364,6 +3441,9 @@ def _apply_schedule_decisions(program: LoopProgram, plan: LoopPlan) -> LoopProgr
         checked.provenance == "auto"
         and checked.workspace is not None
         and any(tile.loop == checked.workspace.reduction_loop for tile in checked.tiles)
+        # Without a tile of the workspace axis the plan is the reduction-tiled
+        # form: plain affine splits below, and no workspace.
+        and any(tile.loop in checked.workspace.axis_loops for tile in checked.tiles)
     ):
         # The reduce-out automatic family strip-mines the last reduction
         # loop as well as the workspace axis (plus any recorded prefix
@@ -3379,10 +3459,21 @@ def _apply_schedule_decisions(program: LoopProgram, plan: LoopPlan) -> LoopProgr
         # serial tile of the workspace axis.  That composition is measured
         # byte-identical to the explicit stack tile, so it lowers through
         # the same verified pass; the plan facts themselves stay untouched.
+        #
+        # Only the axis tile carries the workspace.  A row tile (a tile of a
+        # loop above the reduction) is a plain affine split, and a row-tiled
+        # plan with no axis tile materializes no workspace at all: the
+        # producer accumulates directly into the dense result.  The shipped
+        # compiler keeps a full-row workspace there (zeroed per row, copied
+        # out after the reduction), so on those plans the two kernels differ
+        # (``ijkl->jl`` over ``ddds``; the batched product on the regblock
+        # arm).  Both are correct; which is faster is not yet measured, and
+        # emitting the shipped form as well is open work.
         stack_equivalent = (
             checked.provenance == "auto"
             and checked.workspace is not None
             and tile.kind == "affine"
+            and tile.loop in checked.workspace.axis_loops
         )
         if tile.kind == "panel":
             scheduled = apply_panel_tile(
@@ -3624,11 +3715,16 @@ def erase_schedule(program: LoopProgram) -> LoopProgram:
             type(node) in (TileOuterFor, TileInnerFor, *_PANEL_TYPES) for node in loops
         )
     ):
-        if program.parallel is None:
+        if (
+            program.parallel is None
+            and program.assembly is None
+            and program.accumulator is None
+        ):
             return program
-        # An abstract parallel selection is schedule state: erasing a
-        # program that carries only the selection still returns the
-        # unscheduled base.
+        # An abstract parallel selection is schedule state, and so are the
+        # recorded assembly strategy and accumulator structure: erasing a
+        # program that carries only selections still returns the unscheduled
+        # base.  (A program with splits loses them in the rebuild below.)
         stripped_builder = LoopIRBuilder.resuming(program)
         return _rebuild_program(
             program,

@@ -73,6 +73,9 @@ from scorch.compiler.loopir.verifier import verify_program
 from scorch.compiler.scheduler import Schedule
 from scorch.storage import TensorIndex
 from scorch.stensor import STensor
+from tests.test_scorch.loopir_executed_programs import (
+    assert_program_matches_pytorch,
+)
 
 _F32 = torch.float32
 
@@ -2009,46 +2012,84 @@ def test_canonical_dump_is_arm_stable():
     assert len(dumps) == 1
 
 
-# -- fail-closed neighbours (recorded seam occupants) ------------------------
+# -- neighbours (recorded seam occupants, past and present) -------------------
+
+
+# The permuted-result neighbours: (operand format, result format, operand
+# indices, result indices, shape) and the conversion the new compiler's plan
+# records for the operand (the mode order it is converted to, the layout it is
+# converted into).
+_PERMUTED_RESULT_NEIGHBOURS = [
+    (("ss", "ss", "ij", "ji", (4, 5)), ((1, 0), "ss")),
+    (("ds", "ds", "ij", "ji", (4, 5)), ((1, 0), "ds")),
+    (("sss", "sss", "ijk", "ikj", (3, 4, 5)), ((0, 2, 1), "sss")),
+    (("sss", "ds", "ijk", "ki", (3, 4, 5)), ((2, 1, 0), "sss")),
+]
+_PERMUTED_RESULT_NEIGHBOUR_IDS = ["ss->ji", "ds->ji", "sss->ikj", "sss->ki"]
 
 
 @pytest.mark.parametrize("arm", [False, True])
 @pytest.mark.parametrize(
-    ("operand_fmt", "result_fmt", "operand_indices", "result_indices", "shape"),
-    [
-        ("ss", "ss", "ij", "ji", (4, 5)),
-        ("ds", "ds", "ij", "ji", (4, 5)),
-        ("sss", "sss", "ijk", "ikj", (3, 4, 5)),
-        ("sss", "ds", "ijk", "ki", (3, 4, 5)),
-    ],
-    ids=["ss->ji", "ds->ji", "sss->ikj", "sss->ki"],
+    ("cell", "conversion"),
+    _PERMUTED_RESULT_NEIGHBOURS,
+    ids=_PERMUTED_RESULT_NEIGHBOUR_IDS,
 )
-def test_reorder_blocked_neighbours_carry_a_plan_diagnostic_not_a_defect_code(
-    operand_fmt, result_fmt, operand_indices, result_indices, shape, arm
+def test_permuted_result_neighbours_convert_the_operand(cell, conversion, arm):
+    """The successor to the reorder-blocked lock at this seam.
+
+    These four stopped inside loop-plan legality: the result is stored in an
+    order the operand is not stored in, so the pre-forced order was refused by
+    the result's own storage-order rule as well, and the automatic plan origin
+    had no legal order to fall back to.  The plan now converts the operand to
+    the result's order (``test_loopir_operand_conversions.py`` owns the
+    mechanism), and the four compile in both arms.  ``sss->ki`` reduces ``j``
+    between the result's two coordinates and drains this file's sorted
+    workspace region; the other three reduce nothing and need no workspace.
+
+    The cells the lock named before these -- ``ss->i``, ``ds->i``, ``sss->i``,
+    ``sss->j`` and ``sss->ij`` -- moved when the bound-prefix family landed;
+    ``test_loopir_bound_prefix_target`` owns all five.
+    """
+
+    operand_fmt, result_fmt, operand_indices, result_indices, shape = cell
+    result_shape = tuple(shape[operand_indices.index(c)] for c in result_indices)
+    kernel = compile_cin_via_loopir(
+        reduction_cin(operand_fmt, result_fmt, operand_indices, result_indices),
+        result_shape,
+        ((shape, _F32),),
+        compile_options=auto_options(arm),
+    )
+    assert [(c.mode_order, c.format) for c in kernel.conversions] == [conversion]
+    assert ("wksp.sort();" in kernel.cpp_source) == (result_indices == "ki")
+
+
+@pytest.mark.parametrize("arm", [False, True])
+@pytest.mark.parametrize(
+    ("cell", "conversion"),
+    _PERMUTED_RESULT_NEIGHBOURS,
+    ids=_PERMUTED_RESULT_NEIGHBOUR_IDS,
+)
+def test_the_shipped_plan_refusal_is_a_plan_diagnostic_not_a_defect_code(
+    cell, conversion, arm
 ):
-    """These routes are stable, but not through the defect-code channel.
+    """The shipped compiler still refuses the four, through a plan diagnostic.
 
-    The reorder-blocked cells stop inside loop-plan legality, which raises
-    ``InvalidSchedule``.  That exception carries no ``defect``: its stable
-    identifier is a structured ``LoopPlanDiagnostic`` in ``diagnostics``.
-    Recording that distinction matters because the retained frontier receipt
-    derived the same string by matching the *message text*, which is a
-    classification of a diagnostic rather than a read of one.
-
-    The occupants are now the PERMUTED-result cells, whose pre-forced order is
-    refused by the result's own storage-order rule as well, so the automatic
-    plan origin has no legal order to fall back to.  The cells this test used
-    to name -- ``ss->i``, ``ds->i``, ``sss->i``, ``sss->j`` and ``sss->ij`` --
-    moved when the bound-prefix family landed: three are admitted and the rest
-    reach their own shape-specific codes.  ``test_loopir_bound_prefix_target``
-    owns all five, and the two-way gating that separates them.
+    Its plan origin has no conversion, so the four still stop inside loop-plan
+    legality, which raises ``InvalidSchedule``.  That route is stable, but not
+    through the defect-code channel.  The exception carries no ``defect``: its
+    stable identifier is a structured ``LoopPlanDiagnostic`` in
+    ``diagnostics``.  Recording that distinction matters because the retained
+    frontier receipt derived the same string by matching the *message text*,
+    which is a classification of a diagnostic rather than a read of one.  It
+    also means there is no shipped text to compare the new compiler's with.
     """
 
     from scorch.compiler.diagnostics import InvalidSchedule
 
+    operand_fmt, result_fmt, operand_indices, result_indices, shape = cell
     result_shape = tuple(shape[operand_indices.index(c)] for c in result_indices)
     with pytest.raises(InvalidSchedule) as error:
-        compile_cin_via_loopir(
+        legacy_generated_cpp(
             reduction_cin(operand_fmt, result_fmt, operand_indices, result_indices),
             result_shape,
             ((shape, _F32),),
@@ -2062,69 +2103,52 @@ def test_reorder_blocked_neighbours_carry_a_plan_diagnostic_not_a_defect_code(
     assert diagnostics[0].stage == "loop_plan"
 
 
-@pytest.mark.parametrize("arm", [False, True])
+@pytest.mark.parametrize("arm", [0, 1])
 @pytest.mark.parametrize(
-    ("operand_fmt", "result_fmt", "operand_indices", "result_indices", "code"),
-    [
-        # A compressed result prefix level driven by a DENSE domain used to sit
-        # here (``dds ijk->ik [ss]``).  It is admitted since 2026-10-11: the
-        # level appends under its drained child's position counter, and
-        # ``test_loopir_dense_domain_sparse_result.py`` proves its storage
-        # against the operand's own structure.
-        #
-        # A compressed-parent/dense-leaf result keeps its own reduction seam.
-        ("sss", "sd", "ijk", "ik", "unsupported_sparse_output_reduction"),
-    ],
-    ids=["dense-leaf"],
+    ("cell", "conversion"),
+    _PERMUTED_RESULT_NEIGHBOURS,
+    ids=_PERMUTED_RESULT_NEIGHBOUR_IDS,
 )
-def test_unmigrated_neighbours_keep_precise_domain_codes(
-    operand_fmt, result_fmt, operand_indices, result_indices, code, arm
-):
-    shape = (3, 4, 5)
-    result_shape = tuple(shape[operand_indices.index(c)] for c in result_indices)
-    with pytest.raises(LoopIRLoweringError) as error:
-        compile_cin_via_loopir(
-            reduction_cin(operand_fmt, result_fmt, operand_indices, result_indices),
-            result_shape,
-            ((shape, _F32),),
-            compile_options=auto_options(arm),
-        )
-    assert error.value.defect.code == code
+def test_permuted_result_neighbours_match_pytorch(cell, conversion, arm):
+    """Executed: float64 values to 1e-12 and exactly the implied stored coordinates."""
+
+    operand_fmt, result_fmt, operand_indices, result_indices, _ = cell
+    kernel, _ = assert_program_matches_pytorch(
+        (("A", operand_fmt, operand_indices, None),),
+        (result_indices, result_fmt, None),
+        arm,
+    )
+    assert [(c.mode_order, c.format) for c in kernel.conversions] == [conversion]
 
 
 @pytest.mark.parametrize("arm", [False, True])
 @pytest.mark.parametrize(
-    ("result_indices", "message"),
-    [
-        ("jk", "every drained result level to be compressed"),
-    ],
-    ids=["dense-row-drained"],
+    ("result_fmt", "result_indices"),
+    [("sd", "ik"), ("ds", "jk")],
+    ids=["dense-leaf", "dense-row-drained"],
 )
-def test_dense_result_level_under_a_stored_loop_stops_at_the_target(
-    result_indices, message, arm
-):
-    """A DRAINED dense result level is still a target boundary.
+def test_dense_levels_a_workspace_drains_into(result_fmt, result_indices, arm):
+    """Two recorded seams that moved on 2026-10-12.
 
-    Recorded seam move.  This test carried two cells, differing in which half
-    of the split the dense level lands in.  The PREFIX half (``ik``) is blocker
-    3 and is migrated -- see ``test_loopir_row_scope_prefix_target.py``, and
-    ``test_the_migrated_row_scope_prefix_no_longer_stops_here`` below, which
-    states the migration where the lock used to be.  The DRAINED half survives:
-    a workspace key level owns its own ordering and appends one coordinate per
-    drained entry, so a dense level cannot be one, and no catch-up applies.
+    ``sss ijk->ik [sd]`` (a compressed-parent/dense-leaf result) exited with
+    ``unsupported_sparse_output_reduction``, and ``sss ijk->jk [ds]`` (a
+    DRAINED dense row level) stopped at this target with
+    ``unsupported_program_shape``.  Both drain the sorted workspace into a
+    dense level now: a drained dense level is addressed by the drained
+    coordinate, and a compressed level above it is committed only when its
+    dense block holds an entry.  Both are judged here on the
+    dense-below-compressed table's inputs; ``ijk->ik as sd`` is also a cell of
+    ``test_loopir_dense_below_compressed_target.py`` and ``ijk->jk as ds`` of
+    ``test_sparse_output_reduction_sweep.py``.
     """
 
-    shape = (3, 4, 5)
-    result_shape = tuple(shape["ijk".index(c)] for c in result_indices)
-    with pytest.raises(LoopIRTargetError) as error:
-        compile_cin_via_loopir(
-            reduction_cin("sss", "ds", "ijk", result_indices),
-            result_shape,
-            ((shape, _F32),),
-            compile_options=auto_options(arm),
-        )
-    assert error.value.defect.code == "unsupported_program_shape"
-    assert message in str(error.value)
+    from tests.test_scorch.test_loopir_dense_below_compressed_target import (
+        assert_statement_matches_pytorch,
+    )
+
+    assert_statement_matches_pytorch(
+        reduction_cin("sss", result_fmt, "ijk", result_indices), arm
+    )
 
 
 @pytest.mark.parametrize("arm", [False, True])

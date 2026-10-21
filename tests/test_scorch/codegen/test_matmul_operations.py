@@ -3,6 +3,8 @@ Tests for matrix multiplication operations in the CIN compiler.
 Includes different formats and algorithms for SpMV and SpMM operations.
 """
 
+import pytest
+
 from scorch.compiler.cin import (
     IndexVar,
     TensorVar,
@@ -13,6 +15,7 @@ from scorch.compiler.cin import (
     Operation,
     TileSizeVar,
 )
+from scorch.compiler.diagnostics import UnsupportedFeature
 from scorch.compiler.scheduler import Scheduler
 
 from tests.test_scorch.test_helpers import (
@@ -22,6 +25,14 @@ from tests.test_scorch.test_helpers import (
     create_matrix_multiplication,
     create_workspace_operation,
 )
+
+
+def _assert_unscheduled_sparse_result_reduction(cin_stmt):
+    with pytest.raises(UnsupportedFeature) as refusal:
+        lower_and_print(cin_stmt)
+    assert [diagnostic.code for diagnostic in refusal.value.diagnostics] == [
+        "unscheduled_sparse_result_reduction"
+    ]
 
 
 def test_spmv_codegen():
@@ -61,7 +72,7 @@ def test_spmv_wksp_codegen():
     })
 
     # Create a workspace
-    workspace = Workspace(name="wksp", dim=0)
+    workspace = Workspace(name="wksp", dim=0, dtype=tensors["y"].dtype)
 
     # Create the CIN statement for SpMV with workspace
     # For SpMV: y[i] = A[i,j] * x[j]
@@ -111,8 +122,11 @@ def test_spmm_codegen():
     # Create the CIN statement for sparse matrix multiplication
     cin_stmt = create_matrix_multiplication(tensors, (i, j, k), contract_idx_pos=2)
 
-    # Lower and print the generated code
-    lower_and_print(cin_stmt)
+    # The loops are i, k, j with no workspace: the kernel appended a coordinate of
+    # A for every (k, j) it met -- a column once per k that reaches it, unsorted --
+    # and added into A's values at a position its vector never grew to.  The
+    # unscheduled program is refused; ``scorch.matmul`` schedules a workspace.
+    _assert_unscheduled_sparse_result_reduction(cin_stmt)
 
 
 def test_sddmm_codegen():
@@ -136,7 +150,10 @@ def test_sddmm_codegen():
     print("\nCIN statement:")
     print(cin_stmt)
 
-    lower_and_print(cin_stmt)
+    # The reduced index k is the loop *around* A's compressed level j, so the
+    # kernel appended A's row once per k.  Refused as written (with j around k
+    # each stored cell is appended once, and that order lowers).
+    _assert_unscheduled_sparse_result_reduction(cin_stmt)
 
 
 def test_spmm_dd_dd_ds_ijk_gustavson():
@@ -189,6 +206,7 @@ def test_spmm_ds_ds_ds_kij_outer_workspace():
     workspace = Workspace(
         name="wksp",
         dim=2,
+        dtype=A.dtype,
     )
 
     cin_stmt = Where(
@@ -241,6 +259,7 @@ def test_spmm_ds_ds_ds_ikj_gustavson_workspace():
     workspace = Workspace(
         name="wksp",
         dim=1,
+        dtype=A.dtype,
     )
 
     cin_stmt = ForAll(
@@ -355,7 +374,7 @@ def test_spmm_dd_ds_dd_tiled():
     B = TensorVar("B", fmt="dd")
 
     # accum_c = TensorVar("accum_c", fmt="d")
-    accum_c = Workspace("accum_c", dim=1, dense=True)
+    accum_c = Workspace("accum_c", dim=1, dtype=C.dtype, dense=True)
 
     cin_stmt = ForAll(
         i,
@@ -405,6 +424,7 @@ def test_spmm_dd_oo_dd_ikj_gustavson_workspace():
     workspace = Workspace(
         name="wksp",
         dim=1,
+        dtype=A.dtype,
     )
 
     cin_stmt = ForAll(
@@ -509,7 +529,7 @@ def test_spmm_ikj_gustavson_workspace():
     })
 
     # Create a workspace
-    workspace = Workspace(name="wksp", dim=1)
+    workspace = Workspace(name="wksp", dim=1, dtype=tensors["A"].dtype)
 
     # Create the CIN statement for SpMM with Gustavson workspace pattern
     cin_stmt = create_workspace_operation(tensors, workspace, (i, j, k), operation_type="mul")

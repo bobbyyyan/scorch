@@ -46,12 +46,19 @@ Semantics (matching the node contracts exactly):
   its region, its pack origin, or the compact domain fails closed at
   runtime;
 - sparse iteration executes over the format-neutral level interface of
-  :mod:`~scorch.compiler.loopir.levels` (``segment`` / ``coordinate_at`` /
-  ``leaf_value``): all-dense inputs bind nested sequences, inputs with a
-  COMPRESSED level bind a :class:`LevelTensorStorage` (canonical CSR
-  declarations also accept the :class:`CsrMatrix` adapter), and canonical
-  CSR outputs are assembled through an order-checked append builder that
-  returns a :class:`CsrMatrix`;
+  :mod:`~scorch.compiler.loopir.levels` (``segment`` / ``next_position`` /
+  ``coordinate_at`` / ``leaf_value``): all-dense inputs bind nested
+  sequences, inputs with a COMPRESSED or COORDINATE level bind a
+  :class:`LevelTensorStorage` (canonical CSR declarations also accept the
+  :class:`CsrMatrix` adapter), and canonical CSR outputs are assembled
+  through an order-checked append builder that returns a :class:`CsrMatrix`;
+- a sparse cursor steps through its storage: on a COMPRESSED level it moves
+  one position, and on a COORDINATE level (COO) it moves past the run of
+  entries that repeat the current coordinate, so a loop body runs once per
+  stored coordinate of the segment and the bound position is the first
+  entry of that run — the parent position the next level's cursor needs;
+- integer programs (an int64/int32/int8/uint8 scalar type) fail closed
+  before any binding is read;
 - all arithmetic is Python-float arithmetic in program order; the oracle is
   a semantic reference, not a bit-accuracy model of any particular scalar
   width, so numeric comparisons against compiled kernels use tolerances
@@ -138,7 +145,7 @@ from .nodes import (
     WorkspaceReduce,
     WorkspaceRegion,
 )
-from .verifier import verify_program
+from .verifier import unordered_append_outputs, verify_program
 
 TensorValue = Any
 MAX_ORACLE_RANK = MAX_LEVEL_STORAGE_RANK
@@ -155,8 +162,9 @@ class LoopIROracleError(Exception):
 class _AbsentParentType:
     """Sentinel for a union cursor's position when it did not align.
 
-    A child stream chained from an absent parent iterates the empty
-    segment; every other position use of an absent parent fails closed.
+    A child stream chained from an absent parent, directly or through dense
+    levels, iterates the empty segment; every other position use of an
+    absent parent fails closed.
     """
 
     __slots__ = ()
@@ -501,9 +509,26 @@ class _Oracle:
             if level_kinds == (LevelKind.DENSE, LevelKind.COMPRESSED):
                 self.builders[symbol] = CsrOutputBuilder(decl.name, shape)
             elif any(kind is not LevelKind.DENSE for kind in level_kinds):
-                self.builders[symbol] = LevelOutputBuilder(
-                    decl.name, shape, level_kinds
-                )
+                if LevelKind.COORDINATE in level_kinds and tuple(
+                    level.mode for level in decl.levels
+                ) != tuple(range(len(level_kinds))):
+                    # The assembled container has no mode permutation, so a
+                    # COO output whose levels store permuted modes cannot be
+                    # represented; assembling it in logical mode order would
+                    # silently return a different layout.
+                    raise LoopIROracleError(
+                        f"output {decl.name} declares coordinate levels in a "
+                        "permuted mode order; ordered assembly builds level "
+                        "l from logical mode l only"
+                    )
+                try:
+                    self.builders[symbol] = LevelOutputBuilder(
+                        decl.name, shape, level_kinds
+                    )
+                except LevelStorageError as error:
+                    raise LoopIROracleError(
+                        f"output {decl.name} cannot be assembled: {error}"
+                    ) from error
             else:
                 self.values[symbol] = _zeros(shape) if shape else []
         self.indices: Dict[IndexId, int] = {}
@@ -512,6 +537,11 @@ class _Oracle:
         ] = {}
         self.draining_values: Dict[WorkspaceId, float] = {}
         self.sparse_reductions: Dict[SymbolId, Dict[Tuple[int, ...], float]] = {}
+        # A relabelled copy appends out of its result's storage order under a
+        # two-pass record (``verifier._check_append_order``): its entries are
+        # collected here and assembled in coordinate order at program exit.
+        self.unordered_outputs = unordered_append_outputs(program)
+        self.unordered_appends: Dict[SymbolId, Dict[Tuple[int, ...], float]] = {}
         # Union merges bind an absent-parent sentinel for unaligned
         # cursors; every consumer other than child-segment selection
         # fails closed on it through the exact-int position check.
@@ -564,7 +594,11 @@ class _Oracle:
         return cells, cell
 
     def _bind_sparse_input(self, decl: TensorDecl, bound: object) -> LevelTensorStorage:
-        """Snapshot one compressed-layout input behind the level interface."""
+        """Snapshot one input with a stored level behind the level interface.
+
+        Any declaration with a COMPRESSED or COORDINATE level binds here; the
+        bound storage must match the declared level kinds and modes exactly.
+        """
 
         if type(bound) is CsrMatrix:
             if not _is_canonical_csr(decl):
@@ -628,6 +662,12 @@ class _Oracle:
     def run(self) -> Dict[SymbolId, TensorValue]:
         self._exec_stmt(self.program.body)
         results: Dict[SymbolId, TensorValue] = {}
+        for symbol, appended in self.unordered_appends.items():
+            for coords in sorted(appended):
+                try:
+                    self.builders[symbol].append(coords, appended[coords])
+                except LevelStorageError as error:
+                    raise LoopIROracleError(str(error)) from error
         for symbol, entries in self.sparse_reductions.items():
             builder = self.builders[symbol]
             if getattr(builder, "entries", None) or getattr(builder, "rows", None):
@@ -711,6 +751,10 @@ class _Oracle:
                 )
             return self.draining_values[expr.workspace]
         if type(expr) is PositionLoad:
+            if expr.guard is not None and not self.cursors[expr.guard].aligned:
+                # The operand stores nothing at this one-sided coordinate.
+                assert expr.default is not None
+                return self._eval_value(expr.default)
             storage = self.storages.get(expr.tensor)
             if storage is None:
                 decl = self.decls[expr.tensor]
@@ -838,13 +882,17 @@ class _Oracle:
             raise LoopIROracleError(
                 f"cursor tensor {self.decls[decl.tensor].name} has no level storage"
             )
+        anchor = decl.parent
+        while type(anchor) is DensePosition:
+            anchor = anchor.parent
         if (
-            type(decl.parent) is PositionValue
-            and self.positions.get(decl.parent.position) is _ABSENT_PARENT
+            type(anchor) is PositionValue
+            and self.positions.get(anchor.position) is _ABSENT_PARENT
         ):
             # The parent union cursor did not align at the current merged
             # coordinate, so this operand contributes the empty child
-            # stream in this iteration.
+            # stream in this iteration: it stores no row of the dense levels
+            # in between either.
             return storage, 0, 0
         parent = self._eval_position(decl.parent)
         try:
@@ -855,6 +903,22 @@ class _Oracle:
                 f"{self.decls[decl.tensor].name}: {error}"
             ) from error
         return storage, start, end
+
+    def _advance(self, decl: SparseCursorDecl, state: _CursorState) -> None:
+        """Step one cursor to the next stored coordinate of its segment.
+
+        The storage owns the step: one position on a COMPRESSED level, the
+        rest of the run of equal coordinates on a COORDINATE level.
+        """
+
+        try:
+            state.position = state.storage.next_position(
+                state.level, state.position, state.end
+            )
+        except LevelStorageError as error:
+            raise LoopIROracleError(
+                f"cursor step failed on {self.decls[decl.tensor].name}: {error}"
+            ) from error
 
     def _exec_relayout_stage(self, stmt: RelayoutStage) -> None:
         decl = stmt.decl
@@ -1091,6 +1155,9 @@ class _Oracle:
                 state = _CursorState(storage, decl.level, start, end, aligned=False)
                 self.cursors[decl.cursor] = state
                 states.append(state)
+            if stmt.mode is MergeMode.DENSE_UNION:
+                self._exec_dense_union(stmt, states)
+                return
             while True:
                 if stmt.mode is MergeMode.UNION:
                     active = [state for state in states if not state.exhausted]
@@ -1121,8 +1188,9 @@ class _Oracle:
                             else:
                                 self.positions[bound] = _ABSENT_PARENT
                     self._exec_stmt(stmt.body)
-                for state in aligned:
-                    state.position += 1
+                for decl, state in zip(stmt.cursors, states):
+                    if state.aligned:
+                        self._advance(decl, state)
         finally:
             self.indices.pop(stmt.coord_index, None)
             for bound in stmt.positions:
@@ -1130,6 +1198,38 @@ class _Oracle:
                     self.positions.pop(bound, None)
             for decl in stmt.cursors:
                 self.cursors.pop(decl.cursor, None)
+
+    def _exec_dense_union(
+        self, stmt: MergedSparseFor, states: List["_CursorState"]
+    ) -> None:
+        """Every coordinate of the merged dimension, cursors followed in order.
+
+        The caller owns cursor and position cleanup.
+        """
+
+        first = stmt.cursors[0]
+        tensor = self.decls[first.tensor]
+        extent = self._dimension_extent(
+            tensor.dimensions[tensor.levels[first.level].mode]
+        )
+        for candidate in range(extent):
+            for state in states:
+                state.aligned = not state.exhausted and state.coordinate == candidate
+            self.indices[stmt.coord_index] = candidate
+            for cursor_position, bound in enumerate(stmt.positions):
+                if bound is not None:
+                    state = states[cursor_position]
+                    self.positions[bound] = (
+                        state.position if state.aligned else _ABSENT_PARENT
+                    )
+            self._exec_stmt(stmt.body)
+            for state in states:
+                if state.aligned:
+                    state.position += 1
+        if any(not state.exhausted for state in states):
+            raise LoopIROracleError(
+                "a DENSE_UNION cursor stores a coordinate outside its dimension"
+            )
 
     def _exec_stmt(self, stmt: Stmt) -> None:
         if type(stmt) is Block:
@@ -1227,7 +1327,7 @@ class _Oracle:
                         self.positions[stmt.position] = state.position
                         self.indices[stmt.coord_index] = coordinate
                         self._exec_stmt(stmt.body)
-                    state.position += 1
+                    self._advance(stmt.cursor, state)
             finally:
                 self.indices.pop(stmt.coord_index, None)
                 self.positions.pop(stmt.position, None)
@@ -1242,7 +1342,7 @@ class _Oracle:
                     self.positions[stmt.position] = state.position
                     self.indices[stmt.coord_index] = state.coordinate
                     self._exec_stmt(stmt.body)
-                    state.position += 1
+                    self._advance(stmt.cursor, state)
             finally:
                 self.indices.pop(stmt.coord_index, None)
                 self.positions.pop(stmt.position, None)
@@ -1260,6 +1360,15 @@ class _Oracle:
                     f"append target {self.decls[stmt.tensor].name} has no "
                     "assembly builder"
                 )
+            if stmt.tensor in self.unordered_outputs:
+                entries = self.unordered_appends.setdefault(stmt.tensor, {})
+                if coords_tuple in entries:
+                    raise LoopIROracleError(
+                        f"the relabelled copy into {self.decls[stmt.tensor].name} "
+                        f"appended coordinate {coords_tuple} twice"
+                    )
+                entries[coords_tuple] = value
+                return
             try:
                 builder.append(coords_tuple, value)
             except LevelStorageError as error:
@@ -1305,6 +1414,17 @@ def run_program(
     # all mapping code has run so no callback can leave untrusted program
     # state for the oracle to traverse.
     verify_program(program)
+    integer_types = sorted(
+        {decl.dtype.value for decl in program.tensors if not decl.dtype.is_floating}
+    )
+    if integer_types:
+        # The oracle's arithmetic is Python float arithmetic, which holds an
+        # integer exactly only below 2**53 and does not wrap at the declared
+        # width; an integer program is outside it rather than approximated.
+        raise LoopIROracleError(
+            f"the oracle evaluates float32/float64 programs only, not "
+            f"{', '.join(integer_types)}"
+        )
     decls = {decl.symbol.value: decl for decl in program.tensors}
     input_specs = {
         symbol.value: (

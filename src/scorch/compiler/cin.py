@@ -607,7 +607,11 @@ class TensorVar(IndexExpr):
         self._assignment = None
         self.shape = tuple(shape) if shape is not None else None
 
-        if fmt:
+        # ``None`` is the absent format.  An empty string or list is the format
+        # of a rank-0 tensor -- ``parse_format("")`` is ``TensorFormat('')`` --
+        # and testing truth here dropped it, leaving a scalar with no format and
+        # no mode order.
+        if fmt is not None:
             self._format = parse_format(fmt)
 
         self.dtype = dtype
@@ -694,18 +698,32 @@ class TensorVar(IndexExpr):
 
 
 class Workspace(TensorVar):
+    """A temporary tensor that a ``Where`` producer fills and its consumer reads.
+
+    ``dtype`` is required: it is the element type the workspace is emitted
+    with, and a default would silently narrow every workspace whose program
+    computes in another type. A consumer that assigns the workspace into a
+    tensor of a different type fails the structural CIN preflight with
+    ``workspace_type_mismatch``.
+    """
+
     dim: int
     workspace_accesses: List[WorkspaceAccess]
 
     def __init__(
         self,
         name: Optional[str] = None,
+        *,
         dim: int = 1,
-        dtype: torch.dtype = torch.float32,
+        dtype: torch.dtype,
         dense: bool = False,
         tile_size_var: Optional[TileSizeVar] = None,
         mode_order: Optional[List[int]] = None,
     ):
+        if type(dtype) is not torch.dtype:
+            raise TypeError(
+                f"Workspace dtype must be a torch.dtype, got {type(dtype).__name__}"
+            )
         # dim and dense must be set before super().__init__() because
         # TensorVar derives default mode_order from format, which for
         # Workspace depends on these attributes.
@@ -1036,6 +1054,58 @@ class BinaryOp(OpExpr):
     def accept(self, visitor: "CINVisitor") -> None:
         visitor.visit(self.left)
         visitor.visit(self.right)
+
+
+def coordinate_result_driver(
+    result_access: TensorAccess, rhs: IndexExpr
+) -> Optional[TensorAccess]:
+    """The input whose stored entries are the entries of an all-coordinate result.
+
+    A reduction into an all-coordinate result can be lowered with one scalar
+    accumulator per result entry, the entry appended when its reduction ends,
+    only if the loops over the result's indices visit every result coordinate
+    exactly once and the number of visits is known before they run.  Both hold
+    when one input has exactly the result's indices and no other input is
+    stored sparsely along any of them: the loops over the result's indices then
+    walk that input's stored entries, one result entry each, and every other
+    input is read by position.  SDDMM is the case in point --
+    ``S[i,j] * Q[i,k] * K[j,k]`` into ``D[i,j]`` with dense ``Q`` and ``K``.
+    That input's access is returned.
+
+    ``None`` when no input qualifies.  Having the result's indices is not
+    enough: in ``x[a] * B[a,b]`` into ``C[a]`` the vector ``x`` has them, but
+    the loop over ``a`` walks the stored entries of ``B``, which name each
+    ``a`` once per stored ``b``.  ``None`` also for a right-hand side that is
+    not a product of tensor accesses: a sum visits the union of its operands'
+    entries, not one operand's.
+    """
+
+    accesses: List[TensorAccess] = []
+
+    def collect(expr: object) -> bool:
+        if isinstance(expr, TensorAccess):
+            accesses.append(expr)
+            return True
+        if isinstance(expr, BinaryOp) and expr.op is Operation.MUL:
+            return collect(expr.left) and collect(expr.right)
+        return False
+
+    if not collect(rhs) or any(access.is_workspace() for access in accesses):
+        return None
+    result_names = {index_var.name for index_var in result_access.get_index_vars()}
+    for candidate in accesses:
+        names = {index_var.name for index_var in candidate.get_index_vars()}
+        if names != result_names:
+            continue
+        if all(
+            other.level_type_of_index_var(index_var) == LevelType.DENSE
+            for other in accesses
+            if other is not candidate
+            for index_var in other.get_index_vars()
+            if index_var.name in result_names
+        ):
+            return candidate
+    return None
 
 
 class TensorAssign(IndexStmt):

@@ -369,14 +369,17 @@ def test_multi_dense_parent_layouts_convert_and_decode(fmt):
     )
 
 
-def test_materialized_format_is_deeply_detached_from_caller():
+def test_the_caller_format_cannot_change_the_materialized_one():
+    """The result may hold the caller's format itself: it cannot change."""
     requested_level = LevelFormat("s", bit_width=64)
     requested = TensorFormat([requested_level, LevelFormat("d")])
     dense = torch.tensor([[0.0, 2.0, 0.0], [3.0, 0.0, 4.0]])
     converted = STensor.from_torch(dense.clone(), "A").to_sparse(requested)
 
-    object.__setattr__(requested_level, "_mode", LevelType.DENSE)
-    object.__setattr__(requested, "_level_formats", ())
+    with pytest.raises(AttributeError):
+        object.__setattr__(requested_level, "_mode", LevelType.DENSE)
+    with pytest.raises(AttributeError):
+        object.__setattr__(requested, "_level_formats", ())
 
     assert str(converted.format) == "s,d"
     assert converted.format.get_level_formats()[0].bit_width == 64

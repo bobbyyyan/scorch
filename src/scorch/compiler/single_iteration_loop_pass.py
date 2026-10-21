@@ -29,6 +29,7 @@ from .llir_traversal import (
     LLIRTraversalContext,
     LLIRTraversalDiagnostic,
     LLIRTraversalError,
+    LLIRWalker,
 )
 
 SINGLE_ITERATION_LOOP_ELIMINATION_TRAVERSAL_CONTEXT = LLIRTraversalContext(
@@ -454,10 +455,11 @@ def _rewrite_statement_references(
 ) -> LLIRStatementSequence:
     """Apply exactly the broader legacy generated-string rewrite scope.
 
-    Loop headers and auxiliary parallel bodies, ``WhileLoop``, ``ForLoopAuto``,
-    ``Function``, raw nested statement containers, and unsupported expression
-    containers remain intentionally untouched. The common detachment performed
-    before this function still validates them.
+    Loop headers and auxiliary parallel bodies, ``WhileLoop`` conditions,
+    ``ForLoopAuto``, ``Function``, raw nested statement containers, and
+    unsupported expression containers remain untouched. The common detachment
+    performed before this function still validates them.  A reference this
+    scope does not reach stops the elimination (``_names_identifier``).
 
     Every branch that RECONSTRUCTS a statement threads
     ``result_storage`` -- the statement-level result-storage marker
@@ -572,6 +574,22 @@ def _rewrite_statement_references(
                     statement_path + ("body",),
                 ),
             )
+        elif type(statement) is llir.WhileLoop:
+            # A loop that merges two compressed levels is a ``while``.  Under a
+            # removed loop its body reads the removed variable like any other
+            # statement: ``einsum('ab,ac,bc->ab')`` with a coordinate ``A`` and
+            # ``B``, ``C`` compressed along ``c`` kept ``A_val[pA1]`` there and
+            # did not build.  As for ``ForLoop``, the body only.
+            while_loop = cast(llir.WhileLoop, statement)
+            while_loop.body = cast(
+                List[llir.Stmt],
+                _rewrite_statement_references(
+                    cast(LLIRStatementSequence, while_loop.body),
+                    replacements,
+                    context,
+                    statement_path + ("body",),
+                ),
+            )
         elif type(statement) is llir.IfThenElse:
             conditional = cast(llir.IfThenElse, statement)
             if conditional.then_body is not None:
@@ -626,6 +644,42 @@ def _rewrite_statement_references(
     if type(statements) is tuple:
         return tuple(rewritten_statements)
     return rewritten_statements
+
+
+class _IdentifierSearch(LLIRWalker):
+    """Whether any node of a statement list carries ``identifier`` as a token.
+
+    Generated LLIR still spells some operands as text (``Var`` names such as
+    ``A_val[pA1]``, ``RawStmt`` code, call names, schedule expressions), so the
+    search reads every string a node holds and not ``Var`` names alone.
+    Comments are not code.
+    """
+
+    def __init__(self, context: LLIRTraversalContext, identifier: str) -> None:
+        super().__init__(context)
+        self._token = re.compile(
+            rf"(?<![A-Za-z0-9_]){re.escape(identifier)}(?![A-Za-z0-9_])"
+        )
+        self.found = False
+
+    def enter_node(self, node: llir.Node, path: LLIRPath) -> None:
+        if self.found or type(node) is llir.Comment:
+            return
+        for value in vars(node).values():
+            texts = value if type(value) in (list, tuple) else (value,)
+            if any(type(text) is str and self._token.search(text) for text in texts):
+                self.found = True
+                return
+
+
+def _names_identifier(
+    statements: Sequence[LLIRStatementValue],
+    identifier: str,
+    context: SingleIterationLoopEliminationContext,
+) -> bool:
+    search = _IdentifierSearch(context.traversal, identifier)
+    search.walk(cast(LLIRStatementSequence, list(statements)))
+    return search.found
 
 
 def _is_bound_declaration(
@@ -686,10 +740,21 @@ def _eliminate_in_sequence(
     context: SingleIterationLoopEliminationContext,
     path: LLIRPath,
 ) -> LLIRStatementSequence:
+    """Inline each matched loop's body, then drop the bounds nothing reads.
+
+    Elimination removes two declarations: the loop variable's, with the loop
+    header, and the bound's.  Neither may leave a use behind, or the kernel
+    names a variable nothing declares and does not build.  A loop whose
+    rewritten body still names its variable is kept.  A bound is dropped once
+    no statement left in the sequence names it, so loops sharing one bound are
+    all inlined before it goes, and a loop that was kept keeps its bound.
+    """
+
     _process_child_sequences_first(statements, context, path)
     bounds = _collect_single_step_bounds(statements, context, path)
 
     working: List[LLIRStatementValue] = list(statements)
+    inlined_bounds: List[str] = []
     index = 0
     while index < len(working):
         statement = working[index]
@@ -700,8 +765,15 @@ def _eliminate_in_sequence(
             continue
 
         loop = cast(llir.ForLoop, statement)
+        # The body is rewritten on a detached copy: a loop that is kept below
+        # keeps its body as written.
         inlined: List[LLIRStatementValue] = list(
-            cast(Sequence[LLIRStatementValue], loop.body)
+            cast(
+                Sequence[LLIRStatementValue],
+                LLIRRewriter(context.traversal).rewrite(
+                    list(cast(Sequence[LLIRStatementValue], loop.body))
+                ),
+            )
         )
         replacements = _ReferenceReplacements(
             generated_strings=(
@@ -720,30 +792,27 @@ def _eliminate_in_sequence(
                 statement_path + ("body",),
             ),
         )
+        if _names_identifier(inlined, match.loop_variable, context):
+            index += 1
+            continue
 
-        retained: List[LLIRStatementValue] = []
-        for retained_index, candidate in enumerate(working):
+        working[index : index + 1] = inlined
+        if match.end_variable not in inlined_bounds:
+            inlined_bounds.append(match.end_variable)
+
+    for end_variable in inlined_bounds:
+        others = [
+            candidate
+            for candidate_index, candidate in enumerate(working)
             if not _is_bound_declaration(
                 candidate,
-                match.end_variable,
+                end_variable,
                 context,
-                path + (f"[{retained_index}]",),
-            ):
-                retained.append(candidate)
-        working = retained
-
-        loop_index = next(
-            (
-                candidate_index
-                for candidate_index, candidate in enumerate(working)
-                if candidate is statement
-            ),
-            None,
-        )
-        if loop_index is None:
-            break
-        working[loop_index : loop_index + 1] = inlined
-        index = loop_index
+                path + (f"[{candidate_index}]",),
+            )
+        ]
+        if not _names_identifier(others, end_variable, context):
+            working = others
 
     if type(statements) is tuple:
         return tuple(working)

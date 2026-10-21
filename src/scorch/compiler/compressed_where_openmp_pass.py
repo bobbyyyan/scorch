@@ -142,9 +142,13 @@ class CompressedWhereOpenMPContext:
 
     ``workspace_ctype`` is also the legacy result-value C type used for exact
     output allocation.  Production obtains both workspace fields together from
-    the one-dimensional sparse ``Where`` workspace. ``compile_options`` carries
-    the exact outer snapshot through the two nested result-write passes and the
-    remaining output-assembly renderer; standalone pass callers may omit it.
+    the one-dimensional sparse ``Where`` workspace.  ``workspace_name`` is
+    ``None`` for a loop nest that accumulates through no workspace at all (a
+    scalar reduction appended in loop order): nothing is looked for, hoisted or
+    pooled, and ``workspace_ctype`` is then only the result-value C type.
+    ``compile_options`` carries the exact outer snapshot through the two nested
+    result-write passes and the remaining output-assembly renderer; standalone
+    pass callers may omit it.
 
     ``result_assembler`` is the frozen Torch/C++ ABI snapshot for the same
     result.  This pass delegates typed compressed-coordinate and deeper-position
@@ -160,7 +164,7 @@ class CompressedWhereOpenMPContext:
     result_id: SymbolId
     compressed_levels: Tuple[int, ...]
     result_assembler: ResultTensorAssembler
-    workspace_name: str
+    workspace_name: Optional[str]
     workspace_ctype: str
     policy: CompressedWhereOpenMPPolicy = COMPRESSED_WHERE_OPENMP_POLICY
     traversal: LLIRTraversalContext = COMPRESSED_WHERE_OPENMP_TRAVERSAL_CONTEXT
@@ -294,6 +298,26 @@ def _raise_compressed_where_error(
             pass_name=traversal.pass_name,
         )
     )
+
+
+def _hoisted_workspace_name(context: CompressedWhereOpenMPContext) -> str:
+    """The name of the workspace whose declaration this pass hoisted.
+
+    Only a named workspace has a declaration to find, so every statement built
+    around the per-worker pool reads the name through here; a context that names
+    none cannot reach them.
+    """
+
+    name = context.workspace_name
+    if name is None:
+        _raise_compressed_where_error(
+            context,
+            code="invalid_compressed_where_workspace_name",
+            message="a loop nest with no workspace has no declaration to hoist",
+            path=("context", "workspace_name"),
+            value=name,
+        )
+    return name
 
 
 def _validate_non_empty_string(
@@ -436,12 +460,13 @@ def _validate_context(context: object) -> CompressedWhereOpenMPContext:
             path=("context", "result_id"),
             value=typed_context.result_id,
         )
-    _validate_non_empty_string(
-        typed_context,
-        typed_context.workspace_name,
-        code="invalid_compressed_where_workspace_name",
-        field="workspace_name",
-    )
+    if typed_context.workspace_name is not None:
+        _validate_non_empty_string(
+            typed_context,
+            typed_context.workspace_name,
+            code="invalid_compressed_where_workspace_name",
+            field="workspace_name",
+        )
     _validate_non_empty_string(
         typed_context,
         typed_context.workspace_ctype,
@@ -615,8 +640,9 @@ class _WorkspaceInsertRewriter(LLIRRewriter):
     def __init__(self, context: CompressedWhereOpenMPContext) -> None:
         super().__init__(context.traversal)
         self._context = context
-        self._old = f"{context.workspace_name}.insert"
-        self._new = f"{context.workspace_name}.insert_unchecked"
+        workspace_name = _hoisted_workspace_name(context)
+        self._old = f"{workspace_name}.insert"
+        self._new = f"{workspace_name}.insert_unchecked"
         self._identity = LLIRRewriter(context.traversal)
 
     def _rewrite_for_loop(self, node: llir.ForLoop, path: LLIRPath) -> llir.ForLoop:
@@ -794,7 +820,7 @@ def _should_drop_work_statement(
     *,
     result_name: str,
     first_compressed_level: int,
-    workspace_name: str,
+    workspace_name: Optional[str],
 ) -> Tuple[bool, bool]:
     if type(statement) is llir.ForLoop:
         condition = statement.cond
@@ -809,7 +835,7 @@ def _should_drop_work_statement(
         if type(init) is llir.VarInit and init.var.name.startswith(f"p{result_name}"):
             return True, False
     elif type(statement) is llir.VarInit:
-        if statement.var.name == workspace_name:
+        if workspace_name is not None and statement.var.name == workspace_name:
             return True, True
     elif type(statement) is llir.Assign:
         target_name = _assignment_array_name(statement.var)
@@ -876,8 +902,13 @@ def _extract_work_body(
             message=(
                 f"accumulation structure {CHAINED_ACCUMULATOR_STRUCTURE!r} is "
                 "produced by hoisting the accumulator declaration out of the "
-                f"assembly loop, and {context.workspace_name!r} is not declared "
-                "as a direct child of it"
+                "assembly loop, and "
+                + (
+                    "this loop nest accumulates through no workspace"
+                    if context.workspace_name is None
+                    else f"{context.workspace_name!r} is not declared as a direct "
+                    "child of it"
+                )
             ),
             path=("context", "accumulator"),
             value=context.accumulator,
@@ -900,7 +931,7 @@ def _workspace_view_statement(context: CompressedWhereOpenMPContext) -> llir.Var
     DataType member.
     """
 
-    workspace_name = context.workspace_name
+    workspace_name = _hoisted_workspace_name(context)
     return llir.VarInit(
         var=llir.Var(name=workspace_name, type=llir.DataType.AUTO),
         value=llir.MemberCall(
@@ -931,7 +962,9 @@ def _workspace_clear_statement(
     """
 
     return llir.MemberCallStmt(
-        base=llir.Var(name=context.workspace_name, type=llir.DataType.NO_TYPE),
+        base=llir.Var(
+            name=_hoisted_workspace_name(context), type=llir.DataType.NO_TYPE
+        ),
         member="clear",
     )
 
@@ -1436,7 +1469,7 @@ def _workspace_pool_type(
 
 def _thread_count_reference(context: CompressedWhereOpenMPContext) -> llir.Var:
     return llir.Var(
-        name=f"{context.workspace_name}_thread_count",
+        name=f"{_hoisted_workspace_name(context)}_thread_count",
         type=llir.DataType.INT,
     )
 
@@ -1446,7 +1479,7 @@ def _workspace_pool_reference(
     pool_type: llir.DataType,
 ) -> llir.Var:
     return llir.Var(
-        name=f"{context.workspace_name}_pool",
+        name=f"{_hoisted_workspace_name(context)}_pool",
         type=pool_type,
     )
 
@@ -1498,7 +1531,7 @@ def _legacy_workspace_pool_statement(
         if count_threads == fill_threads
         else f"std::max({count_threads}, {fill_threads})"
     )
-    workspace = context.workspace_name
+    workspace = _hoisted_workspace_name(context)
     ctype = context.workspace_ctype
     first_level = context.compressed_levels[0]
     return llir.RawStmt(

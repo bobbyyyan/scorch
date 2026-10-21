@@ -14,6 +14,7 @@ from .llir_traversal import (
     LLIRValue,
     LLIRWalker,
 )
+from .merged_coordinate import merged_coordinate_name
 from ..format import LevelType
 
 ModePositionBegin = Tuple[str, Optional[str]]
@@ -502,7 +503,7 @@ class ModeIterator:
                     type=llir.DataType.INT,
                 )
             self.coord_var_llir = llir.Var(
-                name=f"{self.index_var.name}_{self._tensor_var.name}",
+                name=merged_coordinate_name(self.index_var.name, self._tensor_var.name),
                 type=llir.DataType.INT,
             )
             self.coord_var_value_llir = llir.ArrayAccess(
@@ -524,7 +525,7 @@ class ModeIterator:
             )
             self.iterator_var_end_value_llir = self._compressed_position_access(1)
             self.coord_var_llir = llir.Var(
-                name=f"{self.index_var.name}_{self._tensor_var.name}",
+                name=merged_coordinate_name(self.index_var.name, self._tensor_var.name),
                 type=llir.DataType.INT,
             )
             self.coord_var_value_llir = llir.ArrayAccess(

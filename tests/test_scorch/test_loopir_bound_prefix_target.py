@@ -56,7 +56,6 @@ from scorch.compiler.identity import IndexId
 from scorch.compiler.loop_plan_legality import InvalidSchedule
 from scorch.compiler.loopir.levels import LevelTensorStorage
 from scorch.compiler.loopir.lower_cin import (
-    LoopIRLoweringError,
     _ordered_key_split,
     _SparseOutputReduction,
     lower_normalized_cin_to_loopir,
@@ -231,7 +230,9 @@ def test_the_family_is_its_own_member_not_an_ordered_key_workspace():
 # -- routing -----------------------------------------------------------------
 
 
-@pytest.mark.parametrize("cell", ADMITTED, ids=lambda c: f"{c[0]} {c[2]}->{c[3]} [{c[1]}]")
+@pytest.mark.parametrize(
+    "cell", ADMITTED, ids=lambda c: f"{c[0]} {c[2]}->{c[3]} [{c[1]}]"
+)
 @pytest.mark.parametrize("arm", [False, True], ids=["direct", "regblock"])
 def test_routing_claims_the_family_for_the_assembly_target(cell, arm):
     kernel = compiled(cell, arm)
@@ -366,7 +367,9 @@ def test_routing_reads_bindings_not_positions_for_canonical_csr():
 # -- correctness -------------------------------------------------------------
 
 
-@pytest.mark.parametrize("cell", ADMITTED, ids=lambda c: f"{c[0]} {c[2]}->{c[3]} [{c[1]}]")
+@pytest.mark.parametrize(
+    "cell", ADMITTED, ids=lambda c: f"{c[0]} {c[2]}->{c[3]} [{c[1]}]"
+)
 @pytest.mark.parametrize("arm", [False, True], ids=["direct", "regblock"])
 @pytest.mark.parametrize("dtype", [torch.float32, torch.float64], ids=["f32", "f64"])
 def test_execution_matches_the_oracle_and_pytorch(cell, arm, dtype):
@@ -482,8 +485,18 @@ def test_exact_cancellation_still_stores_its_entry():
 
 
 @pytest.mark.parametrize("arm", [False, True], ids=["direct", "regblock"])
-def test_a_merged_reduction_domain_is_refused_at_cin(arm):
-    """``C[i] += A[i, j] * B[j]`` intersects on the reduction coordinate."""
+def test_a_merged_reduction_domain_matches_pytorch(arm):
+    """``C[i] += A[i, j] * B[j]`` intersects on the reduction coordinate.
+
+    Refused as ``unsupported_merged_reduction`` until the bound-prefix family
+    took a merged reduction loop below its bound levels; it is executed now,
+    on every input of the dense-below-compressed table, against float64
+    values and the stored structure the operands imply.
+    """
+
+    from tests.test_scorch.test_loopir_dense_below_compressed_target import (
+        assert_statement_matches_pytorch,
+    )
 
     i, j = IndexVar("i"), IndexVar("j")
     a = TensorVar("A", fmt="ss", dtype=torch.float32)[i, j]
@@ -493,17 +506,7 @@ def test_a_merged_reduction_domain_is_refused_at_cin(arm):
         i,
         ForAll(j, TensorAssign(c, CINBinaryOp(Operation.MUL, a, b), op=Operation.ADD)),
     )
-    with pytest.raises(LoopIRLoweringError) as error:
-        compile_cin_via_loopir(
-            cin,
-            (EXTENT["i"],),
-            (
-                ((EXTENT["i"], EXTENT["j"]), torch.float32),
-                ((EXTENT["j"],), torch.float32),
-            ),
-            compile_options=auto_options(arm),
-        )
-    assert error.value.defect.code == "unsupported_merged_reduction"
+    assert_statement_matches_pytorch(cin, arm)
 
 
 def test_the_generated_accumulator_identifier_is_name_reserved():
@@ -531,62 +534,43 @@ def test_the_generated_accumulator_identifier_is_name_reserved():
     assert "C_reduction" in error.value.defect.message
 
 
+@pytest.mark.parametrize("arm", [False, True])
 @pytest.mark.parametrize(
-    "cell,code",
+    "cell",
     [
-        # ``forced`` moves the last free variable inward and lands on an order
-        # the result's own storage-order rules refuse, so the repair has a
-        # pre-forced order to fall back to and these cells reach a rule that
-        # describes their SHAPE.  Each carries a different code, which is the
-        # point: the repair's generality is what makes three distinct
-        # shape-specific diagnoses reachable instead of one order complaint.
-        #
-        # Eighteen of the original 28 are admitted since 2026-10-11: the four
-        # ``unsupported_program_shape`` ones and the eight dense-driven
-        # ``unsupported_sparse_output_domain`` ones (the ``WIDENED`` cells
-        # above), and the six interleaved-key ``ijk->j`` ones, which
-        # ``test_loopir_interleaved_workspace_key.py`` executes.  What remains
-        # is the CSR-reduction residue.
-        #
-        # This is the whole lockable set at this tip, enumerated rather than
-        # sampled: every rank-2 and rank-3 reduction cell for which the repair
-        # precondition holds (forced order differs from pre-forced), whose code
-        # is shape-specific, and which is arm-invariant.  §53.7's fourth code,
-        # ``unsupported_union_with_dense``, needs a two-operand combiner and so
-        # cannot be expressed through ``reduction_cin``; it stays uncovered here
-        # and that is stated rather than left to look complete.
-        (("dds", "ds", "ijk", "ij"), "unsupported_sparse_output_reduction"),
-        (("dds", "sd", "ijk", "ij"), "unsupported_sparse_output_reduction"),
-        (("dsd", "ds", "ijk", "ij"), "unsupported_sparse_output_reduction"),
-        (("dsd", "sd", "ijk", "ij"), "unsupported_sparse_output_reduction"),
-        (("dss", "ds", "ijk", "ij"), "unsupported_sparse_output_reduction"),
-        (("dss", "sd", "ijk", "ij"), "unsupported_sparse_output_reduction"),
-        (("sds", "ds", "ijk", "ij"), "unsupported_sparse_output_reduction"),
-        (("sds", "sd", "ijk", "ij"), "unsupported_sparse_output_reduction"),
-        (("ssd", "sd", "ijk", "ij"), "unsupported_sparse_output_reduction"),
-        (("sss", "sd", "ijk", "ij"), "unsupported_sparse_output_reduction"),
+        ("dds", "ds", "ijk", "ij"),
+        ("dds", "sd", "ijk", "ij"),
+        ("dsd", "ds", "ijk", "ij"),
+        ("dsd", "sd", "ijk", "ij"),
+        ("dss", "ds", "ijk", "ij"),
+        ("dss", "sd", "ijk", "ij"),
+        ("sds", "ds", "ijk", "ij"),
+        ("sds", "sd", "ijk", "ij"),
+        ("ssd", "sd", "ijk", "ij"),
+        ("sss", "sd", "ijk", "ij"),
     ],
     ids=lambda value: str(value),
 )
-def test_redispositioned_neighbours_keep_their_shape_specific_codes(cell, code):
-    """§53.7's moved neighbours: the whole lockable set, not a sample.
+def test_redispositioned_neighbours_are_lowered_and_match_pytorch(cell, arm):
+    """The last ten of section 53.7's moved neighbours, lowered since 2026-10-11.
 
-    The repair is deliberately general -- it fires wherever the forced reorder
-    produced an order the storage-order rules refuse and the unforced order is
-    legal -- so 57 refused neighbours gained a code naming their own violation.
-    That improvement was measured over the frontier and only two cells were
-    locked.  All 28 that are expressible as one-operand reductions are locked
-    here, spanning the three codes reachable that way, and the measured
-    precondition for each is that ``select_loop_order``'s forced order really
-    does differ from its pre-forced one; a cell where the two agree cannot be in
-    the moved set at all.
+    Each is ``C[i, j] += A[i, j, k]``: both result coordinates are bound above
+    the reduced loop, so the reduction is a scalar accumulated under a complete
+    result prefix.  They were refused with ``unsupported_sparse_output_reduction``
+    for two receiver-specific reasons that no longer hold.  A ``ds`` result
+    outside the row-workspace shape is decided by the same split as every other
+    dense-prefix receiver.  An ``sd`` result has the accumulator written as one
+    cell of the dense block, and the compressed coordinate above committed once
+    the block is written.
 
-    Blocker 3 and the 2026-10-11 dense-domain and interleaved-key changes have
-    since ADMITTED part of §53.7's original 57, so this set is the
-    lockable remainder at this tip rather than a subset of that historical
-    number -- which is why each cell's code is asserted rather than assumed from
-    the §53.7 split.
+    The precondition section 53.7 measured is still asserted, so the cells stay
+    the ones the forced reorder moved: ``select_loop_order``'s forced order
+    differs from its pre-forced one.
     """
+
+    from tests.test_scorch.test_loopir_dense_below_compressed_target import (
+        assert_statement_matches_pytorch,
+    )
 
     operand_fmt, result_fmt, operand_indices, result_indices = cell
     options = auto_options(False)
@@ -603,9 +587,12 @@ def test_redispositioned_neighbours_keep_their_shape_specific_codes(cell, code):
     )
     assert [v.name for v in forced] != [v.name for v in pre_forced]
 
-    with pytest.raises((LoopIRLoweringError, LoopIRTargetError)) as error:
-        compiled(cell, False)
-    assert error.value.defect.code == code
+    assert_statement_matches_pytorch(
+        reduction_cin(
+            operand_fmt, result_fmt, operand_indices, result_indices, torch.float32
+        ),
+        arm,
+    )
 
 
 def test_the_legacy_refusal_is_structured_and_not_repair_induced():

@@ -20,6 +20,7 @@ from scorch.compiler.parallel_marking_pass import (  # type: ignore[import-untyp
     ParallelWorkspacePoolSpec,
     atomic_work_stealing_prelude,
     mark_first_for_loop_parallel,
+    scalars_carried_between_iterations,
 )
 
 
@@ -496,3 +497,131 @@ def test_pool_attachment_without_typed_policy_fails_closed() -> None:
 
     with pytest.raises(CompilerInvariantError, match="no typed value"):
         mark_first_for_loop_parallel([loop], cluster)
+
+
+def _int(name: str) -> llir.Var:
+    return llir.Var(name=name, type=llir.DataType.INT)
+
+
+def _cursor_advancing_loop() -> llir.ForLoop:
+    """``for (i ...) { int i_C = C0_crd[pC0]; pC0 += (int)(i_C == i); }``.
+
+    The loop a sum of a dense and a compressed operand emits over the dense
+    extent: ``pC0`` is declared before it and advanced at the end of each
+    iteration.
+    """
+
+    loop = _plain_dense_loop()
+    loop.body = [
+        llir.VarInit(
+            _int("i_C"),
+            llir.ArrayAccess(
+                array=llir.Var(name="C0_crd", type=llir.DataType.PTR_INT),
+                index=_int("pC0"),
+            ),
+        ),
+        llir.Assign(
+            _int("pC0"),
+            llir.BinOp("==", _int("i_C"), _int("i")),
+            llir.AssignOp.ADD_ASSIGN,
+        ),
+    ]
+    return loop
+
+
+def test_a_loop_that_advances_an_outer_cursor_is_not_marked() -> None:
+    loop = _cursor_advancing_loop()
+
+    marked = mark_first_for_loop_parallel([loop], EMPTY_PARALLEL_WORKSPACE_CLUSTER)
+
+    assert scalars_carried_between_iterations(loop) == ("pC0",)
+    assert marked is False
+    assert loop.omp_parallel_for is False
+    assert loop.omp_num_threads is None
+    assert "#pragma omp" not in LLIRLowerer().lower_llir(loop)
+
+
+def test_a_carrying_loop_ends_the_search_and_no_later_loop_is_marked() -> None:
+    carrying = _cursor_advancing_loop()
+    independent = _plain_dense_loop()
+
+    marked = mark_first_for_loop_parallel(
+        [carrying, independent], EMPTY_PARALLEL_WORKSPACE_CLUSTER
+    )
+
+    assert marked is False
+    assert carrying.omp_parallel_for is False
+    assert independent.omp_parallel_for is False
+
+
+def test_a_cluster_is_not_placed_when_the_first_loop_carries_a_scalar() -> None:
+    carrying = _cursor_advancing_loop()
+    independent = _plain_dense_loop()
+    cluster = ParallelWorkspaceCluster(
+        alloc=(_alloc_statement(),),
+        pool_specs=(_pool_spec(),),
+    )
+
+    assert mark_first_for_loop_parallel([carrying, independent], cluster) is False
+    for loop in (carrying, independent):
+        assert loop.pre_parallel_body is None
+        assert loop.before_parallel_body is None
+
+
+def test_carried_scalars_are_found_at_any_depth_in_first_assignment_order() -> None:
+    loop = _plain_dense_loop()
+    loop.body = [
+        llir.IfThenElse(
+            cond=llir.BinOp("<", _int("pC0"), _int("pC0_end")),
+            then_body=[
+                llir.WhileLoop(
+                    cond=llir.BinOp("<", _int("pC1_end"), _int("pC0_end")),
+                    body=[llir.Increment(_int("pC1_end"))],
+                )
+            ],
+            else_body=[llir.Assign(_int("pC0"), _int("pC1_end"))],
+        ),
+        llir.Increment(_int("pC1_end")),
+    ]
+
+    assert scalars_carried_between_iterations(loop) == ("pC1_end", "pC0")
+
+
+def test_a_scalar_the_body_declares_is_not_carried() -> None:
+    loop = _plain_dense_loop()
+    inner = _sparse_inner_loop()
+    inner.body = [llir.Increment(_int("count"))]
+    loop.body = [
+        llir.VarInit(_int("count"), llir.Literal(0, llir.DataType.INT)),
+        llir.VarDecl(_int("last")),
+        inner,
+        llir.Assign(_int("last"), _int("count")),
+    ]
+
+    assert scalars_carried_between_iterations(loop) == ()
+    assert mark_first_for_loop_parallel([loop], EMPTY_PARALLEL_WORKSPACE_CLUSTER)
+    assert loop.omp_parallel_for is True
+
+
+def test_a_store_through_a_subscript_is_not_a_carried_scalar() -> None:
+    loop = _plain_dense_loop()
+    loop.body = [
+        llir.Assign(
+            llir.ArrayAccess(
+                array=llir.Var(name="A_values", type=llir.DataType.PTR_FLOAT32),
+                index=llir.Var(name="i", type=llir.DataType.INT64),
+            ),
+            llir.Literal(0, llir.DataType.INT),
+        )
+    ]
+
+    assert scalars_carried_between_iterations(loop) == ()
+
+
+def test_a_scalar_declared_inside_the_parallel_region_is_one_per_worker() -> None:
+    loop = _plain_dense_loop()
+    loop.body = [llir.Increment(_int("wksp_count"))]
+    per_worker = [llir.VarInit(_int("wksp_count"), llir.Literal(0, llir.DataType.INT))]
+
+    assert scalars_carried_between_iterations(loop) == ("wksp_count",)
+    assert scalars_carried_between_iterations(loop, per_worker) == ()

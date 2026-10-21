@@ -37,7 +37,7 @@ from scorch.compiler.cin import (
     TensorAssign,
     TensorVar,
 )
-from scorch.compiler.diagnostics import InvalidSchedule
+from scorch.compiler.diagnostics import InvalidSchedule, VerificationError
 from scorch.compiler.loopir.build import LoopIRBuilder
 from scorch.compiler.loopir.levels import LevelTensorStorage
 from scorch.compiler.loopir.lower_cin import LoopIRLoweringError
@@ -54,11 +54,15 @@ from scorch.compiler.loopir.pipeline import (
     compare_generated_sources,
     compile_cin_via_loopir,
     execute_cin_via_loopir,
+    legacy_generated_cpp,
 )
 from scorch.compiler.loopir.printer import canonical_program_dump
 from scorch.compiler.loopir.schedule_passes import erase_schedule
 from scorch.compiler.loopir.verifier import LoopIRVerificationError, verify_program
 from scorch.stensor import STensor
+from tests.test_scorch.loopir_executed_programs import (
+    assert_program_matches_pytorch,
+)
 from tests.test_scorch.test_loopir_multi_compressed_target import (
     validated_storage_pieces,
 )
@@ -465,48 +469,44 @@ def test_generated_program_matches_the_loopir_oracle(name, result_fmt, operand_f
 # -- fail-closed neighbours --------------------------------------------------
 
 
+# The fail-closed neighbours that sat here are lowered now:
+#
+# * ``ss + sd`` and ``sd + ss`` into ``ss`` (a dense leaf below a level a union
+#   iterates, read where that union's cursor aligned) since 2026-10-12; they
+#   run in ``test_loopir_dense_union.py`` on both compilers.
+# * the ``dds`` copy is the admitted flattened-prefix family
+#   (``test_loopir_multi_dense_prefix_target.py``), and its neighbour -- a
+#   ``dds`` result whose dense-prefix coordinate is driven by a dense-leaf
+#   operand's COMPRESSED level (``dsd``) -- is admitted since 2026-10-11: the
+#   stored stream drives the dense prefix level, and the row-scope catch-up
+#   closes the flattened segments it skips with the segment number computed
+#   from the loop coordinates at run time.
+# * the ``sd``, ``sdd`` and ``sds`` copies into their own layouts are run by
+#   the test below since 2026-10-11.
+
+
 @pytest.mark.parametrize("regblock_enabled", [False, True], ids=["base", "regblock"])
-@pytest.mark.parametrize(
-    "result_fmt,operand_fmts,op,code",
-    [
-        ("ss", ("ss", "sd"), "add", "unsupported_union_with_dense"),
-        ("ss", ("sd", "ss"), "add", "unsupported_union_with_dense"),
-        ("sd", ("sd",), "mul", "unsupported_sparse_output_domain"),
-        ("sdd", ("sdd",), "mul", "unsupported_sparse_output_domain"),
-        # Recorded seam move, twice: the ``dds`` copy that used to sit here is
-        # the admitted flattened-prefix family
-        # (``test_loopir_multi_dense_prefix_target.py``), and its neighbour --
-        # a ``dds`` result whose dense-prefix coordinate is driven by a
-        # dense-leaf operand's COMPRESSED level (``dsd``) -- is admitted since
-        # 2026-10-11: the stored stream drives the dense prefix level, and the
-        # row-scope catch-up closes the flattened segments it skips with the
-        # segment number computed from the loop coordinates at run time.
-        ("sds", ("sds",), "mul", "unsupported_sparse_output"),
-    ],
-    ids=["ss+sd", "sd+ss", "sd-copy", "sdd-copy", "sds-copy"],
-)
-def test_excluded_neighbours_keep_their_exact_codes(
-    result_fmt, operand_fmts, op, code, regblock_enabled
+@pytest.mark.parametrize("layout", ["sd", "sdd", "sds"])
+def test_copies_with_a_dense_level_below_a_compressed_one_match_pytorch(
+    layout, regblock_enabled
 ):
-    shape = shape_of(result_fmt)
-    with pytest.raises((LoopIRLoweringError, LoopIRTargetError)) as error:
-        compile_cin_via_loopir(
-            build_cin(result_fmt, operand_fmts, op),
-            shape,
-            bindings_for(operand_fmts, shape, torch.float32),
-            compile_options=auto_options(regblock_enabled),
-        )
-    assert error.value.defect.code == code
+    """A copy into its own layout is lowered since 2026-10-11.
 
-
-@pytest.mark.parametrize("regblock_enabled", [False, True], ids=["base", "regblock"])
-def test_permuted_compressed_structure_stays_fail_closed(regblock_enabled):
-    """Only all-dense tensors may permute; compressed structure may not.
-
-    This is the pre-existing ``unsupported_mode_order`` boundary, unchanged by
-    this family: a dense-leaf co-operand does not make a permuted compressed
-    layout lowerable.
+    The ordered assembly commits a compressed coordinate after the dense block
+    below it is written (``test_loopir_dense_below_compressed_target.py``).
     """
+
+    from tests.test_scorch.test_loopir_dense_below_compressed_target import (
+        assert_statement_matches_pytorch,
+    )
+
+    assert_statement_matches_pytorch(
+        build_cin(layout, (layout,), "mul"), regblock_enabled
+    )
+
+
+def build_permuted_compressed_cooperand():
+    """``C[i,j] = A[i,j] * B[i,j]`` with ``B`` an ``sd`` tensor stored in order (j, i)."""
 
     ivars = (IndexVar("i"), IndexVar("j"))
     result = TensorVar("C", fmt="ss", dtype=torch.float32)
@@ -515,19 +515,71 @@ def test_permuted_compressed_structure_stays_fail_closed(regblock_enabled):
     stmt = TensorAssign(result[ivars], CINBinaryOp(Operation.MUL, a, b))
     for index_var in reversed(ivars):
         stmt = ForAll(index_var, stmt)
-    with pytest.raises(
-        (LoopIRLoweringError, LoopIRTargetError, InvalidSchedule)
-    ) as error:
+    return stmt
+
+
+@pytest.mark.parametrize("regblock_enabled", [False, True], ids=["base", "regblock"])
+def test_a_permuted_compressed_cooperand_is_converted(regblock_enabled):
+    """A compressed co-operand stored in another mode order no longer fails closed.
+
+    This was the ``unsupported_mode_order`` boundary: only all-dense tensors
+    could permute.  A tensor with a compressed level is now lowered in the
+    identity-order form of its storage order
+    (``test_loopir_storage_order_form.py``), and here no loop order follows
+    both ``A`` (stored ``i, j``) and ``B`` (stored ``j, i``), so the plan
+    converts ``B`` to ``i, j``.  In that order an ``sd`` layout would store
+    cells ``B`` does not hold, so ``B`` is converted into ``ss``, which stores
+    exactly its entries.
+
+    A shape is bound in the order the tensor's levels are stored: ``B`` is
+    ``(5, 4)`` here.  Its logical-order shape contradicts the other tensors'
+    extents and is refused by the CIN verifier.
+
+    The shipped compiler's plan origin refuses the program
+    (``result_storage_order``), so there is no shipped text to compare with.
+    """
+
+    options = auto_options(regblock_enabled)
+    bindings = (((4, 5), torch.float32), ((5, 4), torch.float32))
+    kernel = compile_cin_via_loopir(
+        build_permuted_compressed_cooperand(), (4, 5), bindings, compile_options=options
+    )
+    assert [(c.mode_order, c.format) for c in kernel.conversions] == [((0, 1), "ss")]
+    assert len(kernel.conversion_sources) == 1
+
+    with pytest.raises(VerificationError) as mismatch:
         compile_cin_via_loopir(
-            stmt,
+            build_permuted_compressed_cooperand(),
             (4, 5),
             (((4, 5), torch.float32), ((4, 5), torch.float32)),
-            compile_options=auto_options(regblock_enabled),
+            compile_options=options,
         )
-    code = getattr(getattr(error.value, "defect", None), "code", None)
-    assert code in ("unsupported_mode_order", "unsupported_loop_order") or (
-        "result_storage_order" in str(error.value)
+    assert "index_extent_mismatch" in str(mismatch.value)
+
+    with pytest.raises(InvalidSchedule) as refusal:
+        legacy_generated_cpp(
+            build_permuted_compressed_cooperand(),
+            (4, 5),
+            bindings,
+            compile_options=options,
+        )
+    assert [d.code for d in refusal.value.diagnostics] == ["result_storage_order"]
+
+
+@pytest.mark.parametrize("arm", [0, 1], ids=["base", "regblock"])
+def test_a_permuted_compressed_cooperand_matches_pytorch(arm):
+    """The same program executed on operands stored as declared.
+
+    float64 values to 1e-12, and exactly the stored coordinates the operands'
+    stored entries imply: ``B`` holds stored zeros under every stored ``j``.
+    """
+
+    kernel, _ = assert_program_matches_pytorch(
+        (("A", "ss", "ij", None), ("B", "sd", "ij", (1, 0))),
+        ("ij", "ss", None),
+        arm,
     )
+    assert [(c.mode_order, c.format) for c in kernel.conversions] == [((0, 1), "ss")]
 
 
 _PERMUTED_DENSE_COOPERANDS = [

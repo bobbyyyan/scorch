@@ -374,31 +374,96 @@ def test_repeated_operand_loads_fail_at_target_boundary():
     )
 
 
-def test_unsupported_mode_order_at_target_boundary():
-    """Compressed structure stays a target mode-order boundary.
-
-    All-dense input and result permutations are level-mapped.  Forging a
-    result permutation without rebuilding its loop order therefore reaches
-    the physical storage-order diagnostic, while compressed structure stays
-    outside the target's admitted layout surface.
-    """
+def forged_permuted_result_matmul():
+    """``build_matmul`` with the dense result's two levels swapped in place."""
 
     fixture = build_matmul()
     result_decl = fixture.program.tensors[-1]
     assert result_decl.name == "C"
     forge(result_decl.levels[0], mode=1)
     forge(result_decl.levels[1], mode=0)
+    return fixture
+
+
+@pytest.mark.parametrize("regblock_enabled", [False, True], ids=["plain", "blocked"])
+def test_a_forged_dense_result_permutation_is_level_mapped(regblock_enabled):
+    """A permuted all-dense result is written through its level map.
+
+    All-dense input and result permutations are level-mapped, and an all-dense
+    tensor is read and written by its coordinates in any loop order.  Forging a
+    result permutation without rebuilding its loop order used to reach the
+    physical storage-order diagnostic (``unsupported_loop_order``).  The target
+    now lowers it, to the kernel of the program that declares the same layout
+    -- ``C`` stored ``(j, i)`` in the nest ``i, k, j`` -- which is also the
+    shipped compiler's kernel for that program, byte for byte.
+
+    A shape is bound per storage level, so the forged result is ``(4, 3)``;
+    its logical-order shape is refused.
+    """
+
+    from scorch.ops import _lower_generated_llir
+
+    options = CompileOptions.from_environment().with_regblock_enabled(regblock_enabled)
+    fixture = forged_permuted_result_matmul()
+    input_shapes = {fixture.a: (3, 5), fixture.b: (5, 4)}
+    context = CompilationContext(options)
+    function = lower_loopir_to_llir(
+        fixture.program,
+        input_shapes=input_shapes,
+        result_shape=(4, 3),
+        compile_options=options,
+        compilation_context=context,
+    )
+    source = _lower_generated_llir(function, options, context)
+    assert "int pC0 = j;" in source
+    assert "int pC1 = pC0 * C1_size + i;" in source
+
+    i, k, j = IndexVar("i"), IndexVar("k"), IndexVar("j")
+    declared = ForAll(
+        i,
+        ForAll(
+            k,
+            ForAll(
+                j,
+                TensorAssign(
+                    TensorVar("C", fmt="dd", mode_order=[1, 0])[i, j],
+                    CINBinaryOp(
+                        Operation.MUL,
+                        TensorVar("A", fmt="dd")[i, k],
+                        TensorVar("B", fmt="dd")[k, j],
+                    ),
+                    op=Operation.ADD,
+                ),
+            ),
+        ),
+    )
+    comparison = compare_generated_sources(
+        declared,
+        (4, 3),
+        [((3, 5), F32), ((5, 4), F32)],
+        compile_options=options,
+    )
+    assert comparison.identical
+    assert source == comparison.loopir_cpp
+
+    fixture = forged_permuted_result_matmul()
     expect_target_code(
-        "unsupported_loop_order",
+        "dimension_extent_mismatch",
         fixture.program,
         {fixture.a: (3, 5), fixture.b: (5, 4)},
-        (4, 3),
+        (3, 4),
     )
 
-    # A forged compressed-structure permutation cannot even reach the
-    # target: the verifier's dimension-domain rules reject the layout-
-    # inconsistent position chain first.  The target's compressed branch
-    # stays as defense in depth behind that boundary.
+
+def test_a_forged_compressed_permutation_fails_in_the_verifier():
+    """Compressed structure cannot be permuted by forging its level modes.
+
+    A forged compressed-structure permutation cannot even reach the target:
+    the verifier's dimension-domain rules reject the layout-inconsistent
+    position chain first.  The target's compressed branch stays as defense in
+    depth behind that boundary.
+    """
+
     from scorch.compiler.loopir.lower_cin import lower_normalized_cin_to_loopir
 
     i, j = IndexVar("i"), IndexVar("j")
@@ -749,34 +814,34 @@ def test_level_zero_cursors_lower_at_target_boundary():
     assert comparison.identical
 
 
-def test_three_cursor_merge_fails_at_target_boundary():
-    i, j = IndexVar("i"), IndexVar("j")
-    c = TensorVar("C", fmt="ds")
-    a = TensorVar("A", fmt="ds")
-    b = TensorVar("B", fmt="ds")
-    d = TensorVar("D", fmt="ds")
-    assign = TensorAssign(
-        c[i, j],
-        CINBinaryOp(
-            Operation.ADD, CINBinaryOp(Operation.ADD, a[i, j], b[i, j]), d[i, j]
-        ),
+# ``C = A + B + D``, all CSR, was refused here at the target boundary: the
+# generic target required exactly two cursors in an innermost merge.  It now
+# emits every merge ``_supported_merge`` admits, and the sparse-result table of
+# ``test_loopir_dense_union.py`` executes the program (``ds,ds,ds ij,ij,ij->ij``,
+# and its rank-3 twin) on both compilers and both arms against float64.
+
+
+@pytest.mark.parametrize("arm", [False, True], ids=["plain", "blocked"])
+def test_csr_product_with_a_dense_factor_matches_pytorch(arm):
+    """``C[i, j] = A[i, j] * B[i, j]`` into CSR, ``B`` dense: an append with no
+    merge (the stored stream of ``A`` drives the compressed level).
+
+    This program was refused at the target boundary until the multi-compressed
+    assembly took dense prefixes; it is executed now, on every input of the
+    dense-below-compressed table, against float64 values and the stored
+    structure the operands imply.
+    """
+
+    from tests.test_scorch.test_loopir_dense_below_compressed_target import (
+        assert_statement_matches_pytorch,
     )
-    cin = ForAll(i, ForAll(j, assign))
-    with pytest.raises(LoopIRTargetError) as error:
-        compile_cin_via_loopir(cin, (5, 7), [((5, 7), F32)] * 3)
-    assert error.value.defect.code == "unsupported_program_shape"
 
-
-def test_append_without_merge_fails_at_target_boundary():
     i, j = IndexVar("i"), IndexVar("j")
     c = TensorVar("C", fmt="ds")
     a = TensorVar("A", fmt="ds")
     b = TensorVar("B", fmt="dd")
     assign = TensorAssign(c[i, j], CINBinaryOp(Operation.MUL, a[i, j], b[i, j]))
-    cin = ForAll(i, ForAll(j, assign))
-    with pytest.raises(LoopIRTargetError) as error:
-        compile_cin_via_loopir(cin, (5, 7), [((5, 7), F32), ((5, 7), F32)])
-    assert error.value.defect.code == "unsupported_program_shape"
+    assert_statement_matches_pytorch(ForAll(i, ForAll(j, assign)), arm)
 
 
 def test_nonzero_union_default_fails_at_target_boundary():

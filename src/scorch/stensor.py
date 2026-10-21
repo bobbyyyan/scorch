@@ -28,9 +28,21 @@ from .exceptions import (
     TensorStorageError,
     TensorTypeError,
     TensorValidationError,
+    raise_if_native_repeat,
 )
-from .format import TensorFormat, LevelFormat, LevelType, audit_format_state
-from .layout import TensorLayout, TensorMetadata, _normalize_shape
+from .format import (
+    TensorFormat,
+    LevelFormat,
+    LevelType,
+    audit_format_state,
+    owned_format,
+)
+from .layout import (
+    TensorLayout,
+    TensorMetadata,
+    _normalize_shape,
+    common_value_dtype,
+)
 
 # Names only -- plan.py imports torch and the native extension, nothing from this
 # module, so there is no cycle. Imported as constants because _set_state runs on
@@ -42,11 +54,16 @@ from .plan import (
     GRAD_ATTR as _PLAN_GRAD_ATTR,
 )
 from .storage import (
+    AuditedIndex,
     SparseStorage,
     TensorIndex,
+    repeated_coordinate_in,
     tensor_version,
+    _canonical_storage,
+    _index_components,
     _owned_sparse_storage,
     _owned_tensor_index_components,
+    _validate_index_storage,
 )
 from .utils import (
     parse_format,
@@ -124,10 +141,10 @@ def _finalize_generated_mode_indices(
 # between calls, and rebuilding the rest was 7.3 us of the 19.4 us a warm 64x64
 # `einsum("ik,kj->ij", ..., format="dd")` spent in Python.
 #
-# This is the same trade as `_DENSE_PARTS_CACHE` above, made sound the same way: each
-# cached part is an immutable value object -- TensorIndex, TensorLayout and
-# TensorMetadata, whose only `object.__setattr__` calls are inside their own
-# constructors -- and a dense tensor's per-mode index arrays are empty tuples, so there
+# This is the same trade as `_DENSE_PARTS_CACHE` above, made sound the same way. The
+# layout and the metadata cannot change once built (format.py, "Read-only stored
+# state"), so every result may hold the same ones. So may every result hold the same
+# index arrays: a dense index has none, its per-mode array tuples are empty, and there
 # is nothing shared that a holder could write through.
 #
 # A *sparse* result keeps the ordinary path. Its index arrays are different arrays on
@@ -149,7 +166,7 @@ def _dense_result_parts(
     name: Optional[str],
     value: torch.Tensor,
     adopt: bool,
-) -> Optional[Tuple[TensorIndex, TensorLayout, TensorMetadata]]:
+) -> Optional[Tuple[AuditedIndex, TensorLayout, TensorMetadata]]:
     """The constant parts of a dense generated result, or None to take the long way.
 
     Declines unless the format is all-dense *and* the kernel handed back no index
@@ -162,8 +179,8 @@ def _dense_result_parts(
         return None
     if any(arrays for arrays in mode_indices):
         return None
-    # `adopt` is deliberately absent: it decides whether TensorIndex copies the arrays it
-    # is given, and an all-dense index has none, so the two settings build the same index.
+    # `adopt` is deliberately absent: it decides whether the index arrays are copied, and
+    # an all-dense index has none, so the two settings build the same parts.
     key = (
         tuple(shape),
         tensor_format,
@@ -175,17 +192,17 @@ def _dense_result_parts(
     cached = _RESULT_PARTS_CACHE.get(key)
     if cached is not None:
         return cached
-    # Build the parts with the ordinary constructors, so what is cached is what the
-    # ordinary path produces rather than a second implementation of it.
-    index = TensorIndex(
-        tensor_format=tensor_format,
-        mode_indices=_finalize_generated_mode_indices(tensor_format, mode_indices),
-        mode_order=mode_order,
-        _adopt=adopt,
+    # Build the parts with the checks the ordinary path below makes, so what is cached
+    # is what that path produces rather than a second implementation of it.
+    audited = _index_components(
+        tensor_format,
+        _finalize_generated_mode_indices(tensor_format, mode_indices),
+        mode_order,
+        None,
+        not adopt,
     )
-    layout = TensorLayout.from_physical_shape(
-        shape, index.format, index.mode_order, index.index_dtype
-    )
+    index_format, _, order, index_dtype = audited
+    layout = TensorLayout.from_physical_shape(shape, index_format, order, index_dtype)
     # `_from_owned_layout` and not the public constructor: a runtime tensor's
     # metadata and storage share one layout object, which `_set_state` checks by
     # identity. The public constructor detaches the layout it is handed, which
@@ -197,7 +214,7 @@ def _dense_result_parts(
         layout,
         False,
     )
-    parts = (index, layout, metadata)
+    parts = (audited, layout, metadata)
     if len(_RESULT_PARTS_CACHE) < _RESULT_PARTS_CACHE_MAX:
         _RESULT_PARTS_CACHE[key] = parts
     return parts
@@ -275,7 +292,7 @@ def _wrap_generated_result(
         shape, tensor_format, kernel_mode_indices, mode_order, name, value, adopt
     )
     if parts is not None:
-        cached_index, cached_layout, cached_metadata = parts
+        cached_audited, cached_layout, cached_metadata = parts
         # `_from_validated` skips the shape-against-storage check that `STensor.__init__`
         # does; the layout was built from this same `shape` and the cache key contains it,
         # so that check could only ever pass. `_set_state` still compares the metadata's
@@ -283,27 +300,30 @@ def _wrap_generated_result(
         return STensor._from_validated(
             cached_metadata,
             SparseStorage(
-                cached_layout, value, index=cached_index, _trusted_index=True
+                cached_layout,
+                value,
+                _audited_index=cached_audited,
+                _trusted_index=True,
             ),
         )
-    index = TensorIndex(
-        tensor_format=tensor_format,
-        mode_indices=_finalize_generated_mode_indices(
-            tensor_format, kernel_mode_indices
-        ),
-        mode_order=mode_order,
-        _adopt=adopt,
+    # The cheap per-array checks, once, on the arrays the kernel returned: type, dtype,
+    # rank, contiguity, device, one array per level. `not adopt` copies them first.
+    audited = _index_components(
+        tensor_format,
+        _finalize_generated_mode_indices(tensor_format, kernel_mode_indices),
+        mode_order,
+        None,
+        not adopt,
     )
+    index_format, _, order, index_dtype = audited
     # Build the storage here rather than letting STensor do it, because this is the one
     # construction site that may declare the index trusted: these arrays came out of our
     # own codegen microseconds ago. `SparseStorage` then skips the O(nnz) structural walk
     # unless `storage._VALIDATE_KERNEL_RESULTS` is on, which the test suite turns on.
     # Keeping the decision here means STensor's public signature does not grow a way for
     # a caller to declare their own arrays trusted.
-    layout = TensorLayout.from_physical_shape(
-        shape, index.format, index.mode_order, index.index_dtype
-    )
-    storage = SparseStorage(layout, value, index=index, _trusted_index=True)
+    layout = TensorLayout.from_physical_shape(shape, index_format, order, index_dtype)
+    storage = SparseStorage(layout, value, _audited_index=audited, _trusted_index=True)
     # `_from_validated`, not `STensor(storage=...)`: the public path re-owns the storage
     # it is handed, which rebuilds through `mode_indices=` and so clones every index
     # array and walks it again -- discarding both the adoption and the trust granted one
@@ -324,84 +344,37 @@ def _wrap_generated_result(
 
 _MAX_FORMAT_BIT_WIDTH = (1 << 63) - 1
 
+# One message for a runtime construction that lacks a part, from the public constructor
+# and from `STensor._from_parts`.
+_MISSING_PARTS = (
+    "runtime STensor construction requires shape, index, and value; "
+    "missing {}. Use TensorSpec for compile-only tensors."
+)
+
 
 def _owned_sparse_format(tensor_format: TensorFormat) -> TensorFormat:
-    """Validate and detach one parsed public ``to_sparse`` format.
+    """The format a ``to_sparse`` result holds, from one parsed public format.
 
-    ``TensorFormat`` and ``LevelFormat`` are frozen value objects, but Python's
-    ``object.__setattr__`` can still forge or mutate their stored state.  A
-    runtime tensor must not retain caller-owned format objects: changing one
-    after conversion would otherwise change the tensor's declared layout while
-    leaving its index arrays and values untouched.  Inspect exact stored fields
-    without invoking overridable accessors, then rebuild both container layers.
+    A format's fields are read-only and were validated when it was built (format.py,
+    "Read-only stored state"), so nothing a caller does later can change the result's
+    declared layout. What is left to check here is what this entry point allows beyond
+    the constructor: an exact ``TensorFormat``, and bit widths that fit a signed int64.
+    The levels are those ``audit_format_state`` reads, so an ``int``-subclass width is an
+    exact ``int`` before it is compared.
     """
 
     if type(tensor_format) is not TensorFormat:
         raise TensorTypeError("to_sparse format must be an exact TensorFormat")
-    audited = audit_format_state(tensor_format)
-    if audited is not None:
-        for audited_level in audited:
-            if (
-                audited_level.bit_width is not None
-                and audited_level.bit_width > _MAX_FORMAT_BIT_WIDTH
-            ):
-                raise TensorFormatError(
-                    "to_sparse format level bit_width must be a positive "
-                    "signed-int64 exact int or None"
-                )
-        # The shared construction-side audit already proved every stored
-        # field exact and rebuilt both container layers.
-        return TensorFormat(audited)
-    # Otherwise re-walk the same state to name the exact defect: this public
-    # entry point owes a more precise error than the shared construction
-    # boundary.
-    state = object.__getattribute__(tensor_format, "__dict__")
-    state_keys = tuple(state) if type(state) is dict else ()
-    if (
-        type(state) is not dict
-        or len(state_keys) != 1
-        or type(state_keys[0]) is not str
-        or state_keys[0] != "_level_formats"
-    ):
+    levels = audit_format_state(tensor_format)
+    if levels is None:
         raise TensorFormatError("to_sparse format has malformed stored state")
-    levels = state["_level_formats"]
-    if type(levels) is not tuple:
-        raise TensorFormatError("to_sparse format levels must be an exact tuple")
-
-    owned_levels = []
-    for level, level_format in enumerate(levels):
-        if type(level_format) is not LevelFormat:
+    for level in levels:
+        if level.bit_width is not None and level.bit_width > _MAX_FORMAT_BIT_WIDTH:
             raise TensorFormatError(
-                f"to_sparse format level {level} must be an exact LevelFormat"
-            )
-        level_state = object.__getattribute__(level_format, "__dict__")
-        level_keys = tuple(level_state) if type(level_state) is dict else ()
-        if (
-            type(level_state) is not dict
-            or len(level_keys) != 2
-            or any(type(key) is not str for key in level_keys)
-            or set(level_keys) != {"_mode", "_bit_width"}
-        ):
-            raise TensorFormatError(
-                f"to_sparse format level {level} has malformed stored state"
-            )
-        mode = level_state["_mode"]
-        bit_width = level_state["_bit_width"]
-        if type(mode) is not LevelType:
-            raise TensorFormatError(
-                f"to_sparse format level {level} mode must be an exact LevelType"
-            )
-        if bit_width is not None and (
-            type(bit_width) is not int
-            or bit_width <= 0
-            or bit_width > _MAX_FORMAT_BIT_WIDTH
-        ):
-            raise TensorFormatError(
-                f"to_sparse format level {level} bit_width must be a positive "
+                "to_sparse format level bit_width must be a positive "
                 "signed-int64 exact int or None"
             )
-        owned_levels.append(LevelFormat(mode, bit_width=bit_width))
-    return TensorFormat(owned_levels)
+    return owned_format(tensor_format)
 
 
 class Window(object):
@@ -437,14 +410,14 @@ class Window(object):
 # largest cost in a small matmul -- wrapping the dense right-hand operand was ~51% of
 # `scorch.matmul` on a 64x64 SpMM, all of it discarded when the call returned.
 #
-# So build them once per key with the ordinary constructor and reuse them. The cached
-# parts are whatever the real path produced, not a reimplementation of it, and a test
-# asserts the fast and ordinary paths agree field by field.
+# So build them once per key with `STensor._from_parts`, the constructor every
+# construction inside this module uses, and reuse them. The cached parts are whatever
+# that path produced, not a reimplementation of it, and a test asserts the fast and
+# ordinary paths agree field by field.
 #
-# Sharing is safe because each cached part is an immutable value object: TensorLayout,
-# TensorMetadata and TensorFormat are frozen dataclasses whose only object.__setattr__
-# calls are inside their own __post_init__, and a dense tensor's mode-index arrays are
-# empty tuples.
+# Sharing is safe because TensorLayout, TensorMetadata and TensorFormat cannot change
+# once built (format.py, "Read-only stored state"), and a dense tensor's mode-index
+# arrays are empty tuples.
 # --------------------------------------------------------------------------- #
 _DENSE_PARTS_CACHE: dict = {}
 _DENSE_PARTS_CACHE_MAX = 512
@@ -674,15 +647,13 @@ def _dense_from_torch(
     parts = _DENSE_PARTS_CACHE.get(key)
     value = _flat_contiguous_values(tensor)
     if parts is None:
-        built = STensor(
-            name=name,
-            shape=tuple(tensor.shape),
-            index=TensorIndex(
-                tensor_format="d" * rank,
-                mode_indices=[[] for _ in range(rank)],
-                mode_order=mode_order,
-            ),
-            value=value,
+        built = STensor._from_parts(
+            name,
+            tuple(tensor.shape),
+            "d" * rank,
+            [[] for _ in range(rank)],
+            value,
+            mode_order=mode_order,
         )
         if len(_DENSE_PARTS_CACHE) < _DENSE_PARTS_CACHE_MAX:
             storage = built._storage
@@ -837,10 +808,7 @@ class STensor:
                 if item is None
             ]
             if missing:
-                raise TensorValidationError(
-                    "runtime STensor construction requires shape, index, and value; "
-                    f"missing {', '.join(missing)}. Use TensorSpec for compile-only tensors."
-                )
+                raise TensorValidationError(_MISSING_PARTS.format(", ".join(missing)))
             if not isinstance(value, torch.Tensor):
                 raise TensorTypeError("value must be a torch.Tensor")
             if shape is None:
@@ -869,6 +837,62 @@ class STensor:
         """Internal constructor for already assembled value objects."""
         tensor = object.__new__(cls)
         tensor._set_state(metadata, storage)
+        return tensor
+
+    @classmethod
+    def _from_parts(
+        cls,
+        name: Optional[str],
+        shape: Sequence[int],
+        tensor_format: Union[TensorFormat, str, List[str]],
+        mode_indices: Sequence[Sequence[torch.Tensor]],
+        value: Optional[torch.Tensor],
+        *,
+        mode_order: Optional[Sequence[int]] = None,
+        index_dtype: Optional[torch.dtype] = None,
+        adopt: bool = False,
+        requires_grad: Optional[bool] = False,
+    ) -> "STensor":
+        """Internal constructor from a format, its index arrays and the values.
+
+        Builds what ``STensor(name, shape, index=TensorIndex(tensor_format,
+        mode_indices, mode_order, index_dtype, _adopt=adopt), value=value)`` builds,
+        with the same checks, raised in the same order, and the same result: the index
+        arrays are audited, copied unless ``adopt``, and walked in full, exactly as a
+        caller's are. What it leaves out is the index object in the middle. A storage
+        handed an index has to audit it again, because it cannot tell an index made in
+        the calling expression from one a user kept and changed, and it copies again
+        the arrays of an index that did not adopt them (``storage._index_components``
+        has the measurement). Every construction inside Scorch that starts from arrays
+        goes through here; the public constructor keeps the full audit for an index
+        object a caller brings.
+        """
+        audited = _index_components(
+            tensor_format, mode_indices, mode_order, index_dtype, not adopt
+        )
+        index_format, _, order, index_dtype = audited
+        if type(requires_grad) is not bool:
+            raise TensorTypeError("requires_grad must be a bool")
+        if value is None:
+            raise TensorValidationError(_MISSING_PARTS.format("value"))
+        if not isinstance(value, torch.Tensor):
+            raise TensorTypeError("value must be a torch.Tensor")
+        layout = TensorLayout.from_physical_shape(
+            shape, index_format, order, index_dtype
+        )
+        storage = SparseStorage(layout, value, _audited_index=audited)
+        # The storage's own values tensor, read directly: the `value` property hands
+        # out a new detached tensor per read, and two reads were 2 of this path's calls.
+        owned_value = storage._value
+        metadata = TensorMetadata._from_owned_layout(
+            "tensor" if name is None else name,
+            owned_value.dtype,
+            owned_value.device,
+            layout,
+            requires_grad,
+        )
+        tensor = object.__new__(cls)
+        tensor._set_state(metadata, storage, fresh_storage=True)
         return tensor
 
     def _set_state(
@@ -1298,7 +1322,9 @@ class STensor:
                 name="A",
                 fmt=output_format,
                 shape=result_shape,
-                dtype=self.dtype,
+                # Not ``self.dtype``: an int64 ``self`` plus a float64 ``other``
+                # would store each sum truncated to an integer.
+                dtype=common_value_dtype(self.dtype, other.dtype, operation="addition"),
                 mode_order=self.storage.index.mode_order,
             )
             B = TensorVar(
@@ -1377,26 +1403,29 @@ class STensor:
         compilation_context.complete_stage(kernel_name_token)
         module = _load_validated_prepared_kernel(prepared_build)
 
-        result_cpp = module.evaluate(
-            result_shape,
-            self.shape,
-            self._native_mode_indices(),
-            self.storage.value,
-            other.shape,
-            other._native_mode_indices(),
-            other.storage.value,
-        )
+        try:
+            result_cpp = module.evaluate(
+                result_shape,
+                self.shape,
+                self._native_mode_indices(),
+                self.storage.value,
+                other.shape,
+                other._native_mode_indices(),
+                other.storage.value,
+            )
+        except RuntimeError as error:
+            raise_if_native_repeat(error)
+            raise
 
-        result = STensor(
-            shape=result_shape,
-            index=TensorIndex(
-                mode_indices=_finalize_generated_mode_indices(
-                    output_format, result_cpp.storage.index.mode_indices
-                ),
-                tensor_format=output_format,
-                mode_order=self.storage.index.mode_order,
+        result = STensor._from_parts(
+            None,
+            result_shape,
+            output_format,
+            _finalize_generated_mode_indices(
+                output_format, result_cpp.storage.index.mode_indices
             ),
-            value=result_cpp.storage.value,
+            result_cpp.storage.value,
+            mode_order=self.storage.index.mode_order,
         )
 
         return result
@@ -1445,6 +1474,48 @@ class STensor:
         )
         return STensor._from_validated(metadata, storage)
 
+    def coalesce(self) -> STensor:
+        """This tensor with every coordinate stored once and in order, as torch's
+        ``coalesce``: entries at one coordinate are summed, an explicitly stored zero is
+        kept, and ``self`` is returned when there is nothing to do.
+
+        Scorch never builds a COO tensor that stores a coordinate twice: one built from
+        raw arrays is refused with :class:`~scorch.exceptions.RepeatedCoordinateError`,
+        and a torch COO tensor's repeats are summed on import, as torch defines them. A
+        kernel's index check refuses a repeat written into the index arrays in place
+        afterwards, with the same error. This is the repair that error asks for. It
+        applies to a COO tensor and to one whose levels are all dense or compressed; any
+        other defect in the index arrays still raises.
+
+        Returns
+        -------
+        STensor
+            ``self`` when every coordinate is stored once and in order, else a new
+            tensor whose storage shares nothing with this one.
+        """
+        storage = self._storage
+        layout = storage.layout
+        if not _validate_index_storage(
+            layout,
+            storage._mode_indices,
+            storage._value,
+            allow_unordered=True,
+            repair_coo=True,
+        ):
+            return self
+        mode_indices, values = _canonical_storage(
+            layout, storage._mode_indices, storage._value
+        )
+        canonical = SparseStorage(layout, values, mode_indices=mode_indices)
+        metadata = TensorMetadata._from_owned_layout(
+            name=self.metadata.name,
+            dtype=self.metadata.dtype,
+            device=self.metadata.device,
+            layout=canonical.layout,
+            requires_grad=self.metadata.requires_grad,
+        )
+        return STensor._from_validated(metadata, canonical)
+
     @classmethod
     def from_components(
         cls,
@@ -1466,17 +1537,14 @@ class STensor:
         """
         if isinstance(shape, (str, bytes)) or not isinstance(shape, Sequence):
             raise TensorTypeError("shape must be a sequence of integers")
-        index = TensorIndex(
-            tensor_format=tensor_format,
-            mode_indices=mode_indices,
+        return cls._from_parts(
+            name,
+            tuple(shape),
+            tensor_format,
+            mode_indices,
+            values,
             mode_order=mode_order,
             index_dtype=index_dtype,
-        )
-        return cls(
-            name=name,
-            shape=tuple(shape),
-            index=index,
-            value=values,
             requires_grad=requires_grad,
         )
 
@@ -1547,15 +1615,13 @@ class STensor:
         if len(shape) != 2:
             raise TensorLayoutError("CSR format is only valid for rank-2 tensors")
 
-        return STensor(
-            name=name,
-            shape=tuple(shape),
-            index=TensorIndex(
-                tensor_format="ds",
-                mode_indices=[[], [crow_indices, col_indices]],
-                _adopt=True,  # shared with `csr_matrix`, as torch shares them
-            ),
-            value=values,
+        return STensor._from_parts(
+            name,
+            tuple(shape),
+            "ds",
+            [[], [crow_indices, col_indices]],
+            values,
+            adopt=True,  # shared with `csr_matrix`, as torch shares them
         )
 
     @staticmethod
@@ -1602,8 +1668,11 @@ class STensor:
         Notes
         -----
         The caller's indices are never mutated or narrowed. Raw COO input is
-        coalesced into canonical int64 coordinates, and that dtype is recorded
-        by :attr:`layout`. Re-exported as ``scorch.from_coo``.
+        sorted into canonical int64 coordinates, and that dtype is recorded
+        by :attr:`layout`. Raw arrays that store one coordinate twice are
+        refused with :class:`~scorch.exceptions.RepeatedCoordinateError`; a torch
+        COO tensor's repeats are summed, as torch defines them. Re-exported as
+        ``scorch.from_coo``.
 
         Examples
         --------
@@ -1680,18 +1749,30 @@ class STensor:
                 raise TensorIndexError("COO index rank does not match shape rank")
             if indices.shape[1] != values.numel():
                 raise TensorStorageError("COO coordinate and value counts must match")
-            # Coalesce without ever modifying the caller's tensors. PyTorch's COO
-            # builder canonicalizes coordinates to int64, which is recorded in
-            # the resulting layout rather than silently narrowed to int32.
+            # Sort without ever modifying the caller's tensors. PyTorch's COO builder
+            # canonicalizes coordinates to int64, which is recorded in the resulting
+            # layout rather than silently narrowed to int32.
             try:
-                canonical = torch.sparse_coo_tensor(
+                given = torch.sparse_coo_tensor(
                     indices.to(torch.int64),
                     values.resolve_conj().resolve_neg(),
                     tuple(shape),
                     check_invariants=True,
-                ).coalesce()
+                )
+                canonical = given.coalesce()
             except (RuntimeError, TypeError, ValueError, OverflowError) as error:
                 raise TensorIndexError(f"invalid COO coordinates: {error}") from error
+            # Raw arrays that store a coordinate twice are refused, where a torch COO
+            # tensor's repeats are summed above (torch defines them as a sum; Bobby,
+            # 2026-10-12). coalesce() has already run, so a repeat is exactly a drop in
+            # the entry count and costs nothing to detect.
+            if canonical._nnz() != given._nnz():
+                raise repeated_coordinate_in(
+                    given._indices(),
+                    "COO indices",
+                    "for instance STensor.from_torch(torch.sparse_coo_tensor(indices, "
+                    "values, shape)), which sums them as torch does",
+                )
             (indices,) = _torch_index_members(canonical)
             values = canonical.values()
             shape = tuple(canonical.shape)
@@ -1699,15 +1780,13 @@ class STensor:
         if indices is None or values is None or shape is None:
             raise TensorStorageError("COO components were not initialized")
         mode_indices = [[indices[mode]] for mode in range(len(shape))]
-        return STensor(
-            name=name,
-            shape=tuple(shape),
-            index=TensorIndex(
-                tensor_format="o" * len(shape),
-                mode_indices=mode_indices,
-                _adopt=True,  # the coalesced tensor's own, as torch shares them
-            ),
-            value=values,
+        return STensor._from_parts(
+            name,
+            tuple(shape),
+            "o" * len(shape),
+            mode_indices,
+            values,
+            adopt=True,  # the coalesced tensor's own, as torch shares them
         )
 
     @staticmethod
@@ -1815,16 +1894,14 @@ class STensor:
                 for i in range(tensor.dim()):
                     mode_indices.append([tensor_indices[i]])
 
-                return STensor(
-                    name=name,
-                    shape=tuple(tensor.shape),
-                    index=TensorIndex(
-                        tensor_format="o" * rank,
-                        mode_indices=mode_indices,
-                        mode_order=mode_order,
-                        _adopt=True,  # shared with `tensor`, as torch shares them
-                    ),
-                    value=tensor.values().resolve_conj().resolve_neg(),
+                return STensor._from_parts(
+                    name,
+                    tuple(tensor.shape),
+                    "o" * rank,
+                    mode_indices,
+                    tensor.values().resolve_conj().resolve_neg(),
+                    mode_order=mode_order,
+                    adopt=True,  # shared with `tensor`, as torch shares them
                 )
 
             elif tensor.layout == torch.sparse_csr:
@@ -1832,16 +1909,14 @@ class STensor:
                 values = tensor.values()
                 shape = tensor.size()
 
-                return STensor(
-                    name=name,
-                    shape=shape,
-                    index=TensorIndex(
-                        tensor_format="ds",
-                        mode_indices=[[], [crow_indices, col_indices]],
-                        mode_order=mode_order,
-                        _adopt=True,  # shared with `tensor`, as torch shares them
-                    ),
-                    value=values.resolve_conj().resolve_neg(),
+                return STensor._from_parts(
+                    name,
+                    shape,
+                    "ds",
+                    [[], [crow_indices, col_indices]],
+                    values.resolve_conj().resolve_neg(),
+                    mode_order=mode_order,
+                    adopt=True,  # shared with `tensor`, as torch shares them
                 )
             raise TensorStorageError(f"unsupported sparse layout {tensor.layout}")
 
@@ -2083,24 +2158,26 @@ class STensor:
         compilation_context.complete_stage(kernel_name_token)
         module = _load_validated_prepared_kernel(prepared_build)
 
-        result_cpp = module.evaluate(
-            self.shape,
-            self.shape,
-            self._native_mode_indices(),
-            self.storage.value,
-        )
+        try:
+            result_cpp = module.evaluate(
+                self.shape,
+                self.shape,
+                self._native_mode_indices(),
+                self.storage.value,
+            )
+        except RuntimeError as error:
+            raise_if_native_repeat(error)
+            raise
 
-        new_tensor = STensor(
-            name=self.name,
-            shape=self.shape,
-            index=TensorIndex(
-                tensor_format=output_format,
-                mode_indices=_finalize_generated_mode_indices(
-                    output_format, result_cpp.storage.index.mode_indices
-                ),
-                mode_order=self.storage.index.mode_order,
+        new_tensor = STensor._from_parts(
+            self.name,
+            self.shape,
+            output_format,
+            _finalize_generated_mode_indices(
+                output_format, result_cpp.storage.index.mode_indices
             ),
-            value=result_cpp.storage.value,
+            result_cpp.storage.value,
+            mode_order=self.storage.index.mode_order,
         )
 
         if in_place:
@@ -2234,15 +2311,13 @@ class STensor:
                 if rank_one_kind is LevelType.COMPRESSED
                 else [[nonzero_indices]]
             )
-            new_tensor = STensor(
-                name=self.name,
-                shape=self.shape,
-                index=TensorIndex(
-                    tensor_format=output_format,
-                    mode_indices=mode_indices,
-                    mode_order=self.storage.index.mode_order,
-                ),
-                value=filtered_values,
+            new_tensor = STensor._from_parts(
+                self.name,
+                self.shape,
+                output_format,
+                mode_indices,
+                filtered_values,
+                mode_order=self.storage.index.mode_order,
             )
             self._set_state(new_tensor.metadata, new_tensor.storage)
         else:
@@ -2431,12 +2506,16 @@ class STensor:
             compilation_context.complete_stage(kernel_name_token)
             module = _load_validated_prepared_kernel(prepared_build)
 
-            result_cpp = module.evaluate(
-                self.shape,
-                self.shape,
-                self._native_mode_indices(),
-                self.storage.value,
-            )
+            try:
+                result_cpp = module.evaluate(
+                    self.shape,
+                    self.shape,
+                    self._native_mode_indices(),
+                    self.storage.value,
+                )
+            except RuntimeError as error:
+                raise_if_native_repeat(error)
+                raise
 
             # A generated result like any other: `module.evaluate` above just ran a
             # kernel whose output levels codegen allocated with `torch::empty`. It went
@@ -2549,15 +2628,13 @@ class STensor:
             values = collapsed[mask].reshape(-1).clone()
         else:
             values = dense.reshape(-1)[:0].clone()
-        new_tensor = STensor(
-            name=self.name,
-            shape=shape,
-            index=TensorIndex(
-                tensor_format=output_format,
-                mode_indices=mode_indices,
-                mode_order=self.storage.index.mode_order,
-            ),
-            value=values,
+        new_tensor = STensor._from_parts(
+            self.name,
+            shape,
+            output_format,
+            mode_indices,
+            values,
+            mode_order=self.storage.index.mode_order,
         )
         self._set_state(new_tensor.metadata, new_tensor.storage)
         return self
@@ -2568,6 +2645,8 @@ class STensor:
         *,
         _compile_options: Optional[CompileOptions] = None,
         _compilation_context: Optional[CompilationContext] = None,
+        _target_format: Optional[TensorFormat] = None,
+        _keep_every_stored_entry: bool = False,
     ) -> STensor:
         """Relay out the tensor into a new logical mode order (transpose).
 
@@ -2601,6 +2680,14 @@ class STensor:
         ``mode_order`` maps physical axis → logical axis. This is how Scorch
         represents a transposed operand without recomputing; the general
         (non-fast-path) route triggers a JIT C++ compile on first use.
+
+        The general path keeps the format's letters by storage position and
+        copies only the entries whose value is nonzero.  Two internal
+        keyword arguments, set only by einsum's operand relayout
+        (``scorch.ops._einsum_operand_relayout``), change that:
+        ``_target_format`` stores the result in another format of the same
+        rank, and ``_keep_every_stored_entry`` copies every stored entry
+        whatever its value.
         """
         dim = len(self.shape)
         if not isinstance(mode_order, (list, tuple)):
@@ -2618,7 +2705,16 @@ class STensor:
             else [i for i in range(dim)]
         )
 
-        if old_mode_order == mode_order:
+        target_format = self.format
+        same_format = True
+        if _target_format is not None:
+            if _target_format.get_order() != dim:
+                raise TensorLayoutError(
+                    f"_target_format must have {dim} levels, got {_target_format}"
+                )
+            target_format = _target_format
+            same_format = _target_format == self.format
+        if old_mode_order == mode_order and same_format:
             return self
 
         # old_mode_order maps physical_axis -> logical_axis.
@@ -2636,7 +2732,8 @@ class STensor:
         # Fast path for 2D tensors in core formats. This avoids lowering/compiling
         # a transpose kernel for the common matmul operands.
         fmt_str = str(self.format)
-        if dim == 2 and fmt_str in {"d,d", "d,s", "o,o"}:
+        # These three keep every stored entry already.
+        if dim == 2 and fmt_str in {"d,d", "d,s", "o,o"} and same_format:
 
             def _coalesce_2d_coo(
                 row: torch.Tensor, col: torch.Tensor, vals: torch.Tensor, num_cols: int
@@ -2701,6 +2798,15 @@ class STensor:
                     self.values,
                     result_shape[1],
                 )
+                if coalesced_values.numel() != self.values.numel():
+                    # Transposing distinct coordinates keeps them distinct, so only an
+                    # in-place write to the index arrays after construction gets here.
+                    # Refused, as the kernels' index check refuses it, not summed.
+                    raise repeated_coordinate_in(
+                        torch.stack(old_coords),
+                        "this COO tensor's index arrays",
+                        "STensor.coalesce() sums them",
+                    )
                 mode_indices = [
                     [coalesced_row],
                     [coalesced_col],
@@ -2748,16 +2854,14 @@ class STensor:
                 raise TensorStorageError(
                     "mode-order conversion did not produce storage"
                 )
-            new_tensor = STensor(
-                name=self.name,
-                shape=result_shape,
-                index=TensorIndex(
-                    tensor_format=self.format,
-                    mode_indices=mode_indices,
-                    mode_order=mode_order[:],
-                    index_dtype=self.index_dtype,
-                ),
-                value=values,
+            new_tensor = STensor._from_parts(
+                self.name,
+                result_shape,
+                self.format,
+                mode_indices,
+                values,
+                mode_order=mode_order[:],
+                index_dtype=self.index_dtype,
             )
             self._set_state(new_tensor.metadata, new_tensor.storage)
             return self
@@ -2798,7 +2902,7 @@ class STensor:
 
             A = TensorVar(
                 name="A",
-                fmt=self.format,
+                fmt=target_format,
                 shape=result_shape,
                 dtype=self.dtype,
                 mode_order=mode_order[:],
@@ -2807,6 +2911,7 @@ class STensor:
             workspace = Workspace(
                 name="wksp",
                 dim=len(self.shape),
+                dtype=self.dtype,
                 mode_order=mode_order[:],
             )
 
@@ -2841,7 +2946,7 @@ class STensor:
             compilation_context=compilation_context,
         )
         lowerer = CINLowerer(
-            filter_zeros=True,
+            filter_zeros=not _keep_every_stored_entry,
             compile_options=compile_options,
             compilation_context=compilation_context,
         )
@@ -2884,24 +2989,26 @@ class STensor:
         compilation_context.complete_stage(kernel_name_token)
         module = _load_validated_prepared_kernel(prepared_build)
 
-        result_cpp = module.evaluate(
-            result_shape,
-            self.shape,
-            self._native_mode_indices(),
-            self.storage.value,
-        )
+        try:
+            result_cpp = module.evaluate(
+                result_shape,
+                self.shape,
+                self._native_mode_indices(),
+                self.storage.value,
+            )
+        except RuntimeError as error:
+            raise_if_native_repeat(error)
+            raise
 
-        new_tensor = STensor(
-            name=self.name,
-            shape=result_shape,
-            index=TensorIndex(
-                tensor_format=self.format,
-                mode_indices=_finalize_generated_mode_indices(
-                    self.format, result_cpp.storage.index.mode_indices
-                ),
-                mode_order=mode_order[:],
+        new_tensor = STensor._from_parts(
+            self.name,
+            result_shape,
+            target_format,
+            _finalize_generated_mode_indices(
+                target_format, result_cpp.storage.index.mode_indices
             ),
-            value=result_cpp.storage.value,
+            result_cpp.storage.value,
+            mode_order=mode_order[:],
         )
         self._set_state(new_tensor.metadata, new_tensor.storage)
 

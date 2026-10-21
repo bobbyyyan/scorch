@@ -6,6 +6,12 @@ from itertools import product
 import pytest
 import torch
 
+# Six tests below build a kernel with torch.utils.cpp_extension.load_inline.  The
+# attribute exists only once the submodule has been imported; Scorch imports it on
+# first compile, so without this line those tests fail whenever they are the first
+# in their process to compile.
+import torch.utils.cpp_extension
+
 import scorch
 import scorch.ops as scorch_ops
 from scorch import STensor, einsum, utils
@@ -529,6 +535,7 @@ def test_spmm_ds_ds_ds_ikj_gustavson():
     workspace = Workspace(
         name="wksp",
         dim=1,
+        dtype=A.dtype,
     )
 
     # A[i, j] = ForAll(i,
@@ -682,6 +689,7 @@ def test_spmm_ds_ds_ds_kij_outer():
     workspace = Workspace(
         name="wksp",
         dim=2,
+        dtype=A.dtype,
     )
 
     cin_stmt = Where(
@@ -1018,6 +1026,7 @@ def test_spmm_ss_dd_dd_ikj_gustavson():
     workspace = Workspace(
         name="wksp",
         dim=1,
+        dtype=A.dtype,
     )
 
     """
@@ -1135,6 +1144,7 @@ def test_spmm_ds_dd_dd_ikj_gustavson():
     workspace = Workspace(
         name="wksp",
         dim=1,
+        dtype=A.dtype,
     )
 
     """
@@ -1253,6 +1263,7 @@ def test_spmm_ds_ds_ds_ikj_gustavson_random():
     workspace = Workspace(
         name="wksp",
         dim=1,
+        dtype=A.dtype,
     )
 
     """
@@ -1353,6 +1364,7 @@ def test_spmm_ss_ds_ds_ikj_gustavson():
     workspace = Workspace(
         name="wksp",
         dim=1,
+        dtype=A.dtype,
     )
 
     """

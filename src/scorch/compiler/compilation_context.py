@@ -46,6 +46,10 @@ class CompilerStageId(Enum):
     # sequences and their timing records are unchanged.
     CIN_TO_LOOPIR_LOWERING = "cin_to_loopir_lowering"
     LOOPIR_SCHEDULE_APPLICATION = "loopir_schedule_application"
+    # Begun only for an automatic plan that records no assembly strategy and
+    # whose result has a level that is not dense: the stage completes the plan
+    # and applies the completed one.
+    LOOPIR_ASSEMBLY_SELECTION = "loopir_assembly_selection"
     LOOPIR_TO_LLIR_LOWERING = "loopir_to_llir_lowering"
 
 

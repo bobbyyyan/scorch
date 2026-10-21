@@ -40,6 +40,7 @@ sources = [
     "src/scorch/csrc/ops.cpp",
     "src/scorch/csrc/spmm_gathered.cpp",
     "src/scorch/csrc/spmm_panelled.cpp",
+    "src/scorch/csrc/sealed_values.cpp",
 ]
 depends = [
     "src/scorch/csrc/header.h",

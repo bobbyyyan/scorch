@@ -278,6 +278,7 @@ def test_stage_identities_records_and_owner_are_typed_frozen_and_stable() -> Non
         # driver begins these; every legacy stage sequence below is unchanged.
         CompilerStageId.CIN_TO_LOOPIR_LOWERING,
         CompilerStageId.LOOPIR_SCHEDULE_APPLICATION,
+        CompilerStageId.LOOPIR_ASSEMBLY_SELECTION,
         CompilerStageId.LOOPIR_TO_LLIR_LOWERING,
     )
     assert _FULL_STAGE_SEQUENCE == [
@@ -292,6 +293,7 @@ def test_stage_identities_records_and_owner_are_typed_frozen_and_stable() -> Non
         "kernel_name_and_build_request_assembly",
         "cin_to_loopir_lowering",
         "loopir_schedule_application",
+        "loopir_assembly_selection",
         "loopir_to_llir_lowering",
     ]
 
@@ -3476,17 +3478,12 @@ def test_malformed_tiled_stack_decl_fails_first_pass_and_suppresses_later_stages
         ("wksp", "kTile_j", llir.DataType.CONSTEXPR_INT),
     ]
     assert diagnostic.code == "invalid_fixed_stack_array_extent"
-    assert diagnostic.path == (
-        "root",
-        "[1]",
-        "body",
-        "[5]",
-        "body",
-        "[1]",
-        "extent",
-    )
-    assert diagnostic.stage == "LLIR transformation"
-    assert diagnostic.pass_name == "insert_sparse_prefetch"
+    # The walk starts at the loop that would be marked, so the path does too.
+    assert diagnostic.path == ("root", "[5]", "body", "[1]", "extent")
+    # The loop-carried scalar walk of parallel marking (CIN lowering) is the first
+    # LLIR walker to meet the node, before the first managed LLIR pass.
+    assert diagnostic.stage == "CIN lowering"
+    assert diagnostic.pass_name == "parallel_loop_carried_scalars"
     assert _stage_values(context) == _EINSUM_PREFIX_THROUGH_ADAPTER
     assert [record.sequence_index for record in context.stage_run_records] == list(
         range(len(context.stage_run_records))
@@ -4240,8 +4237,10 @@ def test_malformed_tiled_workspace_read_fails_cin_lowering_and_stops_later_work(
 
     assert len(injected_reads) == 1
     assert failure.value.diagnostic.code == "invalid_tensor_access_metadata"
-    assert failure.value.diagnostic.stage == "LLIR transformation"
-    assert failure.value.diagnostic.pass_name == "insert_sparse_prefetch"
+    # The loop-carried scalar walk of parallel marking (CIN lowering) is the first
+    # LLIR walker to meet the node, before the first managed LLIR pass.
+    assert failure.value.diagnostic.stage == "CIN lowering"
+    assert failure.value.diagnostic.pass_name == "parallel_loop_carried_scalars"
     assert context.compile_options is options
     assert _stage_values(context) == _EINSUM_PREFIX_THROUGH_ADAPTER
     assert context.llir_pass_run_records == ()
@@ -4491,8 +4490,10 @@ def test_malformed_mode_iterator_coordinate_read_stops_all_later_work(
 
     assert len(injected_reads) == 1
     assert failure.value.diagnostic.code == "invalid_tensor_access_metadata"
-    assert failure.value.diagnostic.stage == "LLIR transformation"
-    assert failure.value.diagnostic.pass_name == "insert_sparse_prefetch"
+    # The loop-carried scalar walk of parallel marking (CIN lowering) is the first
+    # LLIR walker to meet the node, before the first managed LLIR pass.
+    assert failure.value.diagnostic.stage == "CIN lowering"
+    assert failure.value.diagnostic.pass_name == "parallel_loop_carried_scalars"
     assert context.compile_options is options
     assert _stage_values(context) == _EINSUM_PREFIX_THROUGH_ADAPTER
     assert context.llir_pass_run_records == ()
@@ -4557,8 +4558,10 @@ def test_malformed_mode_iterator_position_bound_stops_all_later_work(
 
     assert len(injected_bounds) == 1
     assert failure.value.diagnostic.code == "invalid_add_operator"
-    assert failure.value.diagnostic.stage == "LLIR transformation"
-    assert failure.value.diagnostic.pass_name == "insert_sparse_prefetch"
+    # The loop-carried scalar walk of parallel marking (CIN lowering) is the first
+    # LLIR walker to meet the node, before the first managed LLIR pass.
+    assert failure.value.diagnostic.stage == "CIN lowering"
+    assert failure.value.diagnostic.pass_name == "parallel_loop_carried_scalars"
     assert context.compile_options is options
     assert _stage_values(context) == _EINSUM_PREFIX_THROUGH_ADAPTER
     assert context.llir_pass_run_records == ()

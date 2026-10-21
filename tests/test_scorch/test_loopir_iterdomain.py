@@ -138,20 +138,63 @@ def test_broadcast_variable_resolves_dense():
     assert table.domains[1].kind is DomainKind.DENSE
 
 
-def test_union_with_dense_fails_closed():
-    expect_defect(
-        "unsupported_union_with_dense",
-        elementwise_cin(Operation.ADD, fmt_b="dd", fmt_out="dd"),
-    )
+def test_union_with_dense_visits_every_coordinate():
+    """``A + B`` with ``B`` dense: every coordinate of ``j`` is a candidate,
+    and ``A``'s stored stream is followed in order (DENSE_UNION)."""
+
+    table = analyzed(elementwise_cin(Operation.ADD, fmt_b="dd", fmt_out="dd"))
+    assert table.domains[0].kind is DomainKind.DENSE
+    domain = table.domains[1]
+    assert domain.kind is DomainKind.DENSE_UNION
+    assert [ref.level for ref in domain.cursors] == [1]
 
 
-def test_union_with_invariant_fails_closed():
+def test_union_with_a_dense_invariant_visits_every_coordinate():
     i, j = IndexVar("i"), IndexVar("j")
     C = TensorVar("C", fmt="dd", dtype=torch.float32)
     A = TensorVar("A", fmt="ds", dtype=torch.float32)
     x = TensorVar("x", fmt="d", dtype=torch.float32)
     cin = ForAll(i, ForAll(j, TensorAssign(C[i, j], A[i, j] + x[i])))
+    domain = analyzed(cin).domains[1]
+    assert domain.kind is DomainKind.DENSE_UNION
+    assert len(domain.cursors) == 1
+
+
+def test_union_with_a_sparse_invariant_fails_closed():
+    """``x[i]`` stored compressed covers every ``j`` only where it stores
+    ``i``, so the candidate set would change with the enclosing coordinate."""
+
+    i, j = IndexVar("i"), IndexVar("j")
+    C = TensorVar("C", fmt="dd", dtype=torch.float32)
+    A = TensorVar("A", fmt="ds", dtype=torch.float32)
+    x = TensorVar("x", fmt="s", dtype=torch.float32)
+    cin = ForAll(i, ForAll(j, TensorAssign(C[i, j], A[i, j] + x[i])))
     expect_defect("unsupported_union_operand", cin)
+
+
+def test_product_of_dense_unions_is_a_dense_union():
+    i, j = IndexVar("i"), IndexVar("j")
+    C = TensorVar("C", fmt="dd", dtype=torch.float32)
+    A = TensorVar("A", fmt="ds", dtype=torch.float32)
+    B = TensorVar("B", fmt="ds", dtype=torch.float32)
+    D = TensorVar("D", fmt="dd", dtype=torch.float32)
+    E = TensorVar("E", fmt="dd", dtype=torch.float32)
+    cin = ForAll(
+        i, ForAll(j, TensorAssign(C[i, j], (A[i, j] + D[i, j]) * (B[i, j] + E[i, j])))
+    )
+    domain = analyzed(cin).domains[1]
+    assert domain.kind is DomainKind.DENSE_UNION
+    assert len(domain.cursors) == 2
+
+
+def test_dense_union_inside_an_intersection_fails_closed():
+    i, j = IndexVar("i"), IndexVar("j")
+    C = TensorVar("C", fmt="dd", dtype=torch.float32)
+    A = TensorVar("A", fmt="ds", dtype=torch.float32)
+    B = TensorVar("B", fmt="ds", dtype=torch.float32)
+    D = TensorVar("D", fmt="dd", dtype=torch.float32)
+    cin = ForAll(i, ForAll(j, TensorAssign(C[i, j], (A[i, j] + D[i, j]) * B[i, j])))
+    expect_defect("unsupported_nested_merge", cin)
 
 
 def test_sparse_subtraction_fails_closed():
@@ -168,11 +211,21 @@ def test_nested_merge_fails_closed():
     expect_defect("unsupported_nested_merge", cin)
 
 
-def test_coordinate_level_type_fails_closed():
+@pytest.mark.parametrize("fmt", ["do", "od", "so", "os"])
+def test_a_coordinate_level_beside_another_kind_fails_closed(fmt):
     expect_defect(
-        "unsupported_level_type",
-        elementwise_cin(Operation.MUL, fmt_a="oo", fmt_out="dd"),
+        "unsupported_mixed_coordinate_hierarchy",
+        elementwise_cin(Operation.MUL, fmt_a=fmt, fmt_b="dd", fmt_out="dd"),
     )
+
+
+def test_an_all_coordinate_operand_has_a_sparse_domain_per_level():
+    table = analyzed(
+        elementwise_cin(Operation.MUL, fmt_a="oo", fmt_b="dd", fmt_out="dd")
+    )
+    for level, domain in enumerate(table.domains):
+        assert domain.kind is DomainKind.SPARSE
+        assert [cursor.level for cursor in domain.cursors] == [level]
 
 
 def test_plan_mismatch_fails_closed():

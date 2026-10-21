@@ -3,20 +3,26 @@
 Promoted from the Phase-3.5 spike (its level-storage and CSR
 container modules) for the Phase-5 sparse vertical slice.  The
 oracle's execution core consumes only this small interface — ``segment``,
-``coordinate_at``, and ``leaf_value`` on a validated
+``next_position``, ``coordinate_at``, and ``leaf_value`` on a validated
 :class:`LevelTensorStorage` — so its traversal is defined over generic
 physical levels rather than any one container.  CSR is exactly one adapter
 (:class:`CsrMatrix` plus :func:`from_csr` on the input side,
 :class:`CsrOutputBuilder` on the assembly side); DCSR, CSC, CSF-like, and
 any other DENSE/COMPRESSED level composition with any physical-to-logical
-mode permutation bind through the same storage class.
+mode permutation bind through the same storage class.  So does COO: a tensor
+whose levels are all COORDINATE levels, with any mode permutation.  A
+COORDINATE level mixed with a DENSE or COMPRESSED level is not supported.
 
 Canonical means: exact int/float scalars; per-level consistency between the
 parent position count and the child level's storage (``seg_offsets`` of
 length ``parents + 1``, starting at zero, nondecreasing; per-segment
 coordinates strictly increasing and inside the stored dimension's extent);
 dense extents equal to the stored dimension's extent; and a value stream
-owned by the leaf level with exactly one scalar per leaf position.
+owned by the leaf level with exactly one scalar per leaf position.  For COO
+it means: one coordinate array per level, all of one length, every coordinate
+inside the stored dimension's extent; the entry tuples, read in level order,
+strictly increasing in lexicographic order, so that no tuple is stored twice;
+and one scalar per entry.
 Everything unexpected raises :class:`LevelStorageError` rather than being
 coerced.  This module is Torch-free and is loaded only by the oracle and
 dedicated tests, never by production compilation.
@@ -215,7 +221,50 @@ class CompressedLevel:
     coords: Tuple[int, ...]
 
 
-_LEVEL_KINDS = {DenseLevel: LevelKind.DENSE, CompressedLevel: LevelKind.COMPRESSED}
+@dataclass(frozen=True)
+class CoordinateLevel:
+    """One COORDINATE physical level: one stored coordinate per entry.
+
+    ``coords[position]`` is the coordinate of entry ``position`` in the
+    logical mode this level stores.  Every level of a COO tensor is a
+    coordinate level, and they all share the one position space
+    ``0 .. n - 1`` of the tensor's ``n`` stored entries.
+    """
+
+    coords: Tuple[int, ...]
+
+
+_LEVEL_KINDS = {
+    DenseLevel: LevelKind.DENSE,
+    CompressedLevel: LevelKind.COMPRESSED,
+    CoordinateLevel: LevelKind.COORDINATE,
+}
+
+_COORDINATE_LEVELS_ONLY = (
+    "a coordinate level requires every level of the tensor to be a coordinate level"
+)
+
+
+def _check_coordinate_entry_order(columns: Sequence[Tuple[int, ...]]) -> None:
+    """Require the entries of equally long coordinate arrays to be canonical.
+
+    ``columns`` holds one validated coordinate array per level, in level
+    order.  The entry tuples must be strictly increasing in lexicographic
+    order, which also means no tuple is stored twice.
+    """
+
+    if not columns:
+        return
+    for position in range(1, len(columns[0])):
+        previous = tuple(column[position - 1] for column in columns)
+        current = tuple(column[position] for column in columns)
+        if current <= previous:
+            raise LevelStorageError(
+                "coordinate-level entries must be lexicographically "
+                f"increasing; entry {position} is "
+                f"{_diagnostic_coords(current)} after "
+                f"{_diagnostic_coords(previous)}"
+            )
 
 
 @dataclass(frozen=True)
@@ -259,6 +308,7 @@ class LevelTensorStorage:
             raise LevelStorageError(f"levels must be an owned tuple of length {rank}")
         counts: List[int] = []
         parent_count = 1
+        coordinate_columns: List[Tuple[int, ...]] = []
         for number, level in enumerate(self.levels):
             extent = self.shape[self.modes[number]]
             if type(level) is DenseLevel:
@@ -327,12 +377,41 @@ class LevelTensorStorage:
                             )
                         last = coord
                 parent_count = len(coords)
+            elif type(level) is CoordinateLevel:
+                if any(type(other) is not CoordinateLevel for other in self.levels):
+                    raise LevelStorageError(
+                        f"levels[{number}] is a coordinate level, and "
+                        f"{_COORDINATE_LEVELS_ONLY}"
+                    )
+                coords = _stored_field(level, "coords", f"levels[{number}]")
+                if type(coords) is not tuple:
+                    raise LevelStorageError(
+                        f"levels[{number}].coords must be an owned tuple"
+                    )
+                # Level 0 fixes the entry count; every later level, and the
+                # value stream, must hold exactly that many.
+                if number > 0 and len(coords) != parent_count:
+                    raise LevelStorageError(
+                        f"levels[{number}] has {len(coords)} coordinates for "
+                        f"{parent_count} stored entries"
+                    )
+                for position, coord in enumerate(coords):
+                    _expect_exact_int(coord, f"levels[{number}].coords[{position}]")
+                    if not 0 <= coord < extent:
+                        raise LevelStorageError(
+                            f"levels[{number}] coordinate "
+                            f"{_diagnostic_int(coord)} outside [0, "
+                            f"{_diagnostic_int(extent)})"
+                        )
+                coordinate_columns.append(coords)
+                parent_count = len(coords)
             else:
                 raise LevelStorageError(
                     f"levels[{number}] has unsupported storage class "
                     f"{type(level).__name__}"
                 )
             counts.append(parent_count)
+        _check_coordinate_entry_order(coordinate_columns)
         if type(self.values) is not tuple:
             raise LevelStorageError("values must be an owned tuple")
         if len(self.values) != parent_count:
@@ -375,6 +454,13 @@ class LevelTensorStorage:
                         )
                     )
                 )
+            elif type(level) is CoordinateLevel:
+                coords = _stored_field(level, "coords", f"levels[{number}]")
+                if type(coords) is not tuple:
+                    raise LevelStorageError(
+                        f"levels[{number}].coords must be an owned tuple"
+                    )
+                copied_levels.append(CoordinateLevel(cast(Tuple[int, ...], coords)))
             else:
                 if type(level) is not CompressedLevel:
                     raise LevelStorageError(
@@ -434,8 +520,83 @@ class LevelTensorStorage:
             raise LevelStorageError("parent-position count must be nonnegative")
         return count
 
+    def _coordinate_columns(
+        self, levels: Tuple[object, ...], through: int
+    ) -> List[Tuple[int, ...]]:
+        """The equally long coordinate arrays of levels ``0 .. through``."""
+
+        columns: List[Tuple[int, ...]] = []
+        for number in range(through + 1):
+            stored = levels[number]
+            if type(stored) is not CoordinateLevel:
+                raise LevelStorageError(
+                    f"levels[{number}] is not a coordinate level, and "
+                    f"{_COORDINATE_LEVELS_ONLY}"
+                )
+            coords = _stored_field(stored, "coords", f"levels[{number}]")
+            if type(coords) is not tuple:
+                raise LevelStorageError(
+                    f"levels[{number}].coords must be an owned tuple"
+                )
+            if columns and len(coords) != len(columns[0]):
+                raise LevelStorageError(
+                    f"levels[{number}] has {len(coords)} coordinates for "
+                    f"{len(columns[0])} stored entries"
+                )
+            columns.append(coords)
+        return columns
+
+    def _coordinate_segment(
+        self, levels: Tuple[object, ...], level: int, parent_position: int
+    ) -> Tuple[int, int]:
+        """Half-open entry range one parent position dominates in COO storage.
+
+        The root dominates every entry at level 0.  At a deeper level the
+        parent position is the entry that starts a run of entries with equal
+        coordinates on levels ``0 .. level - 1``, and the segment is that
+        run.  The caller has checked ``parent_position`` against the parent
+        position count.
+        """
+
+        columns = self._coordinate_columns(levels, level)
+        count = len(columns[0])
+        if level == 0:
+            return (0, count)
+        if parent_position >= count:
+            raise LevelStorageError(
+                f"levels[{level}].coords has no entry at parent position "
+                f"{parent_position}"
+            )
+
+        def coordinate(number: int, position: int) -> int:
+            return _expect_exact_int(
+                columns[number][position], f"levels[{number}].coords[{position}]"
+            )
+
+        def same_run(first: int, second: int) -> bool:
+            return all(
+                coordinate(number, first) == coordinate(number, second)
+                for number in range(level)
+            )
+
+        if parent_position > 0 and same_run(parent_position - 1, parent_position):
+            raise LevelStorageError(
+                f"parent position {parent_position} does not start a run of "
+                f"equal coordinates on the levels above level {level}"
+            )
+        end = parent_position + 1
+        while end < count and same_run(parent_position, end):
+            end += 1
+        return (parent_position, end)
+
     def segment(self, level: int, parent_position: int) -> Tuple[int, int]:
-        """Half-open child-position range one parent position dominates."""
+        """Half-open child-position range one parent position dominates.
+
+        A compressed level reads the range from its segment offsets.  A
+        coordinate level has no offsets: the root dominates every entry, and
+        an entry that starts a run of equal coordinates on the levels above
+        dominates that run.
+        """
 
         level = _expect_exact_int(level, "level")
         parent_position = _expect_exact_int(parent_position, "parent_position")
@@ -445,13 +606,15 @@ class LevelTensorStorage:
         if not 0 <= level < len(levels):
             raise LevelStorageError(f"no level {level} in rank-{len(levels)}")
         stored = levels[level]
-        if type(stored) is not CompressedLevel:
+        if type(stored) is not CompressedLevel and type(stored) is not CoordinateLevel:
             raise LevelStorageError(f"level {level} has no stored segments")
         if not 0 <= parent_position < self._parent_count(level):
             raise LevelStorageError(
                 f"parent position {parent_position} outside "
                 f"[0, {self._parent_count(level)}) at level {level}"
             )
+        if type(stored) is CoordinateLevel:
+            return self._coordinate_segment(levels, level, parent_position)
         offsets = _stored_field(stored, "seg_offsets", f"levels[{level}]")
         if type(offsets) is not tuple:
             raise LevelStorageError(
@@ -480,8 +643,58 @@ class LevelTensorStorage:
             )
         return (start, end)
 
+    def next_position(self, level: int, position: int, end: int) -> int:
+        """The position a cursor on ``level`` moves to after ``position``.
+
+        ``end`` is the end of the segment the cursor walks.  A compressed
+        level stores each coordinate of a segment once, so the cursor moves
+        to ``position + 1``.  A coordinate level stores one coordinate per
+        entry, so the cursor moves past the run of entries that repeat the
+        coordinate at ``position``: to the first later position inside the
+        segment whose coordinate differs, or to ``end``.
+        """
+
+        level = _expect_exact_int(level, "level")
+        position = _expect_exact_int(position, "position")
+        end = _expect_exact_int(end, "end")
+        levels = _stored_field(self, "levels", "LevelTensorStorage")
+        if type(levels) is not tuple:
+            raise LevelStorageError("levels must be an owned tuple")
+        if not 0 <= level < len(levels):
+            raise LevelStorageError(f"no level {level} in rank-{len(levels)}")
+        stored = levels[level]
+        if type(stored) is not CompressedLevel and type(stored) is not CoordinateLevel:
+            raise LevelStorageError(f"level {level} has no stored coordinates")
+        coords = _stored_field(stored, "coords", f"levels[{level}]")
+        if type(coords) is not tuple:
+            raise LevelStorageError(f"levels[{level}].coords must be an owned tuple")
+        if not 0 <= position < len(coords):
+            raise LevelStorageError(
+                f"position {position} outside [0, {len(coords)}) at level {level}"
+            )
+        if not position < end <= len(coords):
+            raise LevelStorageError(
+                f"segment end {end} outside ({position}, {len(coords)}] "
+                f"at level {level}"
+            )
+        if type(stored) is CompressedLevel:
+            return position + 1
+        coordinate = _expect_exact_int(
+            coords[position], f"levels[{level}].coords[{position}]"
+        )
+        following = position + 1
+        while (
+            following < end
+            and _expect_exact_int(
+                coords[following], f"levels[{level}].coords[{following}]"
+            )
+            == coordinate
+        ):
+            following += 1
+        return following
+
     def coordinate_at(self, level: int, position: int) -> int:
-        """The stored coordinate at one compressed-level position."""
+        """The stored coordinate at one compressed- or coordinate-level position."""
 
         level = _expect_exact_int(level, "level")
         position = _expect_exact_int(position, "position")
@@ -491,7 +704,7 @@ class LevelTensorStorage:
         if not 0 <= level < len(levels):
             raise LevelStorageError(f"no level {level} in rank-{len(levels)}")
         stored = levels[level]
-        if type(stored) is not CompressedLevel:
+        if type(stored) is not CompressedLevel and type(stored) is not CoordinateLevel:
             raise LevelStorageError(f"level {level} has no stored coordinates")
         coords = _stored_field(stored, "coords", f"levels[{level}]")
         if type(coords) is not tuple:
@@ -548,6 +761,9 @@ class LevelTensorStorage:
         zero-extent modes stay representable.  Compressed levels prune
         subtrees with no stored leaf entry (exact zeros are dropped, as in
         ``CsrMatrix.from_dense``); dense levels materialize every child.
+        Coordinate levels drop exact zeros the same way: a COO tensor stores
+        exactly the nonzero cells, in lexicographic order of its storage
+        levels.
         """
 
         for name, metadata in (
@@ -580,8 +796,17 @@ class LevelTensorStorage:
                     f"kinds[{position}] must be a LevelKind member, got "
                     f"{type(kind).__name__}"
                 )
-            if kind not in (LevelKind.DENSE, LevelKind.COMPRESSED):
+            if kind not in (
+                LevelKind.DENSE,
+                LevelKind.COMPRESSED,
+                LevelKind.COORDINATE,
+            ):
                 raise LevelStorageError(f"from_dense cannot build {kind.value} levels")
+        all_coordinate = all(kind is LevelKind.COORDINATE for kind in kinds)
+        if LevelKind.COORDINATE in kinds and not all_coordinate:
+            raise LevelStorageError(
+                f"from_dense cannot build these levels: {_COORDINATE_LEVELS_ONLY}"
+            )
         all_values: Dict[Tuple[int, ...], float] = {}
         support: Dict[Tuple[int, ...], None] = {}
 
@@ -614,6 +839,19 @@ class LevelTensorStorage:
                 walk(child, logical + (coordinate,))
 
         walk(dense, ())
+        if all_coordinate:
+            # ``support`` is keyed by coordinates in storage-level order, so
+            # sorting it lists the stored entries in canonical order.
+            entries = sorted(support)
+            return cls(
+                shape=shape,
+                modes=modes,
+                levels=tuple(
+                    CoordinateLevel(tuple(entry[number] for entry in entries))
+                    for number in range(rank)
+                ),
+                values=tuple(all_values[entry] for entry in entries),
+            )
         prefixes: List[Tuple[int, ...]] = [()]
         levels: List[object] = []
         for number, kind in enumerate(kinds):
@@ -665,6 +903,18 @@ class LevelTensorStorage:
                     for prefix in prefixes
                     for coordinate in range(level.extent)
                 ]
+            elif type(level) is CoordinateLevel:
+                # Validation admitted only an all-coordinate tensor, whose
+                # levels share one position per entry: read every entry's
+                # tuple across the levels at once.
+                columns = [
+                    cast(CoordinateLevel, stored).coords for stored in self.levels
+                ]
+                prefixes = [
+                    tuple(column[position] for column in columns)
+                    for position in range(len(level.coords))
+                ]
+                break
             else:
                 if type(level) is not CompressedLevel:
                     raise LevelStorageError(
@@ -789,12 +1039,16 @@ class CsrOutputBuilder:
 
 @dataclass(frozen=True)
 class LevelTensor:
-    """One canonical, immutable level-stored tensor of DENSE/COMPRESSED levels.
+    """One canonical, immutable level-stored tensor.
 
-    ``positions``/``coordinates`` hold one entry per physical level:
-    compressed levels carry their position and coordinate tuples, dense
-    levels carry ``None`` for both (dense storage is implicit).  Explicit
-    zero values are permitted, exactly as for :class:`CsrMatrix`.
+    Its levels are DENSE/COMPRESSED levels in any composition, or COORDINATE
+    levels only (COO).  ``positions``/``coordinates`` hold one entry per
+    physical level: compressed levels carry their position and coordinate
+    tuples, dense levels carry ``None`` for both (dense storage is
+    implicit), and coordinate levels carry ``None`` for positions and one
+    coordinate per stored entry.  The entry tuples of a COO tensor are
+    strictly increasing in lexicographic order.  Explicit zero values are
+    permitted, exactly as for :class:`CsrMatrix`.
     """
 
     shape: Tuple[int, ...]
@@ -828,12 +1082,23 @@ class LevelTensor:
             or len(self.level_kinds) != rank
             or any(
                 type(kind) is not LevelKind
-                or (kind is not LevelKind.DENSE and kind is not LevelKind.COMPRESSED)
+                or (
+                    kind is not LevelKind.DENSE
+                    and kind is not LevelKind.COMPRESSED
+                    and kind is not LevelKind.COORDINATE
+                )
                 for kind in self.level_kinds
             )
         ):
             raise LevelStorageError(
-                "LevelTensor needs one DENSE/COMPRESSED kind per level"
+                "LevelTensor needs one DENSE/COMPRESSED kind per level, or the "
+                "COORDINATE kind on every level"
+            )
+        if any(kind is LevelKind.COORDINATE for kind in self.level_kinds) and any(
+            kind is not LevelKind.COORDINATE for kind in self.level_kinds
+        ):
+            raise LevelStorageError(
+                f"LevelTensor mixes level kinds: {_COORDINATE_LEVELS_ONLY}"
             )
         if (
             type(self.positions) is not tuple
@@ -846,6 +1111,7 @@ class LevelTensor:
             )
 
         parent_count = 1
+        coordinate_columns: List[Tuple[int, ...]] = []
         for level, kind in enumerate(self.level_kinds):
             offsets = self.positions[level]
             coords = self.coordinates[level]
@@ -855,6 +1121,28 @@ class LevelTensor:
                         f"dense level {level} must use implicit storage"
                     )
                 parent_count *= self.shape[level]
+                continue
+            if kind is LevelKind.COORDINATE:
+                if offsets is not None or type(coords) is not tuple:
+                    raise LevelStorageError(
+                        f"coordinate level {level} needs an owned coordinate "
+                        "tuple and no positions"
+                    )
+                if level > 0 and len(coords) != parent_count:
+                    raise LevelStorageError(
+                        f"coordinate level {level} has {len(coords)} "
+                        f"coordinates for {parent_count} stored entries"
+                    )
+                for position, coord in enumerate(coords):
+                    _expect_exact_int(coord, f"coordinates[{level}][{position}]")
+                    if not 0 <= coord < self.shape[level]:
+                        raise LevelStorageError(
+                            f"coordinate {_diagnostic_int(coord)} escapes level "
+                            f"{level} extent "
+                            f"{_diagnostic_int(self.shape[level])}"
+                        )
+                coordinate_columns.append(coords)
+                parent_count = len(coords)
                 continue
             if type(offsets) is not tuple or type(coords) is not tuple:
                 raise LevelStorageError(
@@ -903,6 +1191,7 @@ class LevelTensor:
                         )
                     last = coord
             parent_count = len(coords)
+        _check_coordinate_entry_order(coordinate_columns)
         if type(self.values) is not tuple or len(self.values) != parent_count:
             raise LevelStorageError(
                 "LevelTensor needs one owned value per leaf position"
@@ -920,11 +1209,23 @@ class LevelOutputBuilder:
     Admits any rank of DENSE and COMPRESSED levels with at least one
     COMPRESSED level.  Appends must be lexicographically strictly
     increasing.  ``finish`` derives the per-level position/coordinate
-    storage from the append stream alone and enforces the dense-suffix
-    contract: every level after the last compressed level is dense storage
-    with no skip representation, so each materialized position of the last
-    compressed level must receive its complete Cartesian block of trailing
-    dense coordinates.
+    storage from the append stream alone, by one rule for every level: a
+    compressed coordinate is stored exactly when some append lies under it,
+    and a dense level stores every cell of its extent under each stored
+    parent.  Dense storage has no skip representation, so a cell of a stored
+    dense block that no append addressed is still a position: a compressed
+    level below it owns an empty segment there, and a value there is zero.
+    An assembly driven by a stored coordinate stream therefore appends only
+    the cells its operand stored and never has to visit the rest of a block
+    it opened; one driven by a dense domain appends every cell.
+
+    Also admits any rank of COORDINATE levels only (COO), under the same
+    append order.  A COO result stores the append stream as it is: one
+    coordinate per level and one value per append.
+
+    The builder has no mode permutation: level ``l`` stores logical mode
+    ``l``, so the coordinate order of an append is both the logical mode
+    order and the storage-level order.
     """
 
     def __init__(
@@ -956,14 +1257,18 @@ class LevelOutputBuilder:
             raise LevelStorageError(
                 "output level kinds must be one LevelKind per storage level"
             )
-        if any(
+        all_coordinate = all(kind is LevelKind.COORDINATE for kind in level_kinds)
+        if not all_coordinate and any(
             kind is not LevelKind.DENSE and kind is not LevelKind.COMPRESSED
             for kind in level_kinds
         ):
             raise LevelStorageError(
-                "ordered assembly supports DENSE and COMPRESSED levels only"
+                "ordered assembly supports DENSE and COMPRESSED levels, or "
+                "COORDINATE levels on every level"
             )
-        if not any(kind is LevelKind.COMPRESSED for kind in level_kinds):
+        if not all_coordinate and not any(
+            kind is LevelKind.COMPRESSED for kind in level_kinds
+        ):
             raise LevelStorageError(
                 "ordered assembly requires at least one compressed level"
             )
@@ -999,6 +1304,19 @@ class LevelOutputBuilder:
 
     def finish(self) -> LevelTensor:
         rank = len(self.shape)
+        if all(kind is LevelKind.COORDINATE for kind in self.level_kinds):
+            # COO stores the ordered append stream itself: level ``l`` holds
+            # every entry's coordinate in mode ``l``.
+            return LevelTensor(
+                shape=self.shape,
+                level_kinds=self.level_kinds,
+                positions=(None,) * rank,
+                coordinates=tuple(
+                    tuple(coords[level] for coords, _ in self.entries)
+                    for level in range(rank)
+                ),
+                values=tuple(value for _, value in self.entries),
+            )
         last_compressed = max(
             level
             for level, kind in enumerate(self.level_kinds)
@@ -1009,48 +1327,47 @@ class LevelOutputBuilder:
         for extent in suffix_extents:
             suffix_cells *= extent
 
-        # The dense-suffix contract: entries group into complete, in-order
-        # Cartesian blocks per materialized last-compressed position.
-        if suffix_extents:
-            if suffix_cells == 0:
-                # No coordinate tuple can address a zero-extent dense suffix,
-                # so the canonical append stream is necessarily empty.  Keep
-                # the empty sparse structure representable without dividing
-                # or stepping by zero.
-                if self.entries:
-                    raise LevelStorageError(
-                        f"assembly of {self.name} contains entries beneath a "
-                        "zero-extent trailing dense level"
-                    )
-                suffix_extents = ()
-            else:
-                if len(self.entries) % suffix_cells != 0:
-                    raise LevelStorageError(
-                        f"assembly of {self.name} left an incomplete trailing "
-                        "dense block"
-                    )
-
-        if suffix_extents:
-
-            def _expected_suffix(offset: int) -> Tuple[int, ...]:
-                coordinates = [0] * len(suffix_extents)
-                for level in range(len(suffix_extents) - 1, -1, -1):
-                    offset, coordinates[level] = divmod(offset, suffix_extents[level])
-                return tuple(coordinates)
-
-            for block_start in range(0, len(self.entries), suffix_cells):
-                block = self.entries[block_start : block_start + suffix_cells]
-                head = block[0][0][: last_compressed + 1]
-                for offset, (coords, _) in enumerate(block):
-                    if coords[: last_compressed + 1] != head:
+        # Every level after the last compressed level is dense, so each stored
+        # position of that level owns one block of ``suffix_cells`` values in
+        # the block's own lexicographic order.  The append order already
+        # groups a block's entries together and lists them by increasing
+        # offset, so one pass fills each block; a cell no append addressed
+        # keeps the zero the block was opened with.
+        values: List[float]
+        if not suffix_extents:
+            values = [value for _, value in self.entries]
+        elif suffix_cells == 0:
+            # No coordinate tuple can address a zero-extent dense suffix, so
+            # the canonical append stream is necessarily empty.  Keep the
+            # empty sparse structure representable without dividing or
+            # stepping by zero.
+            if self.entries:
+                raise LevelStorageError(
+                    f"assembly of {self.name} contains entries beneath a "
+                    "zero-extent trailing dense level"
+                )
+            values = []
+        else:
+            values = []
+            block_head: Any = None
+            block_start = 0
+            for coords, value in self.entries:
+                head = coords[: last_compressed + 1]
+                if head != block_head:
+                    block_head = head
+                    block_start = len(values)
+                    try:
+                        values.extend([0.0] * suffix_cells)
+                    except (MemoryError, OverflowError) as error:
                         raise LevelStorageError(
-                            f"assembly of {self.name} split a dense block "
-                            "across materialized parents"
-                        )
-                    if coords[last_compressed + 1 :] != _expected_suffix(offset):
-                        raise LevelStorageError(
-                            f"assembly of {self.name} skipped a trailing " "dense cell"
-                        )
+                            f"assembly of {self.name} cannot materialize a "
+                            "trailing dense block of "
+                            f"{_diagnostic_int(suffix_cells)} cells"
+                        ) from error
+                offset = 0
+                for coord, extent in zip(coords[last_compressed + 1 :], suffix_extents):
+                    offset = offset * extent + coord
+                values[block_start + offset] = value
 
         # Derive per-level compressed storage from the ordered stream.
         positions: List[Any] = [None] * rank
@@ -1091,7 +1408,7 @@ class LevelOutputBuilder:
             level_kinds=self.level_kinds,
             positions=tuple(positions),
             coordinates=tuple(coordinates),
-            values=tuple(value for _, value in self.entries),
+            values=tuple(values),
         )
 
     def _parent_key(self, coords: Tuple[int, ...], level: int) -> Tuple[int, ...]:

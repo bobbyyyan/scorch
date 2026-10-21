@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass, replace
+from dataclasses import FrozenInstanceError, dataclass, replace
 import json
 import math
 
@@ -12,21 +12,29 @@ import math
 # abc. `from __future__ import annotations` above means the annotations that
 # also use these names are never evaluated at runtime.
 from collections.abc import Mapping, Sequence
-from typing import Any, Optional, Tuple, Union
+from typing import TYPE_CHECKING, Any, Optional, Tuple, Union, cast
 
 import torch
 
 from .exceptions import (
     CompileSpecError,
+    OperandDtypeMismatchError,
     TensorDeviceError,
     TensorLayoutError,
     TensorTypeError,
     TensorValidationError,
+    UnsupportedDtypePromotionError,
 )
 from .format import (
     FormatInput,
     LevelType,
     TensorFormat,
+    _field_unset,
+    _reduce_value,
+    _restore_value,
+    _seal,
+    _sealed_new,
+    _sealed_type,
     owned_format,
     parse_format,
 )
@@ -48,12 +56,50 @@ def validate_runtime_contract(tensor_format: TensorFormat, dtype: torch.dtype) -
     """Reject layouts and value dtypes that Scorch cannot execute safely."""
     if dtype not in SUPPORTED_VALUE_DTYPES:
         raise TensorValidationError(f"Scorch tensor dtype {dtype} is not supported")
-    if any(
-        level_type == LevelType.SINGLETON for level_type in tensor_format.level_types
-    ):
+    # A membership test, not a generator over the levels: this runs for every tensor's
+    # metadata, and level_types holds the exact LevelType members.
+    if LevelType.SINGLETON in tensor_format.level_types:
         raise TensorLayoutError(
             "singleton levels are not supported by the Scorch runtime"
         )
+
+
+def common_value_dtype(*dtypes: torch.dtype, operation: str) -> torch.dtype:
+    """The value dtype the result of ``operation`` on operands of ``dtypes`` stores.
+
+    PyTorch's promotion rule (``torch.promote_types``), so that no operand's values
+    are rounded or truncated on the way into the result: an int64 matrix times a
+    float64 vector is float64, not int64.  For operands of one dtype it is that
+    dtype.  Promotion can name a type Scorch does not store (int8 with uint8
+    promotes to int16); such a pair is refused.
+    """
+
+    common = dtypes[0]
+    for dtype in dtypes[1:]:
+        common = torch.promote_types(common, dtype)
+    if common not in SUPPORTED_VALUE_DTYPES:
+        raise UnsupportedDtypePromotionError(
+            f"{operation} of operands with value dtypes "
+            f"{', '.join(str(dtype) for dtype in dtypes)} needs {common}, "
+            "which Scorch does not store"
+        )
+    return common
+
+
+def require_same_value_dtype(*dtypes: torch.dtype, operation: str) -> torch.dtype:
+    """The one value dtype of a product's operands, or ``OperandDtypeMismatchError``.
+
+    PyTorch does not promote the operands of a product (``matmul``, ``mv``, ``mm``,
+    ``@``, ``einsum``): operands of different dtypes raise ``RuntimeError``.  Sums
+    promote instead (:func:`common_value_dtype`).
+    """
+
+    if any(dtype != dtypes[0] for dtype in dtypes[1:]):
+        raise OperandDtypeMismatchError(
+            f"{operation} operands must have the same value dtype, got "
+            f"{', '.join(str(dtype) for dtype in dtypes)}"
+        )
+    return dtypes[0]
 
 
 def _normalize_shape(shape: ShapeLike, field: str) -> Tuple[int, ...]:
@@ -119,34 +165,68 @@ def _parse_dtype(value: Union[str, torch.dtype], field: str) -> torch.dtype:
     raise TensorTypeError(f"{field} must be a torch.dtype, got {type(value).__name__}")
 
 
-# Shared TensorLayout instances, keyed by the arguments that produced them. Bounded so
-# a caller cycling through shapes cannot grow it without limit; the real key space for a
-# given model is a handful of (shape, format) pairs.
+# Shared TensorLayout instances, keyed by the arguments that produced them. A layout
+# cannot change once built (format.py, "Read-only stored state"), so every tensor built
+# from equal arguments may hold the same one. Bounded so a caller cycling through shapes
+# cannot grow it without limit; the real key space for a given model is a handful of
+# (shape, format) pairs.
 _LAYOUT_CACHE: dict = {}
 _LAYOUT_CACHE_MAX = 4096
 
+_LAYOUT_FIELDS = (
+    "logical_shape",
+    "physical_shape",
+    "format",
+    "permutation",
+    "index_dtype",
+)
+if TYPE_CHECKING:
+    # The bases are made at import time, so a type checker sees them as plain objects.
+    _TensorLayoutFields = object
+    _TensorMetadataFields = object
+else:
+    _TensorLayoutFields = _sealed_type("TensorLayoutFields", _LAYOUT_FIELDS)
+    _TensorMetadataFields = _sealed_type(
+        "TensorMetadataFields",
+        ("name", "dtype", "device", "layout", "requires_grad"),
+    )
+_LAYOUT_DESCRIPTORS = tuple(
+    (name, _TensorLayoutFields.__dict__[name]) for name in _LAYOUT_FIELDS
+)
 
-@dataclass(frozen=True)
-class TensorLayout:
+
+@dataclass(frozen=True, init=False)
+class TensorLayout(_TensorLayoutFields):
     """Canonical mapping between logical modes and their physical storage."""
+
+    # Read-only fields held by TensorLayoutFields: see format.py, "Read-only stored
+    # state". index_dtype's default is __init__'s: a default here would be a class
+    # attribute hiding the field.
+    __slots__ = ()
 
     logical_shape: Tuple[int, ...]
     physical_shape: Tuple[int, ...]
     format: TensorFormat
     permutation: Tuple[int, ...]
-    index_dtype: torch.dtype = torch.int32
+    index_dtype: torch.dtype
 
-    def __post_init__(self) -> None:
-        logical_shape = _normalize_shape(self.logical_shape, "logical_shape")
-        physical_shape = _normalize_shape(self.physical_shape, "physical_shape")
-        # A layout is the tensor's single authoritative format holder, so it
-        # detaches the caller's value here rather than on every read.  See
-        # ``format.owned_format``: canonical subclasses are normalized, while
-        # malformed values fail closed instead of retaining caller-owned state.
-        tensor_format = owned_format(parse_format(self.format))
+    def __init__(
+        self,
+        logical_shape: ShapeLike,
+        physical_shape: ShapeLike,
+        format: FormatInput,
+        permutation: Sequence[int],
+        index_dtype: torch.dtype = torch.int32,
+    ) -> None:
+        logical_shape = _normalize_shape(logical_shape, "logical_shape")
+        physical_shape = _normalize_shape(physical_shape, "physical_shape")
+        # The layout is the tensor's single authoritative format holder. See
+        # ``format.owned_format``: an exact format is held as it is, a subclass is
+        # normalized, and a format never constructed fails closed.
+        tensor_format = owned_format(parse_format(format))
         rank = len(logical_shape)
-        permutation = _normalize_permutation(self.permutation, rank)
-        index_dtype = _parse_dtype(self.index_dtype, "index_dtype")
+        permutation = _normalize_permutation(permutation, rank)
+        index_dtype = _parse_dtype(index_dtype, "index_dtype")
         if len(physical_shape) != rank:
             raise TensorLayoutError(
                 "logical_shape and physical_shape must have the same rank"
@@ -165,11 +245,35 @@ class TensorLayout:
             raise TensorLayoutError(
                 "index_dtype must be torch.int32 or torch.int64, " f"got {index_dtype}"
             )
-        object.__setattr__(self, "logical_shape", logical_shape)
-        object.__setattr__(self, "physical_shape", physical_shape)
-        object.__setattr__(self, "format", tensor_format)
-        object.__setattr__(self, "permutation", permutation)
-        object.__setattr__(self, "index_dtype", index_dtype)
+        if not _seal(
+            self, logical_shape, physical_shape, tensor_format, permutation, index_dtype
+        ):
+            raise FrozenInstanceError("cannot assign to field 'logical_shape'")
+
+    def __reduce__(self):
+        # An exact layout loads through from_physical_shape (the logical shape follows
+        # from the physical one and the permutation), which serves an equal layout from
+        # the layout cache and validates the arguments when it is not there.
+        if type(self) is TensorLayout:
+            return (
+                TensorLayout.from_physical_shape,
+                (self.physical_shape, self.format, self.permutation, self.index_dtype),
+            )
+        return _reduce_value(
+            self,
+            (
+                self.logical_shape,
+                self.physical_shape,
+                self.format,
+                self.permutation,
+                self.index_dtype,
+            ),
+        )
+
+    def __setstate__(self, state):
+        _restore_value(
+            self, state, TensorLayout.__init__, _LAYOUT_DESCRIPTORS, TensorLayoutError
+        )
 
     @classmethod
     def from_logical_shape(
@@ -192,26 +296,27 @@ class TensorLayout:
         permutation: Optional[Sequence[int]] = None,
         index_dtype: torch.dtype = torch.int32,
     ) -> "TensorLayout":
-        # Every STensor construction lands here, and a TensorLayout is a frozen value
-        # object that is never mutated after __post_init__ (the only object.__setattr__
-        # calls on one are inside it), so equal arguments can share one instance. On a
-        # small SpMM the normalize-and-validate work below is ~11% of the whole call,
-        # repeated identically on every iteration of a training loop.
+        # Every STensor construction lands here, and a TensorLayout cannot change once
+        # built, so equal arguments can share one instance. On a small SpMM the
+        # normalize-and-validate work below is ~11% of the whole call, repeated
+        # identically on every iteration of a training loop. Only the exact class is
+        # cached, since the key does not name the class.
         #
         # A key build that raises is not an error: an argument too malformed to hash is
         # left to the normal path below, which reports it with the right exception type.
         key = None
-        try:
-            key = (
-                tuple(physical_shape),
-                tensor_format,
-                None if permutation is None else tuple(permutation),
-                index_dtype,
-            )
-            cached = _LAYOUT_CACHE.get(key)
-        except TypeError:
-            key = None
-            cached = None
+        cached = None
+        if cls is TensorLayout:
+            try:
+                key = (
+                    tuple(physical_shape),
+                    tensor_format,
+                    None if permutation is None else tuple(permutation),
+                    index_dtype,
+                )
+                cached = _LAYOUT_CACHE.get(key)
+            except TypeError:
+                key = None
         if cached is not None:
             return cached
 
@@ -294,100 +399,111 @@ class TensorLayout:
 
 
 def owned_layout(layout: object) -> TensorLayout:
-    """Return a detached canonical layout from exact stored base state.
+    """The layout an object retains when it is handed ``layout``.
 
-    ``TensorLayout`` is frozen only by convention. Retaining a caller's object
-    lets later ``object.__setattr__`` mutation rewrite every storage or metadata
-    value that shares it. Canonical subclasses remain accepted, but subclass
-    descriptors are bypassed and extra/malformed stored state fails closed.
+    A layout cannot change once built (format.py, "Read-only stored state"), so an exact
+    ``TensorLayout`` is retained as it is, and any number of storages and metadata may
+    share it. A subclass is rebuilt as an exact layout from the base's fields, read through
+    the base's own descriptors so that none of the subclass's code runs; the constructor
+    validates them again. A layout that was never constructed fails closed.
     """
 
+    layout_type = type(layout)
+    # The constructor sets every field at once, so one unset field means all are.
+    if layout_type is TensorLayout:
+        if _field_unset(layout, _LAYOUT_DESCRIPTORS[0][1]):
+            raise TensorLayoutError("layout has malformed stored state")
+        return cast(TensorLayout, layout)
     try:
-        is_layout = issubclass(type(layout), TensorLayout)
+        is_layout = issubclass(layout_type, TensorLayout)
     except TypeError:
         is_layout = False
     if not is_layout:
         raise TensorTypeError("layout must be a TensorLayout")
-    state = TensorLayout.__dict__["__dict__"].__get__(layout, TensorLayout)
-    expected = {
-        "logical_shape",
-        "physical_shape",
-        "format",
-        "permutation",
-        "index_dtype",
-    }
-    if (
-        type(state) is not dict
-        or any(type(key) is not str for key in state)
-        or set(state) != expected
-        or type(state["logical_shape"]) is not tuple
-        or type(state["physical_shape"]) is not tuple
-        or type(state["permutation"]) is not tuple
-    ):
+    if _field_unset(layout, _LAYOUT_DESCRIPTORS[0][1]):
         raise TensorLayoutError("layout has malformed stored state")
+    fields = [descriptor.__get__(layout) for _, descriptor in _LAYOUT_DESCRIPTORS]
     try:
-        return TensorLayout(
-            logical_shape=state["logical_shape"],
-            physical_shape=state["physical_shape"],
-            format=state["format"],
-            permutation=state["permutation"],
-            index_dtype=state["index_dtype"],
-        )
+        return TensorLayout(*fields)
     except (TensorTypeError, TensorLayoutError):
         raise
     except Exception as error:
         raise TensorLayoutError("layout has malformed stored state") from error
 
 
-@dataclass(frozen=True)
-class TensorMetadata:
+_METADATA_FIELDS = ("name", "dtype", "device", "layout", "requires_grad")
+_METADATA_DESCRIPTORS = tuple(
+    (name, _TensorMetadataFields.__dict__[name]) for name in _METADATA_FIELDS
+)
+
+
+def _metadata_fields(
+    name: Any,
+    dtype: Any,
+    device: Any,
+    layout: Any,
+    requires_grad: Any,
+    *,
+    own_layout: bool,
+) -> Tuple[Any, ...]:
+    """Validate metadata's arguments; return its fields in declaration order."""
+    if not issubclass(type(name), str):
+        raise TensorLayoutError("tensor name must be a non-empty string")
+    # Bypass a subclass override and retain an exact immutable ``str``.
+    name = str.strip(name)
+    if not name:
+        raise TensorLayoutError("tensor name must be a non-empty string")
+    dtype = _parse_dtype(dtype, "dtype")
+    try:
+        if type(device) is torch.device:
+            pass
+        elif issubclass(type(device), str):
+            device = torch.device(str.__str__(device))
+        else:
+            raise TypeError
+    except Exception as error:
+        raise TensorDeviceError(
+            f"invalid tensor device of type {type(device).__name__}"
+        ) from error
+    if device.type != "cpu":
+        raise TensorDeviceError(f"Scorch runtime tensors must be on CPU, got {device}")
+    if own_layout:
+        layout = owned_layout(layout)
+    elif type(layout) is not TensorLayout:
+        raise TensorTypeError("owned metadata layout must be a TensorLayout")
+    validate_runtime_contract(layout.format, dtype)
+    if type(requires_grad) is not bool:
+        raise TensorTypeError("requires_grad must be a bool")
+    return (name, dtype, device, layout, requires_grad)
+
+
+@dataclass(frozen=True, init=False)
+class TensorMetadata(_TensorMetadataFields):
     """All non-payload runtime tensor metadata in one immutable value."""
+
+    # Read-only fields held by TensorMetadataFields: see format.py, "Read-only stored
+    # state". requires_grad's default is __init__'s, as index_dtype's is TensorLayout's.
+    __slots__ = ()
 
     name: str
     dtype: torch.dtype
     device: torch.device
     layout: TensorLayout
-    requires_grad: bool = False
+    requires_grad: bool
 
-    def __post_init__(self) -> None:
-        self._normalize_fields(own_layout=True)
-
-    def _normalize_fields(self, *, own_layout: bool) -> None:
-        if not issubclass(type(self.name), str):
-            raise TensorLayoutError("tensor name must be a non-empty string")
-        # Bypass a subclass override and retain an exact immutable ``str``.
-        name = str.strip(self.name)
-        if not name:
-            raise TensorLayoutError("tensor name must be a non-empty string")
-        dtype = _parse_dtype(self.dtype, "dtype")
-        try:
-            if type(self.device) is torch.device:
-                device = self.device
-            elif issubclass(type(self.device), str):
-                device = torch.device(str.__str__(self.device))
-            else:
-                raise TypeError
-        except Exception as error:
-            raise TensorDeviceError(
-                f"invalid tensor device of type {type(self.device).__name__}"
-            ) from error
-        if device.type != "cpu":
-            raise TensorDeviceError(
-                f"Scorch runtime tensors must be on CPU, got {device}"
-            )
-        if own_layout:
-            layout = owned_layout(self.layout)
-        elif type(self.layout) is TensorLayout:
-            layout = self.layout
-        else:
-            raise TensorTypeError("owned metadata layout must be a TensorLayout")
-        validate_runtime_contract(layout.format, dtype)
-        if type(self.requires_grad) is not bool:
-            raise TensorTypeError("requires_grad must be a bool")
-        object.__setattr__(self, "name", name)
-        object.__setattr__(self, "dtype", dtype)
-        object.__setattr__(self, "device", device)
-        object.__setattr__(self, "layout", layout)
+    def __init__(
+        self,
+        name: str,
+        dtype: torch.dtype,
+        device: Union[str, torch.device],
+        layout: TensorLayout,
+        requires_grad: bool = False,
+    ) -> None:
+        fields = _metadata_fields(
+            name, dtype, device, layout, requires_grad, own_layout=True
+        )
+        if not _seal(self, *fields):
+            raise FrozenInstanceError("cannot assign to field 'name'")
 
     @classmethod
     def _from_owned_layout(
@@ -398,22 +514,35 @@ class TensorMetadata:
         layout: TensorLayout,
         requires_grad: bool = False,
     ) -> "TensorMetadata":
-        """Build metadata sharing one storage-owned canonical layout.
+        """Build metadata around a layout the caller already owns.
 
-        Public construction always detaches its caller. A runtime tensor,
-        however, intentionally has one layout object jointly owned by its
-        metadata and storage; this private boundary preserves that invariant
-        without copying the already-owned value a second time.
+        Public construction passes its layout through ``owned_layout``. A runtime tensor's
+        metadata and storage hold one layout object between them; this private boundary
+        builds the metadata around the storage's, which is an exact ``TensorLayout`` by
+        construction, without that step.
         """
 
-        metadata = object.__new__(cls)
-        object.__setattr__(metadata, "name", name)
-        object.__setattr__(metadata, "dtype", dtype)
-        object.__setattr__(metadata, "device", device)
-        object.__setattr__(metadata, "layout", layout)
-        object.__setattr__(metadata, "requires_grad", requires_grad)
-        metadata._normalize_fields(own_layout=False)
-        return metadata
+        return _sealed_new(
+            cls,
+            *_metadata_fields(
+                name, dtype, device, layout, requires_grad, own_layout=False
+            ),
+        )
+
+    def __reduce__(self):
+        return _reduce_value(
+            self,
+            (self.name, self.dtype, self.device, self.layout, self.requires_grad),
+        )
+
+    def __setstate__(self, state):
+        _restore_value(
+            self,
+            state,
+            TensorMetadata.__init__,
+            _METADATA_DESCRIPTORS,
+            TensorLayoutError,
+        )
 
     def to_dict(self) -> Mapping[str, Any]:
         return {
@@ -538,9 +667,22 @@ class TensorSpec:
     def dim(self) -> int:
         return self.layout.rank
 
-    def with_mode_order(self, mode_order: Sequence[int]) -> "TensorSpec":
+    def with_mode_order(
+        self,
+        mode_order: Sequence[int],
+        *,
+        tensor_format: Optional[TensorFormat] = None,
+    ) -> "TensorSpec":
+        """This spec under another storage order, and optionally another format.
+
+        ``tensor_format`` is set only by einsum's operand relayout
+        (``scorch.ops._einsum_operand_relayout``), for an operand it converts.
+        """
         new_layout = TensorLayout.from_logical_shape(
-            self.logical_shape, self.format, mode_order, self.index_dtype
+            self.logical_shape,
+            self.format if tensor_format is None else tensor_format,
+            mode_order,
+            self.index_dtype,
         )
         spec = object.__new__(TensorSpec)
         object.__setattr__(spec, "metadata", replace(self.metadata, layout=new_layout))

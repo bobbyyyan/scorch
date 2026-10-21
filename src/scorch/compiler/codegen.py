@@ -887,13 +887,29 @@ class LLIRLowerer:
                 counter_var = ir._atomic_counter_var
                 loop_bound = ir._loop_bound
                 loop_var = ir.init.var.name if ir.init else "i"
+                # The loop this replaces counts in its own variable's type.  A
+                # loop over a compressed level counts positions in ``int`` up
+                # to an ``int`` end; a loop over a dense level counts
+                # coordinates in ``int64_t`` up to an ``int64_t`` extent.  The
+                # replacement was written for the first: with an extent as the
+                # bound, ``std::min(_start + _chunk, A0_size)`` mixes ``int``
+                # and ``int64_t`` and has no overload, so the kernel did not
+                # build.  A 64-bit loop keeps its type throughout.
+                wide = ir.init is not None and ir.init.var.type is llir.DataType.INT64
+                counter_type = "int64_t" if wide else "int"
+                chunk_end = (
+                    f"std::min<int64_t>(_start + {chunk_var}, {loop_bound})"
+                    if wide
+                    else f"std::min(_start + {chunk_var}, {loop_bound})"
+                )
                 parts = []
                 if ir.before_parallel_body:
                     parts.append(self.lower_llir(ir.before_parallel_body, indent_level))
                 parts.extend(
                     [
                         self.lower_llir(
-                            f"std::atomic<int> {counter_var}{{0}};", indent_level
+                            f"std::atomic<{counter_type}> {counter_var}{{0}};",
+                            indent_level,
                         ),
                         self.lower_llir(
                             "#pragma omp parallel" + self._omp_num_threads_clause(ir),
@@ -910,7 +926,7 @@ class LLIRLowerer:
                 parts.append(self.lower_llir(f"while (true) {{", indent_level + 1))
                 parts.append(
                     self.lower_llir(
-                        f"const int _start = {counter_var}.fetch_add({chunk_var}, std::memory_order_relaxed);",
+                        f"const {counter_type} _start = {counter_var}.fetch_add({chunk_var}, std::memory_order_relaxed);",
                         indent_level + 2,
                     )
                 )
@@ -921,13 +937,13 @@ class LLIRLowerer:
                 )
                 parts.append(
                     self.lower_llir(
-                        f"const int _end = std::min(_start + {chunk_var}, {loop_bound});",
+                        f"const {counter_type} _end = {chunk_end};",
                         indent_level + 2,
                     )
                 )
                 parts.append(
                     self.lower_llir(
-                        f"for (int {loop_var} = _start; {loop_var} < _end; {loop_var}++) {{",
+                        f"for ({counter_type} {loop_var} = _start; {loop_var} < _end; {loop_var}++) {{",
                         indent_level + 2,
                     )
                 )

@@ -96,7 +96,7 @@ def _build_existing_workspace() -> ForAll:
     i = IndexVar("i")
     result = TensorVar("C", fmt="d")
     source = TensorVar("A", fmt="d")
-    workspace = Workspace("tmp", dim=1, dense=True)
+    workspace = Workspace("tmp", dim=1, dtype=result.dtype, dense=True)
     return ForAll(
         i,
         Where(

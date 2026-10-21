@@ -726,10 +726,15 @@ def test_last_matching_bound_wins_and_only_its_loop_matches() -> None:
         SINGLE_ITERATION_LOOP_ELIMINATION_CONTEXT,
     )
 
-    assert len(output) == 2
-    assert type(output[0]) is llir.ForLoop
+    # The first loop is not matched and still reads ``end``, so the bounds stay.
+    assert [type(statement) for statement in output] == [
+        llir.VarInit,
+        llir.ForLoop,
+        llir.VarInit,
+        llir.RawStmt,
+    ]
     assert cast(
-        llir.Var, cast(llir.VarInit, cast(llir.ForLoop, output[0]).init).value
+        llir.Var, cast(llir.VarInit, cast(llir.ForLoop, output[1]).init).value
     ).name == ("first_base")
     assert _raw_codes(output) == ["second"]
 
@@ -1091,11 +1096,16 @@ def test_guarded_prefetch_rewrite_matches_the_legacy_whole_statement_scope(
         (llir.AddressOf(_var("lane")), "&lane"),
     ),
 )
-def test_guarded_call_rewrite_preserves_legacy_bare_argument_scope(
+def test_a_bare_argument_reference_keeps_the_loop(
     typed_argument: llir.Expr,
     raw_argument: str,
 ) -> None:
-    """Only guard and array-index references receive exact-name rewrites."""
+    """Only guard and array-index references receive exact-name rewrites.
+
+    A bare argument is outside that scope.  Removing the loop would leave it
+    naming a variable nothing declares, so the loop stays, body as written, in
+    the typed spelling and in the raw one.
+    """
 
     guard = llir.GuardedCallStmt(
         cond=llir.BinOp(
@@ -1119,18 +1129,24 @@ def test_guarded_call_rewrite_preserves_legacy_bare_argument_scope(
     assert LLIRLowerer().lower_llir(typed_output) == LLIRLowerer().lower_llir(
         legacy_output
     )
-    rewritten = cast(llir.GuardedCallStmt, typed_output[0])
-    condition_left = cast(llir.Add, cast(llir.BinOp, rewritten.cond).left).left
-    assert type(condition_left) is llir.Literal
-    assert cast(llir.Literal, condition_left).value == 0
+    for output in (typed_output, legacy_output):
+        assert [type(statement) for statement in output] == [
+            llir.VarInit,
+            llir.ForLoop,
+        ]
+    kept = cast(llir.GuardedCallStmt, cast(llir.ForLoop, typed_output[1]).body[0])
+    condition_left = cast(llir.Add, cast(llir.BinOp, kept.cond).left).left
+    assert cast(llir.Var, condition_left).name == "lane"
     if type(typed_argument) is llir.AddressOf:
-        rewritten_address = cast(llir.AddressOf, rewritten.call.args[0])
-        assert cast(llir.Var, rewritten_address.operand).name == "lane"
+        kept_address = cast(llir.AddressOf, kept.call.args[0])
+        assert cast(llir.Var, kept_address.operand).name == "lane"
     else:
-        assert cast(llir.Var, rewritten.call.args[0]).name == "lane"
+        assert cast(llir.Var, kept.call.args[0]).name == "lane"
+    kept_raw = cast(llir.RawStmt, cast(llir.ForLoop, legacy_output[1]).body[0])
+    assert kept_raw.code == f"if (lane + 1 < p_end) consume({raw_argument})"
 
 
-def test_guarded_call_rewrite_preserves_terminal_condition_reference_scope() -> None:
+def test_a_terminal_condition_reference_keeps_the_loop() -> None:
     """A terminal name is not one of the legacy space/bracket token matches."""
 
     guard = llir.GuardedCallStmt(
@@ -1151,11 +1167,16 @@ def test_guarded_call_rewrite_preserves_terminal_condition_reference_scope() -> 
     assert LLIRLowerer().lower_llir(typed_output) == LLIRLowerer().lower_llir(
         legacy_output
     )
-    rewritten = cast(llir.GuardedCallStmt, typed_output[0])
-    assert cast(llir.Var, cast(llir.BinOp, rewritten.cond).right).name == "lane"
+    for output in (typed_output, legacy_output):
+        assert [type(statement) for statement in output] == [
+            llir.VarInit,
+            llir.ForLoop,
+        ]
+    kept = cast(llir.GuardedCallStmt, cast(llir.ForLoop, typed_output[1]).body[0])
+    assert cast(llir.Var, cast(llir.BinOp, kept.cond).right).name == "lane"
 
 
-def test_guarded_call_argument_rewrite_matches_function_call_scope() -> None:
+def test_a_call_argument_reference_keeps_the_loop_guarded_or_not() -> None:
     """Guarding a call does not broaden its legacy expression rewrite scope."""
 
     argument = llir.Add(_var("lane"), llir.Literal(1, llir.DataType.INT))
@@ -1174,10 +1195,19 @@ def test_guarded_call_argument_rewrite_matches_function_call_scope() -> None:
         SINGLE_ITERATION_LOOP_ELIMINATION_CONTEXT,
     )
 
-    rewritten_guard = cast(llir.GuardedCallStmt, guarded_output[0])
-    rewritten_plain = cast(llir.FunctionCallStmt, plain_output[0])
-    assert rewritten_guard.call.args == rewritten_plain.args
-    assert LLIRLowerer().lower_llir(rewritten_guard.call) == "consume(lane + 1);"
+    for output in (guarded_output, plain_output):
+        assert [type(statement) for statement in output] == [
+            llir.VarInit,
+            llir.ForLoop,
+        ]
+    kept_guard = cast(
+        llir.GuardedCallStmt, cast(llir.ForLoop, guarded_output[1]).body[0]
+    )
+    kept_plain = cast(
+        llir.FunctionCallStmt, cast(llir.ForLoop, plain_output[1]).body[0]
+    )
+    assert LLIRLowerer().lower_llir(kept_guard.call) == "consume(lane + 1);"
+    assert LLIRLowerer().lower_llir(kept_plain) == "consume(lane + 1);"
 
 
 def test_function_call_rewrite_traverses_product_and_sizeof_arguments() -> None:
@@ -1296,99 +1326,182 @@ def test_exact_structured_access_index_is_rewritten_and_reapplication_is_noop() 
     assert rewritten is not access
 
 
-def test_rewrite_omits_headers_parallel_regions_and_nested_containers() -> None:
+def _nested_header(field: str) -> llir.ForLoop:
     old = "Array[ix]"
-    nested_header = _loop([], loop_variable="nested")
-    nested_header.init = llir.VarInit(_var("nested"), _var(old))
-    nested_header.cond = llir.BinOp("<", _var(old), _var("limit"))
-    nested_header.update = llir.Assign(_access("Array", "ix"), llir.Literal(1))
-    nested_header.body = [llir.RawStmt(old)]
-    nested_header.before_parallel_body = [llir.RawStmt(old)]
-    nested_header.pre_parallel_body = [llir.RawStmt(old)]
-    nested_header.post_parallel_body = [llir.RawStmt(old)]
-    while_loop = llir.WhileLoop(_var(old), [llir.RawStmt(old)])
-    auto_loop = llir.ForLoopAuto(_var(old), _var(old), [llir.RawStmt(old)])
-    function = llir.Function(
-        llir.DataType.VOID,
-        "function_ix]",
-        [_var(old)],
-        [llir.RawStmt(old)],
+    nested = _loop([], loop_variable="nested")
+    if field == "init":
+        nested.init = llir.VarInit(_var("nested"), _var(old))
+    elif field == "cond":
+        nested.cond = llir.BinOp("<", _var(old), _var("limit"))
+    elif field == "update":
+        nested.update = llir.Assign(_access("Array", "ix"), llir.Literal(1))
+    else:
+        setattr(nested, field, [llir.RawStmt(old)])
+    return nested
+
+
+# One statement each, reading the loop variable where the rewrite does not reach.
+_OUTSIDE_THE_REWRITE_SCOPE: List[Tuple[str, Callable[[], object]]] = [
+    ("nested loop init", lambda: _nested_header("init")),
+    ("nested loop condition", lambda: _nested_header("cond")),
+    ("nested loop update", lambda: _nested_header("update")),
+    ("before_parallel_body", lambda: _nested_header("before_parallel_body")),
+    ("pre_parallel_body", lambda: _nested_header("pre_parallel_body")),
+    ("post_parallel_body", lambda: _nested_header("post_parallel_body")),
+    (
+        "while condition",
+        lambda: llir.WhileLoop(_var("Array[ix]"), [llir.RawStmt("step")]),
+    ),
+    (
+        "range-for",
+        lambda: llir.ForLoopAuto(
+            _var("Array[ix]"), _var("items"), [llir.RawStmt("step")]
+        ),
+    ),
+    (
+        "range-for body",
+        lambda: llir.ForLoopAuto(
+            _var("item"), _var("items"), [llir.RawStmt("Array[ix]")]
+        ),
+    ),
+    (
+        "function",
+        lambda: llir.Function(
+            llir.DataType.VOID,
+            "function",
+            [_var("argument")],
+            [llir.RawStmt("Array[ix]")],
+        ),
+    ),
+    (
+        "if condition",
+        lambda: llir.IfThenElse(
+            cond=_var("Array[ix]"), then_body=[llir.RawStmt("step")]
+        ),
+    ),
+    (
+        "cast",
+        lambda: llir.Assign(
+            _var("cast"), llir.Cast(_var("Array[ix]"), llir.DataType.FLOAT32)
+        ),
+    ),
+    (
+        "unary",
+        lambda: llir.Assign(_var("unary"), llir.UnaryOp("-", _var("Array[ix]"))),
+    ),
+    (
+        "call",
+        lambda: llir.Assign(
+            _var("call"), llir.FunctionCall("identity", [_var("Array[ix]")])
+        ),
+    ),
+    (
+        "array",
+        lambda: llir.Assign(
+            _var("array"), llir.Array([_var("Array[ix]")], llir.DataType.INT64)
+        ),
+    ),
+    ("return", lambda: llir.Return(_var("Array[ix]"))),
+    ("nested statement list", lambda: [llir.RawStmt("Array[ix]")]),
+    ("bare name", lambda: llir.RawStmt("consume(ix)")),
+]
+
+
+@pytest.mark.parametrize(
+    "build",
+    [build for _, build in _OUTSIDE_THE_REWRITE_SCOPE],
+    ids=[name for name, _ in _OUTSIDE_THE_REWRITE_SCOPE],
+)
+def test_a_reference_outside_the_rewrite_scope_keeps_the_loop(
+    build: Callable[[], object],
+) -> None:
+    """Headers, parallel regions and nested containers are not rewritten.
+
+    A reference to the loop variable there would name a variable nothing
+    declares once the loop is gone.  The loop and its bound stay, and the
+    statement the rewrite does reach keeps its spelling too.
+    """
+
+    body = cast(List[llir.Stmt], [llir.RawStmt("Array[ix]"), build()])
+    source: List[llir.Stmt] = [_bound(), _loop(body, loop_variable="ix")]
+    expected = LLIRLowerer().lower_llir(
+        cast(List[llir.Stmt], [_bound(), _loop(body, loop_variable="ix")])
     )
-    conditional = llir.IfThenElse(
-        cond=_var(old),
-        then_body=[llir.RawStmt(old)],
-        cond_list=[_var(old)],
-        then_body_list=[[llir.RawStmt(old)]],
-    )
-    raw_nested = [llir.RawStmt(old)]
-    body = cast(
-        List[llir.Stmt],
-        [
-            nested_header,
-            while_loop,
-            auto_loop,
-            function,
-            conditional,
-            llir.Assign(_var("cast"), llir.Cast(_var(old), llir.DataType.FLOAT32)),
-            llir.Assign(_var("unary"), llir.UnaryOp("-", _var(old))),
-            llir.Assign(_var("call"), llir.FunctionCall("identity", [_var(old)])),
-            llir.Assign(_var("array"), llir.Array([_var(old)], llir.DataType.INT64)),
-            llir.Return(_var(old)),
-            raw_nested,
-        ],
-    )
-    outer = _loop(body, loop_variable="ix")
-    outer.before_parallel_body = [llir.RawStmt(old)]
-    outer.pre_parallel_body = [llir.RawStmt(old)]
-    outer.post_parallel_body = [llir.RawStmt(old)]
-    source: List[llir.Stmt] = [_bound(), outer]
 
     output = eliminate_single_iteration_loops(
         source,
         SINGLE_ITERATION_LOOP_ELIMINATION_CONTEXT,
     )
 
-    header = cast(llir.ForLoop, output[0])
-    assert cast(llir.Var, cast(llir.VarInit, header.init).value).name == old
-    assert cast(llir.Var, cast(llir.BinOp, header.cond).left).name == old
-    header_target = cast(llir.ArrayAccess, cast(llir.Assign, header.update).var)
-    assert cast(llir.Var, header_target.array).name == "Array"
-    assert cast(llir.Var, header_target.index).name == "ix"
-    assert cast(llir.RawStmt, header.body[0]).code == "Array[base]"
-    assert cast(llir.RawStmt, header.before_parallel_body[0]).code == old
-    assert cast(llir.RawStmt, header.pre_parallel_body[0]).code == old
-    assert cast(llir.RawStmt, header.post_parallel_body[0]).code == old
+    assert [type(statement) for statement in output] == [llir.VarInit, llir.ForLoop]
+    kept = cast(llir.ForLoop, output[1])
+    assert kept is not source[1]
+    assert cast(llir.RawStmt, kept.body[0]).code == "Array[ix]"
+    assert LLIRLowerer().lower_llir(output) == expected
 
-    output_while = cast(llir.WhileLoop, output[1])
-    assert cast(llir.Var, output_while.cond).name == old
-    assert cast(llir.RawStmt, output_while.body[0]).code == old
-    output_auto = cast(llir.ForLoopAuto, output[2])
-    assert output_auto.var.name == old
-    assert cast(llir.Var, output_auto.array).name == old
-    assert cast(llir.RawStmt, output_auto.body[0]).code == old
-    output_function = cast(llir.Function, output[3])
-    assert output_function.name == "function_ix]"
-    assert cast(llir.Var, output_function.args[0]).name == old
-    assert cast(llir.RawStmt, output_function.body[0]).code == old
-    output_if = cast(llir.IfThenElse, output[4])
-    assert cast(llir.Var, output_if.cond).name == old
-    assert cast(llir.Var, output_if.cond_list[0]).name == old
-    assert cast(llir.RawStmt, cast(List[llir.Stmt], output_if.then_body)[0]).code == (
-        "Array[base]"
+
+def test_rewrite_reaches_loop_and_conditional_bodies() -> None:
+    old = "Array[ix]"
+    nested = _loop([llir.RawStmt(old)], loop_variable="nested", end_variable="limit")
+    while_loop = llir.WhileLoop(_var("more"), [llir.RawStmt(old)])
+    merged = llir.WhileLoop(
+        _var("more"),
+        [llir.IfThenElse(cond=_var("same"), then_body=[llir.RawStmt(old)])],
     )
-    assert cast(llir.RawStmt, output_if.then_body_list[0][0]).code == "Array[base]"
+    conditional = llir.IfThenElse(
+        cond=_var("first"),
+        then_body=[llir.RawStmt(old)],
+        else_body=[llir.RawStmt(old)],
+        cond_list=[_var("second")],
+        then_body_list=[[llir.RawStmt(old)]],
+    )
+    body = cast(List[llir.Stmt], [nested, while_loop, merged, conditional])
+    source: List[llir.Stmt] = [_bound(), _loop(body, loop_variable="ix")]
 
-    cast_expression = cast(llir.Cast, cast(llir.Assign, output[5]).value)
-    assert cast(llir.Var, cast_expression.expr).name == old
-    unary = cast(llir.UnaryOp, cast(llir.Assign, output[6]).value)
-    assert cast(llir.Var, unary.operand).name == old
-    call = cast(llir.FunctionCall, cast(llir.Assign, output[7]).value)
-    assert cast(llir.Var, call.args[0]).name == old
-    array = cast(llir.Array, cast(llir.Assign, output[8]).value)
-    assert cast(llir.Var, array.values[0]).name == old
-    assert cast(llir.Var, cast(llir.Return, output[9]).value).name == old
-    assert type(output[10]) is list
-    assert cast(llir.RawStmt, cast(List[llir.Stmt], output[10])[0]).code == old
+    output = eliminate_single_iteration_loops(
+        source,
+        SINGLE_ITERATION_LOOP_ELIMINATION_CONTEXT,
+    )
+
+    assert [type(statement) for statement in output] == [
+        llir.ForLoop,
+        llir.WhileLoop,
+        llir.WhileLoop,
+        llir.IfThenElse,
+    ]
+    assert _raw_codes(cast(llir.ForLoop, output[0]).body) == ["Array[base]"]
+    assert _raw_codes(cast(llir.WhileLoop, output[1]).body) == ["Array[base]"]
+    inner = cast(llir.IfThenElse, cast(llir.WhileLoop, output[2]).body[0])
+    assert _raw_codes(cast(List[llir.Stmt], inner.then_body)) == ["Array[base]"]
+    output_if = cast(llir.IfThenElse, output[3])
+    assert _raw_codes(cast(List[llir.Stmt], output_if.then_body)) == ["Array[base]"]
+    assert _raw_codes(cast(List[llir.Stmt], output_if.else_body)) == ["Array[base]"]
+    assert _raw_codes(output_if.then_body_list[0]) == ["Array[base]"]
+    assert source[1] is not output[0]
+    assert _raw_codes(while_loop.body) == [old]
+
+
+def test_a_bound_still_read_after_its_loop_is_removed_stays() -> None:
+    """The bound's declaration goes only when nothing left names the bound."""
+
+    source: List[llir.Stmt] = [
+        _bound(),
+        _loop([llir.RawStmt("Array[lane]")]),
+        llir.RawStmt("after(end)"),
+    ]
+
+    output = eliminate_single_iteration_loops(
+        source,
+        SINGLE_ITERATION_LOOP_ELIMINATION_CONTEXT,
+    )
+
+    assert [type(statement) for statement in output] == [
+        llir.VarInit,
+        llir.RawStmt,
+        llir.RawStmt,
+    ]
+    assert cast(llir.VarInit, output[0]).var.name == "end"
+    assert _raw_codes(output) == ["Array[base]", "after(end)"]
 
 
 def test_nested_for_loop_and_if_then_else_analysis_is_postorder() -> None:

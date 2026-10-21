@@ -398,10 +398,25 @@ def test_permuted_mode_order_is_structurally_valid():
 
 
 def test_unsupported_level_kind():
-    fixture = build_vector_add()
+    """A coordinate level beside a level of another kind has no segment."""
+
+    fixture = build_matmul()
     forge(fixture.program.tensors[0].levels[0], kind=LevelKind.COORDINATE)
     defect = expect_defect("unsupported_level_kind", fixture.program)
     assert "coordinate" in defect.message
+
+
+def test_all_coordinate_input_levels_are_declared_executable():
+    """A tensor whose levels are all coordinate levels is an admitted layout.
+
+    It no longer fails with ``unsupported_level_kind``; like the compressed
+    case below, the forged program fails at the coordinate load, which is
+    only defined on all-dense tensors.
+    """
+
+    fixture = build_vector_add()
+    forge(fixture.program.tensors[0].levels[0], kind=LevelKind.COORDINATE)
+    expect_defect("layout_mismatch", fixture.program)
 
 
 def test_compressed_input_level_is_now_declared_executable():
@@ -417,7 +432,7 @@ def test_compressed_input_level_is_now_declared_executable():
     expect_defect("layout_mismatch", fixture.program)
 
 
-@pytest.mark.parametrize("kind", [LevelKind.COORDINATE, LevelKind.SINGLETON])
+@pytest.mark.parametrize("kind", [LevelKind.SINGLETON])
 def test_every_unrepresented_level_kind_fails_closed(kind):
     fixture = build_vector_add()
     forge(fixture.program.tensors[2].levels[0], kind=kind)
@@ -624,10 +639,27 @@ def test_forged_binary_op():
 
 
 def test_verifier_reports_paths():
+    """A defect is reported at the node that has it.
+
+    Operands may differ in element type (their sum has the promoted type), so
+    a float64 ``b`` beside a float32 ``a`` is a legal declaration.  The defect
+    is the float64 sum stored into the float32 ``c``, reported at the stored
+    value.
+    """
+
     fixture = build_vector_add()
     forge(fixture.program.tensors[1], dtype=ScalarType.FLOAT64)
     defect = expect_defect("mixed_dtype", fixture.program)
-    assert defect.path == "program.tensors[1]"
+    assert defect.path == "program.body.statements[0].body.statements[0].value"
+
+
+def test_a_result_of_the_operands_promoted_type_verifies():
+    """float32 + float64 stored into float64 is a well-typed program."""
+
+    fixture = build_vector_add()
+    forge(fixture.program.tensors[1], dtype=ScalarType.FLOAT64)
+    forge(fixture.program.tensors[2], dtype=ScalarType.FLOAT64)
+    verify_program(fixture.program)
 
 
 PRODUCTION_SUBSET_DEFECT_CODES = {
@@ -724,12 +756,19 @@ PRODUCTION_SUBSET_DEFECT_CODES = {
     "parallel_race",
     # Physical position-load code added by the Phase-7 mixed-operand slice.
     "position_load_mismatch",
+    # Guarded position-load code added with the sums into sparse results
+    # (2026-10-12): a PositionLoad's guard and its default are set together.
+    "malformed_guard",
     # Assembly-strategy legality code added by the Phase-7 assembly slice.
     "unsupported_assembly_strategy",
     # Accumulation-structure legality code added by the Phase-7 accumulator
     # slice: a wholly dense result has no sparse accumulation workspace, so it
     # cannot record which structure holds one.
     "unsupported_accumulator_structure",
+    # Append-order code added with the relabelled copy for operand conversions
+    # (2026-10-12): an append out of its result's storage order is admitted
+    # only under a two-pass record, as a relabelled copy of one input.
+    "unordered_append",
 }
 
 

@@ -50,8 +50,11 @@ approximated.
 
 from __future__ import annotations
 
+import copy
+
+import itertools
 import re
-from dataclasses import dataclass, fields as dataclass_fields
+from dataclasses import dataclass, fields as dataclass_fields, replace
 from enum import Enum
 from types import FunctionType, MappingProxyType
 from typing import (
@@ -67,6 +70,7 @@ from typing import (
     Sequence,
     Set,
     Tuple,
+    Type,
     TypeGuard,
     Union,
     cast,
@@ -99,6 +103,7 @@ from ..llir_traversal import (
     SUPPORTED_LLIR_STATEMENT_NODE_TYPES,
 )
 from ..loop_plan import MAX_AFFINE_TILE_WIDTH
+from ..merged_coordinate import merged_coordinate_name
 from ..parallel_marking_pass import (
     _CPP_KEYWORDS,
     EMPTY_PARALLEL_WORKSPACE_CLUSTER,
@@ -141,6 +146,7 @@ from ..sparse_accumulator import (
 )
 from ..sparse_assembly import (
     DEFAULT_SERIAL_STRATEGY,
+    INVALID_SCHEDULE_ASSEMBLY,
     SPARSE_ASSEMBLY_STRATEGIES,
     TWO_PASS_STRATEGIES,
     UNSUPPORTED_ASSEMBLY_HOST,
@@ -148,11 +154,13 @@ from ..sparse_assembly import (
     compressed_levels_of,
     partitionable_receiver_levels,
 )
+from .assembly_rule import automatic_assembly
+from .llir_scope import reads_out_of_scope
 from .parallel_chunk_assembly import (
     PARALLEL_CHUNK_RUNTIME_SPELLINGS,
-    ROWS_PER_THREAD as PARALLEL_CHUNK_ROWS_PER_THREAD,
     ParallelChunkAssemblyContext,
     build_parallel_chunk_assembly,
+    parallel_chunk_gate_derivable,
     parallel_chunk_generated_names,
 )
 from .nodes import (
@@ -170,6 +178,7 @@ from .nodes import (
     DimensionId,
     Expr,
     FloatConst,
+    IntegerConst,
     IndexValue,
     LEVEL_KIND_TO_LEVEL_TYPE,
     LevelDecl,
@@ -277,6 +286,7 @@ _LOOPIR_GRAPH_NODE_TYPES = (
     DensePosition,
     DimensionDecl,
     FloatConst,
+    IntegerConst,
     IndexValue,
     LevelDecl,
     Load,
@@ -395,7 +405,48 @@ _OPAQUE_TUPLE_CACHE_FIELDS = frozenset(
 _SCALAR_TO_TORCH: Dict[ScalarType, torch.dtype] = {
     ScalarType.FLOAT32: torch.float32,
     ScalarType.FLOAT64: torch.float64,
+    ScalarType.INT64: torch.int64,
+    ScalarType.INT32: torch.int32,
+    ScalarType.INT8: torch.int8,
+    ScalarType.UINT8: torch.uint8,
 }
+
+# How a zero of each floating-point element type is spelled in a scalar
+# declaration; every integer element type spells it ``0`` (as B2 does for the
+# shipped scalar accumulator).
+_FLOATING_ZERO_SPELLINGS: Dict[ScalarType, str] = {
+    ScalarType.FLOAT32: "0.0f",
+    ScalarType.FLOAT64: "0.0",
+}
+
+
+def _scalar_llir_type(dtype: ScalarType) -> llir.DataType:
+    """The LLIR scalar type a value of ``dtype`` is declared with."""
+    return dtype_to_c_datatype(_SCALAR_TO_TORCH[dtype])
+
+
+def _value_pointer_type(torch_dtype: torch.dtype) -> llir.DataType:
+    """The pointer type of a value array of ``torch_dtype``.
+
+    Spelled through ``dtype_to_c_datatype``, as the shared result ABI
+    (``torch_cpp_abi``) and result-write pass spell it.  ``llir.DataType.
+    ptr_type(torch_dtype)`` agrees for every element type but int32, which it
+    spells ``int*`` where the shared code spells ``int32_t*``; a completion
+    check that compares this target's statements with the shared pass's then
+    sees two types for one array.
+    """
+    return llir.DataType.ptr_type(dtype_to_c_datatype(torch_dtype))
+
+
+def _is_additive_identity(expr: Optional[Expr]) -> bool:
+    """``0.0`` in a floating-point program, ``0`` in an integer one (the
+    verifier holds each constant to its program's kind)."""
+    if type(expr) is FloatConst:
+        return cast(FloatConst, expr).value == 0.0
+    if type(expr) is IntegerConst:
+        return cast(IntegerConst, expr).value == 0
+    return False
+
 
 _BINARY_TO_CXX: Dict[BinaryOp, str] = {
     BinaryOp.ADD: "+",
@@ -495,6 +546,26 @@ class LoopIRTargetError(Exception):
 
 def _fail(code: str, message: str) -> NoReturn:
     raise LoopIRTargetError(LoopIRTargetDefect(code, message))
+
+
+def _guarded_load_cursors(expr: Expr) -> Set[CursorId]:
+    """The guard cursors of every guarded :class:`PositionLoad` an expression reads."""
+
+    if type(expr) is PositionLoad:
+        return set() if expr.guard is None else {expr.guard}
+    if type(expr) is BinaryExpr:
+        return _guarded_load_cursors(expr.lhs) | _guarded_load_cursors(expr.rhs)
+    return set()
+
+
+def _reads_guarded_load(expr: Expr) -> bool:
+    """Whether a value expression reads a guarded :class:`PositionLoad`."""
+
+    if type(expr) is PositionLoad:
+        return expr.guard is not None
+    if type(expr) is BinaryExpr:
+        return _reads_guarded_load(expr.lhs) or _reads_guarded_load(expr.rhs)
+    return False
 
 
 def _registered_loopir_node_fields(node_type: type) -> Tuple[str, ...]:
@@ -1707,6 +1778,10 @@ class _TargetLowering:
                     reserve(f"{decl.name}{level}_pos", owner)
                     reserve(f"{decl.name}{level}_crd", owner)
                     reserve(f"p{decl.name}{level}_end", owner)
+                if level_decl.kind is LevelKind.COORDINATE:
+                    reserve(f"{decl.name}{level}_crd", owner)
+                    reserve(f"{decl.name}{level}_crd_tensor", owner)
+                    reserve(f"p{decl.name}{level}_end", owner)
 
         output = self.result_decl
         output_owner = f"output tensor {output.name!r}"
@@ -1737,7 +1812,7 @@ class _TargetLowering:
             for cursor in loop.cursors:
                 tensor_name = self.decls[cursor.tensor].name
                 self._reserve_generated_name(
-                    f"{dimension_name}_{tensor_name}",
+                    merged_coordinate_name(dimension_name, tensor_name),
                     f"merged coordinate of input tensor {tensor_name!r}",
                 )
 
@@ -1772,11 +1847,12 @@ class _TargetLowering:
                 "this target lowering supports exactly one output tensor",
             )
         for decl in self.program.tensors:
-            # verify_program already rejected COORDINATE/SINGLETON level
-            # kinds, non-CSR sparse outputs, and non-permutation level
-            # modes, so only the admitted storage-permutation scope needs a
-            # target-boundary check: all-dense tensors may permute, while
-            # compressed structure may not.
+            # verify_program already rejected SINGLETON level kinds, a
+            # coordinate level beside a level of another kind, non-CSR
+            # sparse outputs, and non-permutation level modes, so only the
+            # admitted storage-permutation scope needs a target-boundary
+            # check: all-dense tensors may permute, while compressed or
+            # coordinate structure may not.
             modes = tuple(level.mode for level in decl.levels)
             if modes == tuple(range(len(decl.levels))):
                 continue
@@ -2039,11 +2115,60 @@ class _TargetLowering:
                 f"unsupported nest statement {type(only).__name__}",
             )
 
+    def _validate_coordinate_nest(self, loops: List[_Loop]) -> None:
+        """Keep a nest that walks a coordinate level inside what is emitted.
+
+        A coordinate cursor is lowered by the single-cursor sparse loop and
+        by an intersection merge.  An affine tile splits a dense loop, and a
+        dense workspace region places the sparse loop it encloses inside its
+        producer; both leave the sparse loop itself to that lowering, and
+        those nests emit the legacy text.  Panels, windows, staged relayouts,
+        result tiles and explicit parallel selections rewrite the sparse
+        loop's own bounds from its position array, which a coordinate level
+        does not have.  Each of them fails closed beside a coordinate cursor
+        until it is lowered and tested for it.  A union merge walks a
+        coordinate level run by run, as an intersection does: an aligned
+        cursor steps over its run, an unaligned one's run is empty, and the
+        one-cursor tails scan and step runs too.
+        """
+
+        if not any(
+            self._cursor_is_coordinate(cursor)
+            for loop in loops
+            for cursor in loop.cursors
+        ):
+            return
+        unsupported = [
+            what
+            for what, present in (
+                ("a panel loop", any(loop.kind is _PANEL_OUTER for loop in loops)),
+                (
+                    "a windowed loop",
+                    any(loop.kind is _SPARSE_WINDOW for loop in loops),
+                ),
+                ("a staged relayout", self.relayout is not None),
+                ("a result tile", self.result_tile is not None),
+                ("an explicit parallel selection", self.parallel is not None),
+            )
+            if present
+        ]
+        if unsupported:
+            _fail(
+                "unsupported_level_kind",
+                "a nest that walks a coordinate level cannot yet carry "
+                + unsupported[0],
+            )
+
     def _validate_loop_kinds(self, loops: List[_Loop], leaf: Stmt) -> None:
-        if loops[0].kind not in (_DENSE, _TILE_OUTER, _PANEL_OUTER, _SPARSE):
+        self._validate_coordinate_nest(loops)
+        dense_merged_nest = self._dense_result_merged_nest(loops, leaf)
+        if loops[0].kind not in (_DENSE, _TILE_OUTER, _PANEL_OUTER, _SPARSE) and not (
+            dense_merged_nest and loops[0].kind is _MERGED
+        ):
             # A single-cursor sparse outermost loop is the mixed dense-leaf
-            # operand chain's root-parent row loop; merged outermost
-            # iteration stays outside the migrated families.
+            # operand chain's root-parent row loop.  A merged outermost loop
+            # is admitted for a dense result (``_dense_result_merged_nest``);
+            # elsewhere it stays outside the migrated families.
             _fail(
                 "unsupported_program_shape",
                 "the migrated families require a dense, sparse, tile-origin, "
@@ -2079,7 +2204,7 @@ class _TargetLowering:
             if loop.kind in (_TILE_OUTER, _TILE_INNER)
         ]
         if tile_positions:
-            if any(loop.kind is _MERGED for loop in loops):
+            if any(loop.kind is _MERGED for loop in loops) and not dense_merged_nest:
                 _fail(
                     "unsupported_program_shape",
                     "affine splits over merged iteration are outside the "
@@ -2094,16 +2219,20 @@ class _TargetLowering:
         merged_positions = [
             position for position, loop in enumerate(loops) if loop.kind is _MERGED
         ]
-        if merged_positions:
+        if merged_positions and dense_merged_nest:
+            # Validated by ``_dense_result_merged_nest``; the merged case
+            # machinery descends and accumulates (``_merged_case_stmts``).
+            pass
+        elif merged_positions:
             if merged_positions != [len(loops) - 1]:
                 _fail(
                     "unsupported_program_shape",
                     "a merged loop is supported only as the innermost loop",
                 )
-            if len(loops[-1].cursors) != 2:
+            if not _supported_merge(loops[-1].node, binds_positions=False):
                 _fail(
                     "unsupported_program_shape",
-                    "this target lowering merges exactly two sparse cursors",
+                    "this target lowering merges two or more sparse cursors",
                 )
             if type(leaf) is StoreReduce:
                 _fail(
@@ -2118,16 +2247,88 @@ class _TargetLowering:
             )
         for loop in loops:
             for cursor in loop.cursors:
-                if cursor.level < 1 and loop.kind is not _SPARSE:
+                if (
+                    cursor.level < 1
+                    and loop.kind is not _SPARSE
+                    and not (dense_merged_nest and loop.kind is _MERGED)
+                    and not (
+                        loop.kind is _MERGED
+                        and type(leaf) is AppendEntry
+                        and cast(MergedSparseFor, loop.node).mode
+                        is MergeMode.INTERSECTION
+                    )
+                ):
                     # A single-cursor loop descends a root-parent level-0
                     # segment exactly like a dense-parent one (the mixed
-                    # dense-leaf operand chain's row loop); merged or
-                    # windowed level-0 iteration stays fail-closed.
+                    # dense-leaf operand chain's row loop), and so does a
+                    # merge in a dense result's nest: its iterator inits read
+                    # the root segment ``pos[0]..pos[1]``.  So does the
+                    # innermost intersection of an ordered assembly (a CSR row
+                    # with a vector that has no row index): the vector's
+                    # cursor is initialized from its root segment each time
+                    # the loop is entered.  A union there, and windowed
+                    # level-0 iteration, stay fail-closed.
                     _fail(
                         "unsupported_program_shape",
                         "level-0 (root-parent) cursors are outside the "
                         "migrated merged and windowed families",
                     )
+
+    def _dense_result_merged_nest(self, loops: List[_Loop], leaf: Stmt) -> bool:
+        """Whether a dense result's nest carries merges the generic target emits.
+
+        Only the generic target itself, an untiled nest, and a dense result
+        written by ``Store`` or ``StoreReduce``: every cell is addressed by its
+        coordinates, so a merge may bind a result coordinate or a summed one at
+        any depth.  A merge above the innermost loop binds its cursors'
+        positions: an intersection descends into its child only when every
+        cursor stores the coordinate; a union (or a DENSE_UNION) descends at
+        every candidate coordinate, and the child stream of a cursor that did
+        not align is the empty segment (``_segment_bound``).  The innermost
+        merge is any merge ``_supported_merge`` admits, its one-sided cases
+        folding the absent operand's identity into the value.  The two-cursor innermost union over a dense result keeps
+        the legacy route, which emits it byte for byte, so this returns False
+        for that nest.
+        """
+
+        if type(self) is not _TargetLowering:
+            return False
+        if not self.result_is_dense or type(leaf) not in (Store, StoreReduce):
+            return False
+        if self.relayout is not None:
+            return False
+        if self.panel is not None or self.result_tile is not None:
+            return False
+        # Affine splits strip-mine dense loops only, and the stack workspace
+        # region's producer is one more loop chain above its point loop, so a
+        # merge may sit among them unchanged: it is never split and never
+        # the innermost loop there.
+        if any(
+            loop.kind not in (_DENSE, _SPARSE, _MERGED, _TILE_OUTER, _TILE_INNER)
+            for loop in loops
+        ):
+            return False
+        merged = [
+            position for position, loop in enumerate(loops) if loop.kind is _MERGED
+        ]
+        if not merged:
+            return False
+        if (
+            merged == [len(loops) - 1]
+            and len(loops[-1].cursors) == 2
+            and type(leaf) is Store
+            and loops[0].kind is not _MERGED
+            and all(cursor.level >= 1 for cursor in loops[-1].cursors)
+            and cast(MergedSparseFor, loops[-1].node).mode is not MergeMode.DENSE_UNION
+        ):
+            # The shape the legacy rules already admit, unchanged.
+            return False
+        for position in merged:
+            node = cast(MergedSparseFor, loops[position].node)
+            innermost = position == len(loops) - 1
+            if not _supported_merge(node, binds_positions=not innermost):
+                return False
+        return True
 
     def _collect_region_chains(
         self, region: WorkspaceRegion, prefix: List[_Loop]
@@ -2183,6 +2384,24 @@ class _TargetLowering:
                 )
                 body = only.body
                 continue
+            if type(only) is MergedSparseFor and (
+                cast(MergedSparseFor, only).mode is MergeMode.INTERSECTION
+            ):
+                # A summed coordinate several operands store: the merge
+                # descends into the rest of the producer chain only where
+                # every cursor aligned (``_merged_case_stmts``).
+                first = only.cursors[0]
+                producer_loops.append(
+                    _Loop(
+                        _MERGED,
+                        only.coord_index,
+                        self._level_dimension(first.tensor, first.level),
+                        only,
+                        tuple(only.cursors),
+                    )
+                )
+                body = only.body
+                continue
             if type(only) is TileInnerFor:
                 if only.tile != decl.tile:
                     # The reduce-out family strip-mines reduction loops
@@ -2228,8 +2447,8 @@ class _TargetLowering:
             _fail(
                 "unsupported_program_shape",
                 "workspace producers support dense loops, single-cursor "
-                "sparse loops, strip-mined reduction point loops, and the "
-                "owning point loop only",
+                "sparse loops, intersections, strip-mined reduction point "
+                "loops, and the owning point loop only",
             )
         if len(producer_loops) < 2:
             _fail(
@@ -3055,8 +3274,9 @@ class _TargetLowering:
                     state, node = state_of(
                         value,
                         PositionLoad,
-                        {"node_id", "tensor", "position"},
+                        {"node_id", "tensor", "position", "guard", "default"},
                     )
+                    guard, default = state["guard"], state["default"]
                     return (
                         "position_load",
                         id(value),
@@ -3067,6 +3287,12 @@ class _TargetLowering:
                             "position-load tensor identity",
                         ),
                         visit(state["position"], depth + 1),
+                        (
+                            None
+                            if guard is None
+                            else identity(guard, CursorId, "guard cursor identity")
+                        ),
+                        None if default is None else visit(default, depth + 1),
                     )
                 if type(value) is StagedRead:
                     state, node = state_of(
@@ -3154,6 +3380,15 @@ class _TargetLowering:
                             "a cursor default must retain an exact float value",
                         )
                     return ("float", id(value), node, literal.hex())
+                if type(value) is IntegerConst:
+                    state, node = state_of(value, IntegerConst, {"node_id", "value"})
+                    literal = state["value"]
+                    if type(literal) is not int:
+                        _fail(
+                            "unsupported_program_shape",
+                            "a cursor default must retain an exact int value",
+                        )
+                    return ("int", id(value), node, literal)
                 if type(value) is WorkspaceRead:
                     state, node = state_of(
                         value,
@@ -3678,7 +3913,11 @@ class _TargetLowering:
                 {"node_id", "mode", "cursors", "coord_index", "body", "positions"},
             )
             mode = state["mode"]
-            if mode is not MergeMode.UNION and mode is not MergeMode.INTERSECTION:
+            if mode not in (
+                MergeMode.UNION,
+                MergeMode.INTERSECTION,
+                MergeMode.DENSE_UNION,
+            ):
                 _fail(
                     "unsupported_program_shape",
                     "a merged position-binding loop has a malformed merge mode",
@@ -3747,7 +3986,9 @@ class _TargetLowering:
                 )
             return stored
 
-        load_state = state_of(load, PositionLoad, {"node_id", "tensor", "position"})
+        load_state = state_of(
+            load, PositionLoad, {"node_id", "tensor", "position", "guard", "default"}
+        )
         tensor = load_state["tensor"]
         tensor_value = _stored_identity_value(tensor, SymbolId)
         if (
@@ -3845,7 +4086,26 @@ class _TargetLowering:
                 f"the position load of {decl.name!r} must ground at the "
                 f"bound position of its own level-{level} cursor",
             )
-        if require_unconditional:
+        guard = load_state["guard"]
+        if guard is not None:
+            # A guarded load grounds at the position its guard's merge binds:
+            # the guard is the loaded tensor's cursor at the grounding level,
+            # iterated by a UNION or DENSE_UNION merge.  The load runs only
+            # where that cursor aligned, so the binding may be optional.
+            guard_decl = self._cursor_decl(guard)
+            binding = self._bound_position_snapshot.get(position_value)
+            if (
+                (guard_decl.tensor, guard_decl.level) != (tensor, level)
+                or binding is None
+                or binding[2] != _MERGED
+                or binding[3] not in (MergeMode.UNION, MergeMode.DENSE_UNION)
+            ):
+                _fail(
+                    "unsupported_program_shape",
+                    f"the guarded position load of {decl.name!r} must ground "
+                    "at the union-bound position of its guard cursor",
+                )
+        elif require_unconditional:
             # Raw emission has already proved both the complete program graph
             # and this exact read-only witness unchanged.  Rewalking every
             # loop binding for each merged alignment case would repeat the
@@ -3858,7 +4118,8 @@ class _TargetLowering:
                 )
             binding = bindings.get(position_value)
             if binding is None or (
-                binding[2] == _MERGED and binding[3] is MergeMode.UNION
+                binding[2] == _MERGED
+                and binding[3] in (MergeMode.UNION, MergeMode.DENSE_UNION)
             ):
                 _fail(
                     "unsupported_program_shape",
@@ -4013,7 +4274,18 @@ class _TargetLowering:
                 self.loop_positions[per_tensor[level]]
                 for level in range(len(decl.levels))
             ]
-            if positions != sorted(positions) or len(set(positions)) != len(positions):
+            if len(set(positions)) != len(positions):
+                _fail(
+                    "unsupported_loop_order",
+                    f"tensor {decl.name!r} storage order "
+                    "conflicts with the loop nest order",
+                )
+            if positions != sorted(positions) and not self._coordinate_addressed(
+                symbol
+            ):
+                # Only an all-dense tensor is addressed by its coordinates
+                # alone (see ``_dense_resolve_index``); a compressed level
+                # needs its parent's position bound before its loop starts.
                 _fail(
                     "unsupported_loop_order",
                     f"tensor {decl.name!r} storage order "
@@ -4146,8 +4418,53 @@ class _TargetLowering:
             return loop.node.index
         return loop.index
 
+    def _operand_absent_here(self, symbol: SymbolId, level: int) -> bool:
+        """Whether the entry a dense level hangs from is known to be absent.
+
+        A dense level's position is arithmetic on the position of the nearest
+        stored level above it.  Inside a union's alignment case, tail loop or
+        one-operand drain the emission knows which of the union's cursors
+        aligned; when the cursor of that stored level did not, the operand
+        stores no entry there and the dense level has no position.  Every
+        reader of the position consults the same cursor: a guarded load folds
+        to its default (``_guard_alignment``) and a child stream becomes the
+        empty segment (``_segment_bound``), so nothing in the case reads it,
+        and a one-operand drain does not declare the position it would be
+        computed from at all.  The legacy iteration lattice likewise resolves
+        a dense level only for the operands of the lattice point it emits.
+
+        Only the nearest stored level decides.  A cursor further up that did
+        not align leaves the cursors below it iterating the empty segment,
+        and the positions under those are still declared and read there.
+        """
+
+        decl = self.decls[symbol]
+        stored = level - 1
+        while stored >= 0 and decl.levels[stored].kind is LevelKind.DENSE:
+            stored -= 1
+        if stored < 0:
+            return False
+        for cursor, aligned in getattr(self, "_alignment_override", {}).items():
+            if aligned:
+                continue
+            owner = self._cursor_decl(cursor)
+            if owner.tensor == symbol and owner.level == stored:
+                return True
+        return False
+
     def _input_bound_var(self, loop: _Loop) -> Optional[llir.Var]:
+        """The extent of the first input storing this loop's dimension densely.
+
+        An operand absent in the current union case (``_operand_absent_here``)
+        is passed over, so a loop that drains one operand is bounded by that
+        operand's own extent, as the legacy lattice spells it.  When every
+        such operand is absent the first one's extent is the bound: the
+        extents of one dimension are equal, and the argument is always in
+        scope.
+        """
+
         lookup = self._loop_logical_index(loop)
+        absent: Optional[llir.Var] = None
         for symbol in self._input_symbols:
             decl = self.decls[symbol]
             per_tensor = self.level_drivers.get(symbol, {})
@@ -4156,10 +4473,14 @@ class _TargetLowering:
                     per_tensor.get(level) == lookup
                     and decl.levels[level].kind is LevelKind.DENSE
                 ):
-                    return llir.Var(
+                    bound = llir.Var(
                         name=f"{decl.name}{level}_size", type=llir.DataType.INT64
                     )
-        return None
+                    if not self._operand_absent_here(symbol, level):
+                        return bound
+                    if absent is None:
+                        absent = bound
+        return absent
 
     def _loop_bound_var(self, loop: _Loop) -> llir.Var:
         bound = self._input_bound_var(loop)
@@ -4238,17 +4559,80 @@ class _TargetLowering:
             value=value,
         )
 
+    def _coordinate_addressed(self, symbol: SymbolId) -> bool:
+        """Whether every level position of ``symbol`` is computed here.
+
+        An all-dense tensor's positions are its coordinates folded through
+        the level extents, so this target can place them wherever the loops
+        bind those coordinates, and a workspace region's copy-out places the
+        result's the same way (``_lower_workspace_consumer``).  A result
+        written through a panel, a staged relayout or a heap tile has
+        positions that completion places, in storage order.
+        """
+
+        if not all(
+            level.kind is LevelKind.DENSE for level in self.decls[symbol].levels
+        ):
+            return False
+        if symbol != self.result_symbol:
+            return True
+        return self.panel is None and self.relayout is None and self.result_tile is None
+
+    def _dense_resolve_index(self, symbol: SymbolId, level: int) -> object:
+        """The loop coordinate at which a dense level's position resolves.
+
+        ``p{level} = p{level - 1} * size{level} + coordinate`` needs the
+        level's own coordinate and its parent's position, so it resolves in
+        the innermost of the loops driving levels ``0..level``.  When the
+        loops visit the tensor in storage order that is the level's own
+        driver, so every such program resolves where it always has; an
+        all-dense tensor visited out of storage order resolves each level
+        where the last coordinate it needs is bound.
+        """
+
+        per_tensor = self.level_drivers.get(symbol, {})
+        own = per_tensor.get(level)
+        if not self._coordinate_addressed(symbol):
+            return own
+        drivers = [per_tensor.get(parent) for parent in range(level + 1)]
+        if any(driver not in self.loop_positions for driver in drivers):
+            return own
+        return max(drivers, key=lambda driver: self.loop_positions[driver])
+
+    def _coordinate_loop(self, symbol: SymbolId, level: int, loop: _Loop) -> _Loop:
+        """The loop binding ``level``'s coordinate, for a resolve at ``loop``.
+
+        Resolved below its own loop (``_dense_resolve_index``), a level's
+        coordinate is still its own driving loop's variable.
+        """
+
+        own = self.level_drivers[symbol][level]
+        if own == loop.index:
+            return loop
+        return self.loops[self.loop_positions[own]]
+
     def _input_resolves_at(self, loop: _Loop) -> List[llir.Stmt]:
+        """The dense input positions that resolve in ``loop``'s body.
+
+        An operand absent in the current union case has no position to
+        resolve (``_operand_absent_here``), and nothing in the case reads it.
+        """
+
         stmts: List[llir.Stmt] = []
         for symbol in self._input_symbols:
             decl = self.decls[symbol]
-            per_tensor = self.level_drivers.get(symbol, {})
             for level in range(len(decl.levels)):
-                if per_tensor.get(level) != loop.index:
+                if self._dense_resolve_index(symbol, level) != loop.index:
                     continue
                 if decl.levels[level].kind is not LevelKind.DENSE:
                     continue
-                stmts.append(self._position_init(decl.name, level, loop))
+                if self._operand_absent_here(symbol, level):
+                    continue
+                stmts.append(
+                    self._position_init(
+                        decl.name, level, self._coordinate_loop(symbol, level, loop)
+                    )
+                )
         return stmts
 
     def _result_resolves_at(self, loop: _Loop) -> List[llir.Stmt]:
@@ -4261,14 +4645,18 @@ class _TargetLowering:
             # synthesized consumer loop, never to the producer chain —
             # exactly where the legacy consumer lowering resolves them.
             return stmts
-        for level, index in enumerate(self._result_storage_indices()):
-            if self._index_of(index, "store index") != loop.index:
+        symbol = self.result_symbol
+        for level in range(len(self.result_decl.levels)):
+            if self._dense_resolve_index(symbol, level) != loop.index:
                 continue
             if self.result_decl.levels[level].kind is not LevelKind.DENSE:
                 continue
             stmts.append(
                 self._position_init(
-                    self.result_decl.name, level, loop, result_chain=True
+                    self.result_decl.name,
+                    level,
+                    self._coordinate_loop(symbol, level, loop),
+                    result_chain=True,
                 )
             )
         return stmts
@@ -4335,11 +4723,20 @@ class _TargetLowering:
             return llir.ArrayAccess(
                 array=llir.Var(
                     name=f"{decl.name}_val",
-                    type=llir.DataType.ptr_type(torch_dtype),
+                    type=_value_pointer_type(torch_dtype),
                 ),
                 index=llir.Var(name=physical_index, type=llir.DataType.INT),
                 tensor_access=self._input_metadata(expr.tensor),
             )
+        if _reads_guarded_load(expr):
+            # Outside a case that fixes a guard's alignment, a guarded read
+            # is selected by its guard's runtime alignment test; where the
+            # alignment is known false the read is the additive identity and
+            # drops out of the sum.  A united cursor's own value has no
+            # runtime-selected form here, so its alignment must be known.
+            self._require_known_cursor_alignment(expr)
+            folded = self._merged_case_value(expr, set())
+            return llir.Literal(0, llir.DataType.INT) if folded is None else folded
         if type(expr) is PositionLoad:
             # The value-bearing leaf position variable is the resolved end
             # of the load's validated dense spine (``p{name}{leaf}``), or
@@ -4349,7 +4746,7 @@ class _TargetLowering:
             return llir.ArrayAccess(
                 array=llir.Var(
                     name=f"{decl.name}_val",
-                    type=llir.DataType.ptr_type(torch_dtype),
+                    type=_value_pointer_type(torch_dtype),
                 ),
                 index=llir.Var(
                     name=f"p{decl.name}{len(decl.levels) - 1}",
@@ -4360,7 +4757,14 @@ class _TargetLowering:
         if type(expr) is CursorValue:
             cursor = self._cursor_decl(expr.cursor)
             loop = self.loops[self.cursor_loops[expr.cursor]]
-            if loop.kind not in (_SPARSE, _SPARSE_WINDOW):
+            if loop.kind not in (_SPARSE, _SPARSE_WINDOW) and not (
+                loop.kind is _MERGED
+                and cast(MergedSparseFor, loop.node).mode is MergeMode.INTERSECTION
+            ):
+                # An intersection's body runs only in its one case, where
+                # every cursor sits at the agreed coordinate, so a value read
+                # below it is the plain read at the cursor's position.  A
+                # union's cursor may be absent, and is lowered per case.
                 _fail(
                     "unsupported_program_shape",
                     "merged cursor values are lowered per alignment case, "
@@ -4371,7 +4775,7 @@ class _TargetLowering:
             return llir.ArrayAccess(
                 array=llir.Var(
                     name=f"{decl.name}_val",
-                    type=llir.DataType.ptr_type(torch_dtype),
+                    type=_value_pointer_type(torch_dtype),
                 ),
                 index=llir.Var(
                     name=f"p{decl.name}{cursor.level}", type=llir.DataType.INT
@@ -4515,6 +4919,49 @@ class _TargetLowering:
                 "a position-load spine changed after target construction",
             )
 
+    def _require_known_cursor_alignment(self, expr: Expr) -> None:
+        """Fail closed on a united cursor read whose alignment is unknown."""
+
+        if type(expr) is BinaryExpr:
+            self._require_known_cursor_alignment(expr.lhs)
+            self._require_known_cursor_alignment(expr.rhs)
+            return
+        if type(expr) is not CursorValue or self._always_aligned_here(expr.cursor):
+            return
+        if getattr(self, "_alignment_override", {}).get(expr.cursor) is None:
+            _fail(
+                "unsupported_union_dense_descent",
+                "a united cursor's value beside a guarded dense read is "
+                "lowered only inside an alignment case of its merge",
+            )
+
+    def _guard_alignment(
+        self, guard: CursorId, aligned: Set[CursorId]
+    ) -> "llir.Expr | bool":
+        """Whether a united cursor is aligned where the leaf runs.
+
+        A constant where the emission already knows it (the cursor is one of
+        the current case's aligned cursors, or an enclosing case fixed its
+        alignment); otherwise the emitted test ``x_T == x`` of the merge
+        that iterates it.
+        """
+
+        if guard in aligned or self._always_aligned_here(guard):
+            return True
+        override = getattr(self, "_alignment_override", {}).get(guard)
+        if override is not None:
+            return bool(override)
+        loop = self.loops[self.cursor_loops[guard]]
+        owner = next(c for c in loop.cursors if c.cursor == guard)
+        return llir.BinOp(
+            op="==",
+            left=llir.Var(
+                name=self._merged_coordinate_name(loop, owner),
+                type=llir.DataType.INT,
+            ),
+            right=llir.Var(name=self._loop_var_name(loop), type=llir.DataType.INT),
+        )
+
     def _merged_case_value(
         self, expr: Expr, aligned: Set[CursorId]
     ) -> Optional[llir.Expr]:
@@ -4533,13 +4980,13 @@ class _TargetLowering:
 
         if type(expr) is CursorValue:
             cursor = self._cursor_decl(expr.cursor)
-            if expr.cursor in aligned:
+            if expr.cursor in aligned or self._always_aligned_here(expr.cursor):
                 decl = self.decls[cursor.tensor]
                 torch_dtype = _SCALAR_TO_TORCH[decl.dtype]
                 return llir.ArrayAccess(
                     array=llir.Var(
                         name=f"{decl.name}_val",
-                        type=llir.DataType.ptr_type(torch_dtype),
+                        type=_value_pointer_type(torch_dtype),
                     ),
                     index=llir.Var(
                         name=f"p{decl.name}{cursor.level}",
@@ -4548,15 +4995,40 @@ class _TargetLowering:
                     tensor_access=self._input_metadata(cursor.tensor),
                 )
             default = expr.default
-            if type(default) is not FloatConst or default.value != 0.0:
+            if not _is_additive_identity(default):
                 _fail(
                     "unsupported_union_default",
                     "the migrated UNION families require the additive "
-                    "identity 0.0 as the unaligned-cursor default",
+                    "identity (0.0, or 0 in an integer program) as the "
+                    "unaligned-cursor default",
                 )
             return None
         if type(expr) is Load:
             return self._lower_value(expr)
+        if type(expr) is PositionLoad and expr.guard is not None:
+            load = cast(PositionLoad, expr)
+            self._validated_position_load_spine(load, require_unconditional=False)
+            default = load.default
+            if not _is_additive_identity(default):
+                _fail(
+                    "unsupported_union_default",
+                    "the migrated UNION families require the additive "
+                    "identity (0.0, or 0 in an integer program) as the "
+                    "unaligned-guard default",
+                )
+            alignment = self._guard_alignment(cast(CursorId, load.guard), aligned)
+            if alignment is False:
+                return None
+            read = self._lower_value(replace(load, guard=None, default=None))
+            if alignment is True:
+                return read
+            # The integer zero takes the read's floating type under C++'s
+            # usual arithmetic conversions, so a float32 sum stays float32.
+            return llir.Select(
+                cond=cast(llir.Expr, alignment),
+                when_true=read,
+                when_false=llir.Literal(0, llir.DataType.INT),
+            )
         if type(expr) is PositionLoad:
             self._require_unconditional_position_load(cast(PositionLoad, expr))
             return self._lower_value(expr)
@@ -4584,9 +5056,49 @@ class _TargetLowering:
         )
         raise AssertionError("unreachable")
 
+    def _always_aligned_here(self, cursor_id: CursorId) -> bool:
+        """Whether a cursor bound by an enclosing loop is aligned in its body.
+
+        A merge's case names only that merge's own aligned cursors, but a
+        leaf value may read a cursor an enclosing loop bound: MTTKRP's
+        ``value(A)`` at A's last level, read inside the merge over ``r``.
+        A single-cursor loop's cursor and an intersection's cursors sit on
+        the loop's coordinate for the whole body, so the value is the one at
+        their position.  A union's cursor is aligned only in some cases, so
+        it is never answered here; the caller falls back to its default.
+        """
+
+        for loop in self.loops:
+            if loop.kind is _SPARSE and any(
+                cursor.cursor == cursor_id for cursor in loop.cursors
+            ):
+                return True
+            if loop.kind is _MERGED:
+                node = cast(MergedSparseFor, loop.node)
+                if node.mode is MergeMode.INTERSECTION and any(
+                    cursor.cursor == cursor_id for cursor in node.cursors
+                ):
+                    return True
+        return False
+
     def _merged_case_stmts(
         self, loop: _Loop, aligned: Set[CursorId]
     ) -> Optional[List[llir.Stmt]]:
+        if (
+            type(self) is _TargetLowering
+            and self.loop_positions.get(loop.index, len(self.loops) - 1)
+            != len(self.loops) - 1
+        ):
+            # A merge above the innermost loop of a dense result's nest: an
+            # intersection (``_dense_result_merged_nest``) whose one case
+            # descends into the child loop with every cursor aligned, or a
+            # dense union split for a guarded read, each of whose cases
+            # descends with its cursors' alignment fixed by the caller.
+            if cast(MergedSparseFor, loop.node).mode is MergeMode.DENSE_UNION:
+                return self._loop_children(self.loop_positions[loop.index])
+            if aligned != {cursor.cursor for cursor in loop.cursors}:
+                return None
+            return self._loop_children(self.loop_positions[loop.index])
         value = self._merged_case_value(
             self.leaf.value, aligned  # type: ignore[attr-defined]
         )
@@ -4610,6 +5122,13 @@ class _TargetLowering:
             llir.Assign(
                 var=target,
                 value=value,
+                # A summed merged loop, or a merge binding a result coordinate
+                # under ADD, accumulates like the unmerged leaf does.
+                op=(
+                    llir.AssignOp.ADD_ASSIGN
+                    if type(self.leaf) is StoreReduce
+                    else llir.AssignOp.ASSIGN
+                ),
                 result_storage=self._result_storage(
                     (RESULT_VALUES, None, STORAGE_WRITE)
                 ),
@@ -4646,7 +5165,9 @@ class _TargetLowering:
         return stmts
 
     def _merged_coordinate_name(self, loop: _Loop, cursor: SparseCursorDecl) -> str:
-        return f"{self._loop_var_name(loop)}_{self.decls[cursor.tensor].name}"
+        return merged_coordinate_name(
+            self._loop_var_name(loop), self.decls[cursor.tensor].name
+        )
 
     def _cursor_position_name(self, cursor: SparseCursorDecl) -> str:
         return f"p{self.decls[cursor.tensor].name}{cursor.level}"
@@ -4663,6 +5184,172 @@ class _TargetLowering:
         name = self.decls[cursor.tensor].name
         return llir.Var(name=f"p{name}{cursor.level - 1}", type=llir.DataType.INT)
 
+    def _cursor_is_coordinate(self, cursor: SparseCursorDecl) -> bool:
+        """Whether a cursor walks a COORDINATE level (one of a COO tensor)."""
+
+        return (
+            self.decls[cursor.tensor].levels[cursor.level].kind is LevelKind.COORDINATE
+        )
+
+    def _coordinate_run_end(self, cursor: SparseCursorDecl) -> Optional[llir.Var]:
+        """``p{T}{L+1}_end``: where the run at a coordinate cursor ends.
+
+        A cursor over a coordinate level that has a level below it stops at
+        the first entry of each run of equal coordinates.  The run is the
+        segment of the level below, so its end is that level's iterator end,
+        which the legacy lowering finds by scanning forward from the cursor.
+        ``None`` on the last level, which is walked entry by entry.
+        """
+
+        decl = self.decls[cursor.tensor]
+        if cursor.level + 1 >= len(decl.levels):
+            return None
+        return llir.Var(
+            name=f"p{decl.name}{cursor.level + 1}_end", type=llir.DataType.INT
+        )
+
+    def _coordinate_run_scan(
+        self,
+        cursor: SparseCursorDecl,
+        coordinate: llir.Expr,
+        aligned: Optional[llir.Expr] = None,
+    ) -> List[llir.Stmt]:
+        """The legacy ``Find iterator end for coordinate level`` group.
+
+        ``pA1_end = pA0 + 1; while (pA1_end < pA0_end && A0_crd[pA1_end] == i)
+        pA1_end++;`` -- empty on the last level.  Under a union a cursor may
+        stand past the merged coordinate; ``aligned`` is then its alignment
+        test, and the run starts at ``pA0 + (int)(aligned)``, so the run of a
+        cursor that did not align is empty (the entries are sorted, so the
+        scan cannot extend it either).
+        """
+
+        run_end = self._coordinate_run_end(cursor)
+        if run_end is None:
+            return []
+        position_name = self._cursor_position_name(cursor)
+        name = self.decls[cursor.tensor].name
+        step: llir.Expr = (
+            llir.Literal(value=1)
+            if aligned is None
+            else llir.Cast(expr=aligned, data_type=llir.DataType.INT)
+        )
+        return [
+            llir.Comment("Find iterator end for coordinate level"),
+            llir.Assign(
+                var=run_end,
+                value=llir.BinOp(
+                    op="+",
+                    left=llir.Var(name=position_name, type=llir.DataType.INT),
+                    right=step,
+                ),
+            ),
+            llir.WhileLoop(
+                cond=llir.BinOp(
+                    op="&&",
+                    left=llir.BinOp(
+                        op="<",
+                        left=run_end,
+                        right=llir.Var(
+                            name=f"{position_name}_end", type=llir.DataType.INT
+                        ),
+                    ),
+                    right=llir.BinOp(
+                        op="==",
+                        left=llir.ArrayAccess(
+                            array=llir.Var(
+                                name=f"{name}{cursor.level}_crd",
+                                type=llir.DataType.ARRAY_INT,
+                            ),
+                            index=run_end,
+                        ),
+                        right=coordinate,
+                    ),
+                ),
+                body=[llir.Increment(var=run_end)],
+            ),
+            llir.BlankLine(),
+        ]
+
+    def _coordinate_run_scan_at(self, position: int) -> List[llir.Stmt]:
+        """The run scan of the loop at ``position``; empty unless it walks a
+        coordinate level that has a level below it."""
+
+        loop = self.loops[position]
+        if loop.kind is not _SPARSE or not self._cursor_is_coordinate(loop.cursors[0]):
+            return []
+        return self._coordinate_run_scan(
+            loop.cursors[0],
+            llir.Var(name=self._loop_var_name(loop), type=llir.DataType.INT),
+        )
+
+    def _run_scan_follows_catch_up(self, position: int) -> bool:
+        """Whether the loop's children emit its run scan themselves.
+
+        The legacy lowering finds the end of a coordinate run after it has
+        caught the result's position array up to the loop's coordinate and
+        before it resolves any dense position.  Only a family whose loops
+        open with such a catch-up moves the scan; it then emits
+        :meth:`_coordinate_run_scan_at` right after the catch-up.
+        """
+
+        return False
+
+    def _coordinate_merge_inits(self, cursor: SparseCursorDecl) -> List[llir.Stmt]:
+        """The iterator group of a coordinate cursor that a merge advances.
+
+        A merge declares each cursor's position itself, where a single-cursor
+        loop declares it in its header: level 0 starts at the first stored
+        entry, and a later level where its parent stands, at the first entry
+        of the parent's run.  The ends are those of the single-cursor loop.
+        """
+
+        position = llir.Var(
+            name=self._cursor_position_name(cursor), type=llir.DataType.INT
+        )
+        start: llir.Expr = (
+            llir.Literal(0) if cursor.level == 0 else self._cursor_parent_var(cursor)
+        )
+        return [
+            llir.VarInit(var=position, value=start),
+            *self._coordinate_iterator_inits(cursor),
+        ]
+
+    def _coordinate_iterator_inits(self, cursor: SparseCursorDecl) -> List[llir.Stmt]:
+        """The legacy ``Initialize iterators`` group of a coordinate cursor.
+
+        Level 0 declares its end as the stored entry count and the end of
+        every level below it as zero; each of those is assigned by the run
+        scan of the level above before its loop starts.  A later level
+        declares nothing.
+        """
+
+        if cursor.level != 0:
+            return []
+        decl = self.decls[cursor.tensor]
+        stmts: List[llir.Stmt] = [
+            llir.VarInit(
+                var=llir.Var(
+                    name=f"{self._cursor_position_name(cursor)}_end",
+                    type=llir.DataType.INT,
+                ),
+                value=llir.FunctionCall(
+                    name=f"{decl.name}0_crd_tensor.size",
+                    args=[llir.Literal(0)],
+                ),
+            )
+        ]
+        for level in range(1, len(decl.levels)):
+            stmts.append(
+                llir.VarInit(
+                    var=llir.Var(
+                        name=f"p{decl.name}{level}_end", type=llir.DataType.INT
+                    ),
+                    value=llir.Literal(0),
+                )
+            )
+        return stmts
+
     def _cursor_parent_index(self, cursor: SparseCursorDecl, offset: int) -> llir.Expr:
         """The pos-array subscript at one cursor's parent position.
 
@@ -4678,10 +5365,76 @@ class _TargetLowering:
             return parent
         return llir.Add(left=parent, right=llir.Literal(offset, llir.DataType.INT))
 
+    def _union_parent_alignment(
+        self, cursor: SparseCursorDecl
+    ) -> "Optional[llir.Expr | bool]":
+        """Whether the parent entry a cursor's stream hangs from is present.
+
+        ``None`` when the cursor's parent does not hang from a position bound
+        by a union (it is then present whenever the cursor's loop runs).
+        Otherwise the parent is such a position, directly or through dense
+        levels between the two, and the union's cursor may not have aligned
+        at the merged coordinate: the result is that alignment, as the
+        emitted test ``x_T == x`` inside the merge's body, or as a constant
+        where the emission already knows it (a union's tail loops).
+        """
+
+        parent = cursor.parent
+        while type(parent) is DensePosition:
+            parent = parent.parent
+        if type(parent) is not PositionValue:
+            return None
+        for loop in self.loops:
+            if loop.kind is not _MERGED:
+                continue
+            node = cast(MergedSparseFor, loop.node)
+            if node.mode not in (MergeMode.UNION, MergeMode.DENSE_UNION):
+                continue
+            for owner, bound in zip(node.cursors, node.positions):
+                if bound != parent.position:
+                    continue
+                override = getattr(self, "_alignment_override", {}).get(owner.cursor)
+                if override is not None:
+                    return bool(override)
+                return llir.BinOp(
+                    op="==",
+                    left=llir.Var(
+                        name=self._merged_coordinate_name(loop, owner),
+                        type=llir.DataType.INT,
+                    ),
+                    right=llir.Var(
+                        name=self._loop_var_name(loop), type=llir.DataType.INT
+                    ),
+                )
+        return None
+
+    def _segment_bound(self, cursor: SparseCursorDecl, offset: int) -> llir.Expr:
+        """``T{l}_pos[parent + offset]``: one end of a cursor's stored segment.
+
+        Below a union cursor that did not align, the parent position names
+        some other entry, so the segment is the empty one, ``[0, 0)``.
+        """
+
+        bound: llir.Expr = llir.ArrayAccess(
+            array=self._cursor_pos_array(cursor),
+            index=self._cursor_parent_index(cursor, offset),
+        )
+        aligned = self._union_parent_alignment(cursor)
+        if aligned is None or aligned is True:
+            return bound
+        zero = llir.Literal(0, llir.DataType.INT)
+        if aligned is False:
+            return zero
+        return llir.Select(
+            cond=cast(llir.Expr, aligned), when_true=bound, when_false=zero
+        )
+
     def _iterator_inits(self, loop: _Loop) -> List[llir.Stmt]:
         """The legacy ``Initialize iterators`` group for one sparse loop."""
 
         stmts: List[llir.Stmt] = []
+        if loop.kind is _SPARSE and self._cursor_is_coordinate(loop.cursors[0]):
+            return self._coordinate_iterator_inits(loop.cursors[0])
         if loop.kind in (_SPARSE, _SPARSE_WINDOW):
             cursor = loop.cursors[0]
             end_init = llir.VarInit(
@@ -4689,10 +5442,7 @@ class _TargetLowering:
                     name=f"{self._cursor_position_name(cursor)}_end",
                     type=llir.DataType.INT,
                 ),
-                value=llir.ArrayAccess(
-                    array=self._cursor_pos_array(cursor),
-                    index=self._cursor_parent_index(cursor, 1),
-                ),
+                value=self._segment_bound(cursor, 1),
             )
             if loop.kind is _SPARSE_WINDOW:
                 # The panel completion rewires exactly this declaration on
@@ -4711,16 +5461,16 @@ class _TargetLowering:
             stmts.append(end_init)
             return stmts
         for cursor in loop.cursors:
+            if self._cursor_is_coordinate(cursor):
+                stmts.extend(self._coordinate_merge_inits(cursor))
+                continue
             stmts.append(
                 llir.VarInit(
                     var=llir.Var(
                         name=self._cursor_position_name(cursor),
                         type=llir.DataType.INT,
                     ),
-                    value=llir.ArrayAccess(
-                        array=self._cursor_pos_array(cursor),
-                        index=self._cursor_parent_index(cursor, 0),
-                    ),
+                    value=self._segment_bound(cursor, 0),
                 )
             )
             stmts.append(
@@ -4729,10 +5479,7 @@ class _TargetLowering:
                         name=f"{self._cursor_position_name(cursor)}_end",
                         type=llir.DataType.INT,
                     ),
-                    value=llir.ArrayAccess(
-                        array=self._cursor_pos_array(cursor),
-                        index=self._cursor_parent_index(cursor, 1),
-                    ),
+                    value=self._segment_bound(cursor, 1),
                 )
             )
         return stmts
@@ -4840,13 +5587,24 @@ class _TargetLowering:
     def _lower_merged(self, position: int) -> List[llir.Stmt]:
         loop = self.loops[position]
         node = loop.node
+        if node.mode is MergeMode.DENSE_UNION:
+            return self._lower_dense_union(position)
         dimension_name = self._loop_var_name(loop)
         cursors = loop.cursors
         result_resolves = self._result_resolves_at(loop)
+        # A union above the innermost loop of the generic target's dense
+        # result descends at every candidate coordinate; each child stream is
+        # chained through ``_segment_bound``, which makes the stream of a
+        # cursor that did not align the empty segment.
+        descends = (
+            type(self) is _TargetLowering
+            and node.mode is MergeMode.UNION
+            and position != len(self.loops) - 1
+        )
 
-        def coordinate_loads() -> List[llir.Stmt]:
+        def coordinate_loads(point: Sequence[SparseCursorDecl]) -> List[llir.Stmt]:
             stmts: List[llir.Stmt] = [llir.Comment("Load coordinates")]
-            for cursor in cursors:
+            for cursor in point:
                 stmts.append(
                     llir.VarInit(
                         var=llir.Var(
@@ -4878,87 +5636,6 @@ class _TargetLowering:
                 op="==", left=coordinate_var(cursor), right=dimension_var()
             )
 
-        # Alignment cases in the legacy lattice order: all cursors aligned
-        # first, then each single-cursor case for UNION merges.
-        cases: List[Tuple[Set[CursorId], llir.Expr]] = []
-        both_guard = llir.BinOp(
-            op="&&",
-            left=aligned_guard(cursors[0]),
-            right=aligned_guard(cursors[1]),
-        )
-        cases.append(({cursor.cursor for cursor in cursors}, both_guard))
-        if node.mode is MergeMode.UNION:
-            for cursor in cursors:
-                cases.append(({cursor.cursor}, aligned_guard(cursor)))
-
-        cond_list: List[llir.Expr] = []
-        then_body_list: List[List[llir.Stmt]] = []
-        for aligned, guard in cases:
-            case_stmts = self._merged_case_stmts(loop, aligned)
-            if case_stmts is None:
-                continue
-            cond_list.append(guard)
-            then_body_list.append(case_stmts)
-        if not cond_list:
-            _fail(
-                "unsupported_program_shape",
-                "a merged loop must emit at least one alignment case",
-            )
-
-        while_body: List[llir.Stmt] = [
-            *coordinate_loads(),
-            llir.BlankLine(),
-            llir.Comment("Resolve coordinates"),
-            llir.VarInit(
-                var=llir.Var(name=dimension_name, type=llir.DataType.INT),
-                value=llir.FunctionCall(
-                    name="std::min",
-                    args=[
-                        llir.Array(
-                            values=tuple(coordinate_var(cursor) for cursor in cursors),
-                            data_type=llir.DataType.INT,
-                        )
-                    ],
-                ),
-            ),
-            llir.BlankLine(),
-        ]
-        input_resolves = self._input_resolves_at(loop)
-        if input_resolves:
-            while_body.append(llir.Comment("Resolve dense coordinates"))
-            while_body.extend(input_resolves)
-        if result_resolves:
-            while_body.append(
-                llir.Comment("Resolve index into dense level of values array")
-            )
-            while_body.extend(result_resolves)
-        while_body.append(llir.Comment("Inner loops over child regions"))
-        while_body.append(
-            llir.IfThenElse(
-                cond_list=cond_list,
-                then_body_list=then_body_list,
-                make_last_case_else=False,
-            )
-        )
-        while_body.append(llir.BlankLine())
-        while_body.append(llir.Comment("Advance iterators"))
-        for cursor in cursors:
-            while_body.append(
-                llir.Assign(
-                    var=llir.Var(
-                        name=self._cursor_position_name(cursor),
-                        type=llir.DataType.INT,
-                    ),
-                    value=llir.BinOp(
-                        op="==",
-                        left=coordinate_var(cursor),
-                        right=dimension_var(),
-                    ),
-                    op=llir.AssignOp.ADD_ASSIGN,
-                    cast=True,
-                )
-            )
-
         def position_cond(cursor: SparseCursorDecl) -> llir.Expr:
             return llir.BinOp(
                 op="<",
@@ -4972,26 +5649,264 @@ class _TargetLowering:
                 ),
             )
 
-        merge_loop = llir.WhileLoop(
-            cond=llir.BinOp(
-                op="&&",
-                left=position_cond(cursors[0]),
-                right=position_cond(cursors[1]),
-            ),
-            body=while_body,
-        )
-        merge_loop.scorch_index_var = dimension_name
+        def merge_loop_over(
+            point: Tuple[SparseCursorDecl, ...],
+        ) -> Optional[llir.WhileLoop]:
+            """The merge loop over the cursors of one lattice point.
 
+            The loop runs while every cursor of ``point`` has entries; the
+            loop's other cursors are exhausted there, so their alignment is
+            known to be false in every case and below.
+            """
+
+            saved_outer = getattr(self, "_alignment_override", {})
+            self._alignment_override = {
+                **saved_outer,
+                **{cursor.cursor: False for cursor in cursors if cursor not in point},
+            }
+            try:
+                return merge_point_loop(point)
+            finally:
+                self._alignment_override = saved_outer
+
+        def merge_point_loop(
+            point: Tuple[SparseCursorDecl, ...],
+        ) -> Optional[llir.WhileLoop]:
+            # Alignment cases in the legacy lattice order: all cursors aligned
+            # first, then each single-cursor case for UNION merges.
+            cases: List[Tuple[Set[CursorId], llir.Expr]] = []
+            # An intersection may merge more than two cursors (one coordinate
+            # several operands store); every cursor sits at the minimum when the
+            # case fires.  Two cursors give the one ``&&`` the legacy emits.
+            both_guard = _conjunction([aligned_guard(cursor) for cursor in point])
+            cases.append(({cursor.cursor for cursor in point}, both_guard))
+            if node.mode is MergeMode.UNION:
+                # Every proper subset, larger first: the if-chain reaches a
+                # subset's case only when no larger aligned subset fired.  Two
+                # cursors give the legacy pair of single-cursor cases.
+                for size in range(len(point) - 1, 0, -1):
+                    for chosen in itertools.combinations(point, size):
+                        cases.append(
+                            (
+                                {cursor.cursor for cursor in chosen},
+                                _conjunction([aligned_guard(c) for c in chosen]),
+                            )
+                        )
+
+            cond_list: List[llir.Expr] = []
+            then_body_list: List[List[llir.Stmt]] = []
+            for aligned, guard in cases if not descends else ():
+                # Inside one case the alignment of this merge's cursors is known,
+                # so a child stream hanging from one of them is either the
+                # parent's segment or nothing; no runtime test is emitted for it.
+                saved_override = getattr(self, "_alignment_override", {})
+                self._alignment_override = {
+                    **saved_override,
+                    **{cursor.cursor: cursor.cursor in aligned for cursor in point},
+                }
+                try:
+                    case_stmts = self._merged_case_stmts(loop, aligned)
+                finally:
+                    self._alignment_override = saved_override
+                if case_stmts is None:
+                    continue
+                cond_list.append(guard)
+                then_body_list.append(case_stmts)
+            if not cond_list and not descends:
+                if len(point) < len(cursors):
+                    # A tail merge none of whose cases emits anything.
+                    return None
+                _fail(
+                    "unsupported_program_shape",
+                    "a merged loop must emit at least one alignment case",
+                )
+
+            while_body: List[llir.Stmt] = [
+                *coordinate_loads(point),
+                llir.BlankLine(),
+                llir.Comment("Resolve coordinates"),
+                llir.VarInit(
+                    var=llir.Var(name=dimension_name, type=llir.DataType.INT),
+                    value=llir.FunctionCall(
+                        name="std::min",
+                        args=[
+                            llir.Array(
+                                values=tuple(
+                                    coordinate_var(cursor) for cursor in point
+                                ),
+                                data_type=llir.DataType.INT,
+                            )
+                        ],
+                    ),
+                ),
+                llir.BlankLine(),
+            ]
+            scanned = False
+            for cursor in point:
+                if not self._cursor_is_coordinate(cursor):
+                    continue
+                # The run of entries that share the merged coordinate: the
+                # segment of the level below, and how far an aligned cursor
+                # advances.  At a cursor that is not aligned the scan stops at
+                # once, and neither the child nor the advance reads it.  The
+                # legacy lowering heads the scans of one merge with one comment.
+                scan = self._coordinate_run_scan(
+                    cursor,
+                    dimension_var(),
+                    aligned_guard(cursor) if node.mode is MergeMode.UNION else None,
+                )
+                while_body.extend(scan[1:] if scanned else scan)
+                scanned = scanned or bool(scan)
+            input_resolves = self._input_resolves_at(loop)
+            if input_resolves:
+                while_body.append(llir.Comment("Resolve dense coordinates"))
+                while_body.extend(input_resolves)
+            if result_resolves:
+                while_body.append(
+                    llir.Comment("Resolve index into dense level of values array")
+                )
+                while_body.extend(result_resolves)
+            while_body.append(llir.Comment("Inner loops over child regions"))
+            if descends:
+                while_body.extend(self._loop_children(position))
+            else:
+                while_body.append(
+                    llir.IfThenElse(
+                        cond_list=cond_list,
+                        then_body_list=then_body_list,
+                        make_last_case_else=False,
+                    )
+                )
+            while_body.append(llir.BlankLine())
+            while_body.append(llir.Comment("Advance iterators"))
+            for cursor in point:
+                run_end = (
+                    self._coordinate_run_end(cursor)
+                    if self._cursor_is_coordinate(cursor)
+                    else None
+                )
+                if run_end is not None:
+                    # An aligned coordinate cursor steps over its whole run.
+                    while_body.append(
+                        llir.IfThenElse(
+                            cond=aligned_guard(cursor),
+                            then_body=[
+                                llir.Assign(
+                                    var=llir.Var(
+                                        name=self._cursor_position_name(cursor),
+                                        type=llir.DataType.INT,
+                                    ),
+                                    value=run_end,
+                                )
+                            ],
+                        )
+                    )
+                    continue
+                while_body.append(
+                    llir.Assign(
+                        var=llir.Var(
+                            name=self._cursor_position_name(cursor),
+                            type=llir.DataType.INT,
+                        ),
+                        value=llir.BinOp(
+                            op="==",
+                            left=coordinate_var(cursor),
+                            right=dimension_var(),
+                        ),
+                        op=llir.AssignOp.ADD_ASSIGN,
+                        cast=True,
+                    )
+                )
+
+            merge_loop = llir.WhileLoop(
+                cond=_conjunction([position_cond(cursor) for cursor in point]),
+                body=while_body,
+            )
+            merge_loop.scorch_index_var = dimension_name
+            return merge_loop
+
+        def exhausted_runs(point: Sequence[SparseCursorDecl]) -> List[llir.Stmt]:
+            """Empty the run of every coordinate cursor outside ``point``.
+
+            A loop over a lattice point runs after the cursors outside it
+            are exhausted; the run end the last merge iteration left behind
+            belongs to an earlier coordinate, so a child stream hanging from
+            such a cursor is made the empty segment at its position.
+            """
+
+            stmts: List[llir.Stmt] = []
+            for cursor in cursors:
+                run_end = (
+                    self._coordinate_run_end(cursor)
+                    if self._cursor_is_coordinate(cursor)
+                    else None
+                )
+                if cursor in point or run_end is None:
+                    continue
+                stmts.append(
+                    llir.Assign(
+                        var=run_end,
+                        value=llir.Var(
+                            name=self._cursor_position_name(cursor),
+                            type=llir.DataType.INT,
+                        ),
+                    )
+                )
+            return stmts
+
+        full_loop = merge_loop_over(tuple(cursors))
+        assert full_loop is not None
         stmts: List[llir.Stmt] = [
             llir.Comment("Initialize iterators"),
             *self._iterator_inits(loop),
             llir.BlankLine(),
-            merge_loop,
+            full_loop,
         ]
 
         if node.mode is MergeMode.UNION:
+            # After the full merge some cursor is exhausted.  The lattice
+            # points below it run in order, larger first, each while all of
+            # its cursors have entries (at most one point of each size does);
+            # the single-cursor points are the tails below.
+            for size in range(len(cursors) - 1, 1, -1):
+                for point in itertools.combinations(cursors, size):
+                    tail_merge = merge_loop_over(point)
+                    if tail_merge is not None:
+                        stmts.extend(exhausted_runs(point))
+                        stmts.append(tail_merge)
             for cursor in cursors:
-                tail_case = self._merged_case_stmts(loop, {cursor.cursor})
+                tail_case: Optional[List[llir.Stmt]]
+                if descends:
+                    # After the merge only this cursor has entries left: it
+                    # is aligned at every tail coordinate and the others are
+                    # exhausted, so their child streams are empty.
+                    saved = getattr(self, "_alignment_override", {})
+                    self._alignment_override = {
+                        **saved,
+                        **{
+                            other.cursor: other.cursor == cursor.cursor
+                            for other in cursors
+                        },
+                    }
+                    try:
+                        tail_case = self._loop_children(position)
+                    finally:
+                        self._alignment_override = saved
+                else:
+                    # The same one-cursor case as the merge body's, with the
+                    # exhausted cursors' alignment known to be false.
+                    saved = getattr(self, "_alignment_override", {})
+                    self._alignment_override = {
+                        **saved,
+                        **{
+                            other.cursor: other.cursor == cursor.cursor
+                            for other in cursors
+                        },
+                    }
+                    try:
+                        tail_case = self._merged_case_stmts(loop, {cursor.cursor})
+                    finally:
+                        self._alignment_override = saved
                 if tail_case is None:
                     continue
                 tail_body: List[llir.Stmt] = [
@@ -5018,18 +5933,240 @@ class _TargetLowering:
                         llir.Comment("Resolve index into dense level of values array")
                     )
                     tail_body.extend(tail_resolves)
+                tail_run_end = (
+                    self._coordinate_run_end(cursor)
+                    if self._cursor_is_coordinate(cursor)
+                    else None
+                )
+                if tail_run_end is not None:
+                    # Each tail coordinate is this cursor's own, so its run
+                    # is scanned unguarded and the cursor steps over it.
+                    tail_body[3:3] = self._coordinate_run_scan(
+                        cursor, llir.Var(name=dimension_name, type=llir.DataType.INT)
+                    )
                 tail_body.extend(tail_case)
                 tail_body.append(llir.Comment("Advance iterator"))
-                tail_body.append(
-                    llir.Increment(
-                        var=llir.Var(
-                            name=self._cursor_position_name(cursor),
-                            type=llir.DataType.INT,
-                        )
-                    )
+                tail_position = llir.Var(
+                    name=self._cursor_position_name(cursor),
+                    type=llir.DataType.INT,
                 )
+                tail_body.append(
+                    llir.Increment(var=tail_position)
+                    if tail_run_end is None
+                    else llir.Assign(var=tail_position, value=tail_run_end)
+                )
+                stmts.extend(exhausted_runs((cursor,)))
                 stmts.append(llir.WhileLoop(cond=position_cond(cursor), body=tail_body))
         return stmts
+
+    def _dense_union_splits_cases(self, position: int) -> bool:
+        """Whether a DENSE_UNION loop splits its body by alignment.
+
+        The innermost loop splits the leaf; a dense result's loop above it
+        descends once at every coordinate instead (``_segment_bound`` makes
+        an unaligned cursor's child stream empty) -- unless the leaf reads a
+        dense level guarded by one of this loop's cursors.  Then each case
+        descends with that cursor's alignment known, so the guarded read is
+        a plain load or drops out, with no test per inner cell.
+        """
+
+        if position == len(self.loops) - 1:
+            return True
+        leaf_value = getattr(getattr(self, "leaf", None), "value", None)
+        if leaf_value is None:
+            return False
+        guards = _guarded_load_cursors(leaf_value)
+        return any(cursor.cursor in guards for cursor in self.loops[position].cursors)
+
+    def _dense_union_bound(self, loop: _Loop) -> llir.Expr:
+        """The extent a DENSE_UNION loop counts to.
+
+        A dense input level or a dense result level usually declares it; a
+        union with an invariant term may have neither (a compressed result
+        level declares no size), and then the first cursor's tensor shape
+        names it (the extent of the level the cursor walks).
+        """
+
+        bound = self._input_bound_var(loop)
+        if bound is not None:
+            return bound
+        lookup = self._loop_logical_index(loop)
+        for level, index in enumerate(self._result_storage_indices()):
+            # Only a dense result level declares ``{C}{level}_size``.
+            if (
+                self._index_of(index, "store index") == lookup
+                and self.result_decl.levels[level].kind is LevelKind.DENSE
+            ):
+                return llir.Var(
+                    name=f"{self.result_decl.name}{level}_size",
+                    type=llir.DataType.INT64,
+                )
+        first = loop.cursors[0]
+        return llir.ArrayAccess(
+            array=llir.Var(
+                name=f"{self.decls[first.tensor].name}_shape",
+                type=llir.DataType.STD_VECTOR_INT,
+            ),
+            index=llir.Literal(first.level, llir.DataType.INT),
+        )
+
+    def _lower_dense_union(self, position: int) -> List[llir.Stmt]:
+        """Every coordinate of the dimension, the cursors' streams followed.
+
+        ``x_T`` is the cursor's current stored coordinate, or ``-1`` once its
+        segment is exhausted, so ``x_T == x`` is exactly the cursor's
+        alignment.  The innermost loop splits the leaf by alignment, most
+        cursors first and the dense-only case last; a loop above the
+        innermost one descends at every coordinate, its cursors' child
+        streams chained through ``_segment_bound``.  Aligned cursors advance
+        after the body.  The loop is serial: the cursors carry state from
+        one coordinate to the next.
+        """
+
+        loop = self.loops[position]
+        cursors = loop.cursors
+        name = self._loop_var_name(loop)
+
+        def coordinate_var(cursor: SparseCursorDecl) -> llir.Var:
+            return llir.Var(
+                name=self._merged_coordinate_name(loop, cursor),
+                type=llir.DataType.INT,
+            )
+
+        def position_var(cursor: SparseCursorDecl) -> llir.Var:
+            return llir.Var(
+                name=self._cursor_position_name(cursor), type=llir.DataType.INT
+            )
+
+        loop_var = llir.Var(name=name, type=llir.DataType.INT64)
+
+        def aligned_guard(cursor: SparseCursorDecl) -> llir.Expr:
+            return llir.BinOp(op="==", left=coordinate_var(cursor), right=loop_var)
+
+        body: List[llir.Stmt] = [llir.Comment("Load coordinates")]
+        for cursor in cursors:
+            body.append(
+                llir.VarInit(
+                    var=coordinate_var(cursor),
+                    value=llir.Select(
+                        cond=llir.BinOp(
+                            op="<",
+                            left=position_var(cursor),
+                            right=llir.Var(
+                                name=f"{self._cursor_position_name(cursor)}_end",
+                                type=llir.DataType.INT,
+                            ),
+                        ),
+                        when_true=llir.ArrayAccess(
+                            array=self._cursor_crd_array(cursor),
+                            index=position_var(cursor),
+                        ),
+                        when_false=llir.Literal(-1, llir.DataType.INT),
+                    ),
+                )
+            )
+        scanned = False
+        for cursor in cursors:
+            if not self._cursor_is_coordinate(cursor):
+                continue
+            # A coordinate cursor's run at this coordinate: empty unless it
+            # aligned (``_coordinate_run_scan``), and how far it advances.
+            scan = self._coordinate_run_scan(cursor, loop_var, aligned_guard(cursor))
+            body.extend(scan[1:] if scanned else scan)
+            scanned = scanned or bool(scan)
+        input_resolves = self._input_resolves_at(loop)
+        if input_resolves:
+            body.append(llir.Comment("Resolve dense coordinates"))
+            body.extend(input_resolves)
+        result_resolves = self._result_resolves_at(loop)
+        if result_resolves:
+            body.append(llir.Comment("Resolve index into dense level of values array"))
+            body.extend(result_resolves)
+        if self._dense_union_splits_cases(position):
+            cond_list: List[llir.Expr] = []
+            then_body_list: List[List[llir.Stmt]] = []
+            subsets = [
+                frozenset(cursor.cursor for cursor in chosen)
+                for size in range(len(cursors), -1, -1)
+                for chosen in itertools.combinations(cursors, size)
+            ]
+            dense_only_emitted = False
+            for aligned in subsets:
+                # As in ``_lower_merged``: inside a case the alignment of this
+                # loop's cursors is known, so their child streams fold.
+                saved_override = getattr(self, "_alignment_override", {})
+                self._alignment_override = {
+                    **saved_override,
+                    **{cursor.cursor: cursor.cursor in aligned for cursor in cursors},
+                }
+                try:
+                    case_stmts = self._merged_case_stmts(loop, set(aligned))
+                finally:
+                    self._alignment_override = saved_override
+                if case_stmts is None:
+                    continue
+                if aligned:
+                    cond_list.append(
+                        _conjunction(
+                            [
+                                aligned_guard(cursor)
+                                for cursor in cursors
+                                if cursor.cursor in aligned
+                            ]
+                        )
+                    )
+                else:
+                    cond_list.append(llir.Literal(1, llir.DataType.INT))
+                    dense_only_emitted = True
+                then_body_list.append(case_stmts)
+            if cond_list:
+                body.append(
+                    llir.IfThenElse(
+                        cond_list=cond_list,
+                        then_body_list=then_body_list,
+                        make_last_case_else=dense_only_emitted,
+                    )
+                )
+        else:
+            body.extend(self._loop_children(position))
+        body.append(llir.Comment("Advance iterators"))
+        for cursor in cursors:
+            run_end = (
+                self._coordinate_run_end(cursor)
+                if self._cursor_is_coordinate(cursor)
+                else None
+            )
+            if run_end is not None:
+                # An aligned coordinate cursor steps over its whole run.
+                body.append(
+                    llir.IfThenElse(
+                        cond=aligned_guard(cursor),
+                        then_body=[
+                            llir.Assign(var=position_var(cursor), value=run_end)
+                        ],
+                    )
+                )
+                continue
+            body.append(
+                llir.Assign(
+                    var=position_var(cursor),
+                    value=aligned_guard(cursor),
+                    op=llir.AssignOp.ADD_ASSIGN,
+                    cast=True,
+                )
+            )
+        for_loop = llir.ForLoop(
+            init=llir.VarInit(var=loop_var, value=llir.Literal(0)),
+            cond=llir.BinOp(op="<", left=loop_var, right=self._dense_union_bound(loop)),
+            update=llir.Increment(var=loop_var),
+            body=body,
+        )
+        return [
+            llir.Comment("Initialize iterators"),
+            *self._iterator_inits(loop),
+            llir.BlankLine(),
+            for_loop,
+        ]
 
     def _lower_sparse(self, position: int) -> List[llir.Stmt]:
         loop = self.loops[position]
@@ -5076,6 +6213,9 @@ class _TargetLowering:
                 Tuple[llir.Comment, llir.VarInit, llir.BlankLine],
                 context_snapshot,
             )
+        coordinate = self._cursor_is_coordinate(cursor)
+        if not self._run_scan_follows_catch_up(position):
+            body.extend(self._coordinate_run_scan_at(position))
         input_resolves = self._input_resolves_at(loop)
         result_resolves = self._result_resolves_at(loop)
         if input_resolves:
@@ -5087,29 +6227,53 @@ class _TargetLowering:
         body.extend(self._loop_children(position))
 
         position_var = llir.Var(name=position_name, type=llir.DataType.INT)
+        start: llir.Expr
+        update: Union[llir.Increment, llir.Assign]
+        if coordinate:
+            # Level 0 starts at the first stored entry; a later level starts
+            # where its parent stands, at the first entry of the parent's
+            # run.  A level with a level below it steps to the end of the
+            # run it just descended; the last level steps one entry.
+            start = (
+                llir.Literal(0)
+                if cursor.level == 0
+                else self._cursor_parent_var(cursor)
+            )
+            run_end = self._coordinate_run_end(cursor)
+            update = (
+                llir.Increment(var=position_var)
+                if run_end is None
+                else llir.Assign(var=position_var, value=run_end)
+            )
+        else:
+            start = self._segment_bound(cursor, 0)
+            update = llir.Increment(
+                var=llir.Var(name=position_name, type=llir.DataType.INT)
+            )
         for_loop = llir.ForLoop(
             init=llir.VarInit(
                 var=llir.Var(name=position_name, type=llir.DataType.INT),
-                value=llir.ArrayAccess(
-                    array=self._cursor_pos_array(cursor),
-                    index=self._cursor_parent_index(cursor, 0),
-                ),
+                value=start,
             ),
             cond=llir.BinOp(
                 op="<",
                 left=position_var,
                 right=llir.Var(name=f"{position_name}_end", type=llir.DataType.INT),
             ),
-            update=llir.Increment(
-                var=llir.Var(name=position_name, type=llir.DataType.INT)
-            ),
+            update=update,
             body=body,
         )
         for_loop.scorch_index_var = dimension_name
         self._record_emitted_loop(position, for_loop)
+        inits = self._iterator_inits(loop)
+        if coordinate and not inits:
+            # Its end was declared with level 0's and assigned by the run
+            # scan of the level above, so the legacy group is empty: no
+            # comment, only the blank line that closes it.
+            return [llir.BlankLine(), for_loop]
         return [
             llir.Comment("Initialize iterators"),
-            *self._iterator_inits(loop),
+            *inits,
             llir.BlankLine(),
             for_loop,
         ]
@@ -5171,6 +6335,8 @@ class _TargetLowering:
             stmts.extend([llir.BlankLine(), self._lower_dense(position + 1)])
         elif producer.kind is _SPARSE:
             stmts.extend(self._lower_sparse(position + 1))
+        elif producer.kind is _MERGED:
+            stmts.extend(self._lower_merged(position + 1))
         elif producer.kind is _TILE_INNER:
             # The reduce-out family opens its producer with the strip-mined
             # reduction point loop; its origin loop is on the outer chain.
@@ -5204,13 +6370,26 @@ class _TargetLowering:
             for level, index in enumerate(self._result_storage_indices())
             if self._index_of(index, "store index") == point.index
         ]
-        if len(levels) != 1 or levels[0] == 0:
+        if len(levels) != 1:
             _fail(
                 "unsupported_program_shape",
                 "the workspace copy-out coordinate must drive exactly one "
-                "trailing result level",
+                "result level",
             )
         level = levels[0]
+        drivers = self.level_drivers[self.result_symbol]
+        if any(
+            self.loop_positions[drivers[parent]] >= self.region_start
+            for parent in range(level)
+        ) or any(
+            self.loop_positions[drivers[child]] >= self.region_start
+            for child in range(level + 1, len(self.result_decl.levels))
+        ):
+            _fail(
+                "unsupported_program_shape",
+                "every result coordinate but the copy-out coordinate must be "
+                "bound outside the workspace region",
+            )
         torch_dtype = _SCALAR_TO_TORCH[region.workspace.dtype]
         loop_var = llir.Var(name=f"{name}_in", type=llir.DataType.INT64)
         body: List[llir.Stmt] = [
@@ -5232,25 +6411,47 @@ class _TargetLowering:
                 ),
                 then_body=[llir.Break()],
             ),
-            llir.VarInit(
-                var=llir.Var(
-                    name=f"p{result_name}{level}",
-                    type=llir.DataType.INT64,
-                ),
-                value=llir.Add(
-                    left=llir.Mul(
-                        left=llir.Var(
-                            name=f"p{result_name}{level - 1}",
-                            type=llir.DataType.INT64,
-                        ),
-                        right=llir.Var(
-                            name=f"{result_name}{level}_size",
-                            type=llir.DataType.INT64,
-                        ),
+        ]
+        # The copy-out coordinate's level and every level stored below it
+        # resolve here; the levels above it resolved on the outer chain.  A
+        # result visited in storage order has the copy-out coordinate on its
+        # last level, so this is the one statement legacy emits.
+        for chained in range(level, len(self.result_decl.levels)):
+            coordinate = (
+                name
+                if chained == level
+                else self._loop_var_name(
+                    self.loops[self.loop_positions[drivers[chained]]]
+                )
+            )
+            coordinate_var = llir.Var(name=coordinate, type=llir.DataType.INT64)
+            body.append(
+                llir.VarInit(
+                    var=llir.Var(
+                        name=f"p{result_name}{chained}",
+                        type=llir.DataType.INT64,
                     ),
-                    right=llir.Var(name=name, type=llir.DataType.INT64),
-                ),
-            ),
+                    value=(
+                        coordinate_var
+                        if chained == 0
+                        else llir.Add(
+                            left=llir.Mul(
+                                left=llir.Var(
+                                    name=f"p{result_name}{chained - 1}",
+                                    type=llir.DataType.INT64,
+                                ),
+                                right=llir.Var(
+                                    name=f"{result_name}{chained}_size",
+                                    type=llir.DataType.INT64,
+                                ),
+                            ),
+                            right=coordinate_var,
+                        )
+                    ),
+                )
+            )
+        last = len(self.result_decl.levels) - 1
+        body.append(
             llir.Assign(
                 var=llir.ArrayAccess(
                     array=llir.Var(
@@ -5258,7 +6459,7 @@ class _TargetLowering:
                         type=llir.DataType.NO_TYPE,
                     ),
                     index=llir.Var(
-                        name=f"p{result_name}{level}",
+                        name=f"p{result_name}{last}",
                         type=llir.DataType.INT64,
                     ),
                     tensor_access=self._result_metadata(),
@@ -5266,7 +6467,7 @@ class _TargetLowering:
                 value=llir.ArrayAccess(
                     array=llir.Var(
                         name=region.workspace.name,
-                        type=llir.DataType.ptr_type(torch_dtype),
+                        type=_value_pointer_type(torch_dtype),
                     ),
                     index=llir.Var(
                         name=loop_var.name,
@@ -5277,8 +6478,8 @@ class _TargetLowering:
                 result_storage=self._result_storage(
                     (RESULT_VALUES, None, STORAGE_WRITE)
                 ),
-            ),
-        ]
+            )
+        )
         for_loop = llir.ForLoop(
             init=llir.VarInit(var=loop_var, value=llir.Literal(0)),
             cond=llir.BinOp(
@@ -5503,6 +6704,24 @@ class _TargetLowering:
             # chain: iterator initialization replaces the pre-loop blank
             # line at function scope, exactly the legacy outer-sparse shape.
             stmts = list(self._lower_sparse(first_position))
+            if (
+                self._cursor_is_coordinate(first.cursors[0])
+                and self._coordinate_run_end(first.cursors[0]) is not None
+            ):
+                # The loop over a coordinate level with a level below it
+                # steps from one run of equal coordinates to the next, so
+                # its trip count is not known before it runs and the
+                # parallel gate below has no counted loop to mark.  The
+                # legacy lowering leaves it serial for a dense result as
+                # well.  A rank-1 COO tensor is walked entry by entry, a
+                # counted loop the gate treats like any other.
+                return stmts
+        elif first.kind is _MERGED:
+            # A dense result's nest opening with a merge
+            # (``_dense_result_merged_nest``).  It is a while loop over the
+            # operands' root segments, which the parallel gate below has no
+            # counted loop to mark, so it runs serially.
+            return list(self._lower_merged(first_position))
         else:
             outer_loop = (
                 self._lower_tile_outer(first_position)
@@ -5533,14 +6752,85 @@ class _TargetLowering:
                 # initializers: the applied policy is the row-count-only
                 # ``scorch_nthreads(-1, rows)`` form.  Byte parity requires
                 # the same policy, so the position-array search is
-                # deliberately given no statements to inspect.
-                outer = stmts[1]
-                assert type(outer) is llir.ForLoop
+                # deliberately given no statements to inspect.  The outer
+                # loop follows a blank line when it is dense and its iterator
+                # initialization when it walks stored coordinates.
+                outer_loops = [stmt for stmt in stmts if type(stmt) is llir.ForLoop]
+                if not outer_loops:
+                    _fail(
+                        "unsupported_program_shape",
+                        "a dense result over a merged nest needs a counted "
+                        "outer loop to parallelize",
+                    )
+                outer = cast(llir.ForLoop, outer_loops[0])
                 outer.omp_parallel_for = True
                 apply_parallel_policy(outer, body=())
             else:
                 mark_first_for_loop_parallel(stmts, EMPTY_PARALLEL_WORKSPACE_CLUSTER)
         return stmts
+
+    # True on the two classes that lower the all-compressed twin of a program
+    # whose result is all-coordinate (COO): ``_CoordinateResultAssemblyLowering``
+    # and ``_CoordinateResultOrderedKeyLowering``.  A COO result is assembled as
+    # its twin is -- one entry appended per stored cell, in lexicographic order
+    # of the storage levels -- so every structural decision of a family is the
+    # twin's.  What differs is what an append stores: one coordinate on every
+    # level, and no position array.  The emission points that write result
+    # levels consult this flag.  It is a class constant, not instance state: a
+    # target is sealed when it is constructed, its type included.
+    _coordinate_result = False
+
+    def _result_level_types(self) -> Tuple[LevelType, ...]:
+        """The level types the result is declared with and assembled as."""
+
+        if self._coordinate_result:
+            return (LevelType.COORDINATE,) * len(self.result_decl.levels)
+        return tuple(
+            _LEVEL_KIND_TO_LEVEL_TYPE[level.kind] for level in self.result_decl.levels
+        )
+
+    def _coordinate_entry_appends(
+        self, appends: List[llir.Stmt], upper: Sequence[llir.Expr]
+    ) -> List[llir.Stmt]:
+        """One appended entry of a COO result, from the twin's leaf append.
+
+        ``appends`` is the twin's leaf append -- the value, an optional ``Set
+        coordinates`` comment, the leaf level's coordinate, the leaf position
+        increment -- and ``upper[level]`` the coordinate the entry has on each
+        level above the leaf.  The entry stores all of them, innermost level
+        first, which is the order the legacy lowering writes them in.
+        """
+
+        if not self._coordinate_result:
+            return appends
+        if (
+            len(appends) not in (3, 4)
+            or type(appends[0]) is not llir.FunctionCallStmt
+            or (len(appends) == 4 and type(appends[1]) is not llir.Comment)
+            or type(appends[-2]) is not llir.FunctionCallStmt
+            or type(appends[-1]) is not llir.Increment
+            or len(upper) != len(self.result_decl.levels) - 1
+        ):
+            _fail(
+                "unsupported_sparse_output",
+                "the leaf append of this family is not the value/coordinate "
+                "append a coordinate result extends",
+            )
+        result_name = self.result_decl.name
+        return [
+            *appends[:-1],
+            *(
+                llir.FunctionCallStmt(
+                    name=f"{result_name}{level}_crd.emplace_back",
+                    args=[upper[level]],
+                    result_storage=self._result_storage(
+                        (RESULT_CRD, level, STORAGE_WRITE)
+                    ),
+                )
+                for level in reversed(range(len(upper)))
+            ),
+            appends[-1],
+        ]
 
     def kernel_abi(self) -> TorchCppKernelABI:
         return TorchCppKernelABI(
@@ -5568,10 +6858,7 @@ class _TargetLowering:
         # aliases the plan's own identity object.
         return ResultTensorAssembler(
             name=self.result_decl.name,
-            level_types=tuple(
-                _LEVEL_KIND_TO_LEVEL_TYPE[level.kind]
-                for level in self.result_decl.levels
-            ),
+            level_types=self._result_level_types(),
             dtype=_SCALAR_TO_TORCH[self.result_decl.dtype],
             result_id=SymbolId(self.result_symbol.value),
         )
@@ -5637,34 +6924,40 @@ class _TargetLowering:
 
         return (DEFAULT_SERIAL_STRATEGY,)
 
-    def default_assembly(self) -> str:
-        """The strategy this family chooses when the plan records none.
+    def unrecorded_assembly(self) -> str:
+        """What this lowering assumes of a program that records no strategy.
 
-        This is today's choice, named.  It is the seam a selector replaces: the
-        automatic origin records no strategy (§ the auto replay contract), so
-        every automatically scheduled program lands here and emits exactly what
-        it emitted before the field existed.
-
-        Unlike :meth:`assembly_strategy`, this may decline a *legal* strategy
-        because it does not pay -- an outer extent too small to reach two
-        threads, for instance.  That is cost, it is deliberately here rather
-        than in the legality predicates, and it is what the selector inherits.
+        Not a choice.  Which strategy a sparse result is assembled with is
+        decided by the automatic rule (:func:`.assembly_rule.automatic_assembly`)
+        and recorded on the program before the lowering that emits its kernel is
+        built: by the assembly stage for an automatic plan, by a requested
+        schedule, or by the target entry for any other program
+        (:func:`with_recorded_assembly`).  A lowering therefore sees a program
+        without a strategy in two cases only: the result has dense levels only,
+        and nothing is assembled; or the lowering was built to be asked which
+        strategies it can emit (:func:`assembly_choices`) and emits no kernel.
+        The answer is the serial single pass where the family emits it and the
+        family's first strategy otherwise, and it reads no extent.
         """
 
-        return DEFAULT_SERIAL_STRATEGY
+        supported = self.supported_assemblies()
+        if DEFAULT_SERIAL_STRATEGY in supported:
+            return DEFAULT_SERIAL_STRATEGY
+        return supported[0]
 
     def assembly_strategy(self) -> str:
         """The strategy this program is assembled with.
 
-        The plan's recorded strategy if it has one, else this family's default.
-        A recorded strategy this family cannot emit fails closed; a recorded
-        strategy is never quietly replaced by the default, because a caller who
-        asked for one strategy and got another has no way to find out.
+        The strategy the program records; :meth:`unrecorded_assembly` for a
+        program that records none.  A recorded strategy this family cannot emit
+        fails closed; a recorded strategy is never quietly replaced, because a
+        caller who asked for one strategy and got another has no way to find
+        out.
         """
 
         requested = self.program.assembly
         if requested is None:
-            return self.default_assembly()
+            return self.unrecorded_assembly()
         strategy = requested.value
         if strategy not in self.supported_assemblies():
             _fail(
@@ -5674,6 +6967,23 @@ class _TargetLowering:
                 f"{', '.join(self.supported_assemblies())}",
             )
         return strategy
+
+    def emittable_assemblies(self) -> Tuple[str, ...]:
+        """Every strategy a plan can record for THIS program and get a kernel.
+
+        :meth:`supported_assemblies` answers for the family.  This answers for
+        the program, which is what a scheduler choosing a strategy needs: a
+        recorded strategy in this tuple is emitted, and one outside it is
+        refused with ``unsupported_assembly_host`` or
+        ``unsupported_assembly_strategy``.  The family's list is the exact
+        answer for a family whose strategies do not depend on the program.
+
+        A family may have to emit its serial body to answer, so this is asked of
+        a lowering built for the question and then discarded
+        (:func:`assembly_choices`), never of the one that emits the kernel.
+        """
+
+        return self.supported_assemblies()
 
     def owns_two_phase_output(self) -> bool:
         """Whether the shared compressed-Where pass owns this result's assembly.
@@ -5772,10 +7082,15 @@ class _TargetLowering:
     def _two_phase_spec(
         self,
         compile_options: CompileOptions,
-        workspace_decl: SparseWorkspaceDecl,
+        workspace_decl: Optional[SparseWorkspaceDecl],
         outer_cell: Optional["OuterCellDomain"] = None,
     ) -> Optional[CompressedWhereOpenMPPassSpec]:
         """The shared two-phase configuration, derived from this receiver.
+
+        ``workspace_decl`` is ``None`` for a loop nest that accumulates through
+        no workspace: each result entry is a scalar reduction appended in loop
+        order.  The pass then has no declaration to look for, hoist or pool, and
+        the value type it allocates the result with is the result's own.
 
         One definition for every family that can host the strategy.  ``None``
         when the resolved strategy is not a two-pass one, which keeps the hard
@@ -5811,8 +7126,10 @@ class _TargetLowering:
         from ..compressed_where_openmp_pass import CompressedWhereOpenMPContext
 
         accumulator = self.accumulator_structure()
-        if accumulator == CHAINED_ACCUMULATOR_STRUCTURE and not single_coordinate_key(
-            len(workspace_decl.key_dimensions)
+        if (
+            workspace_decl is not None
+            and accumulator == CHAINED_ACCUMULATOR_STRUCTURE
+            and not single_coordinate_key(len(workspace_decl.key_dimensions))
         ):
             _fail(
                 UNSUPPORTED_ACCUMULATOR_STRUCTURE,
@@ -5835,7 +7152,9 @@ class _TargetLowering:
                 for level in self.result_decl.levels
             )
         )
-        torch_dtype = _SCALAR_TO_TORCH[workspace_decl.dtype]
+        torch_dtype = _SCALAR_TO_TORCH[
+            self.result_decl.dtype if workspace_decl is None else workspace_decl.dtype
+        ]
         return CompressedWhereOpenMPPassSpec(
             CompressedWhereOpenMPContext(
                 result_name=self.result_decl.name,
@@ -5844,7 +7163,9 @@ class _TargetLowering:
                 result_id=SymbolId(self.result_symbol.value),
                 compressed_levels=levels,
                 result_assembler=self.result_assembler(),
-                workspace_name=workspace_decl.name,
+                workspace_name=(
+                    None if workspace_decl is None else workspace_decl.name
+                ),
                 workspace_ctype=dtype_to_c_datatype(torch_dtype).value,
                 compile_options=compile_options,
                 parallel=strategy == "two_pass_parallel",
@@ -5852,6 +7173,39 @@ class _TargetLowering:
                 accumulator=accumulator,
             )
         )
+
+    def _outer_cell_domain(self) -> "OuterCellDomain":
+        """How this program's outermost loop numbers the receiver's cells.
+
+        The cell count is the same dimension extent
+        :meth:`_assembly_catch_up_bound` numbers the same segments with, so the
+        counting pass and the single pass cannot disagree about how many there
+        are.  The cell index is the loop's coordinate: its variable for a dense
+        loop, and the coordinate that loop resolves for a stored one -- spelled as
+        the subscript into the cursor's coordinate array rather than as the
+        variable the body declares, because the fill phase's base loads are the
+        body's first statements and an expression has no declaration to wait for.
+        """
+
+        from ..compressed_where_openmp_pass import OuterCellDomain
+
+        outer = self.loops[0]
+        count = self._loop_bound_var(outer)
+        if outer.kind is _DENSE:
+            index: llir.Expr = llir.Var(
+                name=self._loop_var_name(outer),
+                type=llir.DataType.INT64,
+            )
+        else:
+            cursor = outer.cursors[0]
+            index = llir.ArrayAccess(
+                array=self._cursor_crd_array(cursor),
+                index=llir.Var(
+                    name=self._cursor_position_name(cursor),
+                    type=llir.DataType.INT,
+                ),
+            )
+        return OuterCellDomain(index=index, count=count)
 
     # -- panel completion ----------------------------------------------------
 
@@ -6724,6 +8078,58 @@ class _TargetLowering:
         return function
 
 
+def _conjunction(terms: Sequence[llir.Expr]) -> llir.Expr:
+    """``t0 && t1 && ...`` folded left; two terms give one ``&&`` node."""
+
+    expression = terms[0]
+    for term in terms[1:]:
+        expression = llir.BinOp(op="&&", left=expression, right=term)
+    return expression
+
+
+def _supported_merge(merge: MergedSparseFor, *, binds_positions: bool = True) -> bool:
+    """A merge the shared merged-loop lowering emits.
+
+    A union of two or more cursors (one case per aligned subset, and a tail
+    loop per lattice point below the full one), or an intersection of two or
+    more: the loop advances every cursor sitting at the minimum coordinate,
+    and the one case fires when all of them do.
+    With ``binds_positions`` every cursor's aligned position must be bound, as
+    a merge with a child loop or a descended level needs; an innermost merge
+    over a dense result reads its values through the cursors and binds none.
+    """
+
+    cursors = len(merge.cursors)
+    return (
+        (merge.mode is MergeMode.UNION and cursors >= 2)
+        or (merge.mode is MergeMode.INTERSECTION and cursors >= 2)
+        or (merge.mode is MergeMode.DENSE_UNION and 1 <= cursors <= 2)
+    ) and (
+        not binds_positions
+        or (
+            len(merge.positions) == cursors
+            and all(bound is not None for bound in merge.positions)
+        )
+    )
+
+
+def _contains_dense_union(node: object) -> bool:
+    """Whether a DENSE_UNION merge appears anywhere in a statement tree."""
+
+    if type(node) is MergedSparseFor and (
+        cast(MergedSparseFor, node).mode is MergeMode.DENSE_UNION
+    ):
+        return True
+    if isinstance(node, tuple):
+        return any(_contains_dense_union(item) for item in node)
+    if isinstance(node, Stmt):
+        return any(
+            _contains_dense_union(getattr(node, field.name))
+            for field in dataclass_fields(node)
+        )
+    return False
+
+
 def _single_statement(block: object) -> Optional[Stmt]:
     """The one statement of an exact single-statement block, if any."""
 
@@ -6796,13 +8202,40 @@ def _parallel_sparse_workspace_chain(program: LoopProgram) -> bool:
     )
 
 
+def _narrow_family_lowering(
+    family: Callable[..., _TargetLowering],
+    program: LoopProgram,
+    input_shapes: Mapping[SymbolId, Tuple[int, ...]],
+    result_shape: Tuple[int, ...],
+) -> Optional[_TargetLowering]:
+    """The K = 1 workspace family's lowering, or None when it refuses the shape.
+
+    The structural routing predicates above recognize a family by the opening
+    of its chain; the family's own constructor validates the whole of it (the
+    producer's descent, the cursor parents, the leaf).  A chain that opens like
+    a K = 1 family but continues past it -- a deeper reduction nest, a merged
+    key, a third operand -- is refused there with ``unsupported_program_shape``
+    and belongs to the rank-general region target, which lowers any producer
+    nest.  Using the constructor as the predicate keeps the two from drifting
+    apart.  Any other refusal code is about the program, not the family, and
+    propagates.
+    """
+
+    try:
+        return family(program, input_shapes, result_shape)
+    except LoopIRTargetError as error:
+        if error.defect.code != "unsupported_program_shape":
+            raise
+        return None
+
+
 def _ordered_key_sparse_workspace_chain(program: LoopProgram) -> bool:
     """Whether the program is a rank-general ordered-key workspace chain.
 
-    A possibly-empty prefix of dense or single-cursor sparse loops whose
-    innermost body is one :class:`SparseWorkspaceRegion`.  ``p == 0`` — the
-    region owning the program root — is admitted here precisely because that
-    is the shape a whole-tensor rank-K reduction takes.
+    A possibly-empty prefix of dense loops, single-cursor sparse loops or
+    intersections whose innermost body is one :class:`SparseWorkspaceRegion`.
+    ``p == 0`` — the region owning the program root — is admitted here
+    precisely because that is the shape a whole-tensor rank-K reduction takes.
     """
 
     body: object = program.body
@@ -6818,7 +8251,100 @@ def _ordered_key_sparse_workspace_chain(program: LoopProgram) -> bool:
         if type(only) is SparseFor:
             body = cast(SparseFor, only).body
             continue
+        if (
+            type(only) is MergedSparseFor
+            and cast(MergedSparseFor, only).mode is MergeMode.INTERSECTION
+        ):
+            body = cast(MergedSparseFor, only).body
+            continue
         return False
+
+
+def _ordered_key_target_admits(program: LoopProgram) -> bool:
+    """Whether the dedicated ordered-key target lowers this region chain.
+
+    It lowers a result whose levels are a dense prefix over compressed levels,
+    with every drained level compressed, prefix loops of the two kinds it
+    admits, and the key loops nested in key order below a reduction at the
+    region's top: the programs it lowered before the multi-compressed assembly
+    target took regions, whose C++ therefore does not change.  Every other
+    region chain is lowered by the multi-compressed assembly target, which
+    assembles any dense/compressed layout around a region.  A chain neither
+    target describes stays here, so it keeps this target's refusal.
+    """
+
+    result_decl = next(
+        (
+            decl
+            for decl in program.tensors
+            if program.outputs and decl.symbol == program.outputs[0]
+        ),
+        None,
+    )
+    if result_decl is None:
+        return True
+    levels = result_decl.levels
+    if tuple(level.mode for level in levels) != tuple(range(len(levels))):
+        return True
+    kinds = [level.kind for level in levels]
+    dense_prefix = 0
+    while dense_prefix < len(kinds) and kinds[dense_prefix] is LevelKind.DENSE:
+        dense_prefix += 1
+    if any(kind is not LevelKind.COMPRESSED for kind in kinds[dense_prefix:]):
+        return False
+    body: object = program.body
+    prefix = 0
+    while True:
+        only = _single_statement(body)
+        if type(only) is SparseWorkspaceRegion:
+            region = cast(SparseWorkspaceRegion, only)
+            break
+        if type(only) is MergedSparseFor:
+            # An intersection above the region: this target's prefix chain has
+            # no merged loop; the multi-compressed target assembles it.
+            return False
+        if prefix >= len(kinds) or type(only) not in (DenseFor, SparseFor):
+            return True
+        if type(only) is DenseFor and not (
+            kinds[prefix] is LevelKind.DENSE
+            or (prefix + 1 < len(kinds) and kinds[prefix + 1] is LevelKind.COMPRESSED)
+        ):
+            return False
+        if type(only) is SparseFor and not (
+            kinds[prefix] is LevelKind.COMPRESSED or prefix < dense_prefix
+        ):
+            return False
+        body = cast(Union[DenseFor, SparseFor], only).body
+        prefix += 1
+    if prefix < dense_prefix:
+        # A dense level would be drained.
+        return False
+    depths: Dict[IndexId, int] = {}
+    body = region.producer
+    while True:
+        only = _single_statement(body)
+        if type(only) is SparseWorkspaceInsert:
+            insert = cast(SparseWorkspaceInsert, only)
+            break
+        if type(only) is DenseFor:
+            depths[cast(DenseFor, only).index] = len(depths)
+        elif type(only) in (SparseFor, MergedSparseFor):
+            depths[cast(Union[SparseFor, MergedSparseFor], only).coord_index] = len(
+                depths
+            )
+        else:
+            return True
+        body = cast(Union[DenseFor, SparseFor, MergedSparseFor], only).body
+    key_depths = [
+        depths.get(cast(IndexValue, coord).index) if type(coord) is IndexValue else None
+        for coord in insert.coords
+    ]
+    if any(depth is None for depth in key_depths):
+        return True
+    ordered = cast(List[int], key_depths)
+    return ordered[0] > 0 and all(
+        earlier < later for earlier, later in zip(ordered, ordered[1:])
+    )
 
 
 def _llir_assignment_root_name(target: llir.Expr) -> Optional[str]:
@@ -7662,7 +9188,7 @@ class _SparseWorkspaceLowering(_TargetLowering):
         for cursor in self.merge.cursors:
             tensor_name = self.decls[cursor.tensor].name
             self._reserve_generated_name(
-                f"{self.merge_name}_{tensor_name}",
+                merged_coordinate_name(self.merge_name, tensor_name),
                 f"merged coordinate of input tensor {tensor_name!r}",
             )
 
@@ -7678,7 +9204,7 @@ class _SparseWorkspaceLowering(_TargetLowering):
             return llir.ArrayAccess(
                 array=llir.Var(
                     name=f"{decl.name}_val",
-                    type=llir.DataType.ptr_type(torch_dtype),
+                    type=_value_pointer_type(torch_dtype),
                 ),
                 index=llir.Var(
                     name=self._cursor_position_name(cursor),
@@ -7789,7 +9315,9 @@ class _SparseWorkspaceLowering(_TargetLowering):
 
         def coordinate_var(cursor: SparseCursorDecl) -> llir.Var:
             return llir.Var(
-                name=f"{dimension_name}_{self.decls[cursor.tensor].name}",
+                name=merged_coordinate_name(
+                    dimension_name, self.decls[cursor.tensor].name
+                ),
                 type=llir.DataType.INT,
             )
 
@@ -8686,7 +10214,7 @@ def _stored_prefix_positions(
     return tuple(
         position
         for position in range(min(dense_prefix, len(loops)))
-        if loops[position].kind is _SPARSE
+        if loops[position].kind is _SPARSE or loops[position].kind is _MERGED
     )
 
 
@@ -8787,7 +10315,316 @@ def _stored_prefix_final_statements(
     ]
 
 
-class _OrderedKeySparseWorkspaceLowering(_TargetLowering):
+class _OrderedKeyRegionEmission(_TargetLowering):
+    """The region emission shared by the targets that lower a sparse workspace region.
+
+    A :class:`SparseWorkspaceRegion` lowers the same way whatever assembles the
+    result levels around it: one workspace whose type is chosen by the key rank,
+    one merging insertion per producer leaf at the key coordinates in key order,
+    and a drain that binds each sorted entry's key components and value.  The
+    owner sets ``workspace_decl``, ``sparse_insert``, ``sparse_append``,
+    ``key_rank``, ``key_loops`` (the producer loops binding the key components,
+    in key order) and ``prefix_depth`` (the result levels bound above the
+    region) while it validates the chain.
+    """
+
+    workspace_decl: SparseWorkspaceDecl
+    sparse_insert: SparseWorkspaceInsert
+    sparse_append: AppendEntry
+    key_rank: int
+    key_loops: List[_Loop]
+    prefix_depth: int
+
+    def _drain_coordinate_name(self, component: int) -> str:
+        """The emitted name of one drained key component.
+
+        It is the key dimension's own display name -- the same name the
+        producer loop that inserted that component uses -- so the drain and
+        the producer cannot disagree about which coordinate they mean.
+        """
+
+        return self.dimension_names[self.workspace_decl.key_dimensions[component]]
+
+    def _workspace_init_statement(self) -> llir.VarInit:
+        workspace = self.workspace_decl
+        torch_dtype = _SCALAR_TO_TORCH[workspace.dtype]
+        element_type = dtype_to_c_datatype(torch_dtype)
+        if self.key_rank == 1:
+            return llir.VarInit(
+                var=llir.Var(name=workspace.name, type=llir.DataType.AUTO),
+                value=llir.FunctionCall(
+                    name=f"coo_workspace_1d<{element_type.value}, 1>",
+                    args=[llir.Literal(value=1024, data_type=llir.DataType.INT)],
+                ),
+            )
+        # The rank-K container's shape vector is the KEY domain's extents,
+        # never the result shape: it bounds, dedups and flattens key
+        # coordinates, so conflating it with the result rank is exactly what
+        # made every insertion of a rank-K key throw.
+        return llir.VarInit(
+            var=llir.Var(name=workspace.name, type=llir.DataType.AUTO),
+            value=llir.FunctionCall(
+                name=f"coo_workspace<{element_type.value}, {self.key_rank}>",
+                args=[
+                    llir.Literal(value=1024, data_type=llir.DataType.INT),
+                    llir.Array(
+                        values=[
+                            self._key_extent_expression(component)
+                            for component in range(self.key_rank)
+                        ],
+                        data_type=llir.DataType.INT64,
+                    ),
+                ],
+            ),
+        )
+
+    def _key_extent_expression(self, component: int) -> llir.Expr:
+        """The declared extent of one key dimension.
+
+        Every key component drains into its own result level, so the result
+        shape entry for that level IS the key domain's extent -- read from
+        the runtime result shape, not from any layout assumption.
+        """
+
+        return llir.ArrayAccess(
+            array=llir.Var(
+                name="result_shape",
+                type=llir.DataType.STD_VECTOR_INT,
+            ),
+            index=llir.Literal(
+                value=self.prefix_depth + component,
+                data_type=llir.DataType.INT,
+            ),
+        )
+
+    def _innermost_merge_index(self) -> object:
+        innermost = None
+        for loop in self.loops:
+            if loop.kind is _MERGED:
+                innermost = loop.index
+        return innermost
+
+    def _insert_value(
+        self, aligned: Optional[Set[CursorId]] = None
+    ) -> Optional[llir.Expr]:
+        """The insertion's value expression at its own alignment state.
+
+        Only fully-aligned merge cases descend, so every enclosing merge's
+        cursors are aligned where the insertion runs, as is every
+        single-cursor loop's own cursor.  When the innermost producer loop is
+        itself a merge, ``aligned`` carries that one loop's case instead, and
+        an absent operand folds to its declared additive identity.
+        """
+
+        expression = self._access_value_expression()
+        if not any(loop.kind is _MERGED for loop in self.loops):
+            return self._lower_value(expression)
+        innermost = self._innermost_merge_index()
+        resolved: Set[CursorId] = set()
+        for loop in self.loops:
+            if aligned is not None and loop.index == innermost:
+                resolved |= set(aligned)
+                continue
+            resolved |= {cursor.cursor for cursor in loop.cursors}
+        return self._merged_case_value(expression, resolved)
+
+    def _insert_statement(self, value: Optional[llir.Expr] = None) -> llir.Stmt:
+        if value is None:
+            lowered = self._insert_value()
+            if lowered is None:
+                _fail(
+                    "unsupported_program_shape",
+                    "the workspace insertion value folded away outside a "
+                    "merged alignment case",
+                )
+            value = cast(llir.Expr, lowered)
+        return llir.FunctionCallStmt(
+            name=f"{self.workspace_decl.name}.insert",
+            args=[
+                llir.Array(
+                    values=[
+                        llir.Var(
+                            name=self._loop_var_name(loop),
+                            type=llir.DataType.INT64,
+                        )
+                        for loop in self.key_loops
+                    ],
+                    data_type=llir.DataType.INT64,
+                ),
+                value,
+            ],
+        )
+
+    def _drain_entry_bindings(self, iterator_var: llir.Var) -> List[llir.Stmt]:
+        """Bind the drained key components and merged value."""
+
+        workspace_name = self.workspace_decl.name
+        torch_dtype = _SCALAR_TO_TORCH[self.workspace_decl.dtype]
+        stmts: List[llir.Stmt] = []
+        key_expr: llir.Expr = llir.MemberAccess(base=iterator_var, member="first")
+        for component in range(self.key_rank):
+            value: llir.Expr
+            if self.key_rank == 1:
+                value = key_expr
+            else:
+                value = llir.ArrayAccess(
+                    array=llir.MemberAccess(base=iterator_var, member="first"),
+                    index=llir.Literal(value=component, data_type=llir.DataType.INT),
+                )
+            stmts.append(
+                llir.VarInit(
+                    var=llir.Var(
+                        name=self._drain_coordinate_name(component),
+                        type=llir.DataType.INT64,
+                    ),
+                    value=value,
+                )
+            )
+        stmts.append(
+            llir.VarInit(
+                var=llir.Var(
+                    name=f"{workspace_name}_value",
+                    type=dtype_to_c_datatype(torch_dtype),
+                ),
+                value=llir.MemberAccess(base=iterator_var, member="second"),
+            )
+        )
+        return stmts
+
+    def _region_access_value_expression(self) -> Expr:
+        state = object.__getattribute__(self.sparse_insert, "__dict__")
+        if type(state) is not dict or "value" not in state:
+            _fail(
+                "unsupported_program_shape",
+                "the workspace insertion has malformed stored value state",
+            )
+        return cast(Expr, state["value"])
+
+    def _region_target_owner_signature(self) -> Tuple[object, ...]:
+        """Seal both owning statements: the insertion and the ordered append.
+
+        The shared builder knows the leaf statement kinds of the streaming
+        families; this family's owners are a workspace insertion and an
+        append whose value is the drained entry, so their exact stored state
+        is validated here with the same discipline.
+        """
+
+        def owned_state(statement: object, expected: type, fields: Set[str]) -> dict:
+            if type(statement) is not expected:
+                _fail(
+                    "unsupported_program_shape",
+                    "the target value owner is no longer the exact statement "
+                    "this family admitted",
+                )
+            state = object.__getattribute__(statement, "__dict__")
+            if (
+                type(state) is not dict
+                or any(type(key) is not str for key in state)
+                or set(state) != fields
+            ):
+                _fail(
+                    "unsupported_program_shape",
+                    "the target value owner contains malformed stored state",
+                )
+            return cast(dict, state)
+
+        def identity(value: object, expected: type, label: str) -> int:
+            primitive = _stored_identity_value(value, expected)
+            if primitive is None:
+                _fail(
+                    "unsupported_program_shape",
+                    f"the target value owner has a malformed {label}",
+                )
+            return cast(int, primitive)
+
+        insert_state = owned_state(
+            self.sparse_insert,
+            SparseWorkspaceInsert,
+            {"node_id", "workspace", "coords", "op", "value"},
+        )
+        if insert_state["op"] is not ReduceOp.ADD:
+            _fail(
+                "unsupported_program_shape",
+                "the workspace insertion has a malformed reduction operator",
+            )
+        if type(insert_state["coords"]) is not tuple:
+            _fail(
+                "unsupported_program_shape",
+                "the workspace insertion coordinates must remain an owned tuple",
+            )
+        append_state = owned_state(
+            self.sparse_append,
+            AppendEntry,
+            {"node_id", "tensor", "coords", "value"},
+        )
+        if type(append_state["coords"]) is not tuple:
+            _fail(
+                "unsupported_program_shape",
+                "the ordered append coordinates must remain an owned tuple",
+            )
+        drained = append_state["value"]
+        if type(drained) is not SparseWorkspaceValue:
+            _fail(
+                "unsupported_program_shape",
+                "the ordered append must write the drained workspace entry",
+            )
+        return (
+            "ordered_key_workspace",
+            id(self.sparse_insert),
+            identity(insert_state["node_id"], LoopIRNodeId, "insertion node identity"),
+            identity(
+                insert_state["workspace"], WorkspaceId, "insertion workspace identity"
+            ),
+            tuple(
+                self._validated_value_expression_signature(coord)
+                for coord in insert_state["coords"]
+            ),
+            "add",
+            self._validated_value_expression_signature(insert_state["value"]),
+            id(self.sparse_append),
+            identity(append_state["node_id"], LoopIRNodeId, "append node identity"),
+            identity(append_state["tensor"], SymbolId, "append tensor identity"),
+            tuple(
+                self._validated_value_expression_signature(coord)
+                for coord in append_state["coords"]
+            ),
+            identity(
+                object.__getattribute__(drained, "__dict__").get("workspace"),
+                WorkspaceId,
+                "drained workspace identity",
+            ),
+        )
+
+    def _region_merged_case_stmts(
+        self, loop: _Loop, aligned: Set[CursorId]
+    ) -> Optional[List[llir.Stmt]]:
+        """One alignment case of a merged producer loop.
+
+        A merge above the innermost producer loop descends into its child
+        loop; only the fully-aligned case can, because a one-sided branch
+        would have to iterate a child stream the absent operand does not
+        carry.  The innermost merge instead inserts, folding the case's own
+        absent-operand identity into the value exactly as the shared merged
+        value lowering does.
+        """
+
+        position = self.loop_positions[loop.index]
+        if position != len(self.loops) - 1:
+            if aligned != {cursor.cursor for cursor in loop.cursors}:
+                _fail(
+                    "unsupported_program_shape",
+                    "a one-sided merge case above the innermost producer "
+                    "loop would need a child stream the absent operand does "
+                    "not carry",
+                )
+            return self._loop_children(position)
+        value = self._insert_value(aligned)
+        if value is None:
+            return None
+        return [self._insert_statement(value)]
+
+
+class _OrderedKeySparseWorkspaceLowering(_OrderedKeyRegionEmission):
     """Rank-general target lowering for the ordered-key sparse workspace.
 
     This is the structural generalization of the two K = 1 workspace
@@ -9062,11 +10899,9 @@ class _OrderedKeySparseWorkspaceLowering(_TargetLowering):
             if type(only) is MergedSparseFor:
                 merged = cast(MergedSparseFor, only)
                 require(
-                    merged.mode in (MergeMode.INTERSECTION, MergeMode.UNION)
-                    and len(merged.cursors) == 2
-                    and len(merged.positions) == 2
-                    and all(bound is not None for bound in merged.positions),
-                    "two-cursor merges binding both aligned positions",
+                    _supported_merge(merged),
+                    "two-cursor merges, or intersections of more cursors, "
+                    "binding every aligned position",
                 )
                 first = merged.cursors[0]
                 loops.append(
@@ -9176,13 +11011,7 @@ class _OrderedKeySparseWorkspaceLowering(_TargetLowering):
         return loops
 
     def _access_value_expression(self) -> Expr:
-        state = object.__getattribute__(self.sparse_insert, "__dict__")
-        if type(state) is not dict or "value" not in state:
-            _fail(
-                "unsupported_program_shape",
-                "the workspace insertion has malformed stored value state",
-            )
-        return cast(Expr, state["value"])
+        return self._region_access_value_expression()
 
     def _leaf_indices(self) -> Tuple[Expr, ...]:
         """The loop coordinates that drive each result level.
@@ -9202,99 +11031,7 @@ class _OrderedKeySparseWorkspaceLowering(_TargetLowering):
         )
 
     def _validated_target_owner_signature(self) -> Tuple[object, ...]:
-        """Seal both owning statements: the insertion and the ordered append.
-
-        The shared builder knows the leaf statement kinds of the streaming
-        families; this family's owners are a workspace insertion and an
-        append whose value is the drained entry, so their exact stored state
-        is validated here with the same discipline.
-        """
-
-        def owned_state(statement: object, expected: type, fields: Set[str]) -> dict:
-            if type(statement) is not expected:
-                _fail(
-                    "unsupported_program_shape",
-                    "the target value owner is no longer the exact statement "
-                    "this family admitted",
-                )
-            state = object.__getattribute__(statement, "__dict__")
-            if (
-                type(state) is not dict
-                or any(type(key) is not str for key in state)
-                or set(state) != fields
-            ):
-                _fail(
-                    "unsupported_program_shape",
-                    "the target value owner contains malformed stored state",
-                )
-            return cast(dict, state)
-
-        def identity(value: object, expected: type, label: str) -> int:
-            primitive = _stored_identity_value(value, expected)
-            if primitive is None:
-                _fail(
-                    "unsupported_program_shape",
-                    f"the target value owner has a malformed {label}",
-                )
-            return cast(int, primitive)
-
-        insert_state = owned_state(
-            self.sparse_insert,
-            SparseWorkspaceInsert,
-            {"node_id", "workspace", "coords", "op", "value"},
-        )
-        if insert_state["op"] is not ReduceOp.ADD:
-            _fail(
-                "unsupported_program_shape",
-                "the workspace insertion has a malformed reduction operator",
-            )
-        if type(insert_state["coords"]) is not tuple:
-            _fail(
-                "unsupported_program_shape",
-                "the workspace insertion coordinates must remain an owned tuple",
-            )
-        append_state = owned_state(
-            self.sparse_append,
-            AppendEntry,
-            {"node_id", "tensor", "coords", "value"},
-        )
-        if type(append_state["coords"]) is not tuple:
-            _fail(
-                "unsupported_program_shape",
-                "the ordered append coordinates must remain an owned tuple",
-            )
-        drained = append_state["value"]
-        if type(drained) is not SparseWorkspaceValue:
-            _fail(
-                "unsupported_program_shape",
-                "the ordered append must write the drained workspace entry",
-            )
-        return (
-            "ordered_key_workspace",
-            id(self.sparse_insert),
-            identity(insert_state["node_id"], LoopIRNodeId, "insertion node identity"),
-            identity(
-                insert_state["workspace"], WorkspaceId, "insertion workspace identity"
-            ),
-            tuple(
-                self._validated_value_expression_signature(coord)
-                for coord in insert_state["coords"]
-            ),
-            "add",
-            self._validated_value_expression_signature(insert_state["value"]),
-            id(self.sparse_append),
-            identity(append_state["node_id"], LoopIRNodeId, "append node identity"),
-            identity(append_state["tensor"], SymbolId, "append tensor identity"),
-            tuple(
-                self._validated_value_expression_signature(coord)
-                for coord in append_state["coords"]
-            ),
-            identity(
-                object.__getattribute__(drained, "__dict__").get("workspace"),
-                WorkspaceId,
-                "drained workspace identity",
-            ),
-        )
+        return self._region_target_owner_signature()
 
     def _reserve_family_names(self) -> None:
         workspace_name = self.workspace_decl.name
@@ -9443,39 +11180,6 @@ class _OrderedKeySparseWorkspaceLowering(_TargetLowering):
             return False
         return True
 
-    def _outer_cell_domain(self) -> "OuterCellDomain":
-        """How this program's outermost loop numbers the receiver's cells.
-
-        The cell count is the same dimension extent
-        :meth:`_assembly_catch_up_bound` numbers the same segments with, so the
-        counting pass and the single pass cannot disagree about how many there
-        are.  The cell index is the loop's coordinate: its variable for a dense
-        loop, and the coordinate that loop resolves for a stored one -- spelled as
-        the subscript into the cursor's coordinate array rather than as the
-        variable the body declares, because the fill phase's base loads are the
-        body's first statements and an expression has no declaration to wait for.
-        """
-
-        from ..compressed_where_openmp_pass import OuterCellDomain
-
-        outer = self.loops[0]
-        count = self._loop_bound_var(outer)
-        if outer.kind is _DENSE:
-            index: llir.Expr = llir.Var(
-                name=self._loop_var_name(outer),
-                type=llir.DataType.INT64,
-            )
-        else:
-            cursor = outer.cursors[0]
-            index = llir.ArrayAccess(
-                array=self._cursor_crd_array(cursor),
-                index=llir.Var(
-                    name=self._cursor_position_name(cursor),
-                    type=llir.DataType.INT,
-                ),
-            )
-        return OuterCellDomain(index=index, count=count)
-
     def compressed_where_pass_spec(
         self, compile_options: CompileOptions
     ) -> Optional[CompressedWhereOpenMPPassSpec]:
@@ -9486,8 +11190,10 @@ class _OrderedKeySparseWorkspaceLowering(_TargetLowering):
         ``unsupported_assembly_strategy``, naming the shape -- the same treatment
         :meth:`parallel_chunk_context` gives an illegal chunked request, and for
         the same reason: answering a caller with a different kernel than the one
-        they asked for is unobservable to them.  An UNREQUESTED one cannot arrive,
-        because :meth:`default_assembly` never chooses a two-pass strategy.
+        they asked for is unobservable to them.  An UNREQUESTED one cannot arrive
+        illegal: the automatic rule records a strategy only from
+        :meth:`emittable_assemblies`, which lists the two-pass pair exactly
+        where :meth:`two_pass_assembly_legal` holds.
         """
 
         if self.assembly_strategy() not in TWO_PASS_STRATEGIES:
@@ -9507,33 +11213,26 @@ class _OrderedKeySparseWorkspaceLowering(_TargetLowering):
             self._outer_cell_domain(),
         )
 
-    def default_assembly(self) -> str:
-        """Today's choice for this family, named and unchanged.
+    def emittable_assemblies(self) -> Tuple[str, ...]:
+        """The serial single pass, and each other strategy this program admits.
 
-        The chunked single pass wherever it is legal AND worth its buffers, the
-        serial single pass otherwise.  The second conjunct is the COST half, and
-        it is deliberately here rather than in :meth:`chunk_assembly_legal`:
-
-        * an outer extent below ``2 * ROWS_PER_THREAD`` can never reach two
-          threads for ANY operand -- ``scorch_nthreads``'s row term alone forces
-          the answer -- so a gate there could only cost this kernel and never pay
-          it.  Declining at COMPILE time is what makes that cost exactly zero
-          rather than merely small: a runtime gate still leaves the parallel arm
-          in the function, and an unexecuted arm is not free
-          (``ttm-parallel-singlepass/DUPLICATION.md`` measures 8-34% for one arm
-          and 3-55% for routing the serial arm through a shared body).
-
-        A program is still *legal* at that extent -- it assembles correctly from
-        one chunk -- so an explicit request for the chunked strategy is honoured
-        there.  Keeping the two answers separate is what lets a selector replace
-        this method without touching legality.
+        The chunked single pass needs more than :meth:`chunk_assembly_legal`: its
+        parallel arm opens on an estimate of the stored entries under the
+        outermost loop, derived from the emitted loop itself, and a body that
+        gives no such estimate cannot be gated.  That is asked of the serial body
+        this lowering emits, so the answer is the builder's own.
         """
 
-        if self.chunk_assembly_legal() and self.shapes[self.result_symbol][0] >= (
-            2 * PARALLEL_CHUNK_ROWS_PER_THREAD
+        emittable = [DEFAULT_SERIAL_STRATEGY]
+        if self.chunk_assembly_legal() and parallel_chunk_gate_derivable(
+            self._serial_loop_statements()
         ):
-            return "single_pass_chunk_parallel"
-        return DEFAULT_SERIAL_STRATEGY
+            emittable.append("single_pass_chunk_parallel")
+        if self.two_pass_assembly_legal():
+            emittable.extend(TWO_PASS_STRATEGIES)
+        return tuple(
+            strategy for strategy in SPARSE_ASSEMBLY_STRATEGIES if strategy in emittable
+        )
 
     # -- parallel chunk assembly ----------------------------------------------
 
@@ -9601,6 +11300,11 @@ class _OrderedKeySparseWorkspaceLowering(_TargetLowering):
                 "level below it compressed, no stored-prefix assembly, and no "
                 "panel, relayout or result tile attached",
             )
+        return self._chunk_context()
+
+    def _chunk_context(self) -> ParallelChunkAssemblyContext:
+        """The chunked assembly's configuration for this result."""
+
         levels = self.result_decl.levels
         return ParallelChunkAssemblyContext(
             result_name=self.result_decl.name,
@@ -9615,127 +11319,7 @@ class _OrderedKeySparseWorkspaceLowering(_TargetLowering):
 
     # -- names ---------------------------------------------------------------
 
-    def _drain_coordinate_name(self, component: int) -> str:
-        """The emitted name of one drained key component.
-
-        It is the key dimension's own display name -- the same name the
-        producer loop that inserted that component uses -- so the drain and
-        the producer cannot disagree about which coordinate they mean.
-        """
-
-        return self.dimension_names[self.workspace_decl.key_dimensions[component]]
-
     # -- emission ------------------------------------------------------------
-
-    def _workspace_init_statement(self) -> llir.VarInit:
-        workspace = self.workspace_decl
-        torch_dtype = _SCALAR_TO_TORCH[workspace.dtype]
-        element_type = dtype_to_c_datatype(torch_dtype)
-        if self.key_rank == 1:
-            return llir.VarInit(
-                var=llir.Var(name=workspace.name, type=llir.DataType.AUTO),
-                value=llir.FunctionCall(
-                    name=f"coo_workspace_1d<{element_type.value}, 1>",
-                    args=[llir.Literal(value=1024, data_type=llir.DataType.INT)],
-                ),
-            )
-        # The rank-K container's shape vector is the KEY domain's extents,
-        # never the result shape: it bounds, dedups and flattens key
-        # coordinates, so conflating it with the result rank is exactly what
-        # made every insertion of a rank-K key throw.
-        return llir.VarInit(
-            var=llir.Var(name=workspace.name, type=llir.DataType.AUTO),
-            value=llir.FunctionCall(
-                name=f"coo_workspace<{element_type.value}, {self.key_rank}>",
-                args=[
-                    llir.Literal(value=1024, data_type=llir.DataType.INT),
-                    llir.Array(
-                        values=[
-                            self._key_extent_expression(component)
-                            for component in range(self.key_rank)
-                        ],
-                        data_type=llir.DataType.INT64,
-                    ),
-                ],
-            ),
-        )
-
-    def _key_extent_expression(self, component: int) -> llir.Expr:
-        """The declared extent of one key dimension.
-
-        Every key component drains into its own result level, so the result
-        shape entry for that level IS the key domain's extent -- read from
-        the runtime result shape, not from any layout assumption.
-        """
-
-        return llir.ArrayAccess(
-            array=llir.Var(
-                name="result_shape",
-                type=llir.DataType.STD_VECTOR_INT,
-            ),
-            index=llir.Literal(
-                value=self.prefix_depth + component,
-                data_type=llir.DataType.INT,
-            ),
-        )
-
-    def _innermost_merge_index(self) -> object:
-        innermost = None
-        for loop in self.loops:
-            if loop.kind is _MERGED:
-                innermost = loop.index
-        return innermost
-
-    def _insert_value(
-        self, aligned: Optional[Set[CursorId]] = None
-    ) -> Optional[llir.Expr]:
-        """The insertion's value expression at its own alignment state.
-
-        Only fully-aligned merge cases descend, so every enclosing merge's
-        cursors are aligned where the insertion runs, as is every
-        single-cursor loop's own cursor.  When the innermost producer loop is
-        itself a merge, ``aligned`` carries that one loop's case instead, and
-        an absent operand folds to its declared additive identity.
-        """
-
-        expression = self._access_value_expression()
-        if not any(loop.kind is _MERGED for loop in self.loops):
-            return self._lower_value(expression)
-        innermost = self._innermost_merge_index()
-        resolved: Set[CursorId] = set()
-        for loop in self.loops:
-            if aligned is not None and loop.index == innermost:
-                resolved |= set(aligned)
-                continue
-            resolved |= {cursor.cursor for cursor in loop.cursors}
-        return self._merged_case_value(expression, resolved)
-
-    def _insert_statement(self, value: Optional[llir.Expr] = None) -> llir.Stmt:
-        if value is None:
-            lowered = self._insert_value()
-            if lowered is None:
-                _fail(
-                    "unsupported_program_shape",
-                    "the workspace insertion value folded away outside a "
-                    "merged alignment case",
-                )
-            value = cast(llir.Expr, lowered)
-        return llir.FunctionCallStmt(
-            name=f"{self.workspace_decl.name}.insert",
-            args=[
-                llir.Array(
-                    values=[
-                        llir.Var(
-                            name=self._loop_var_name(loop),
-                            type=llir.DataType.INT64,
-                        )
-                        for loop in self.key_loops
-                    ],
-                    data_type=llir.DataType.INT64,
-                ),
-                value,
-            ],
-        )
 
     def _lower_leaf(self) -> List[llir.Stmt]:
         return [self._insert_statement()]
@@ -9743,66 +11327,7 @@ class _OrderedKeySparseWorkspaceLowering(_TargetLowering):
     def _merged_case_stmts(
         self, loop: _Loop, aligned: Set[CursorId]
     ) -> Optional[List[llir.Stmt]]:
-        """One alignment case of a merged producer loop.
-
-        A merge above the innermost producer loop descends into its child
-        loop; only the fully-aligned case can, because a one-sided branch
-        would have to iterate a child stream the absent operand does not
-        carry.  The innermost merge instead inserts, folding the case's own
-        absent-operand identity into the value exactly as the shared merged
-        value lowering does.
-        """
-
-        position = self.loop_positions[loop.index]
-        if position != len(self.loops) - 1:
-            if aligned != {cursor.cursor for cursor in loop.cursors}:
-                _fail(
-                    "unsupported_program_shape",
-                    "a one-sided merge case above the innermost producer "
-                    "loop would need a child stream the absent operand does "
-                    "not carry",
-                )
-            return self._loop_children(position)
-        value = self._insert_value(aligned)
-        if value is None:
-            return None
-        return [self._insert_statement(value)]
-
-    def _drain_entry_bindings(self, iterator_var: llir.Var) -> List[llir.Stmt]:
-        """Bind the drained key components and merged value."""
-
-        workspace_name = self.workspace_decl.name
-        torch_dtype = _SCALAR_TO_TORCH[self.workspace_decl.dtype]
-        stmts: List[llir.Stmt] = []
-        key_expr: llir.Expr = llir.MemberAccess(base=iterator_var, member="first")
-        for component in range(self.key_rank):
-            value: llir.Expr
-            if self.key_rank == 1:
-                value = key_expr
-            else:
-                value = llir.ArrayAccess(
-                    array=llir.MemberAccess(base=iterator_var, member="first"),
-                    index=llir.Literal(value=component, data_type=llir.DataType.INT),
-                )
-            stmts.append(
-                llir.VarInit(
-                    var=llir.Var(
-                        name=self._drain_coordinate_name(component),
-                        type=llir.DataType.INT64,
-                    ),
-                    value=value,
-                )
-            )
-        stmts.append(
-            llir.VarInit(
-                var=llir.Var(
-                    name=f"{workspace_name}_value",
-                    type=dtype_to_c_datatype(torch_dtype),
-                ),
-                value=llir.MemberAccess(base=iterator_var, member="second"),
-            )
-        )
-        return stmts
+        return self._region_merged_case_stmts(loop, aligned)
 
     def _drain_statements(self) -> List[llir.Stmt]:
         workspace_name = self.workspace_decl.name
@@ -9818,8 +11343,13 @@ class _OrderedKeySparseWorkspaceLowering(_TargetLowering):
         # Key levels above the leaf materialize one coordinate per NEW
         # segment.  ``opened`` cascades: once an outer key component starts a
         # new segment every inner one must too, even when its coordinate
-        # repeats the previous entry's.
-        intermediate = list(range(self.prefix_depth, leaf_level))
+        # repeats the previous entry's.  A coordinate result has no segments:
+        # every drained entry stores its coordinate on every level, below.
+        intermediate = (
+            []
+            if self._coordinate_result
+            else list(range(self.prefix_depth, leaf_level))
+        )
         if intermediate:
             body.append(llir.VarInit(var=opened_var, value=llir.Literal(False)))
         for level in intermediate:
@@ -9878,43 +11408,59 @@ class _OrderedKeySparseWorkspaceLowering(_TargetLowering):
                     ),
                 )
             )
-        body.extend(
-            [
-                # The drained value is a scalar the region owns, not a tensor
-                # access, so it carries no access provenance -- the same
-                # shape the retained rank-1 drain leaves behind.
-                llir.FunctionCallStmt(
-                    name=f"{result_name}_values.emplace_back",
-                    args=[
-                        llir.Var(
-                            name=f"{workspace_name}_value",
-                            type=llir.DataType.NO_TYPE,
-                        )
-                    ],
-                    result_storage=self._result_storage(
-                        (RESULT_VALUES, None, STORAGE_WRITE)
-                    ),
+        entry: List[llir.Stmt] = [
+            # The drained value is a scalar the region owns, not a tensor
+            # access, so it carries no access provenance -- the same
+            # shape the retained rank-1 drain leaves behind.
+            llir.FunctionCallStmt(
+                name=f"{result_name}_values.emplace_back",
+                args=[
+                    llir.Var(
+                        name=f"{workspace_name}_value",
+                        type=llir.DataType.NO_TYPE,
+                    )
+                ],
+                result_storage=self._result_storage(
+                    (RESULT_VALUES, None, STORAGE_WRITE)
                 ),
-                llir.FunctionCallStmt(
-                    name=f"{result_name}{leaf_level}_crd.emplace_back",
-                    args=[
-                        llir.Var(
-                            name=self._drain_coordinate_name(self.key_rank - 1),
-                            type=llir.DataType.NO_TYPE,
-                        )
-                    ],
-                    result_storage=self._result_storage(
-                        (RESULT_CRD, leaf_level, STORAGE_WRITE)
-                    ),
+            ),
+            llir.FunctionCallStmt(
+                name=f"{result_name}{leaf_level}_crd.emplace_back",
+                args=[
+                    llir.Var(
+                        name=self._drain_coordinate_name(self.key_rank - 1),
+                        type=llir.DataType.NO_TYPE,
+                    )
+                ],
+                result_storage=self._result_storage(
+                    (RESULT_CRD, leaf_level, STORAGE_WRITE)
                 ),
-                llir.Increment(
-                    var=llir.Var(
-                        name=f"p{result_name}{leaf_level}",
+            ),
+            llir.Increment(
+                var=llir.Var(
+                    name=f"p{result_name}{leaf_level}",
+                    type=llir.DataType.INT64,
+                )
+            ),
+        ]
+        if self._coordinate_result:
+            # The levels above the leaf: the prefix loops' coordinates, then
+            # the drained key's components above its last.
+            entry = self._coordinate_entry_appends(
+                entry,
+                [
+                    llir.Var(
+                        name=(
+                            self._loop_var_name(self.loops[level])
+                            if level < self.prefix_depth
+                            else self._drain_coordinate_name(level - self.prefix_depth)
+                        ),
                         type=llir.DataType.INT64,
                     )
-                ),
-            ]
-        )
+                    for level in range(leaf_level)
+                ],
+            )
+        body.extend(entry)
         # Parent-link every intermediate key level: the child's position
         # array is written at the parent's own coordinate count, so a
         # repeated child coordinate under a new parent stays a new segment.
@@ -9963,6 +11509,8 @@ class _OrderedKeySparseWorkspaceLowering(_TargetLowering):
 
         result_name = self.result_decl.name
         workspace_name = self.workspace_decl.name
+        if self._coordinate_result:
+            return []
         return [
             llir.VarInit(
                 var=llir.Var(
@@ -10015,10 +11563,26 @@ class _OrderedKeySparseWorkspaceLowering(_TargetLowering):
             return [
                 *_stored_prefix_open_statements(self, position),
                 *children,
+                # The shipped lowering leaves one blank line after a drained
+                # region and another before the close, as the compressed-level
+                # close below also spells; a nested loop leaves only the one
+                # ``_stored_prefix_close_statements`` carries.
+                *([llir.BlankLine()] if position + 1 == self.prefix_depth else []),
                 *_stored_prefix_close_statements(self, position),
             ]
+        if position + 1 == self.prefix_depth and (
+            self._dense_loop_owns_result_assembly(position, self.loops[position])
+        ):
+            # The dense twin of the blank line above: ``_lower_dense`` spells
+            # the close with one blank line before it, and the drained region
+            # leaves its own.
+            return [*children, llir.BlankLine()]
         closes = self._level_close_statements(position)
         if not closes:
+            if self._coordinate_result and position + 1 == self.prefix_depth:
+                # No level to close below a coordinate level; the shipped
+                # lowering still leaves its blank line after a drained region.
+                return [*children, llir.BlankLine()]
             return children
         return [
             *children,
@@ -10054,6 +11618,9 @@ class _OrderedKeySparseWorkspaceLowering(_TargetLowering):
         """
 
         if self.result_decl.levels[position].kind is not LevelKind.COMPRESSED:
+            return []
+        if self._coordinate_result:
+            # Every drained entry stored this level's coordinate itself.
             return []
         return self._parent_append_statements(position)
 
@@ -10181,6 +11748,38 @@ class _OrderedKeySparseWorkspaceLowering(_TargetLowering):
         return function
 
     def raw_loop_statements(self) -> List[llir.Stmt]:
+        statements = self._serial_loop_statements()
+        chunked = self.parallel_chunk_context()
+        if chunked is None:
+            return statements
+        # The gate is emitted HERE, upstream of the completion checkpoint,
+        # rather than as a managed pass.  ``_OrderedKeyExpectedBody`` mirrors
+        # this family's body from exactly these statements and models one
+        # transformation -- the dynamic-vector rewrite -- so emitting the
+        # branch in the target keeps the whole emitted body verified with no
+        # new modelling, and leaves the frozen production pass order alone.
+        gated = build_parallel_chunk_assembly(statements, chunked)
+        if gated is not None:
+            return [llir.BlankLine(), *gated]
+        if self.program.assembly is not None:
+            # A REQUESTED chunked strategy whose gate cannot be built fails
+            # closed, as a request this program cannot express does
+            # (:meth:`parallel_chunk_context`): the serial kernel returned in
+            # its place would be unobservable to the caller.  An unrequested one
+            # keeps the serial body, which is what it emitted before.
+            _fail(
+                UNSUPPORTED_ASSEMBLY_STRATEGY,
+                "single_pass_chunk_parallel opens its parallel arm on an "
+                "estimate of the stored entries under the outermost loop, read "
+                "from the first position array in that loop's body; this "
+                "program's body has no position array indexed by the outermost "
+                "loop's bound, so the estimate cannot be derived",
+            )
+        return statements
+
+    def _serial_loop_statements(self) -> List[llir.Stmt]:
+        """The single-pass serial loop nest: what every strategy starts from."""
+
         _TargetLowering._require_value_expression_unchanged(self)
         _TargetLowering._require_program_graph_unchanged(self)
         if self.prefix_depth == 0:
@@ -10192,7 +11791,10 @@ class _OrderedKeySparseWorkspaceLowering(_TargetLowering):
                 if first.kind is _DENSE
                 else list(self._lower_sparse(0))
             )
-        if self.result_decl.levels[0].kind is LevelKind.COMPRESSED:
+        if self._coordinate_result:
+            # No root segment: a coordinate level has no position array.
+            pass
+        elif self.result_decl.levels[0].kind is LevelKind.COMPRESSED:
             # One root segment: close level 0 once, after the whole nest.  A
             # dense first level instead had every flattened cell closed by
             # its own innermost dense parent, so it needs nothing here.
@@ -10203,17 +11805,6 @@ class _OrderedKeySparseWorkspaceLowering(_TargetLowering):
             # A stored prefix stops at its last stored coordinate instead of at
             # the prefix's extent, so the cells past it are still open.
             statements.extend(_stored_prefix_final_statements(self, self._dense_prefix))
-        chunked = self.parallel_chunk_context()
-        if chunked is not None:
-            # The gate is emitted HERE, upstream of the completion checkpoint,
-            # rather than as a managed pass.  ``_OrderedKeyExpectedBody`` mirrors
-            # this family's body from exactly these statements and models one
-            # transformation -- the dynamic-vector rewrite -- so emitting the
-            # branch in the target keeps the whole emitted body verified with no
-            # new modelling, and leaves the frozen production pass order alone.
-            gated = build_parallel_chunk_assembly(statements, chunked)
-            if gated is not None:
-                return [llir.BlankLine(), *gated]
         return statements
 
 
@@ -10582,11 +12173,6 @@ class _ParallelSparseWorkspaceLowering(_TargetLowering):
 
         return ("two_pass_parallel",)
 
-    def default_assembly(self) -> str:
-        """Today's choice for this family, named and unchanged: two-phase parallel."""
-
-        return "two_pass_parallel"
-
     # -- accumulation structure -----------------------------------------------
 
     def supported_accumulators(self) -> Tuple[str, ...]:
@@ -10623,7 +12209,7 @@ class _ParallelSparseWorkspaceLowering(_TargetLowering):
             return llir.ArrayAccess(
                 array=llir.Var(
                     name=f"{decl.name}_val",
-                    type=llir.DataType.ptr_type(torch_dtype),
+                    type=_value_pointer_type(torch_dtype),
                 ),
                 index=llir.Var(
                     name=self._cursor_position_name(cursor),
@@ -11240,7 +12826,7 @@ class _ParallelSparseWorkspaceLowering(_TargetLowering):
                         var=llir.ArrayAccess(
                             array=llir.Var(
                                 name=f"{result_name}_values_data",
-                                type=llir.DataType.ptr_type(
+                                type=_value_pointer_type(
                                     _SCALAR_TO_TORCH[self.result_decl.dtype]
                                 ),
                             ),
@@ -11735,22 +13321,2679 @@ class _DenseDomainMixedLowering(_TargetLowering):
         ]
 
 
+#: The structured refusal of :class:`_RelabelledCopyAssemblyLowering` for a
+#: relabelled copy it does not emit.  ``operand_conversion`` recognizes it and
+#: emits the sparse-workspace copy instead.
+UNSUPPORTED_RELABELLED_ASSEMBLY = "unsupported_relabelled_assembly"
+
+#: The widest digit, in bits, of the radix sort a relabelled copy into two or
+#: more compressed levels runs.  A pass's digit is ``bit_width(entries)`` bits,
+#: so its count array is never larger than the records it distributes, and at
+#: most this many, so the count array (``8 << 11`` bytes) stays in a core's
+#: first-level cache while the scatter writes.  Not yet measured: it is kept in
+#: this one place so the conversion grid can compare widths.
+RELABELLED_COPY_DIGIT_BITS_MAX = 11
+
+#: Entries per thread of the parallel relabelled copy (the counting sort into
+#: one compressed level): ``scorch_nthreads(entries, entries, this, 1, 1)``
+#: threads, then at most ``entries / segments`` so the per-thread counts are
+#: never larger than the entries.  Not yet measured: a placeholder for the
+#: conversion grid, kept in this one place.
+RELABELLED_COPY_ENTRIES_PER_THREAD = 1 << 15
+
+# The element vector of a relabelled copy's value records.
+_SCALAR_TO_VECTOR: Dict[ScalarType, llir.DataType] = {
+    ScalarType.FLOAT32: llir.DataType.STD_VECTOR_FLOAT32,
+    ScalarType.FLOAT64: llir.DataType.STD_VECTOR_FLOAT64,
+    ScalarType.INT64: llir.DataType.STD_VECTOR_INT,
+    ScalarType.INT32: llir.DataType.STD_VECTOR_INT32,
+    ScalarType.INT8: llir.DataType.STD_VECTOR_INT8,
+    ScalarType.UINT8: llir.DataType.STD_VECTOR_UINT8,
+}
+
+
+def _relabelled_copy_chain(program: LoopProgram) -> bool:
+    """Whether the program appends entries out of its result's storage order.
+
+    Routing is purely structural: a single-statement nest of dense and
+    single-cursor sparse loops over one append whose coordinates, read in the
+    result's storage order, are bound by loops that are not nested in that
+    order.  No other family emits such an append: each of them builds a
+    compressed level by appending in order.  The verifier admits one only as a
+    relabelled copy of one input under a two-pass record
+    (``verifier._check_append_entry``); the target re-checks every condition it
+    relies on and refuses the rest with a code.
+    """
+
+    if len(program.outputs) != 1:
+        return False
+    result_decl = next(
+        (decl for decl in program.tensors if decl.symbol == program.outputs[0]),
+        None,
+    )
+    if result_decl is None:
+        return False
+    depth: Dict[IndexId, int] = {}
+    body: Stmt = program.body
+    while type(body) is Block and len(body.statements) == 1:
+        only = body.statements[0]
+        if type(only) is DenseFor:
+            depth[only.index] = len(depth)
+            body = only.body
+            continue
+        if type(only) is SparseFor:
+            depth[only.coord_index] = len(depth)
+            body = only.body
+            continue
+        if (
+            type(only) is not AppendEntry
+            or only.tensor != result_decl.symbol
+            or len(only.coords) != len(result_decl.levels)
+        ):
+            return False
+        bound: List[int] = []
+        for level in result_decl.levels:
+            coord = only.coords[level.mode]
+            if type(coord) is not IndexValue or coord.index not in depth:
+                return False
+            bound.append(depth[coord.index])
+        return bound != sorted(bound)
+    return False
+
+
+class _RelabelledCopyAssemblyLowering(_TargetLowering):
+    """Two-pass assembly of a result that relabels one input's stored entries.
+
+    Admits the copy an operand conversion emits (``operand_conversion``): one
+    loop per level of a single input, in that input's storage order, appending
+    each stored entry at a permutation of its coordinates.  The result is
+    visited out of its storage order, so the ordered append every other family
+    emits cannot build it.  It is built by counting sort instead, the standard
+    construction for sparse transposition and format conversion (Chou,
+    Kjolstad and Amarasinghe, PLDI 2020):
+
+    1. walk the input and count the entries in each segment of the result's
+       compressed level -- one segment per cell of the dense levels above it --
+       into ``pos[segment + 2]``;
+    2. prefix-sum ``pos``, which leaves ``pos[segment + 1]`` the first position
+       of each segment;
+    3. walk the input again and store each entry at ``pos[segment + 1]``,
+       advancing it, which leaves ``pos[0 .. segments]`` the level's positions;
+       the one slot past them is dropped.
+
+    Linear in the entries plus the segments, with no hashing and no comparison
+    sort.  The entries of one segment agree on every coordinate but the
+    compressed one and the input is walked in its storage order, so they
+    arrive with that coordinate increasing: the level comes out sorted.
+
+    A result with two or more compressed levels (``d...dss...s``) cannot be
+    placed entry by entry: a level's positions depend on how many distinct
+    coordinates the levels above it hold.  Its entries are sorted into the
+    result's lexicographic order first, by the same counting passes
+    (:meth:`_sorted_statements`):
+
+    1. walk the input once, writing each entry's record -- its flattened dense
+       coordinates, its compressed coordinates and its value -- and the largest
+       value of every sort key;
+    2. a stable least-significant-digit radix sort over the result levels the
+       walk leaves out of order, one counting pass per digit; trailing levels
+       already in the input's relative order and a leading run of levels the
+       walk keeps need no pass of their own (:meth:`_sort_keys`);
+    3. one sweep over the sorted records writes every compressed level's
+       positions and coordinates, and the values.
+
+    Linear in the entries times the passes, plus the segments; still no
+    hashing and no comparison sort.
+
+    The result holds dense levels over compressed levels.  Its entry count is
+    the input's value count, which the kernel ABI validates against the input's
+    positions, so the values, coordinates and records are sized once before
+    the walk.  Any other result layout, an input or nest that is not a
+    relabelled copy, a parallel selection and a strategy other than
+    ``two_pass_serial`` are refused with :data:`UNSUPPORTED_RELABELLED_ASSEMBLY`
+    or ``unsupported_assembly_host``.  The family never takes the shared
+    two-phase pass: it owns both of its passes.
+    """
+
+    def _validate_loop_kinds(self, loops: List[_Loop], leaf: Stmt) -> None:
+        """Dense and single-cursor loops over one append, nothing else.
+
+        In place of the shared rule, whose ordered append needs a merged
+        innermost loop; the rest of the nest is checked with the access orders.
+        """
+
+        if type(leaf) is not AppendEntry or any(
+            loop.kind not in (_DENSE, _SPARSE) for loop in loops
+        ):
+            _fail(
+                UNSUPPORTED_RELABELLED_ASSEMBLY,
+                "the relabelled-copy assembly requires dense and single-cursor "
+                "loops over one append",
+            )
+
+    def _validate_access_orders(self) -> None:
+        """Every structural fact the emission relies on, checked before sealing.
+
+        Called by the base constructor in place of the ordered-assembly rule,
+        which an out-of-order append fails by definition.  Nothing is stored:
+        the emission re-derives what it needs from the sealed declarations.
+        """
+
+        def refuse(what: str) -> NoReturn:
+            _fail(
+                UNSUPPORTED_RELABELLED_ASSEMBLY,
+                f"the relabelled-copy assembly requires {what}",
+            )
+
+        if len(self._input_symbols) != 1:
+            refuse("exactly one input")
+        source = self._input_symbols[0]
+        source_decl = self.decls[source]
+        if any(
+            level.kind not in (LevelKind.DENSE, LevelKind.COMPRESSED)
+            for level in source_decl.levels
+        ):
+            refuse("an input of dense and compressed levels")
+        if len(self.loops) != len(source_decl.levels) or any(
+            loop.kind not in (_DENSE, _SPARSE) for loop in self.loops
+        ):
+            refuse("one dense or single-cursor loop per input level")
+        drivers = self.level_drivers.get(source, {})
+        if [drivers.get(level) for level in range(len(source_decl.levels))] != [
+            loop.index for loop in self.loops
+        ]:
+            refuse("the loops to walk the input's levels in its storage order")
+        for loop in self.loops:
+            if loop.kind is _SPARSE and loop.cursors[0].tensor != source:
+                refuse("every sparse loop to walk the input")
+        if type(self.leaf) is not AppendEntry:
+            refuse("an append leaf")
+        appended = [
+            self._index_of(index, "an appended coordinate")
+            for index in self._result_storage_indices()
+        ]
+        if len(set(appended)) != len(appended) or set(appended) != {
+            loop.index for loop in self.loops
+        }:
+            refuse("the appended coordinates to be a permutation of the loops'")
+        value = cast(AppendEntry, self.leaf).value
+        last = self.loops[-1]
+        reads_leaf = (
+            type(value) is CursorValue
+            and last.kind is _SPARSE
+            and cast(CursorValue, value).cursor == last.cursors[0].cursor
+        ) or (
+            type(value) is PositionLoad
+            and cast(PositionLoad, value).tensor == source
+            and source_decl.levels[-1].kind is LevelKind.DENSE
+        )
+        if not reads_leaf:
+            refuse("the appended value to be the input's stored value")
+        kinds = [level.kind for level in self.result_decl.levels]
+        dense = 0
+        while dense < len(kinds) and kinds[dense] is LevelKind.DENSE:
+            dense += 1
+        if (
+            len(kinds) < 2
+            or dense == len(kinds)
+            or any(kind is not LevelKind.COMPRESSED for kind in kinds[dense:])
+        ):
+            refuse("a result of dense levels over compressed levels")
+        if self.program.parallel is not None:
+            refuse("no parallel selection")
+
+    # -- assembly strategy ----------------------------------------------------
+
+    def supported_assemblies(self) -> Tuple[str, ...]:
+        return (
+            AssemblyStrategy.TWO_PASS_SERIAL.value,
+            AssemblyStrategy.TWO_PASS_PARALLEL.value,
+        )
+
+    def emittable_assemblies(self) -> Tuple[str, ...]:
+        """Both strategies, into one compressed level or more."""
+
+        return self.supported_assemblies()
+
+    def _parallel(self) -> bool:
+        """Whether the program records the parallel two-pass strategy.
+
+        Fails closed for a strategy :meth:`emittable_assemblies` leaves out.
+        """
+
+        strategy = self.assembly_strategy()
+        if strategy not in self.emittable_assemblies():
+            _fail(
+                UNSUPPORTED_ASSEMBLY_HOST,
+                f"assembly strategy {strategy!r} is not emitted for a relabelled copy",
+            )
+        return strategy == AssemblyStrategy.TWO_PASS_PARALLEL.value
+
+    def owns_two_phase_output(self) -> bool:
+        # Both passes are this family's own statements; the shared two-phase
+        # transform never sees the program.  The strategy is still checked.
+        self._parallel()
+        return False
+
+    # -- emission ---------------------------------------------------------------
+
+    def _dense_loop_owns_result_assembly(self, position: int, loop: _Loop) -> bool:
+        return False
+
+    def _result_resolves_at(self, loop: _Loop) -> List[llir.Stmt]:
+        return []
+
+    def _compressed_level(self) -> int:
+        return len(self.result_decl.levels) - 1
+
+    def _entry_count_name(self) -> str:
+        return f"{self.result_decl.name}_nnz"
+
+    def _segment_count(self) -> llir.Expr:
+        """The number of segments: the product of the dense levels' extents."""
+
+        result_name = self.result_decl.name
+        count: llir.Expr = llir.Var(
+            name=f"{result_name}0_size", type=llir.DataType.INT64
+        )
+        for level in range(1, self._compressed_level()):
+            count = llir.Mul(
+                count,
+                llir.Var(name=f"{result_name}{level}_size", type=llir.DataType.INT64),
+            )
+        return count
+
+    def _appended_names(self) -> List[str]:
+        """The loop variable holding each result level's coordinate."""
+
+        return [
+            self._loop_var_name(
+                self.loops[
+                    self.loop_positions[self._index_of(index, "an appended coordinate")]
+                ]
+            )
+            for index in self._result_storage_indices()
+        ]
+
+    def _segment(self) -> llir.Expr:
+        """The entry's segment: its dense coordinates, flattened row-major."""
+
+        result_name = self.result_decl.name
+        names = self._appended_names()
+        segment: llir.Expr = llir.Var(name=names[0], type=llir.DataType.INT64)
+        for level in range(1, self._compressed_level()):
+            segment = llir.Add(
+                llir.Mul(
+                    segment,
+                    llir.Var(
+                        name=f"{result_name}{level}_size", type=llir.DataType.INT64
+                    ),
+                ),
+                llir.Var(name=names[level], type=llir.DataType.INT64),
+            )
+        return segment
+
+    def _positions(self) -> llir.Var:
+        return llir.Var(
+            name=f"{self.result_decl.name}{self._compressed_level()}_pos",
+            type=llir.DataType.STD_VECTOR_C_INT,
+        )
+
+    def _position_storage(
+        self, *directions: llir.ResultStorageDirection
+    ) -> llir.ResultStorageMetadata:
+        level = self._compressed_level()
+        return self._result_storage(
+            *((RESULT_POS, level, direction) for direction in directions)
+        )
+
+    def result_size_inits(self) -> List[llir.Stmt]:
+        """The dense extents, and the entry count the result is sized with."""
+
+        source_name = self.decls[self._input_symbols[0]].name
+        return [
+            *super().result_size_inits(),
+            llir.VarInit(
+                llir.Var(name=self._entry_count_name(), type=llir.DataType.INT64),
+                value=llir.FunctionCall(name=f"{source_name}_values.numel", args=[]),
+            ),
+        ]
+
+    def result_assembler(self) -> ResultTensorAssembler:
+        # The values are a Torch tensor of the known entry count, written by
+        # position; an append-built vector would turn every indexed store into
+        # an append (the dynamic-vector pass), which a scatter cannot be.
+        return ResultTensorAssembler(
+            name=self.result_decl.name,
+            level_types=self._result_level_types(),
+            dtype=_SCALAR_TO_TORCH[self.result_decl.dtype],
+            known_nnz_var=self._entry_count_name(),
+            result_id=SymbolId(self.result_symbol.value),
+        )
+
+    def prepare_result_level_indices(
+        self, statements: List[llir.Stmt]
+    ) -> List[llir.Stmt]:
+        """The compressed level's arrays, sized before the walk.
+
+        Declared with their sizes rather than empty, so the dynamic-vector pass,
+        which rewrites indexed stores into empty-declared vectors as appends,
+        leaves the scatter's stores alone.  ``pos`` has two slots past the
+        segments for the counting sort; the last is dropped after the fill.
+        """
+
+        if self._sorts():
+            return self._sorted_level_indices()
+        result_name = self.result_decl.name
+        level = self._compressed_level()
+        return [
+            llir.DirectInit(
+                var=self._positions(),
+                args=(
+                    llir.Add(
+                        llir.Cast(
+                            expr=self._segment_count(), data_type=llir.DataType.SIZE_T
+                        ),
+                        llir.Literal(value=2, data_type=llir.DataType.INT),
+                    ),
+                    llir.Literal(value=0, data_type=llir.DataType.INT),
+                ),
+            ),
+            llir.DirectInit(
+                var=llir.Var(
+                    name=f"{result_name}{level}_crd",
+                    type=llir.DataType.STD_VECTOR_C_INT,
+                ),
+                args=(
+                    llir.Cast(
+                        expr=llir.Var(
+                            name=self._entry_count_name(), type=llir.DataType.INT64
+                        ),
+                        data_type=llir.DataType.SIZE_T,
+                    ),
+                ),
+            ),
+        ]
+
+    def _count_leaf(self) -> List[llir.Stmt]:
+        """``pos[segment + 2] += 1``."""
+
+        return [
+            llir.Assign(
+                var=llir.ArrayAccess(
+                    array=self._positions(),
+                    index=llir.Add(self._segment(), llir.Literal(2)),
+                ),
+                value=llir.Literal(1),
+                op=llir.AssignOp.ADD_ASSIGN,
+                result_storage=self._position_storage(STORAGE_WRITE, STORAGE_READ),
+            )
+        ]
+
+    def _lower_leaf(self) -> List[llir.Stmt]:
+        """Store the entry at its segment's next free position, then advance it."""
+
+        if self._sorts():
+            return self._record_leaf()
+        result_name = self.result_decl.name
+        level = self._compressed_level()
+        slot = llir.Var(name=f"{result_name}{level}_slot", type=llir.DataType.INT64)
+        position = llir.Var(name=f"p{result_name}{level}", type=llir.DataType.INT64)
+        return [
+            llir.VarInit(var=slot, value=llir.Add(self._segment(), llir.Literal(1))),
+            llir.VarInit(
+                var=position,
+                value=llir.ArrayAccess(array=self._positions(), index=slot),
+                result_storage=self._position_storage(STORAGE_READ),
+            ),
+            llir.Assign(
+                var=llir.ArrayAccess(array=self._positions(), index=slot),
+                value=llir.Literal(1),
+                op=llir.AssignOp.ADD_ASSIGN,
+                result_storage=self._position_storage(STORAGE_WRITE, STORAGE_READ),
+            ),
+            llir.Assign(
+                var=llir.ArrayAccess(
+                    array=llir.Var(
+                        name=f"{result_name}{level}_crd",
+                        type=llir.DataType.STD_VECTOR_C_INT,
+                    ),
+                    index=position,
+                ),
+                value=llir.Var(
+                    name=self._appended_names()[level], type=llir.DataType.INT64
+                ),
+                result_storage=self._result_storage((RESULT_CRD, level, STORAGE_WRITE)),
+            ),
+            llir.Assign(
+                var=llir.ArrayAccess(
+                    array=llir.Var(
+                        name=f"{result_name}_values", type=llir.DataType.NO_TYPE
+                    ),
+                    index=position,
+                    tensor_access=self._result_metadata(),
+                ),
+                value=self._lower_value(cast(AppendEntry, self.leaf).value),
+                result_storage=self._result_storage(
+                    (RESULT_VALUES, None, STORAGE_WRITE)
+                ),
+            ),
+        ]
+
+    def _walk(self) -> List[llir.Stmt]:
+        """The input walk, with this lowering's leaf."""
+
+        _TargetLowering._require_value_expression_unchanged(self)
+        if self.loops[0].kind is _SPARSE:
+            return list(self._lower_sparse(0))
+        return [llir.BlankLine(), self._lower_dense(0)]
+
+    def raw_loop_statements(self) -> List[llir.Stmt]:
+        if self._sorts():
+            if self._parallel():
+                return self._parallel_sorted_statements(self._sorted_statements())
+            return self._sorted_statements()
+        if self._parallel():
+            return self._parallel_statements(self._serial_statements())
+        return self._serial_statements()
+
+    def _serial_statements(self) -> List[llir.Stmt]:
+        """The counting sort on one thread: count, prefix-sum, fill."""
+
+        positions = self._positions()
+        index = llir.Var(
+            name=f"{self.result_decl.name}{self._compressed_level()}_segment",
+            type=llir.DataType.INT64,
+        )
+        prefix_sum = llir.ForLoop(
+            init=llir.VarInit(var=index, value=llir.Literal(1)),
+            cond=llir.BinOp(
+                op="<",
+                left=index,
+                right=llir.Add(self._segment_count(), llir.Literal(2)),
+            ),
+            update=llir.Increment(var=index),
+            body=[
+                llir.Assign(
+                    var=llir.ArrayAccess(array=positions, index=index),
+                    value=llir.ArrayAccess(
+                        array=positions,
+                        index=llir.BinOp(op="-", left=index, right=llir.Literal(1)),
+                    ),
+                    op=llir.AssignOp.ADD_ASSIGN,
+                    result_storage=self._position_storage(STORAGE_WRITE, STORAGE_READ),
+                )
+            ],
+        )
+        prefix_sum.scorch_index_var = index.name
+        counting = _RelabelledCopyCountPass(
+            self.program,
+            {symbol: self.shapes[symbol] for symbol in self._input_symbols},
+            self.shapes[self.result_symbol],
+        )
+        count_walk = counting._walk()
+        fill_walk = self._walk()
+        if self.loops[0].kind is _SPARSE:
+            # A compressed outermost level declares its iterator bounds in the
+            # function's scope, before its loop.  Both walks read the same
+            # bounds, so the fill walk uses the count walk's declarations.
+
+            def declarations(walk: List[llir.Stmt]) -> List[llir.Stmt]:
+                return [
+                    stmt
+                    for stmt in walk[:-1]
+                    if type(stmt) not in (llir.Comment, llir.BlankLine)
+                ]
+
+            if (
+                type(count_walk[-1]) is not llir.ForLoop
+                or type(fill_walk[-1]) is not llir.ForLoop
+                or declarations(count_walk) != declarations(fill_walk)
+            ):
+                _fail(
+                    UNSUPPORTED_RELABELLED_ASSEMBLY,
+                    "the two walks of a relabelled copy declare different "
+                    "iterator bounds for its outermost level",
+                )
+            fill_walk = [llir.BlankLine(), fill_walk[-1]]
+        return [
+            llir.Comment("Count the entries of each segment of the compressed level"),
+            *count_walk,
+            llir.BlankLine(),
+            llir.Comment("Prefix sum: segment s starts at position s + 1"),
+            prefix_sum,
+            llir.BlankLine(),
+            llir.Comment("Store each entry at the next free position of its segment"),
+            *fill_walk,
+            llir.BlankLine(),
+            llir.FunctionCallStmt(
+                name=f"{positions.name}.pop_back",
+                args=[],
+                result_storage=self._position_storage(STORAGE_WRITE),
+            ),
+        ]
+
+    # -- one compressed level on several threads -------------------------------
+
+    def _chunk(self) -> llir.Var:
+        """The thread's chunk of the walk, in the parallel counting sort."""
+
+        return self._int64("t")
+
+    def _chunk_counts(self) -> llir.Var:
+        """Per-chunk counts per segment, row-major by chunk; then per-chunk offsets."""
+
+        return llir.Var(
+            name=f"{self.result_decl.name}_counts", type=llir.DataType.STD_VECTOR_C_INT
+        )
+
+    def _chunk_cell(self) -> llir.Expr:
+        """``chunk * segments + segment``: this entry's count in its chunk's row."""
+
+        return llir.Add(
+            llir.Mul(self._chunk(), self._int64("segments")), self._segment()
+        )
+
+    def _chunk_count_leaf(self) -> List[llir.Stmt]:
+        """``counts[chunk * segments + segment] += 1``."""
+
+        return [
+            llir.Assign(
+                var=llir.ArrayAccess(
+                    array=self._chunk_counts(), index=self._chunk_cell()
+                ),
+                value=llir.Literal(1),
+                op=llir.AssignOp.ADD_ASSIGN,
+            )
+        ]
+
+    def _chunk_fill_leaf(self) -> List[llir.Stmt]:
+        """Store the entry at its segment's start plus its chunk's next offset.
+
+        The chunks are contiguous runs of the walk, in walk order, and a
+        chunk's offsets in a segment start after every earlier chunk's entries
+        there; so a segment's entries keep the walk's order, and its
+        coordinates come out increasing as on one thread.
+        """
+
+        result_name = self.result_decl.name
+        level = self._compressed_level()
+        cell = llir.Var(name=f"{result_name}{level}_cell", type=llir.DataType.INT64)
+        position = llir.Var(name=f"p{result_name}{level}", type=llir.DataType.INT64)
+        return [
+            llir.VarInit(var=cell, value=self._chunk_cell()),
+            llir.VarInit(
+                var=position,
+                value=llir.Add(
+                    llir.ArrayAccess(array=self._positions(), index=self._segment()),
+                    llir.ArrayAccess(array=self._chunk_counts(), index=cell),
+                ),
+                result_storage=self._position_storage(STORAGE_READ),
+            ),
+            llir.Assign(
+                var=llir.ArrayAccess(array=self._chunk_counts(), index=cell),
+                value=llir.Literal(1),
+                op=llir.AssignOp.ADD_ASSIGN,
+            ),
+            llir.Assign(
+                var=llir.ArrayAccess(
+                    array=llir.Var(
+                        name=f"{result_name}{level}_crd",
+                        type=llir.DataType.STD_VECTOR_C_INT,
+                    ),
+                    index=position,
+                ),
+                value=llir.Var(
+                    name=self._appended_names()[level], type=llir.DataType.INT64
+                ),
+                result_storage=self._result_storage((RESULT_CRD, level, STORAGE_WRITE)),
+            ),
+            llir.Assign(
+                var=llir.ArrayAccess(
+                    array=llir.Var(
+                        name=f"{result_name}_values", type=llir.DataType.NO_TYPE
+                    ),
+                    index=position,
+                    tensor_access=self._result_metadata(),
+                ),
+                value=self._lower_value(cast(AppendEntry, self.leaf).value),
+                result_storage=self._result_storage(
+                    (RESULT_VALUES, None, STORAGE_WRITE)
+                ),
+            ),
+        ]
+
+    def _outer_range(self) -> Tuple[llir.Expr, llir.Expr]:
+        """The first and one-past-last iteration of the walk's outermost loop.
+
+        A dense outermost level iterates its coordinates; a compressed one its
+        positions.
+        """
+
+        source = self.decls[self._input_symbols[0]]
+        if source.levels[0].kind is LevelKind.DENSE:
+            return (
+                llir.Literal(0, data_type=llir.DataType.INT64),
+                llir.Var(name=f"{source.name}0_size", type=llir.DataType.INT64),
+            )
+        positions = llir.Var(
+            name=f"{source.name}0_pos", type=llir.DataType.INT, is_ptr=True
+        )
+        return (
+            llir.Cast(
+                expr=llir.ArrayAccess(array=positions, index=llir.Literal(0)),
+                data_type=llir.DataType.INT64,
+            ),
+            llir.Cast(
+                expr=llir.ArrayAccess(array=positions, index=llir.Literal(1)),
+                data_type=llir.DataType.INT64,
+            ),
+        )
+
+    def _first_entry(self, outer: llir.Expr) -> llir.Expr:
+        """The value position of the first entry at or after outermost iteration ``outer``.
+
+        The input's entries are stored in walk order, so each outermost
+        iteration owns a contiguous run of value positions; its first is found
+        by descending to the first child at every level (``pos[p]`` at a
+        compressed level, ``p * size`` at a dense one).  Nondecreasing in
+        ``outer``, and the entry count at the loop's end.
+        """
+
+        source = self.decls[self._input_symbols[0]]
+        position: llir.Expr = outer
+        for level in range(1, len(source.levels)):
+            if source.levels[level].kind is LevelKind.DENSE:
+                position = llir.Mul(
+                    position,
+                    llir.Var(
+                        name=f"{source.name}{level}_size", type=llir.DataType.INT64
+                    ),
+                )
+            else:
+                position = llir.Cast(
+                    expr=llir.ArrayAccess(
+                        array=llir.Var(
+                            name=f"{source.name}{level}_pos",
+                            type=llir.DataType.INT,
+                            is_ptr=True,
+                        ),
+                        index=position,
+                    ),
+                    data_type=llir.DataType.INT64,
+                )
+        return position
+
+    def _restricted(
+        self, walk: List[llir.Stmt], low: llir.Expr, high: llir.Expr
+    ) -> List[llir.Stmt]:
+        """``walk`` with its outermost loop running over iterations ``[low, high)``."""
+
+        *head, loop = walk
+        if type(loop) is not llir.ForLoop or type(loop.init) is not llir.VarInit:
+            _fail(
+                UNSUPPORTED_RELABELLED_ASSEMBLY,
+                "the parallel relabelled copy splits the walk's outermost loop, "
+                "which must be one counted loop",
+            )
+        chunk = copy.copy(loop)
+        chunk.init = llir.VarInit(var=loop.init.var, value=low)
+        chunk.cond = llir.BinOp(op="<", left=loop.init.var, right=high)
+        return [*head, chunk]
+
+    def _over(
+        self,
+        var: llir.Var,
+        start: llir.Expr,
+        stop: llir.Expr,
+        body: List[llir.Stmt],
+        threads: Optional[llir.Var] = None,
+        schedule: Optional[str] = None,
+    ) -> llir.ForLoop:
+        """``for (var = start; var < stop; var++)``, an OpenMP loop over ``threads``."""
+
+        parallel = threads is not None
+        return llir.ForLoop(
+            init=llir.VarInit(var=var, value=start),
+            cond=llir.BinOp(op="<", left=var, right=stop),
+            update=llir.Increment(var=var),
+            body=body,
+            omp_parallel_for=parallel,
+            omp_num_threads=threads.name if threads is not None else None,
+            omp_schedule=schedule if parallel else None,
+        )
+
+    def _thread_count(self, cap_by_segments: bool) -> List[llir.Stmt]:
+        """``threads``: one per :data:`RELABELLED_COPY_ENTRIES_PER_THREAD` entries.
+
+        ``scorch_nthreads(entries, entries, that, 1, 1)``.  The counting sort
+        also caps it at ``entries / segments``, so its per-thread counts are
+        never larger than the entries.
+        """
+
+        nnz = llir.Var(name=self._entry_count_name(), type=llir.DataType.INT64)
+        threads = self._int64("threads")
+        one = llir.Literal(1, data_type=llir.DataType.INT64)
+        statements: List[llir.Stmt] = [
+            llir.VarInit(
+                var=threads,
+                value=llir.Cast(
+                    expr=llir.FunctionCall(
+                        name="scorch_nthreads",
+                        args=(
+                            nnz,
+                            nnz,
+                            llir.Literal(
+                                RELABELLED_COPY_ENTRIES_PER_THREAD,
+                                data_type=llir.DataType.INT64,
+                            ),
+                            llir.Literal(1, data_type=llir.DataType.INT),
+                            llir.Literal(1, data_type=llir.DataType.INT64),
+                        ),
+                    ),
+                    data_type=llir.DataType.INT64,
+                ),
+            )
+        ]
+        if cap_by_segments:
+            segments = self._int64("segments")
+            statements = [
+                llir.VarInit(
+                    var=segments,
+                    value=llir.Cast(
+                        expr=self._segment_count(), data_type=llir.DataType.INT64
+                    ),
+                ),
+                *statements,
+                llir.IfThenElse(
+                    cond=llir.BinOp(
+                        op=">", left=llir.Mul(threads, segments), right=nnz
+                    ),
+                    then_body=[
+                        llir.Assign(
+                            var=threads,
+                            value=llir.FunctionCall(
+                                name="std::max<int64_t>",
+                                args=(
+                                    one,
+                                    llir.BinOp(
+                                        op="/",
+                                        left=nnz,
+                                        right=llir.FunctionCall(
+                                            name="std::max<int64_t>",
+                                            args=(one, segments),
+                                        ),
+                                    ),
+                                ),
+                            ),
+                        )
+                    ],
+                ),
+            ]
+        return statements
+
+    def _chunk_bounds(self) -> List[llir.Stmt]:
+        """``bounds[t]``: where chunk ``t`` of the walk's outermost loop starts.
+
+        Chunks of about ``entries / threads`` entries each: chunk ``t`` starts
+        at the first outermost iteration whose entries start at or after
+        ``t * entries / threads`` (a binary search over
+        :meth:`_first_entry`); ``bounds[threads]`` is the loop's end.
+        """
+
+        nnz = llir.Var(name=self._entry_count_name(), type=llir.DataType.INT64)
+        threads = self._int64("threads")
+        bounds = llir.Var(
+            name=f"{self.result_decl.name}_bounds", type=llir.DataType.STD_VECTOR_INT
+        )
+        chunk = self._chunk()
+        begin, end = self._outer_range()
+        one = llir.Literal(1, data_type=llir.DataType.INT64)
+        target = self._int64("target")
+        low, high, middle = (
+            self._int64("low"),
+            self._int64("high"),
+            self._int64("middle"),
+        )
+        search = self._over(
+            chunk,
+            llir.Literal(0, data_type=llir.DataType.INT64),
+            threads,
+            [
+                llir.VarInit(
+                    var=target,
+                    value=llir.BinOp(op="/", left=llir.Mul(chunk, nnz), right=threads),
+                ),
+                llir.VarInit(var=low, value=begin),
+                llir.VarInit(var=high, value=end),
+                llir.WhileLoop(
+                    cond=llir.BinOp(op="<", left=low, right=high),
+                    body=[
+                        llir.VarInit(
+                            var=middle,
+                            value=llir.Add(
+                                low,
+                                llir.BinOp(
+                                    op="/",
+                                    left=llir.BinOp(op="-", left=high, right=low),
+                                    right=llir.Literal(
+                                        2, data_type=llir.DataType.INT64
+                                    ),
+                                ),
+                            ),
+                        ),
+                        llir.IfThenElse(
+                            cond=llir.BinOp(
+                                op="<", left=self._first_entry(middle), right=target
+                            ),
+                            then_body=[
+                                llir.Assign(var=low, value=llir.Add(middle, one))
+                            ],
+                            else_body=[llir.Assign(var=high, value=middle)],
+                        ),
+                    ],
+                ),
+                llir.Assign(var=llir.ArrayAccess(array=bounds, index=chunk), value=low),
+            ],
+        )
+        return [
+            llir.Comment(
+                "Chunks of the outermost loop with about entries / threads entries each"
+            ),
+            llir.DirectInit(
+                var=bounds,
+                args=(
+                    llir.Cast(
+                        expr=llir.Add(threads, one), data_type=llir.DataType.SIZE_T
+                    ),
+                ),
+            ),
+            search,
+            llir.Assign(var=llir.ArrayAccess(array=bounds, index=threads), value=end),
+        ]
+
+    def _chunk_walk(self, pass_type: type) -> List[llir.Stmt]:
+        """The walk of a separately sealed ``pass_type`` lowering, over chunk ``t``."""
+
+        bounds = llir.Var(
+            name=f"{self.result_decl.name}_bounds", type=llir.DataType.STD_VECTOR_INT
+        )
+        chunk = self._chunk()
+        one = llir.Literal(1, data_type=llir.DataType.INT64)
+        sealed = pass_type(
+            self.program,
+            {symbol: self.shapes[symbol] for symbol in self._input_symbols},
+            self.shapes[self.result_symbol],
+        )
+        return self._restricted(
+            sealed._walk(),
+            llir.ArrayAccess(array=bounds, index=chunk),
+            llir.ArrayAccess(array=bounds, index=llir.Add(chunk, one)),
+        )
+
+    def _parallel_statements(self, serial: List[llir.Stmt]) -> List[llir.Stmt]:
+        """The counting sort on several threads, or ``serial`` when one is chosen.
+
+        The standard parallel transposition by per-thread counts (ScanTrans,
+        Wang et al., ICS 2016):
+
+        1. split the walk's outermost loop into one chunk per thread, with
+           about the same number of entries each (:meth:`_chunk_bounds`);
+        2. each thread counts its chunk's entries per segment into its own row
+           of ``counts``;
+        3. per segment, turn the rows into each chunk's offset and write the
+           segment's total, then prefix-sum the totals into positions;
+        4. each thread walks its chunk again and stores each entry at its
+           segment's start plus its own next offset.
+
+        The thread count is chosen when the kernel runs
+        (:meth:`_thread_count`, capped by the segments).  One thread runs
+        ``serial``, the one-thread kernel.
+        """
+
+        threads = self._int64("threads")
+        segments = self._int64("segments")
+        counts = self._chunk_counts()
+        positions = self._positions()
+        chunk = self._chunk()
+        zero = llir.Literal(0, data_type=llir.DataType.INT64)
+        one = llir.Literal(1, data_type=llir.DataType.INT64)
+        segment = self._int64("segment")
+        other = self._int64("u")
+        run, cell, here = self._int64("run"), self._int64("cell"), self._int64("here")
+        offsets = self._over(
+            segment,
+            zero,
+            segments,
+            [
+                llir.VarInit(var=run, value=zero),
+                self._over(
+                    other,
+                    zero,
+                    threads,
+                    [
+                        llir.VarInit(
+                            var=cell, value=llir.Add(llir.Mul(other, segments), segment)
+                        ),
+                        llir.VarInit(
+                            var=here, value=llir.ArrayAccess(array=counts, index=cell)
+                        ),
+                        llir.Assign(
+                            var=llir.ArrayAccess(array=counts, index=cell), value=run
+                        ),
+                        llir.Assign(var=run, value=here, op=llir.AssignOp.ADD_ASSIGN),
+                    ],
+                ),
+                llir.Assign(
+                    var=llir.ArrayAccess(array=positions, index=llir.Add(segment, one)),
+                    value=run,
+                    result_storage=self._position_storage(STORAGE_WRITE),
+                ),
+            ],
+            threads=threads,
+        )
+        offsets.scorch_index_var = segment.name
+        prefix_sum = self._over(
+            segment,
+            one,
+            llir.Add(segments, one),
+            [
+                llir.Assign(
+                    var=llir.ArrayAccess(array=positions, index=segment),
+                    value=llir.ArrayAccess(
+                        array=positions,
+                        index=llir.BinOp(op="-", left=segment, right=one),
+                    ),
+                    op=llir.AssignOp.ADD_ASSIGN,
+                    result_storage=self._position_storage(STORAGE_WRITE, STORAGE_READ),
+                )
+            ],
+        )
+        prefix_sum.scorch_index_var = segment.name
+        several = [
+            *self._chunk_bounds(),
+            llir.DirectInit(
+                var=counts,
+                args=(
+                    llir.Cast(
+                        expr=llir.Mul(threads, segments), data_type=llir.DataType.SIZE_T
+                    ),
+                    llir.Literal(value=0, data_type=llir.DataType.INT),
+                ),
+            ),
+            llir.Comment("Each thread counts its chunk's entries per segment"),
+            self._over(
+                chunk,
+                zero,
+                threads,
+                self._chunk_walk(_RelabelledCopyChunkCountPass),
+                threads=threads,
+                schedule="static, 1",
+            ),
+            llir.Comment(
+                "Each chunk's offset in each segment, and each segment's total"
+            ),
+            offsets,
+            llir.Comment("Prefix sum: the segments' starts"),
+            prefix_sum,
+            llir.Comment("Each thread stores its chunk's entries"),
+            self._over(
+                chunk,
+                zero,
+                threads,
+                self._chunk_walk(_RelabelledCopyChunkFillPass),
+                threads=threads,
+                schedule="static, 1",
+            ),
+            llir.FunctionCallStmt(
+                name=f"{positions.name}.pop_back",
+                args=[],
+                result_storage=self._position_storage(STORAGE_WRITE),
+            ),
+        ]
+        return [
+            llir.Comment(
+                f"Threads: one per {RELABELLED_COPY_ENTRIES_PER_THREAD} entries, at most "
+                "entries / segments"
+            ),
+            *self._thread_count(cap_by_segments=True),
+            llir.IfThenElse(
+                cond=llir.BinOp(op=">", left=threads, right=one),
+                then_body=several,
+                else_body=serial,
+            ),
+        ]
+
+    # -- two or more compressed levels on several threads -----------------------
+
+    def _record_chunk(self, number: str) -> Tuple[llir.Var, llir.Var]:
+        """``[low, high)``: chunk ``t``'s even share of the records."""
+
+        return self._int64(f"low{number}"), self._int64(f"high{number}")
+
+    def _record_chunk_inits(self, number: str) -> List[llir.Stmt]:
+        nnz = llir.Var(name=self._entry_count_name(), type=llir.DataType.INT64)
+        threads = self._int64("threads")
+        chunk = self._chunk()
+        one = llir.Literal(1, data_type=llir.DataType.INT64)
+        low, high = self._record_chunk(number)
+        return [
+            llir.VarInit(
+                var=low,
+                value=llir.BinOp(op="/", left=llir.Mul(chunk, nnz), right=threads),
+            ),
+            llir.VarInit(
+                var=high,
+                value=llir.BinOp(
+                    op="/", left=llir.Mul(llir.Add(chunk, one), nnz), right=threads
+                ),
+            ),
+        ]
+
+    def _parallel_radix_passes(
+        self,
+        number: int,
+        label: str,
+        largest: llir.Var,
+        key: Callable[[llir.Expr], llir.Expr],
+    ) -> List[llir.Stmt]:
+        """The stable passes over one key on several threads.
+
+        Per digit: each thread counts its even share of the records per bucket
+        into its own row of ``histogram``; the rows become offsets bucket by
+        bucket and, inside a bucket, chunk by chunk; each thread then moves its
+        records to its offsets in order.  A bucket's records keep their order,
+        so every pass is stable, as on one thread.
+        """
+
+        name = self.result_decl.name
+        threads = self._int64("threads")
+        chunk = self._chunk()
+        bits = self._int64(f"bits{number}")
+        shift = self._int64(f"shift{number}")
+        digit_bits = self._int64("digit_bits")
+        buckets = self._int64(f"buckets{number}")
+        mask = self._int64("digit_mask")
+        histogram = llir.Var(
+            name=f"{name}_histogram", type=llir.DataType.STD_VECTOR_INT
+        )
+        e = self._int64(f"e{number}")
+        held = self._int64(f"d{number}")
+        to = self._int64(f"to{number}")
+        cell = self._int64(f"cell{number}")
+        here = self._int64(f"here{number}")
+        offset = self._int64(f"offset{number}")
+        bucket = self._int64(f"v{number}")
+        other = self._int64(f"u{number}")
+        zero = llir.Literal(0, data_type=llir.DataType.INT64)
+        one = llir.Literal(1, data_type=llir.DataType.INT64)
+        low, high = self._record_chunk(str(number))
+
+        def digit(at: llir.Expr) -> llir.Expr:
+            return llir.BinOp(
+                op="&",
+                left=llir.BinOp(op=">>", left=key(at), right=shift),
+                right=mask,
+            )
+
+        def chunk_cell() -> llir.Expr:
+            return llir.Add(llir.Mul(chunk, buckets), held)
+
+        moves: List[llir.Stmt] = [
+            llir.VarInit(var=held, value=digit(e)),
+            llir.VarInit(var=cell, value=chunk_cell()),
+            llir.VarInit(var=to, value=llir.ArrayAccess(array=histogram, index=cell)),
+            llir.Assign(
+                var=llir.ArrayAccess(array=histogram, index=cell),
+                value=llir.Literal(1),
+                op=llir.AssignOp.ADD_ASSIGN,
+            ),
+        ]
+        for field in self._record_fields():
+            moves.append(
+                llir.Assign(
+                    var=llir.ArrayAccess(array=self._rec(field, "b"), index=to),
+                    value=llir.ArrayAccess(array=self._rec(field), index=e),
+                )
+            )
+        counting = self._over(
+            chunk,
+            zero,
+            threads,
+            [
+                *self._record_chunk_inits(str(number)),
+                self._over(
+                    e,
+                    low,
+                    high,
+                    [
+                        llir.VarInit(var=held, value=digit(e)),
+                        llir.Assign(
+                            var=llir.ArrayAccess(array=histogram, index=chunk_cell()),
+                            value=llir.Literal(1),
+                            op=llir.AssignOp.ADD_ASSIGN,
+                        ),
+                    ],
+                ),
+            ],
+            threads=threads,
+            schedule="static, 1",
+        )
+        offsets = [
+            llir.VarInit(var=offset, value=zero),
+            self._over(
+                bucket,
+                zero,
+                buckets,
+                [
+                    self._over(
+                        other,
+                        zero,
+                        threads,
+                        [
+                            llir.VarInit(
+                                var=cell,
+                                value=llir.Add(llir.Mul(other, buckets), bucket),
+                            ),
+                            llir.VarInit(
+                                var=here,
+                                value=llir.ArrayAccess(array=histogram, index=cell),
+                            ),
+                            llir.Assign(
+                                var=llir.ArrayAccess(array=histogram, index=cell),
+                                value=offset,
+                            ),
+                            llir.Assign(
+                                var=offset, value=here, op=llir.AssignOp.ADD_ASSIGN
+                            ),
+                        ],
+                    )
+                ],
+            ),
+        ]
+        scattering = self._over(
+            chunk,
+            zero,
+            threads,
+            [
+                *self._record_chunk_inits(str(number)),
+                self._over(e, low, high, moves),
+            ],
+            threads=threads,
+            schedule="static, 1",
+        )
+        swaps: List[llir.Stmt] = [
+            llir.FunctionCallStmt(
+                name=f"{self._rec(field).name}.swap", args=[self._rec(field, "b")]
+            )
+            for field in self._record_fields()
+        ]
+        return [
+            llir.Comment(
+                f"Sort by {label}: one counting pass per digit, on every thread"
+            ),
+            llir.VarInit(var=bits, value=zero),
+            llir.WhileLoop(
+                cond=llir.BinOp(
+                    op=">",
+                    left=llir.BinOp(op=">>", left=largest, right=bits),
+                    right=llir.Literal(0),
+                ),
+                body=[llir.Increment(var=bits)],
+            ),
+            llir.ForLoop(
+                init=llir.VarInit(var=shift, value=zero),
+                cond=llir.BinOp(op="<", left=shift, right=bits),
+                update=llir.Assign(
+                    var=shift, value=digit_bits, op=llir.AssignOp.ADD_ASSIGN
+                ),
+                body=[
+                    llir.VarInit(
+                        var=buckets,
+                        value=llir.FunctionCall(
+                            name="std::min",
+                            args=(
+                                llir.Add(mask, one),
+                                llir.Add(
+                                    llir.BinOp(op=">>", left=largest, right=shift), one
+                                ),
+                            ),
+                        ),
+                    ),
+                    llir.FunctionCallStmt(
+                        name=f"{histogram.name}.assign",
+                        args=[
+                            llir.Cast(
+                                expr=llir.Mul(threads, buckets),
+                                data_type=llir.DataType.SIZE_T,
+                            ),
+                            zero,
+                        ],
+                    ),
+                    counting,
+                    *offsets,
+                    scattering,
+                    *swaps,
+                ],
+            ),
+        ]
+
+    def _parallel_assembly_sweep(self) -> List[llir.Stmt]:
+        """Build every compressed level from the sorted records on several threads.
+
+        Two passes over even shares of the records.  The first counts, per
+        chunk and level, the records that start a new entry at that level
+        (compared with the record before, which may be the previous chunk's
+        last); the counts become each chunk's first entry number per level.
+        The second recomputes the starts and writes coordinates, the positions
+        below each new entry, and the first compressed level's positions: a
+        record that starts a segment ``s`` after the previous record's segment
+        writes ``pos[s']`` for every segment ``s'`` in between, so every
+        segment boundary is written once, by the chunk that crosses it.
+        """
+
+        result_name = self.result_decl.name
+        dense = self._dense_prefix()
+        levels = list(range(dense, len(self.result_decl.levels)))
+        threads = self._int64("threads")
+        chunk = self._chunk()
+        nnz = llir.Var(name=self._entry_count_name(), type=llir.DataType.INT64)
+        zero = llir.Literal(0, data_type=llir.DataType.INT64)
+        one = llir.Literal(1, data_type=llir.DataType.INT64)
+        width = llir.Literal(len(levels), data_type=llir.DataType.INT64)
+        starts = llir.Var(
+            name=f"{result_name}_level_starts", type=llir.DataType.STD_VECTOR_INT
+        )
+        e = self._int64("e")
+        seg = self._int64("seg")
+        low, high = self._record_chunk("s")
+
+        def pos(level: int) -> llir.Var:
+            return llir.Var(
+                name=f"{result_name}{level}_pos", type=llir.DataType.STD_VECTOR_C_INT
+            )
+
+        def crd(level: int) -> llir.Var:
+            return llir.Var(
+                name=f"{result_name}{level}_crd", type=llir.DataType.STD_VECTOR_C_INT
+            )
+
+        def started(level: int) -> llir.Var:
+            return llir.Var(
+                name=f"{result_name}{level}_starts", type=llir.DataType.BOOL
+            )
+
+        def counter(level: int) -> llir.Var:
+            return self._int64(f"n{level}")
+
+        def total(level: int) -> llir.Var:
+            return self._int64(f"total{level}")
+
+        def coordinate(level: int, at: llir.Expr) -> llir.Expr:
+            return llir.ArrayAccess(array=self._rec(str(level)), index=at)
+
+        def segment_of(at: llir.Expr) -> llir.Expr:
+            if dense:
+                return llir.ArrayAccess(array=self._rec("seg"), index=at)
+            return zero
+
+        before = llir.BinOp(op="-", left=e, right=one)
+        first = llir.BinOp(op="==", left=e, right=zero)
+
+        def flags() -> List[llir.Stmt]:
+            out: List[llir.Stmt] = [llir.VarInit(var=seg, value=segment_of(e))]
+            for level in levels:
+                differs = llir.BinOp(
+                    op="!=", left=coordinate(level, e), right=coordinate(level, before)
+                )
+                if level == dense:
+                    cond: llir.Expr = first
+                    if dense:
+                        cond = llir.BinOp(
+                            op="||",
+                            left=cond,
+                            right=llir.BinOp(
+                                op="!=", left=seg, right=segment_of(before)
+                            ),
+                        )
+                    cond = llir.BinOp(op="||", left=cond, right=differs)
+                else:
+                    cond = llir.BinOp(op="||", left=started(level - 1), right=differs)
+                out.append(llir.VarInit(var=started(level), value=cond))
+            return out
+
+        counting_body: List[llir.Stmt] = flags()
+        for index, level in enumerate(levels):
+            counting_body.append(
+                llir.IfThenElse(
+                    cond=started(level),
+                    then_body=[
+                        llir.Assign(
+                            var=llir.ArrayAccess(
+                                array=starts,
+                                index=llir.Add(
+                                    llir.Mul(chunk, width),
+                                    llir.Literal(index, data_type=llir.DataType.INT64),
+                                ),
+                            ),
+                            value=llir.Literal(1),
+                            op=llir.AssignOp.ADD_ASSIGN,
+                        )
+                    ],
+                )
+            )
+        counting = self._over(
+            chunk,
+            zero,
+            threads,
+            [*self._record_chunk_inits("s"), self._over(e, low, high, counting_body)],
+            threads=threads,
+            schedule="static, 1",
+        )
+        other = self._int64("u")
+        run, cell, here = self._int64("run"), self._int64("cell"), self._int64("here")
+        offsets: List[llir.Stmt] = []
+        for index, level in enumerate(levels):
+            offsets.append(
+                llir.VarInit(var=run, value=zero)
+                if index == 0
+                else llir.Assign(var=run, value=zero)
+            )
+            offsets.append(
+                self._over(
+                    other,
+                    zero,
+                    threads,
+                    [
+                        llir.VarInit(
+                            var=cell,
+                            value=llir.Add(
+                                llir.Mul(other, width),
+                                llir.Literal(index, data_type=llir.DataType.INT64),
+                            ),
+                        ),
+                        llir.VarInit(
+                            var=here, value=llir.ArrayAccess(array=starts, index=cell)
+                        ),
+                        llir.Assign(
+                            var=llir.ArrayAccess(array=starts, index=cell), value=run
+                        ),
+                        llir.Assign(var=run, value=here, op=llir.AssignOp.ADD_ASSIGN),
+                    ],
+                )
+            )
+            offsets.append(llir.VarInit(var=total(level), value=run))
+        writing_body: List[llir.Stmt] = flags()
+        previous_segment = self._int64("prev_seg")
+        boundary = self._int64("boundary")
+        for level in levels:
+            then: List[llir.Stmt] = []
+            if level == dense:
+                then.append(
+                    llir.VarInit(
+                        var=previous_segment,
+                        value=llir.Select(
+                            cond=first,
+                            when_true=llir.Literal(-1, data_type=llir.DataType.INT64),
+                            when_false=segment_of(before),
+                        ),
+                    )
+                )
+                then.append(
+                    self._over(
+                        boundary,
+                        llir.Add(previous_segment, one),
+                        llir.Add(seg, one),
+                        [
+                            llir.Assign(
+                                var=llir.ArrayAccess(array=pos(level), index=boundary),
+                                value=counter(level),
+                                result_storage=self._result_storage(
+                                    (RESULT_POS, level, STORAGE_WRITE)
+                                ),
+                            )
+                        ],
+                    )
+                )
+            else:
+                then.append(
+                    llir.IfThenElse(
+                        cond=started(level - 1),
+                        then_body=[
+                            llir.Assign(
+                                var=llir.ArrayAccess(
+                                    array=pos(level),
+                                    index=llir.BinOp(
+                                        op="-", left=counter(level - 1), right=one
+                                    ),
+                                ),
+                                value=counter(level),
+                                result_storage=self._result_storage(
+                                    (RESULT_POS, level, STORAGE_WRITE)
+                                ),
+                            )
+                        ],
+                    )
+                )
+            then.append(
+                llir.Assign(
+                    var=llir.ArrayAccess(array=crd(level), index=counter(level)),
+                    value=coordinate(level, e),
+                    result_storage=self._result_storage(
+                        (RESULT_CRD, level, STORAGE_WRITE)
+                    ),
+                )
+            )
+            then.append(llir.Increment(var=counter(level)))
+            writing_body.append(llir.IfThenElse(cond=started(level), then_body=then))
+        writing_body.append(
+            llir.Assign(
+                var=llir.ArrayAccess(
+                    array=llir.Var(
+                        name=f"{result_name}_values", type=llir.DataType.NO_TYPE
+                    ),
+                    index=e,
+                    tensor_access=self._result_metadata(),
+                ),
+                value=llir.ArrayAccess(array=self._rec("val"), index=e),
+                result_storage=self._result_storage(
+                    (RESULT_VALUES, None, STORAGE_WRITE)
+                ),
+            )
+        )
+        counters = [
+            llir.VarInit(
+                var=counter(level),
+                value=llir.ArrayAccess(
+                    array=starts,
+                    index=llir.Add(
+                        llir.Mul(chunk, width),
+                        llir.Literal(index, data_type=llir.DataType.INT64),
+                    ),
+                ),
+            )
+            for index, level in enumerate(levels)
+        ]
+        writing = self._over(
+            chunk,
+            zero,
+            threads,
+            [
+                *self._record_chunk_inits("s"),
+                *counters,
+                self._over(e, low, high, writing_body),
+            ],
+            threads=threads,
+            schedule="static, 1",
+        )
+        last_segment = self._int64("last_seg")
+        segments = self._extent_product(range(dense))
+        closing: List[llir.Stmt] = [
+            llir.VarInit(
+                var=last_segment,
+                value=llir.Select(
+                    cond=llir.BinOp(op=">", left=nnz, right=zero),
+                    when_true=segment_of(llir.BinOp(op="-", left=nnz, right=one)),
+                    when_false=llir.Literal(-1, data_type=llir.DataType.INT64),
+                ),
+            ),
+            self._over(
+                boundary,
+                llir.Add(last_segment, one),
+                llir.Add(segments, one),
+                [
+                    llir.Assign(
+                        var=llir.ArrayAccess(array=pos(dense), index=boundary),
+                        value=total(dense),
+                        result_storage=self._result_storage(
+                            (RESULT_POS, dense, STORAGE_WRITE)
+                        ),
+                    )
+                ],
+            ),
+        ]
+        for level in levels:
+            if level > dense:
+                closing.append(
+                    llir.Assign(
+                        var=llir.ArrayAccess(array=pos(level), index=total(level - 1)),
+                        value=total(level),
+                        result_storage=self._result_storage(
+                            (RESULT_POS, level, STORAGE_WRITE)
+                        ),
+                    )
+                )
+                closing.append(
+                    llir.FunctionCallStmt(
+                        name=f"{pos(level).name}.resize",
+                        args=[
+                            llir.Cast(
+                                expr=llir.Add(total(level - 1), one),
+                                data_type=llir.DataType.SIZE_T,
+                            )
+                        ],
+                        result_storage=self._result_storage(
+                            (RESULT_POS, level, STORAGE_WRITE)
+                        ),
+                    )
+                )
+            closing.append(
+                llir.FunctionCallStmt(
+                    name=f"{crd(level).name}.resize",
+                    args=[llir.Cast(expr=total(level), data_type=llir.DataType.SIZE_T)],
+                    result_storage=self._result_storage(
+                        (RESULT_CRD, level, STORAGE_WRITE)
+                    ),
+                )
+            )
+        return [
+            llir.Comment(
+                "Build each compressed level from the sorted records, on every thread"
+            ),
+            llir.DirectInit(
+                var=starts,
+                args=(
+                    llir.Cast(
+                        expr=llir.Mul(threads, width), data_type=llir.DataType.SIZE_T
+                    ),
+                    zero,
+                ),
+            ),
+            counting,
+            *offsets,
+            writing,
+            llir.Comment(
+                "The first compressed level's positions past the last segment"
+            ),
+            *closing,
+        ]
+
+    def _parallel_sorted_statements(self, serial: List[llir.Stmt]) -> List[llir.Stmt]:
+        """The radix sort and sweep on several threads, or ``serial`` on one.
+
+        Steps of :meth:`_sorted_statements`, each on every thread:
+
+        1. the walk, split as in the counting sort (:meth:`_chunk_bounds`),
+           writes each entry's record at its own value position (records are
+           in walk order, which is storage order) and each chunk's largest key
+           values, reduced afterwards;
+        2. the radix passes (:meth:`_parallel_radix_passes`);
+        3. the sweep (:meth:`_parallel_assembly_sweep`).
+
+        The levels the walk keeps in order are sorted by like the others: the
+        one-thread form's run counter is sequential.
+        """
+
+        records = _RelabelledCopyChunkRecordPass(
+            self.program,
+            {symbol: self.shapes[symbol] for symbol in self._input_symbols},
+            self.shapes[self.result_symbol],
+        )
+        name = self.result_decl.name
+        nnz = llir.Var(name=self._entry_count_name(), type=llir.DataType.INT64)
+        size = llir.Cast(expr=nnz, data_type=llir.DataType.SIZE_T)
+        threads = self._int64("threads")
+        chunk = self._chunk()
+        zero = llir.Literal(0, data_type=llir.DataType.INT64)
+        one = llir.Literal(1, data_type=llir.DataType.INT64)
+        keys = records._sort_keys()
+        bounds = llir.Var(name=f"{name}_bounds", type=llir.DataType.STD_VECTOR_INT)
+        maxima = llir.Var(name=f"{name}_maxima", type=llir.DataType.STD_VECTOR_INT)
+        width = llir.Literal(len(keys), data_type=llir.DataType.INT64)
+        several: List[llir.Stmt] = [*self._chunk_bounds()]
+        several.append(
+            llir.Comment("Records of the walked entries: current and scratch buffers")
+        )
+        for field in records._record_fields():
+            for buffer in ("a", "b"):
+                several.append(
+                    llir.DirectInit(var=records._rec(field, buffer), args=(size,))
+                )
+        several.append(
+            llir.DirectInit(
+                var=maxima,
+                args=(
+                    llir.Cast(
+                        expr=llir.Mul(threads, width), data_type=llir.DataType.SIZE_T
+                    ),
+                    zero,
+                ),
+            )
+        )
+        walk_body: List[llir.Stmt] = [
+            llir.VarInit(
+                var=self._int64("entry"),
+                value=self._first_entry(llir.ArrayAccess(array=bounds, index=chunk)),
+            )
+        ]
+        for _, largest, _ in keys:
+            walk_body.append(llir.VarInit(var=largest, value=zero))
+        walk_body.extend(self._chunk_walk(_RelabelledCopyChunkRecordPass))
+        for index, (_, largest, _) in enumerate(keys):
+            walk_body.append(
+                llir.Assign(
+                    var=llir.ArrayAccess(
+                        array=maxima,
+                        index=llir.Add(
+                            llir.Mul(chunk, width),
+                            llir.Literal(index, data_type=llir.DataType.INT64),
+                        ),
+                    ),
+                    value=largest,
+                )
+            )
+        several.append(llir.Comment("Each thread walks its chunk into records"))
+        several.append(
+            self._over(
+                chunk, zero, threads, walk_body, threads=threads, schedule="static, 1"
+            )
+        )
+        for index, (_, largest, _) in enumerate(keys):
+            several.append(llir.VarInit(var=largest, value=zero))
+            several.append(
+                self._over(
+                    chunk,
+                    zero,
+                    threads,
+                    [
+                        llir.Assign(
+                            var=largest,
+                            value=llir.FunctionCall(
+                                name="std::max<int64_t>",
+                                args=(
+                                    largest,
+                                    llir.ArrayAccess(
+                                        array=maxima,
+                                        index=llir.Add(
+                                            llir.Mul(chunk, width),
+                                            llir.Literal(
+                                                index, data_type=llir.DataType.INT64
+                                            ),
+                                        ),
+                                    ),
+                                ),
+                            ),
+                        )
+                    ],
+                )
+            )
+        several.extend(self._digit_statements())
+        several.append(
+            llir.DirectInit(
+                var=llir.Var(
+                    name=f"{name}_histogram", type=llir.DataType.STD_VECTOR_INT
+                ),
+                args=(llir.Literal(value=0, data_type=llir.DataType.SIZE_T),),
+            )
+        )
+        for number, (label, largest, key) in enumerate(keys):
+            several.extend(records._parallel_radix_passes(number, label, largest, key))
+        several.extend(records._parallel_assembly_sweep())
+        return [
+            llir.Comment(
+                f"Threads: one per {RELABELLED_COPY_ENTRIES_PER_THREAD} entries"
+            ),
+            *self._thread_count(cap_by_segments=False),
+            llir.IfThenElse(
+                cond=llir.BinOp(op=">", left=threads, right=one),
+                then_body=several,
+                else_body=serial,
+            ),
+        ]
+
+    # -- two or more compressed levels: radix sort, then one assembly sweep ----
+
+    def _sorts(self) -> bool:
+        """Whether the result has more than one compressed level.
+
+        One compressed level is built by the counting sort above, straight into
+        the result's arrays.  More need the entries in the result's
+        lexicographic order before any level can be assembled; they are sorted
+        first (:meth:`_sorted_statements`).
+        """
+
+        return self._dense_prefix() < len(self.result_decl.levels) - 1
+
+    def _dense_prefix(self) -> int:
+        """``a``: the number of dense result levels above the compressed ones."""
+
+        dense = 0
+        for level in self.result_decl.levels:
+            if level.kind is not LevelKind.DENSE:
+                break
+            dense += 1
+        return dense
+
+    def _source_levels(self) -> List[int]:
+        """For each result level, the input level whose coordinate it holds.
+
+        The loops walk the input's levels in its storage order, so a loop's
+        position is the input level it walks.
+        """
+
+        return [
+            self.loop_positions[self._index_of(index, "an appended coordinate")]
+            for index in self._result_storage_indices()
+        ]
+
+    def _kept_prefix(self) -> int:
+        """``p``: the leading result levels that hold the input's leading levels.
+
+        The walk visits the entries grouped by those coordinates already.
+        """
+
+        kept = 0
+        for level, source in enumerate(self._source_levels()):
+            if source != level:
+                break
+            kept += 1
+        return kept
+
+    def _sorted_suffix_start(self) -> int:
+        """``m``: where the trailing result levels in the input's relative order start.
+
+        Entries that agree on the result's coordinates above ``m`` arrive in
+        the input's storage order, which orders them by the levels from ``m``
+        on: those levels never need a sorting pass, because every pass is
+        stable.
+        """
+
+        sources = self._source_levels()
+        start = len(sources) - 1
+        while start > 0 and sources[start - 1] < sources[start]:
+            start -= 1
+        return start
+
+    def _rec(self, field: str, buffer: str = "a") -> llir.Var:
+        """One array of the records' current (``a``) or scratch (``b``) buffer."""
+
+        name = self.result_decl.name
+        types = {
+            "seg": llir.DataType.STD_VECTOR_INT,
+            "run": llir.DataType.STD_VECTOR_INT,
+        }
+        if field == "val":
+            vector = _SCALAR_TO_VECTOR[self.result_decl.dtype]
+        else:
+            vector = types.get(field, llir.DataType.STD_VECTOR_C_INT)
+        return llir.Var(name=f"{name}_rec_{field}_{buffer}", type=vector)
+
+    def _record_fields(self) -> List[str]:
+        """The arrays a record is made of.
+
+        The flattened dense coordinates (``seg``) when there are dense levels,
+        each compressed level's coordinate, the value, and the index of the run
+        of the kept prefix the entry arrived in (``run``) when there is one.
+        """
+
+        fields = ["seg"] if self._dense_prefix() > 0 else []
+        fields.extend(
+            str(level)
+            for level in range(self._dense_prefix(), len(self.result_decl.levels))
+        )
+        fields.append("val")
+        if self._kept_prefix() > 0:
+            fields.append("run")
+        return fields
+
+    def _int64(self, name: str) -> llir.Var:
+        return llir.Var(
+            name=f"{self.result_decl.name}_{name}", type=llir.DataType.INT64
+        )
+
+    def _flattened(self, levels: Sequence[int]) -> llir.Expr:
+        """The coordinates of dense result ``levels``, flattened row-major."""
+
+        result_name = self.result_decl.name
+        names = self._appended_names()
+        flat: llir.Expr = llir.Cast(
+            expr=llir.Var(name=names[levels[0]], type=llir.DataType.INT64),
+            data_type=llir.DataType.INT64,
+        )
+        for level in levels[1:]:
+            flat = llir.Add(
+                llir.Mul(
+                    flat,
+                    llir.Var(
+                        name=f"{result_name}{level}_size", type=llir.DataType.INT64
+                    ),
+                ),
+                llir.Var(name=names[level], type=llir.DataType.INT64),
+            )
+        return flat
+
+    def _extent_product(self, levels: Sequence[int]) -> llir.Expr:
+        result_name = self.result_decl.name
+        product: llir.Expr = llir.Literal(1, data_type=llir.DataType.INT64)
+        for level in levels:
+            product = llir.Mul(
+                product,
+                llir.Var(name=f"{result_name}{level}_size", type=llir.DataType.INT64),
+            )
+        return product
+
+    def _sort_keys(
+        self,
+    ) -> List[Tuple[str, llir.Var, Callable[[llir.Expr], llir.Expr]]]:
+        """The keys of the stable radix sort, least significant first.
+
+        Each is ``(label, largest value, key of record e)``.  The keys are the
+        result levels from the kept prefix ``p`` to ``m``: each compressed one
+        alone, the dense ones together as their flattened coordinates (their
+        product is at most the first compressed level's segment count, which
+        its positions already hold).  Then, when the walk keeps a prefix, the
+        prefix's run index: the passes above regroup the entries, and one
+        stable pass on the run restores the walk's grouping.  The run is the
+        global form of keeping the prefix; sorting inside each run instead is
+        a second form, to be added beside this one where the grid shows it
+        faster.
+        """
+
+        dense = self._dense_prefix()
+        kept = self._kept_prefix()
+        start = self._sorted_suffix_start()
+        keys: List[Tuple[str, llir.Var, Callable[[llir.Expr], llir.Expr]]] = []
+        for level in reversed(range(max(kept, dense), start)):
+
+            def coordinate(e: llir.Expr, level: int = level) -> llir.Expr:
+                return llir.Cast(
+                    expr=llir.ArrayAccess(array=self._rec(str(level)), index=e),
+                    data_type=llir.DataType.INT64,
+                )
+
+            keys.append((f"level {level}", self._int64(f"max{level}"), coordinate))
+        middle = list(range(kept, min(dense, start)))
+        if middle:
+            inner = list(range(middle[-1] + 1, dense))
+            span = self._extent_product(middle)
+            below = self._extent_product(inner)
+
+            def flattened(e: llir.Expr) -> llir.Expr:
+                seg: llir.Expr = llir.ArrayAccess(array=self._rec("seg"), index=e)
+                if inner:
+                    seg = llir.BinOp(op="/", left=seg, right=below)
+                return llir.BinOp(op="%", left=seg, right=span)
+
+            keys.append(
+                (
+                    f"dense levels {middle[0]} to {middle[-1]}",
+                    self._int64("maxdense"),
+                    flattened,
+                )
+            )
+        if kept:
+
+            def run(e: llir.Expr) -> llir.Expr:
+                return llir.ArrayAccess(array=self._rec("run"), index=e)
+
+            keys.append(("the kept prefix's run", self._int64("run"), run))
+        return keys
+
+    def _sorted_level_indices(self) -> List[llir.Stmt]:
+        """The compressed levels' arrays, sized before the sweep that fills them.
+
+        The first compressed level's positions hold one count per segment, two
+        slots for nothing else; every array below it is sized for the largest
+        it can be (one entry per record) and cut to its count after the sweep.
+        Declared with sizes, so the dynamic-vector pass leaves the indexed
+        stores alone.
+        """
+
+        result_name = self.result_decl.name
+        dense = self._dense_prefix()
+        nnz = llir.Cast(
+            expr=llir.Var(name=self._entry_count_name(), type=llir.DataType.INT64),
+            data_type=llir.DataType.SIZE_T,
+        )
+        statements: List[llir.Stmt] = []
+        for level in range(dense, len(self.result_decl.levels)):
+            size: llir.Expr = (
+                llir.Cast(
+                    expr=self._extent_product(range(dense)),
+                    data_type=llir.DataType.SIZE_T,
+                )
+                if level == dense
+                else nnz
+            )
+            statements.append(
+                llir.DirectInit(
+                    var=llir.Var(
+                        name=f"{result_name}{level}_pos",
+                        type=llir.DataType.STD_VECTOR_C_INT,
+                    ),
+                    args=(
+                        llir.Add(
+                            size, llir.Literal(value=1, data_type=llir.DataType.INT)
+                        ),
+                        llir.Literal(value=0, data_type=llir.DataType.INT),
+                    ),
+                )
+            )
+            statements.append(
+                llir.DirectInit(
+                    var=llir.Var(
+                        name=f"{result_name}{level}_crd",
+                        type=llir.DataType.STD_VECTOR_C_INT,
+                    ),
+                    args=(nnz,),
+                )
+            )
+        return statements
+
+    def _record_leaf(self) -> List[llir.Stmt]:
+        """Write the entry's record at the next free slot, and track the keys' maxima."""
+
+        names = self._appended_names()
+        dense = self._dense_prefix()
+        kept = self._kept_prefix()
+        start = self._sorted_suffix_start()
+        entry = self._int64("entry")
+        statements: List[llir.Stmt] = []
+        if kept:
+            differs: llir.Expr = llir.BinOp(op="==", left=entry, right=llir.Literal(0))
+            for level in range(kept):
+                differs = llir.BinOp(
+                    op="||",
+                    left=differs,
+                    right=llir.BinOp(
+                        op="!=",
+                        left=llir.Var(name=names[level], type=llir.DataType.INT64),
+                        right=self._int64(f"prev{level}"),
+                    ),
+                )
+            statements.append(
+                llir.IfThenElse(
+                    cond=differs,
+                    then_body=[
+                        llir.Assign(
+                            var=self._int64("run"),
+                            value=llir.Literal(1),
+                            op=llir.AssignOp.ADD_ASSIGN,
+                        ),
+                        *(
+                            llir.Assign(
+                                var=self._int64(f"prev{level}"),
+                                value=llir.Var(
+                                    name=names[level], type=llir.DataType.INT64
+                                ),
+                            )
+                            for level in range(kept)
+                        ),
+                    ],
+                )
+            )
+            statements.append(
+                llir.Assign(
+                    var=llir.ArrayAccess(array=self._rec("run"), index=entry),
+                    value=self._int64("run"),
+                )
+            )
+        if dense:
+            statements.append(
+                llir.Assign(
+                    var=llir.ArrayAccess(array=self._rec("seg"), index=entry),
+                    value=self._flattened(list(range(dense))),
+                )
+            )
+        for level in range(dense, len(names)):
+            statements.append(
+                llir.Assign(
+                    var=llir.ArrayAccess(array=self._rec(str(level)), index=entry),
+                    value=llir.Var(name=names[level], type=llir.DataType.INT64),
+                )
+            )
+            if max(kept, dense) <= level < start:
+                largest = self._int64(f"max{level}")
+                statements.append(
+                    llir.Assign(
+                        var=largest,
+                        value=llir.FunctionCall(
+                            name="std::max",
+                            args=(
+                                largest,
+                                llir.Cast(
+                                    expr=llir.Var(
+                                        name=names[level], type=llir.DataType.INT64
+                                    ),
+                                    data_type=llir.DataType.INT64,
+                                ),
+                            ),
+                        ),
+                    )
+                )
+        middle = list(range(kept, min(dense, start)))
+        if middle:
+            largest = self._int64("maxdense")
+            statements.append(
+                llir.Assign(
+                    var=largest,
+                    value=llir.FunctionCall(
+                        name="std::max", args=(largest, self._flattened(middle))
+                    ),
+                )
+            )
+        statements.append(
+            llir.Assign(
+                var=llir.ArrayAccess(array=self._rec("val"), index=entry),
+                value=self._lower_value(cast(AppendEntry, self.leaf).value),
+            )
+        )
+        statements.append(llir.Increment(var=entry))
+        return statements
+
+    def _radix_passes(
+        self,
+        number: int,
+        label: str,
+        largest: llir.Var,
+        key: Callable[[llir.Expr], llir.Expr],
+    ) -> List[llir.Stmt]:
+        """The stable passes over one key: one counting pass per digit.
+
+        The key's bit width comes from its largest value, so digits that are
+        zero in every record are never passed over; a key no wider than a digit
+        is one pass with the whole key as the digit.
+        """
+
+        result_name = self.result_decl.name
+        bits = self._int64(f"bits{number}")
+        shift = self._int64(f"shift{number}")
+        digit_bits = self._int64("digit_bits")
+        buckets = self._int64(f"buckets{number}")
+        count = llir.Var(name=f"{result_name}_count", type=llir.DataType.STD_VECTOR_INT)
+        nnz = llir.Var(name=self._entry_count_name(), type=llir.DataType.INT64)
+        mask = self._int64("digit_mask")
+        e = self._int64(f"e{number}")
+        bucket = self._int64(f"v{number}")
+
+        def digit(at: llir.Expr) -> llir.Expr:
+            return llir.BinOp(
+                op="&",
+                left=llir.BinOp(op=">>", left=key(at), right=shift),
+                right=mask,
+            )
+
+        # The digit is bound to a local first: an index expression may only
+        # use arithmetic operators.
+        held = self._int64(f"d{number}")
+        to = self._int64(f"to{number}")
+        moves: List[llir.Stmt] = [
+            llir.VarInit(var=held, value=digit(e)),
+            llir.VarInit(var=to, value=llir.ArrayAccess(array=count, index=held)),
+            llir.Assign(
+                var=llir.ArrayAccess(array=count, index=held),
+                value=llir.Literal(1),
+                op=llir.AssignOp.ADD_ASSIGN,
+            ),
+        ]
+        for field in self._record_fields():
+            moves.append(
+                llir.Assign(
+                    var=llir.ArrayAccess(array=self._rec(field, "b"), index=to),
+                    value=llir.ArrayAccess(array=self._rec(field), index=e),
+                )
+            )
+        swaps: List[llir.Stmt] = [
+            llir.FunctionCallStmt(
+                name=f"{self._rec(field).name}.swap", args=[self._rec(field, "b")]
+            )
+            for field in self._record_fields()
+        ]
+
+        def over_records(var: llir.Var, body: List[llir.Stmt]) -> llir.ForLoop:
+            return llir.ForLoop(
+                init=llir.VarInit(
+                    var=var, value=llir.Literal(0, data_type=llir.DataType.INT64)
+                ),
+                cond=llir.BinOp(op="<", left=var, right=nnz),
+                update=llir.Increment(var=var),
+                body=body,
+            )
+
+        return [
+            llir.Comment(f"Sort by {label}: one counting pass per digit"),
+            llir.VarInit(
+                var=bits, value=llir.Literal(0, data_type=llir.DataType.INT64)
+            ),
+            llir.WhileLoop(
+                cond=llir.BinOp(
+                    op=">",
+                    left=llir.BinOp(op=">>", left=largest, right=bits),
+                    right=llir.Literal(0),
+                ),
+                body=[llir.Increment(var=bits)],
+            ),
+            llir.ForLoop(
+                init=llir.VarInit(
+                    var=shift, value=llir.Literal(0, data_type=llir.DataType.INT64)
+                ),
+                cond=llir.BinOp(op="<", left=shift, right=bits),
+                update=llir.Assign(
+                    var=shift, value=digit_bits, op=llir.AssignOp.ADD_ASSIGN
+                ),
+                body=[
+                    llir.VarInit(
+                        var=buckets,
+                        value=llir.FunctionCall(
+                            name="std::min",
+                            args=(
+                                llir.Add(
+                                    mask, llir.Literal(1, data_type=llir.DataType.INT64)
+                                ),
+                                llir.Add(
+                                    llir.BinOp(op=">>", left=largest, right=shift),
+                                    llir.Literal(1, data_type=llir.DataType.INT64),
+                                ),
+                            ),
+                        ),
+                    ),
+                    llir.FunctionCallStmt(
+                        name=f"{count.name}.assign",
+                        args=[
+                            llir.Cast(
+                                expr=llir.Add(buckets, llir.Literal(1)),
+                                data_type=llir.DataType.SIZE_T,
+                            ),
+                            llir.Literal(0, data_type=llir.DataType.INT64),
+                        ],
+                    ),
+                    over_records(
+                        e,
+                        [
+                            llir.VarInit(var=held, value=digit(e)),
+                            llir.Assign(
+                                var=llir.ArrayAccess(
+                                    array=count,
+                                    index=llir.Add(held, llir.Literal(1)),
+                                ),
+                                value=llir.Literal(1),
+                                op=llir.AssignOp.ADD_ASSIGN,
+                            ),
+                        ],
+                    ),
+                    llir.ForLoop(
+                        init=llir.VarInit(
+                            var=bucket,
+                            value=llir.Literal(1, data_type=llir.DataType.INT64),
+                        ),
+                        cond=llir.BinOp(
+                            op="<",
+                            left=bucket,
+                            right=llir.Add(buckets, llir.Literal(1)),
+                        ),
+                        update=llir.Increment(var=bucket),
+                        body=[
+                            llir.Assign(
+                                var=llir.ArrayAccess(array=count, index=bucket),
+                                value=llir.ArrayAccess(
+                                    array=count,
+                                    index=llir.BinOp(
+                                        op="-", left=bucket, right=llir.Literal(1)
+                                    ),
+                                ),
+                                op=llir.AssignOp.ADD_ASSIGN,
+                            )
+                        ],
+                    ),
+                    over_records(e, moves),
+                    *swaps,
+                ],
+            ),
+        ]
+
+    def _assembly_sweep(self) -> List[llir.Stmt]:
+        """Build every compressed level from the sorted records in one sweep.
+
+        A record starts a new entry at a compressed level when it differs from
+        the record before it at that level or above.  The first compressed
+        level counts its entries per segment, prefix-summed afterwards; each
+        level below records, when the level above starts an entry, where that
+        entry's children begin.  Every record is an entry of the last level.
+        """
+
+        result_name = self.result_decl.name
+        dense = self._dense_prefix()
+        levels = list(range(dense, len(self.result_decl.levels)))
+        e = self._int64("e")
+        nnz = llir.Var(name=self._entry_count_name(), type=llir.DataType.INT64)
+        seg = self._int64("seg")
+        prev_seg = self._int64("prev_seg")
+
+        def pos(level: int) -> llir.Var:
+            return llir.Var(
+                name=f"{result_name}{level}_pos", type=llir.DataType.STD_VECTOR_C_INT
+            )
+
+        def crd(level: int) -> llir.Var:
+            return llir.Var(
+                name=f"{result_name}{level}_crd", type=llir.DataType.STD_VECTOR_C_INT
+            )
+
+        def started(level: int) -> llir.Var:
+            return llir.Var(
+                name=f"{result_name}{level}_starts", type=llir.DataType.BOOL
+            )
+
+        def counter(level: int) -> llir.Var:
+            return self._int64(f"n{level}")
+
+        def previous(level: int) -> llir.Var:
+            return self._int64(f"prev_crd{level}")
+
+        def coordinate(level: int) -> llir.Expr:
+            return llir.ArrayAccess(array=self._rec(str(level)), index=e)
+
+        setup: List[llir.Stmt] = [
+            llir.VarInit(
+                var=prev_seg, value=llir.Literal(-1, data_type=llir.DataType.INT64)
+            )
+        ]
+        for level in levels:
+            setup.append(
+                llir.VarInit(
+                    var=counter(level),
+                    value=llir.Literal(0, data_type=llir.DataType.INT64),
+                )
+            )
+            setup.append(
+                llir.VarInit(
+                    var=previous(level),
+                    value=llir.Literal(-1, data_type=llir.DataType.INT64),
+                )
+            )
+        body: List[llir.Stmt] = [
+            llir.VarInit(
+                var=seg,
+                value=(
+                    llir.ArrayAccess(array=self._rec("seg"), index=e)
+                    if dense
+                    else llir.Literal(0, data_type=llir.DataType.INT64)
+                ),
+            )
+        ]
+        for level in levels:
+            if level == dense:
+                starts: llir.Expr = llir.BinOp(
+                    op="||",
+                    left=llir.BinOp(
+                        op="||",
+                        left=llir.BinOp(op="==", left=e, right=llir.Literal(0)),
+                        right=llir.BinOp(op="!=", left=seg, right=prev_seg),
+                    ),
+                    right=llir.BinOp(
+                        op="!=", left=coordinate(level), right=previous(level)
+                    ),
+                )
+            else:
+                starts = llir.BinOp(
+                    op="||",
+                    left=started(level - 1),
+                    right=llir.BinOp(
+                        op="!=", left=coordinate(level), right=previous(level)
+                    ),
+                )
+            body.append(llir.VarInit(var=started(level), value=starts))
+            then: List[llir.Stmt] = []
+            if level == dense:
+                then.append(
+                    llir.Assign(
+                        var=llir.ArrayAccess(
+                            array=pos(level), index=llir.Add(seg, llir.Literal(1))
+                        ),
+                        value=llir.Literal(1),
+                        op=llir.AssignOp.ADD_ASSIGN,
+                        result_storage=self._result_storage(
+                            (RESULT_POS, level, STORAGE_WRITE),
+                            (RESULT_POS, level, STORAGE_READ),
+                        ),
+                    )
+                )
+            else:
+                then.append(
+                    llir.IfThenElse(
+                        cond=started(level - 1),
+                        then_body=[
+                            llir.Assign(
+                                var=llir.ArrayAccess(
+                                    array=pos(level),
+                                    index=llir.BinOp(
+                                        op="-",
+                                        left=counter(level - 1),
+                                        right=llir.Literal(1),
+                                    ),
+                                ),
+                                value=counter(level),
+                                result_storage=self._result_storage(
+                                    (RESULT_POS, level, STORAGE_WRITE)
+                                ),
+                            )
+                        ],
+                    )
+                )
+            then.append(
+                llir.Assign(
+                    var=llir.ArrayAccess(array=crd(level), index=counter(level)),
+                    value=coordinate(level),
+                    result_storage=self._result_storage(
+                        (RESULT_CRD, level, STORAGE_WRITE)
+                    ),
+                )
+            )
+            then.append(llir.Increment(var=counter(level)))
+            body.append(llir.IfThenElse(cond=started(level), then_body=then))
+        body.append(
+            llir.Assign(
+                var=llir.ArrayAccess(
+                    array=llir.Var(
+                        name=f"{result_name}_values", type=llir.DataType.NO_TYPE
+                    ),
+                    index=e,
+                    tensor_access=self._result_metadata(),
+                ),
+                value=llir.ArrayAccess(array=self._rec("val"), index=e),
+                result_storage=self._result_storage(
+                    (RESULT_VALUES, None, STORAGE_WRITE)
+                ),
+            )
+        )
+        body.append(llir.Assign(var=prev_seg, value=seg))
+        for level in levels:
+            body.append(
+                llir.Assign(
+                    var=previous(level),
+                    value=llir.Cast(
+                        expr=coordinate(level), data_type=llir.DataType.INT64
+                    ),
+                )
+            )
+        sweep = llir.ForLoop(
+            init=llir.VarInit(
+                var=e, value=llir.Literal(0, data_type=llir.DataType.INT64)
+            ),
+            cond=llir.BinOp(op="<", left=e, right=nnz),
+            update=llir.Increment(var=e),
+            body=body,
+        )
+        segment = self._int64("segment")
+        segments = self._extent_product(range(dense))
+        prefix_sum = llir.ForLoop(
+            init=llir.VarInit(
+                var=segment, value=llir.Literal(1, data_type=llir.DataType.INT64)
+            ),
+            cond=llir.BinOp(
+                op="<", left=segment, right=llir.Add(segments, llir.Literal(1))
+            ),
+            update=llir.Increment(var=segment),
+            body=[
+                llir.Assign(
+                    var=llir.ArrayAccess(array=pos(dense), index=segment),
+                    value=llir.ArrayAccess(
+                        array=pos(dense),
+                        index=llir.BinOp(op="-", left=segment, right=llir.Literal(1)),
+                    ),
+                    op=llir.AssignOp.ADD_ASSIGN,
+                    result_storage=self._result_storage(
+                        (RESULT_POS, dense, STORAGE_WRITE),
+                        (RESULT_POS, dense, STORAGE_READ),
+                    ),
+                )
+            ],
+        )
+        prefix_sum.scorch_index_var = segment.name
+        closing: List[llir.Stmt] = [prefix_sum]
+        for level in levels:
+            if level > dense:
+                closing.append(
+                    llir.Assign(
+                        var=llir.ArrayAccess(
+                            array=pos(level), index=counter(level - 1)
+                        ),
+                        value=counter(level),
+                        result_storage=self._result_storage(
+                            (RESULT_POS, level, STORAGE_WRITE)
+                        ),
+                    )
+                )
+                closing.append(
+                    llir.FunctionCallStmt(
+                        name=f"{pos(level).name}.resize",
+                        args=[
+                            llir.Cast(
+                                expr=llir.Add(counter(level - 1), llir.Literal(1)),
+                                data_type=llir.DataType.SIZE_T,
+                            )
+                        ],
+                        result_storage=self._result_storage(
+                            (RESULT_POS, level, STORAGE_WRITE)
+                        ),
+                    )
+                )
+            closing.append(
+                llir.FunctionCallStmt(
+                    name=f"{crd(level).name}.resize",
+                    args=[
+                        llir.Cast(expr=counter(level), data_type=llir.DataType.SIZE_T)
+                    ],
+                    result_storage=self._result_storage(
+                        (RESULT_CRD, level, STORAGE_WRITE)
+                    ),
+                )
+            )
+        return [
+            llir.Comment("Build each compressed level from the sorted records"),
+            *setup,
+            sweep,
+            llir.BlankLine(),
+            llir.Comment("Prefix sum: the first compressed level's segment starts"),
+            *closing,
+        ]
+
+    def _sorted_statements(self) -> List[llir.Stmt]:
+        """Walk the input into records, radix-sort them, and assemble the levels.
+
+        1. Walk the input once in its storage order, writing each entry's
+           record (:meth:`_record_fields`) and the largest value of every key.
+        2. A stable least-significant-digit radix sort over the keys
+           (:meth:`_sort_keys`), one counting pass per digit of
+           ``bit_width(entries)`` bits, at most
+           :data:`RELABELLED_COPY_DIGIT_BITS_MAX`: count, prefix-sum,
+           scatter into the scratch buffer, swap.
+        3. One sweep over the sorted records builds every compressed level
+           (:meth:`_assembly_sweep`).
+
+        Linear in the entries times the passes, plus the segments; no hashing
+        and no comparison sort.
+        """
+
+        result_name = self.result_decl.name
+        nnz = llir.Var(name=self._entry_count_name(), type=llir.DataType.INT64)
+        size = llir.Cast(expr=nnz, data_type=llir.DataType.SIZE_T)
+        statements: List[llir.Stmt] = [
+            llir.Comment("Records of the walked entries: current and scratch buffers")
+        ]
+        for field in self._record_fields():
+            for buffer in ("a", "b"):
+                statements.append(
+                    llir.DirectInit(var=self._rec(field, buffer), args=(size,))
+                )
+        statements.append(
+            llir.VarInit(
+                var=self._int64("entry"),
+                value=llir.Literal(0, data_type=llir.DataType.INT64),
+            )
+        )
+        if self._kept_prefix():
+            statements.append(
+                llir.VarInit(
+                    var=self._int64("run"),
+                    value=llir.Literal(-1, data_type=llir.DataType.INT64),
+                )
+            )
+            for level in range(self._kept_prefix()):
+                statements.append(
+                    llir.VarInit(
+                        var=self._int64(f"prev{level}"),
+                        value=llir.Literal(-1, data_type=llir.DataType.INT64),
+                    )
+                )
+        keys = self._sort_keys()
+        for _, largest, _ in keys:
+            if largest.name != self._int64("run").name:
+                statements.append(
+                    llir.VarInit(
+                        var=largest,
+                        value=llir.Literal(0, data_type=llir.DataType.INT64),
+                    )
+                )
+        statements.append(llir.Comment("Walk the input in its storage order"))
+        statements.extend(self._walk())
+        statements.append(llir.BlankLine())
+        statements.extend(self._digit_statements())
+        statements.append(
+            llir.DirectInit(
+                var=llir.Var(
+                    name=f"{result_name}_count", type=llir.DataType.STD_VECTOR_INT
+                ),
+                args=(llir.Literal(value=0, data_type=llir.DataType.SIZE_T),),
+            )
+        )
+        for number, (label, largest, key) in enumerate(keys):
+            statements.extend(self._radix_passes(number, label, largest, key))
+        statements.append(llir.BlankLine())
+        statements.extend(self._assembly_sweep())
+        return statements
+
+    def _digit_statements(self) -> List[llir.Stmt]:
+        """``digit_bits`` and ``digit_mask``: digits of ``bit_width(entries)`` bits.
+
+        At most :data:`RELABELLED_COPY_DIGIT_BITS_MAX`.
+        """
+
+        nnz = llir.Var(name=self._entry_count_name(), type=llir.DataType.INT64)
+        digit_bits = self._int64("digit_bits")
+        statements: List[llir.Stmt] = [
+            llir.Comment(
+                f"Digits of bit_width(entries) bits, at most {RELABELLED_COPY_DIGIT_BITS_MAX}"
+            )
+        ]
+        statements.append(
+            llir.VarInit(
+                var=digit_bits, value=llir.Literal(1, data_type=llir.DataType.INT64)
+            )
+        )
+        statements.append(
+            llir.WhileLoop(
+                cond=llir.BinOp(
+                    op="&&",
+                    left=llir.BinOp(
+                        op="<",
+                        left=digit_bits,
+                        right=llir.Literal(
+                            RELABELLED_COPY_DIGIT_BITS_MAX,
+                            data_type=llir.DataType.INT64,
+                        ),
+                    ),
+                    right=llir.BinOp(
+                        op=">",
+                        left=llir.BinOp(op=">>", left=nnz, right=digit_bits),
+                        right=llir.Literal(0),
+                    ),
+                ),
+                body=[llir.Increment(var=digit_bits)],
+            )
+        )
+        statements.append(
+            llir.VarInit(
+                var=self._int64("digit_mask"),
+                value=llir.BinOp(
+                    op="-",
+                    left=llir.BinOp(
+                        op="<<",
+                        left=llir.Literal(1, data_type=llir.DataType.INT64),
+                        right=digit_bits,
+                    ),
+                    right=llir.Literal(1),
+                ),
+            )
+        )
+        return statements
+
+
+class _RelabelledCopyChunkCountPass(_RelabelledCopyAssemblyLowering):
+    """The first walk of the parallel counting sort: each chunk counts into its row."""
+
+    def _lower_leaf(self) -> List[llir.Stmt]:
+        return self._chunk_count_leaf()
+
+
+class _RelabelledCopyChunkFillPass(_RelabelledCopyAssemblyLowering):
+    """The second walk of the parallel counting sort: each chunk stores its entries."""
+
+    def _lower_leaf(self) -> List[llir.Stmt]:
+        return self._chunk_fill_leaf()
+
+
+class _RelabelledCopyChunkRecordPass(_RelabelledCopyAssemblyLowering):
+    """The records walk of the parallel radix sort, and its sort keys.
+
+    It keeps no prefix: the one-thread form numbers the runs of the kept
+    prefix with a counter carried from entry to entry, which chunks walked at
+    once cannot share.  The prefix's levels are sorted by like the others.
+    """
+
+    def _kept_prefix(self) -> int:
+        return 0
+
+
+class _RelabelledCopyCountPass(_RelabelledCopyAssemblyLowering):
+    """The first walk of :class:`_RelabelledCopyAssemblyLowering`: it counts.
+
+    A separate, separately sealed lowering of the same program rather than a
+    mode of the first, because a target's state is fixed when it is built; its
+    only difference is the leaf.
+    """
+
+    def _lower_leaf(self) -> List[llir.Stmt]:
+        return self._count_leaf()
+
+
 def _canonical_csr_copy_leaves_its_route(
-    row_loop_is_dense: bool, column_loop_is_dense: bool
+    row_loop_is_dense: bool, column_loop_is_merged: bool
 ) -> bool:
     """Whether a CSR-result assembly takes the multi-compressed target.
 
-    The canonical-CSR route assembles one dense level over one compressed
-    level from a dense row loop and a stored or merged column loop.  The two
-    other drivers are the multi-compressed target's own rules at rank 2: a
-    stored stream over the row skips rows whose position entries the target's
-    row-scope catch-up closes, and a dense loop over the column is a leaf
-    level that appends every cell, because every operand is dense there.
-    Every assembly the canonical route takes stays on it; routing and the
-    target both ask this one function, so they cannot disagree.
+    The canonical-CSR route (the generic target) assembles one dense level
+    over one compressed level from a dense row loop and a merged column loop:
+    its ordered append is defined only below a merge.  Every other driver pair
+    is the multi-compressed target's own rules at rank 2: a stored stream or
+    an intersection over the row skips rows whose position entries the
+    target's row-scope catch-up closes; a single stored stream over the
+    column appends the entries it visits; and a dense loop over the column is
+    a leaf level that appends every cell, because every operand is dense
+    there.  Every assembly the canonical route takes stays on it; routing and
+    the target both ask this one function, so they cannot disagree.
     """
 
-    return not row_loop_is_dense or column_loop_is_dense
+    return not (row_loop_is_dense and column_loop_is_merged)
+
+
+def _dense_level_below_compressed(kinds: Sequence[LevelKind]) -> bool:
+    """Whether some dense result level sits below a compressed one.
+
+    Such a level is one cell of a dense block: each stored position of the
+    nearest compressed level above it owns the block's cells, so the
+    compressed coordinate is committed after its subtree only when the block
+    was written, and cells the loops skipped hold zero (values) or close an
+    empty segment (a compressed level below the block).
+    """
+
+    first = next(
+        (level for level, kind in enumerate(kinds) if kind is LevelKind.COMPRESSED),
+        None,
+    )
+    return first is not None and any(
+        kind is LevelKind.DENSE for kind in kinds[first + 1 :]
+    )
 
 
 def _multi_compressed_assembly_chain(program: LoopProgram) -> bool:
@@ -11793,8 +16036,15 @@ def _multi_compressed_assembly_chain(program: LoopProgram) -> bool:
         or (compressed_suffix == 1 and len(kinds) - compressed_suffix >= 2)
     )
     canonical_csr = kinds == (LevelKind.DENSE, LevelKind.COMPRESSED)
-    if not (ordered_compressed_suffix or canonical_csr) or any(
-        kind is not LevelKind.DENSE for kind in kinds[: len(kinds) - compressed_suffix]
+    # A dense level below a compressed one is admitted in any position: the
+    # target commits the compressed coordinate above each dense block only
+    # when the block was written.
+    if not _dense_level_below_compressed(kinds) and (
+        not (ordered_compressed_suffix or canonical_csr)
+        or any(
+            kind is not LevelKind.DENSE
+            for kind in kinds[: len(kinds) - compressed_suffix]
+        )
     ):
         return False
     body: Stmt = program.body
@@ -11813,7 +16063,7 @@ def _multi_compressed_assembly_chain(program: LoopProgram) -> bool:
         if type(only) is not AppendEntry or len(drivers) != len(kinds):
             return False
         return not canonical_csr or _canonical_csr_copy_leaves_its_route(
-            type(drivers[0]) is DenseFor, type(drivers[1]) is DenseFor
+            type(drivers[0]) is DenseFor, type(drivers[1]) is MergedSparseFor
         )
     return False
 
@@ -11853,8 +16103,11 @@ def _bound_prefix_assembly_chain(program: LoopProgram) -> bool:
     ):
         compressed_suffix += 1
     prefix = len(kinds) - compressed_suffix
-    if compressed_suffix < 1 or any(
-        kind is not LevelKind.DENSE for kind in kinds[:prefix]
+    # A dense level below a compressed one is admitted in any position, as it
+    # is for the assembly without a reduction.
+    if not _dense_level_below_compressed(kinds) and (
+        compressed_suffix < 1
+        or any(kind is not LevelKind.DENSE for kind in kinds[:prefix])
     ):
         return False
     body: Stmt = program.body
@@ -11870,10 +16123,31 @@ def _bound_prefix_assembly_chain(program: LoopProgram) -> bool:
             # guards structurally.  Loops past the last result level reduce.
             if len(assembly) < len(kinds):
                 assembly.append(
-                    only.index if type(only) is DenseFor else only.coord_index
+                    cast(DenseFor, only).index
+                    if type(only) is DenseFor
+                    else cast(SparseFor, only).coord_index
                 )
             else:
                 reductions += 1
+            body = only.body
+            continue
+        if (
+            type(only) is MergedSparseFor
+            and only.mode is MergeMode.INTERSECTION
+            and len(assembly) < len(kinds)
+        ):
+            # An intersection binds a result level like one stored stream: it
+            # visits the coordinates both operands store, once each, in order.
+            assembly.append(only.coord_index)
+            body = only.body
+            continue
+        if (
+            type(only) is MergedSparseFor
+            and _supported_merge(only)
+            and len(assembly) == len(kinds)
+        ):
+            # A merged reduction loop below every assembly loop.
+            reductions += 1
             body = only.body
             continue
         return (
@@ -11887,7 +16161,7 @@ def _bound_prefix_assembly_chain(program: LoopProgram) -> bool:
     return False
 
 
-class _MultiCompressedAssemblyLowering(_TargetLowering):
+class _MultiCompressedAssemblyLowering(_OrderedKeyRegionEmission):
     """Dedicated target lowering for the multi-compressed assembly families.
 
     Admits exactly the assembly forms ``lower_normalized_cin`` produces for
@@ -11921,7 +16195,22 @@ class _MultiCompressedAssemblyLowering(_TargetLowering):
     several dense parents over one compressed level, legacy closes segments
     against only the innermost coordinate and is malformed; that form is
     instead gated by the LoopIR oracle and compiled reference differentials.
+
+    The third leaf form is a :class:`SparseWorkspaceRegion` below ``p >= 0``
+    prefix loops that bind result levels ``0 .. p - 1``, for a result of any
+    dense/compressed layout.  The prefix levels are assembled exactly as the
+    other two forms assemble theirs -- dense blocks below a compressed level
+    included -- with the region where their child loop would be.  The region's
+    producer is any nest of dense, single-cursor and two-cursor merged loops
+    over one insertion; its key loops may nest in any order and need no
+    reduction loop above them, because the drain sorts the entries.  The
+    drain then assembles the drained levels ``p .. n - 1`` from the sorted
+    entries (see :meth:`_block_drain_statements`).
     """
+
+    # The two operands of a united assembly's sum, in leaf order; set by
+    # ``_collect_assembly_chain`` when the receiver is united.
+    _united_operands: Tuple[SymbolId, ...] = ()
 
     def __init__(
         self,
@@ -11957,8 +16246,11 @@ class _MultiCompressedAssemblyLowering(_TargetLowering):
         # bound first so no ordering accident can read one before the chain has
         # been validated.
         self._dense_prefix = 0
+        self._dense_blocks = False
         self._assembly_depth = 0
         self._reduction_depth = 0
+        # Set by ``_collect_region`` when the leaf is a sparse workspace region.
+        self._region_form = False
         if program.parallel is not None:
             _fail(
                 "unsupported_program_shape",
@@ -11990,6 +16282,7 @@ class _MultiCompressedAssemblyLowering(_TargetLowering):
         self._validate_access_orders()
         self._reserve_merge_names()
         self._reserve_reduction_accumulator_name()
+        self._reserve_region_names()
         self._seal_target_state(seal_token)
 
     def _validate_assembly_layouts(self) -> None:
@@ -12017,6 +16310,7 @@ class _MultiCompressedAssemblyLowering(_TargetLowering):
                     or (
                         state["kind"] is not LevelKind.DENSE
                         and state["kind"] is not LevelKind.COMPRESSED
+                        and state["kind"] is not LevelKind.COORDINATE
                     )
                 ):
                     _fail(
@@ -12057,7 +16351,18 @@ class _MultiCompressedAssemblyLowering(_TargetLowering):
             and result_levels[-1 - compressed_suffix].kind is LevelKind.COMPRESSED
         ):
             compressed_suffix += 1
-        prefix = len(result_levels) - compressed_suffix
+        # The dense prefix is the run of dense levels above the first
+        # compressed one.  Without a dense level below a compressed one it is
+        # every level above the compressed suffix.
+        prefix = 0
+        while (
+            prefix < len(result_levels)
+            and result_levels[prefix].kind is LevelKind.DENSE
+        ):
+            prefix += 1
+        dense_blocks = _dense_level_below_compressed(
+            tuple(level.kind for level in result_levels)
+        )
         # The degenerate rank-1 all-compressed result is one stored stream
         # with no dense prefix and no parent level to close.  Canonical CSR is
         # admitted for the bound-prefix reduction form, and for the assembly
@@ -12069,13 +16374,18 @@ class _MultiCompressedAssemblyLowering(_TargetLowering):
             or len(result_levels) == compressed_suffix == 1
             or (compressed_suffix == 1 and prefix >= 2)
         )
-        canonical_csr = compressed_suffix == 1 and prefix == 1
+        canonical_csr = compressed_suffix == 1 and prefix == 1 == len(result_levels) - 1
         require(
-            (ordered_compressed_suffix or canonical_csr)
-            and all(level.kind is LevelKind.DENSE for level in result_levels[:prefix]),
-            "a dense-prefix/multi-compressed-suffix result",
+            dense_blocks
+            or (
+                (ordered_compressed_suffix or canonical_csr)
+                and prefix == len(result_levels) - compressed_suffix
+            ),
+            "a dense-prefix/multi-compressed-suffix result, or one with a dense "
+            "level below a compressed level",
         )
         self._dense_prefix = prefix
+        self._dense_blocks = dense_blocks
         loops: List[_Loop] = []
         body: Stmt = self.program.body
         reduction_loops = 0
@@ -12085,18 +16395,38 @@ class _MultiCompressedAssemblyLowering(_TargetLowering):
                 "a single-statement assembly loop nest",
             )
             only = cast(Block, body).statements[0]
-            if len(loops) - reduction_loops == len(result_levels) and type(only) in (
-                DenseFor,
-                SparseFor,
+            if type(only) is SparseWorkspaceRegion:
+                require(
+                    reduction_loops == 0,
+                    "a workspace region directly below the prefix loops",
+                )
+                self._collect_region(cast(SparseWorkspaceRegion, only), require, loops)
+                return loops
+            if len(loops) - reduction_loops == len(result_levels) and (
+                type(only) in (DenseFor, SparseFor)
+                or (type(only) is MergedSparseFor and _supported_merge(only))
             ):
                 # The optional reduction sub-nest of the bound-prefix family.
                 # Every result coordinate is already bound, so these loops
                 # assemble nothing: they only accumulate, and the shared
-                # dense/sparse loop machinery emits them unchanged.  A merged
-                # reduction domain is refused here rather than approximated,
-                # exactly as the generic nest validator refuses one.
+                # dense/sparse/merged loop machinery emits them.  A merge
+                # above the innermost reduction loop descends only in its
+                # fully-aligned case (``_reduction_merged_case_stmts``).
                 reduction_loops += 1
-                if type(only) is DenseFor:
+                if type(only) is MergedSparseFor:
+                    merged = cast(MergedSparseFor, only)
+                    first = merged.cursors[0]
+                    loops.append(
+                        _Loop(
+                            _MERGED,
+                            merged.coord_index,
+                            self._level_dimension(first.tensor, first.level),
+                            merged,
+                            tuple(merged.cursors),
+                        )
+                    )
+                    body = merged.body
+                elif type(only) is DenseFor:
                     loops.append(_Loop(_DENSE, only.index, only.dimension, only, ()))
                     body = only.body
                 else:
@@ -12161,16 +16491,20 @@ class _MultiCompressedAssemblyLowering(_TargetLowering):
                 body = only.body
                 continue
             if type(only) is MergedSparseFor:
+                # Any merge may drive a dense level, in the prefix or in a
+                # block below a compressed level: the cells it skips are
+                # caught up by coordinate, or stay the block's zeros.  A
+                # union there is admitted only when every level from the
+                # first compressed one down is united, checked once the
+                # whole chain is collected.
                 require(
-                    len(loops) >= prefix,
-                    "stream loops to follow the dense prefix",
+                    len(loops) < len(result_levels),
+                    "no more assembly loops than result levels",
                 )
                 require(
-                    only.mode in (MergeMode.INTERSECTION, MergeMode.UNION)
-                    and len(only.cursors) == 2
-                    and len(only.positions) == 2
-                    and all(bound is not None for bound in only.positions),
-                    "two-cursor merges binding both aligned positions",
+                    _supported_merge(only),
+                    "two-cursor merges, or intersections of more cursors, "
+                    "binding every aligned position",
                 )
                 first = only.cursors[0]
                 loops.append(
@@ -12202,58 +16536,169 @@ class _MultiCompressedAssemblyLowering(_TargetLowering):
             )
             require(
                 ordered_compressed_suffix
+                or dense_blocks
                 or (
                     canonical_csr
                     and len(loops) == 2
                     and _canonical_csr_copy_leaves_its_route(
-                        loops[0].kind is _DENSE, loops[1].kind is _DENSE
+                        loops[0].kind is _DENSE, loops[1].kind is _MERGED
                     )
                 ),
                 "an assembly receiver other than a canonical-CSR one the "
                 "canonical route takes, which keeps its own family",
             )
+
+            def united(loop: _Loop) -> bool:
+                return loop.kind is _MERGED and cast(
+                    MergedSparseFor, loop.node
+                ).mode in (MergeMode.UNION, MergeMode.DENSE_UNION)
+
+            # A union may drive a dense prefix level of a united assembly: the
+            # level's cells are visited in increasing coordinate order, so the
+            # cells it skips are caught up exactly as below a stored stream,
+            # and each case descends into the operands present there.
+            all_suffix_united = bool(loops[prefix:]) and all(
+                united(loop) or loop.kind is _DENSE for loop in loops[prefix:]
+            )
             require(
                 len(loops) == len(result_levels)
-                and all(loop.kind is not _MERGED for loop in loops[:prefix]),
-                "one loop per result level, with a dense domain or one stored "
-                "stream driving each dense prefix level",
+                and all(
+                    loop.kind is not _MERGED
+                    or cast(MergedSparseFor, loop.node).mode is MergeMode.INTERSECTION
+                    or (united(loop) and all_suffix_united)
+                    for loop in loops[:prefix]
+                ),
+                "one loop per result level, with a dense domain, one stored "
+                "stream, an intersection, or (above united compressed levels) "
+                "a union driving each dense prefix level",
             )
             self._assembly_depth = len(loops)
-            union_pairs = {
-                tuple(cursor.tensor for cursor in loop.cursors)
-                for loop in loops
-                if loop.kind is _MERGED
-                and cast(MergedSparseFor, loop.node).mode is MergeMode.UNION
-            }
-            if union_pairs:
-                # One-sided union descent drains a single operand's whole
-                # subtree, so every stream level must unite the same two
-                # operands in the same order; mixing united levels with
-                # single-cursor or intersected levels has no sound
-                # one-sided child iterator.
-                require(
-                    len(union_pairs) == 1
-                    and all(
-                        loop.kind is _MERGED
-                        and cast(MergedSparseFor, loop.node).mode is MergeMode.UNION
-                        for loop in loops[prefix:]
-                    ),
-                    "united assemblies to unite the same two operands at "
-                    "every compressed level",
-                )
+
+            if any(united(loop) for loop in loops):
+                # A dense block below a united compressed level is filled by
+                # every case of the levels above it, the one-sided drains
+                # included, and committed after; a compressed level below
+                # such a block is caught up and closed per cell in those
+                # drains as in the merged cases (``_one_sided_level_statements``).
                 # The union family's proven envelope is the elementwise sum
-                # of exactly the two united operands; wider expressions
-                # (further factors or nested operations) stay fail-closed
-                # rather than approximated.
+                # of two or more operands, each read once: through its cursor
+                # at the leaf, or -- an operand dense at the leaf level -- by
+                # coordinate, or at its dense leaf position guarded by its
+                # united cursor above.  Wider expressions (factors or nested
+                # operations other than the sum) stay fail-closed rather than
+                # approximated.
                 value = cast(AppendEntry, only).value
+
+                def operand_read(read: Expr) -> bool:
+                    return type(read) in (CursorValue, Load) or (
+                        type(read) is PositionLoad
+                        and cast(PositionLoad, read).guard is not None
+                    )
+
+                def summed_reads(expr: Expr) -> List[Expr]:
+                    if type(expr) is BinaryExpr and expr.op is BinaryOp.ADD:
+                        return summed_reads(expr.lhs) + summed_reads(expr.rhs)
+                    return [expr]
+
+                reads = summed_reads(value)
                 require(
-                    type(value) is BinaryExpr
-                    and value.op is BinaryOp.ADD
-                    and type(value.lhs) is CursorValue
-                    and type(value.rhs) is CursorValue,
-                    "a united leaf to append exactly the sum of its two "
-                    "united operand reads",
+                    len(reads) >= 2 and all(operand_read(read) for read in reads),
+                    "a united leaf to append exactly the sum of its united "
+                    "operand reads",
                 )
+
+                cursor_tensors = {
+                    cursor.cursor: cursor.tensor
+                    for loop in loops
+                    for cursor in loop.cursors
+                }
+
+                def read_tensor(read: Expr) -> Optional[SymbolId]:
+                    if type(read) is Load:
+                        return cast(Load, read).tensor
+                    if type(read) is PositionLoad:
+                        load = cast(PositionLoad, read)
+                        guarded = cursor_tensors.get(cast(CursorId, load.guard))
+                        return load.tensor if guarded == load.tensor else None
+                    return cursor_tensors.get(cast(CursorValue, read).cursor)
+
+                read_tensors = [read_tensor(read) for read in reads]
+                require(
+                    all(tensor is not None for tensor in read_tensors)
+                    and len(set(read_tensors)) == len(read_tensors),
+                    "a united leaf to read different operands through the "
+                    "assembly's own cursors or by coordinate",
+                )
+                operands = tuple(cast(SymbolId, tensor) for tensor in read_tensors)
+                # One-sided descent drains a single operand's whole subtree,
+                # so every stream level must unite the same two operands in
+                # the same order: a UNION merges both streams, a DENSE_UNION
+                # follows one stream while the other operand is dense at
+                # that level (present at every coordinate).  Mixing united
+                # levels with single-cursor or intersected levels has no
+                # sound one-sided child iterator.
+                for position, loop in enumerate(loops):
+                    if position < prefix and not united(loop):
+                        continue
+                    if loop.kind is _DENSE:
+                        # Every operand is dense here.  Above every united
+                        # level both are present at each cell; below one, a
+                        # one-sided descent visits every cell for the operand
+                        # present (``_one_sided_dense_statements``).
+                        continue
+                    require(
+                        united(loop),
+                        "united assemblies to unite the same two operands at "
+                        "every compressed level",
+                    )
+                    node = cast(MergedSparseFor, loop.node)
+                    streams = tuple(cursor.tensor for cursor in node.cursors)
+                    if node.mode is MergeMode.UNION:
+                        # Two operands keep their order; more are compared as
+                        # a set (each case names its present operands).
+                        require(
+                            (
+                                streams == operands
+                                if len(operands) == 2
+                                else len(streams) == len(operands)
+                                and set(streams) == set(operands)
+                            ),
+                            "united assemblies to unite the same operands at "
+                            "every compressed level",
+                        )
+                        continue
+                    dense_side = [
+                        tensor for tensor in operands if tensor not in streams
+                    ]
+                    require(
+                        len(set(streams)) == len(streams)
+                        and set(streams) <= set(operands)
+                        and len(dense_side) >= 1
+                        and all(
+                            self._dense_at_dimension(tensor, loop.dimension)
+                            for tensor in dense_side
+                        ),
+                        "a dense union to follow the operands' streams while "
+                        "every other operand stores a dense level for its "
+                        "coordinate",
+                    )
+                for read in reads:
+                    if (
+                        type(read) in (Load, PositionLoad)
+                        and loops[-1].kind is not _DENSE
+                    ):
+                        # Below a dense leaf loop every operand is dense; below
+                        # a merged one only the operand a dense union does not
+                        # stream is.
+                        leaf_loop = cast(MergedSparseFor, loops[-1].node)
+                        require(
+                            leaf_loop.mode is MergeMode.DENSE_UNION
+                            and read_tensor(read)
+                            not in {cursor.tensor for cursor in leaf_loop.cursors},
+                            "a coordinate read only of the operand dense at the "
+                            "leaf level",
+                        )
+                self._united_operands = operands
             self.leaf = only
             return loops
 
@@ -12282,8 +16727,12 @@ class _MultiCompressedAssemblyLowering(_TargetLowering):
             "one loop per result level above the reduction sub-nest",
         )
         require(
-            all(loop.kind is not _MERGED for loop in loops[: self._assembly_depth]),
-            "single-cursor stream loops above a reduction sub-nest",
+            all(
+                loop.kind is not _MERGED
+                or cast(MergedSparseFor, loop.node).mode is MergeMode.INTERSECTION
+                for loop in loops[: self._assembly_depth]
+            ),
+            "single-cursor stream loops or intersections above a reduction " "sub-nest",
         )
         require(
             type(leaf) is StoreReduce
@@ -12302,6 +16751,686 @@ class _MultiCompressedAssemblyLowering(_TargetLowering):
             "the reduced result coordinates to be exactly the assembly loop "
             "coordinates, in order",
         )
+
+    def _collect_region(
+        self,
+        region: SparseWorkspaceRegion,
+        require: Callable[[bool, str], None],
+        loops: List[_Loop],
+    ) -> None:
+        """Validate one workspace-region leaf and append its producer loops.
+
+        ``loops`` holds the prefix loops; each binds the result level at its
+        own position.  The producer nest is appended after them, so a loop's
+        position is its depth in the emitted nest, but only the prefix loops
+        assemble: ``_assembly_depth`` is the prefix length.
+        """
+
+        result_levels = self.result_decl.levels
+        prefix = len(loops)
+        require(
+            all(
+                loop.kind is not _MERGED
+                or cast(MergedSparseFor, loop.node).mode is MergeMode.INTERSECTION
+                for loop in loops
+            ),
+            "dense, single-cursor or intersection prefix loops above a "
+            "workspace region",
+        )
+        workspace_decl = region.workspace
+        require(
+            type(workspace_decl) is SparseWorkspaceDecl,
+            "an exact sparse workspace declaration",
+        )
+        key_rank = len(workspace_decl.key_dimensions)
+        require(
+            key_rank >= 1 and prefix + key_rank == len(result_levels),
+            "one prefix loop per bound result level and one key dimension per "
+            "drained result level",
+        )
+        require(
+            workspace_decl.dtype is self.result_decl.dtype
+            and self.result_decl.dtype in _SCALAR_TO_TORCH,
+            "one shared supported scalar type for the workspace and result",
+        )
+        producer_body: Stmt = region.producer
+        insert: Optional[SparseWorkspaceInsert] = None
+        while insert is None:
+            require(
+                type(producer_body) is Block
+                and len(cast(Block, producer_body).statements) == 1,
+                "a single-statement producer nest",
+            )
+            only = cast(Block, producer_body).statements[0]
+            if type(only) is SparseWorkspaceInsert:
+                insert = cast(SparseWorkspaceInsert, only)
+                break
+            if type(only) is DenseFor:
+                dense_for = cast(DenseFor, only)
+                loops.append(
+                    _Loop(_DENSE, dense_for.index, dense_for.dimension, dense_for, ())
+                )
+                producer_body = dense_for.body
+                continue
+            if type(only) is SparseFor:
+                sparse_for = cast(SparseFor, only)
+                cursor = sparse_for.cursor
+                loops.append(
+                    _Loop(
+                        _SPARSE,
+                        sparse_for.coord_index,
+                        self._level_dimension(cursor.tensor, cursor.level),
+                        sparse_for,
+                        (cursor,),
+                    )
+                )
+                producer_body = sparse_for.body
+                continue
+            if type(only) is MergedSparseFor:
+                merged = cast(MergedSparseFor, only)
+                require(
+                    _supported_merge(merged),
+                    "two-cursor merges, or intersections of more cursors, "
+                    "binding every aligned position",
+                )
+                first = merged.cursors[0]
+                loops.append(
+                    _Loop(
+                        _MERGED,
+                        merged.coord_index,
+                        self._level_dimension(first.tensor, first.level),
+                        merged,
+                        tuple(merged.cursors),
+                    )
+                )
+                producer_body = merged.body
+                continue
+            require(
+                False,
+                "a dense, single-cursor sparse, or two-cursor merged producer loop",
+            )
+        require(
+            len(loops) > prefix,
+            "at least one producer loop inside the workspace region",
+        )
+        require(
+            insert.workspace == workspace_decl.workspace
+            and insert.op is ReduceOp.ADD
+            and len(insert.coords) == key_rank
+            and all(type(coord) is IndexValue for coord in insert.coords),
+            "an ADD insertion of the region's own workspace at plain "
+            "coordinates, one per key dimension",
+        )
+        producer_positions = {
+            loop.index: position
+            for position, loop in enumerate(loops)
+            if position >= prefix
+        }
+        insert_indices = [cast(IndexValue, coord).index for coord in insert.coords]
+        require(
+            all(index in producer_positions for index in insert_indices)
+            and len(set(insert_indices)) == key_rank,
+            "each insertion coordinate bound by its own producer loop",
+        )
+        # The key loops may nest in any order, with or without reduction loops
+        # between or above them: the drain sorts the merged entries, so only
+        # the key ORDER -- the insertion's coordinate order, which is result
+        # level order -- is structural.
+        key_loops = [loops[producer_positions[index]] for index in insert_indices]
+        require(
+            tuple(loop.dimension for loop in key_loops)
+            == tuple(workspace_decl.key_dimensions),
+            "the declared key dimensions to be exactly the drained loops' own "
+            "dimensions",
+        )
+        consumer = region.consumer
+        require(
+            type(consumer) is Block
+            and len(consumer.statements) == 1
+            and type(consumer.statements[0]) is SparseWorkspaceDrainFor,
+            "the one ordered drain as the whole consumer",
+        )
+        drain = cast(SparseWorkspaceDrainFor, consumer.statements[0])
+        require(
+            drain.workspace == workspace_decl.workspace
+            and len(drain.indices) == key_rank,
+            "a drain of the region's own workspace binding one index per key "
+            "dimension",
+        )
+        drain_body = drain.body
+        require(
+            type(drain_body) is Block
+            and len(drain_body.statements) == 1
+            and type(drain_body.statements[0]) is AppendEntry,
+            "the ordered append as the drain loop's whole body",
+        )
+        append = cast(AppendEntry, drain_body.statements[0])
+        require(
+            append.tensor == self.result_symbol
+            and len(append.coords) == len(result_levels)
+            and all(type(coord) is IndexValue for coord in append.coords)
+            and [cast(IndexValue, coord).index for coord in append.coords]
+            == [*(loop.index for loop in loops[:prefix]), *drain.indices]
+            and type(append.value) is SparseWorkspaceValue
+            and cast(SparseWorkspaceValue, append.value).workspace
+            == workspace_decl.workspace,
+            "an append of the drained value at the prefix and drained coordinates",
+        )
+        require(
+            len({loop.dimension for loop in loops}) == len(loops),
+            "one distinct declared dimension per loop",
+        )
+        self._region_form = True
+        self.sparse_region = region
+        self.workspace_decl = workspace_decl
+        self.sparse_insert = insert
+        self.sparse_drain = drain
+        self.sparse_append = append
+        self.key_rank = key_rank
+        self.key_loops = key_loops
+        self.prefix_depth = prefix
+        self._assembly_depth = prefix
+        self.leaf = insert
+
+    def _reserve_region_names(self) -> None:
+        if not self._region_form:
+            return
+        workspace_name = self.workspace_decl.name
+        if not _safe_cpp_display_identifier(workspace_name):
+            _fail(
+                "invalid_display_name",
+                f"workspace name {workspace_name!r} is not a safe ASCII C++ "
+                "identifier",
+            )
+        owner = f"workspace {workspace_name!r}"
+        self._reserve_generated_name(
+            "coo_workspace_1d" if self.key_rank == 1 else "coo_workspace",
+            "the ordered-key sparse-workspace runtime type",
+        )
+        self._reserve_generated_name(workspace_name, owner)
+        self._reserve_generated_name(f"{workspace_name}_value", owner)
+        self._reserve_generated_name("it", "the workspace drain iterator")
+        if self._drain_tracks_openings():
+            self._reserve_generated_name(f"{workspace_name}_first", owner)
+            self._reserve_generated_name(f"{workspace_name}_opened", owner)
+
+    def _access_value_expression(self) -> Expr:
+        if self._region_form:
+            return self._region_access_value_expression()
+        return _TargetLowering._access_value_expression(self)
+
+    def _validated_target_owner_signature(self) -> Tuple[object, ...]:
+        if self._region_form:
+            return self._region_target_owner_signature()
+        return _TargetLowering._validated_target_owner_signature(self)
+
+    def _leaf_indices(self) -> Tuple[Expr, ...]:
+        """With a region, the drained levels are driven by the key loops.
+
+        As in the ordered-key target: the drain's own indices name the same
+        coordinates on the consumer side and are not nest loops, so the shared
+        level-driver machinery is told the producer loops that generated them.
+        """
+
+        if self._region_form:
+            return (
+                *self.sparse_append.coords[: self.prefix_depth],
+                *self.sparse_insert.coords,
+            )
+        return _TargetLowering._leaf_indices(self)
+
+    def _validate_access_orders(self) -> None:
+        """Operands in storage order; with a region, only the prefix in order.
+
+        The drained levels are written in the drain's sorted order, whatever
+        order the producer visits their coordinates in, so the result's key
+        drivers are exempt from the storage-order rule.  Its prefix levels are
+        not: their loops assemble them, outermost first.
+        """
+
+        if not self._region_form:
+            _TargetLowering._validate_access_orders(self)
+            return
+        drivers = self.level_drivers
+        result_drivers = drivers.get(self.result_symbol, {})
+        self.level_drivers = {
+            symbol: per_tensor
+            for symbol, per_tensor in drivers.items()
+            if symbol != self.result_symbol
+        }
+        try:
+            _TargetLowering._validate_access_orders(self)
+        finally:
+            self.level_drivers = drivers
+        levels = len(self.result_decl.levels)
+        if sorted(result_drivers) != list(range(levels)) or [
+            self.loop_positions[result_drivers[level]]
+            for level in range(self.prefix_depth)
+        ] != list(range(self.prefix_depth)):
+            _fail(
+                "unsupported_loop_order",
+                f"tensor {self.result_decl.name!r} prefix levels must be bound "
+                "by the prefix loops, in storage order",
+            )
+
+    def _drain_tracks_openings(self) -> bool:
+        """Whether some drained compressed level has drained levels below it.
+
+        Such a level appends a coordinate only when an entry opens a new
+        segment there, which the drain decides with a flag that starts set at
+        the region's first entry.
+        """
+
+        if self._coordinate_result:
+            # A coordinate level has no segments: every drained entry stores
+            # its coordinate on every level, whatever the entry before stored.
+            return False
+        levels = self.result_decl.levels
+        return any(
+            levels[level].kind is LevelKind.COMPRESSED
+            for level in range(self.prefix_depth, len(levels) - 1)
+        )
+
+    def _drained_position(self, level: int) -> llir.Expr:
+        """The position of the current entry at ``level``, inside the drain.
+
+        A prefix level's position is the one its loop resolved -- a dense
+        level's resolve, or a compressed level's pending position, whose
+        coordinate is committed after the region.  A drained dense level's
+        position is the local the drain computed.  A drained compressed level
+        appended its coordinate already, so its position is one less than its
+        count.
+        """
+
+        name = f"p{self.result_decl.name}{level}"
+        if level < 0:
+            return llir.Literal(value=0, data_type=llir.DataType.INT64)
+        if (
+            level < self.prefix_depth
+            or self.result_decl.levels[level].kind is LevelKind.DENSE
+        ):
+            return llir.Var(name=name, type=llir.DataType.INT64)
+        return llir.BinOp(
+            "-",
+            llir.Var(name=name, type=llir.DataType.INT64),
+            llir.Literal(value=1, data_type=llir.DataType.INT64),
+        )
+
+    def _drained_catch_up(self, level: int, bound: llir.Expr) -> llir.ForLoop:
+        """Close every segment of compressed ``level`` before position ``bound``."""
+
+        return self._assembly_catch_up(self.loops[0], level, bound=bound)
+
+    def _block_extent(self, first: int, stop: int) -> llir.Expr:
+        """The number of cells of dense levels ``first .. stop - 1``."""
+
+        extent: llir.Expr = llir.Var(
+            name=f"{self.result_decl.name}{first}_size", type=llir.DataType.INT64
+        )
+        for level in range(first + 1, stop):
+            extent = llir.Mul(
+                left=extent,
+                right=llir.Var(
+                    name=f"{self.result_decl.name}{level}_size",
+                    type=llir.DataType.INT64,
+                ),
+            )
+        return extent
+
+    def _block_drain_statements(self) -> List[llir.Stmt]:
+        """Sort the workspace and assemble the drained levels from its entries.
+
+        The entries arrive in increasing lexicographic key order, one per
+        stored result coordinate, so every drained coordinate an entry names
+        has a stored entry below it and nothing is ever rolled back.  For each
+        entry, top down:
+
+        - a drained dense level's position is its parent's position times its
+          extent plus the coordinate;
+        - a drained compressed level with drained levels below appends its
+          coordinate when the entry opens a new segment there: the region's
+          first entry, a coordinate appended above, a new parent cell (its
+          position array has not reached the parent position yet), or a new
+          coordinate;
+        - the leaf appends the value and coordinate (compressed) or writes the
+          value at its position, growing the values with zeros (dense).
+
+        A drained compressed level below a drained dense one has one position
+        entry per parent cell; it is caught up to the parent position before
+        it appends, which closes the segments of the cells skipped since.  A
+        drained compressed level below a drained compressed one closes its
+        segment at its parent's coordinate count after each entry.  The first
+        drained level keeps the protocol the prefix level above it expects
+        (or the root close), exactly as if a loop had assembled it.
+        """
+
+        levels = self.result_decl.levels
+        count = len(levels)
+        prefix = self.prefix_depth
+        result_name = self.result_decl.name
+        workspace_name = self.workspace_decl.name
+        iterator_var = llir.Var(name="it", type=llir.DataType.CONST_AUTO_REF)
+        opened = llir.Var(name=f"{workspace_name}_opened", type=llir.DataType.BOOL)
+        first = llir.Var(name=f"{workspace_name}_first", type=llir.DataType.BOOL)
+        value = llir.Var(name=f"{workspace_name}_value", type=llir.DataType.NO_TYPE)
+
+        def int64(name: str) -> llir.Var:
+            return llir.Var(name=name, type=llir.DataType.INT64)
+
+        body: List[llir.Stmt] = self._drain_entry_bindings(iterator_var)
+        body.append(llir.BlankLine())
+        if self._coordinate_result:
+            # One entry per drained key: its value, then its coordinate on
+            # every level, innermost first -- the drained key components below
+            # the prefix, the prefix loops' own coordinates above.  Nothing is
+            # opened, caught up or closed: no level has a position array.
+            leaf = count - 1
+            body.extend(
+                self._coordinate_entry_appends(
+                    [
+                        llir.FunctionCallStmt(
+                            name=f"{result_name}_values.emplace_back",
+                            args=[value],
+                            result_storage=self._result_storage(
+                                (RESULT_VALUES, None, STORAGE_WRITE)
+                            ),
+                        ),
+                        llir.FunctionCallStmt(
+                            name=f"{result_name}{leaf}_crd.emplace_back",
+                            args=[int64(self._drain_coordinate_name(leaf - prefix))],
+                            result_storage=self._result_storage(
+                                (RESULT_CRD, leaf, STORAGE_WRITE)
+                            ),
+                        ),
+                        llir.Increment(var=int64(f"p{result_name}{leaf}")),
+                    ],
+                    [
+                        *self._assembly_coordinates(prefix),
+                        *(
+                            int64(self._drain_coordinate_name(level - prefix))
+                            for level in range(prefix, leaf)
+                        ),
+                    ],
+                )
+            )
+            return [
+                llir.BlankLine(),
+                llir.Comment("Lower consumer CIN"),
+                llir.FunctionCallStmt(name=f"{workspace_name}.sort", args=[]),
+                llir.ForLoopAuto(
+                    var=iterator_var,
+                    array=llir.Var(name=workspace_name, type=llir.DataType.AUTO),
+                    body=body,
+                ),
+                # The shipped compiler's drain ends with this line.
+                llir.BlankLine(),
+            ]
+        if self._drain_tracks_openings():
+            body.append(
+                llir.VarInit(
+                    var=opened, value=llir.Var(name=first.name, type=first.type)
+                )
+            )
+            body.append(llir.Assign(var=first, value=llir.Literal(False)))
+        for level in range(prefix, count):
+            coordinate = int64(self._drain_coordinate_name(level - prefix))
+            if levels[level].kind is LevelKind.DENSE:
+                body.append(
+                    llir.VarInit(
+                        var=int64(f"p{result_name}{level}"),
+                        value=llir.Add(
+                            llir.Mul(
+                                left=self._drained_position(level - 1),
+                                right=int64(f"{result_name}{level}_size"),
+                            ),
+                            coordinate,
+                        ),
+                    )
+                )
+                if level == count - 1:
+                    body.extend(self._dense_cell_store(value))
+                continue
+            catch_up: List[llir.Stmt] = []
+            parent_is_drained_dense = (
+                level > prefix and levels[level - 1].kind is LevelKind.DENSE
+            )
+            if parent_is_drained_dense:
+                catch_up = [
+                    self._drained_catch_up(level, self._drained_position(level - 1))
+                ]
+            if level == count - 1:
+                body.extend(
+                    [
+                        *catch_up,
+                        llir.FunctionCallStmt(
+                            name=f"{result_name}_values.emplace_back",
+                            args=[value],
+                            result_storage=self._result_storage(
+                                (RESULT_VALUES, None, STORAGE_WRITE)
+                            ),
+                        ),
+                        llir.FunctionCallStmt(
+                            name=f"{result_name}{level}_crd.emplace_back",
+                            args=[coordinate],
+                            result_storage=self._result_storage(
+                                (RESULT_CRD, level, STORAGE_WRITE)
+                            ),
+                        ),
+                        llir.Increment(var=int64(f"p{result_name}{level}")),
+                    ]
+                )
+                continue
+            new_coordinate: llir.Expr = llir.BinOp(
+                "!=",
+                llir.FunctionCall(name=f"{result_name}{level}_crd.back", args=[]),
+                coordinate,
+            )
+            if parent_is_drained_dense:
+                new_coordinate = llir.BinOp(
+                    "||",
+                    llir.BinOp(
+                        "<",
+                        llir.Var(
+                            name=f"{result_name}{level}_pos_index",
+                            type=llir.DataType.INT,
+                        ),
+                        self._drained_position(level - 1),
+                    ),
+                    new_coordinate,
+                )
+            body.append(
+                llir.IfThenElse(
+                    cond=llir.BinOp(
+                        "||",
+                        llir.Var(name=opened.name, type=opened.type),
+                        new_coordinate,
+                    ),
+                    then_body=[
+                        llir.Assign(var=opened, value=llir.Literal(True)),
+                        *catch_up,
+                        llir.FunctionCallStmt(
+                            name=f"{result_name}{level}_crd.push_back",
+                            args=[coordinate],
+                            result_storage=self._result_storage(
+                                (RESULT_CRD, level, STORAGE_WRITE)
+                            ),
+                        ),
+                        llir.Increment(var=int64(f"p{result_name}{level}")),
+                    ],
+                    result_storage=self._result_storage(
+                        (RESULT_CRD, level, STORAGE_READ)
+                    ),
+                )
+            )
+        for level in range(prefix + 1, count):
+            if (
+                levels[level].kind is LevelKind.COMPRESSED
+                and levels[level - 1].kind is LevelKind.COMPRESSED
+            ):
+                body.append(
+                    llir.FunctionCallStmt(
+                        name="scorch_vector_set",
+                        args=[
+                            llir.Var(
+                                name=f"{result_name}{level}_pos",
+                                type=llir.DataType.NO_TYPE,
+                            ),
+                            llir.FunctionCall(
+                                name=f"{result_name}{level - 1}_crd.size", args=[]
+                            ),
+                            llir.FunctionCall(
+                                name=f"{result_name}{level}_crd.size", args=[]
+                            ),
+                        ],
+                        result_storage=self._result_storage(
+                            (RESULT_POS, level, STORAGE_WRITE),
+                            (RESULT_CRD, level - 1, STORAGE_READ),
+                            (RESULT_CRD, level, STORAGE_READ),
+                        ),
+                    )
+                )
+        return [
+            llir.BlankLine(),
+            llir.Comment("Lower consumer CIN"),
+            llir.FunctionCallStmt(name=f"{workspace_name}.sort", args=[]),
+            llir.ForLoopAuto(
+                var=iterator_var,
+                array=llir.Var(name=workspace_name, type=llir.DataType.AUTO),
+                body=body,
+            ),
+        ]
+
+    def _drained_block_close_statements(self) -> List[llir.Stmt]:
+        """Complete the dense block below the region's last drained coordinates.
+
+        A drained compressed level ``a`` with dense levels below it owns one
+        block of those levels' cells per coordinate.  The drain fills a block
+        only up to its last entry, and the next block's first write closes the
+        rest, so after the drain only the block of the last coordinate is
+        open: its values (or the position entries of the compressed level
+        below it) are completed to the block's end.  Blocks below prefix levels
+        are completed by the prefix's own commit and closes.
+        """
+
+        levels = self.result_decl.levels
+        count = len(levels)
+        result_name = self.result_decl.name
+        statements: List[llir.Stmt] = []
+        for above in range(self.prefix_depth, count - 1):
+            if (
+                levels[above].kind is not LevelKind.COMPRESSED
+                or levels[above + 1].kind is not LevelKind.DENSE
+            ):
+                continue
+            below = above + 1
+            while below < count and levels[below].kind is LevelKind.DENSE:
+                below += 1
+            stop = llir.Mul(
+                left=llir.FunctionCall(name=f"{result_name}{above}_crd.size", args=[]),
+                right=self._block_extent(above + 1, below),
+            )
+            if below == count:
+                statements.append(
+                    llir.FunctionCallStmt(
+                        name=f"{result_name}_values.resize",
+                        args=[stop, llir.Literal(0)],
+                        result_storage=self._result_storage(
+                            (RESULT_CRD, above, STORAGE_READ),
+                            (RESULT_VALUES, None, STORAGE_WRITE),
+                        ),
+                    )
+                )
+            else:
+                statements.append(self._drained_catch_up(below, stop))
+        if not statements:
+            return []
+        return [
+            llir.BlankLine(),
+            llir.Comment("Complete the block below the last drained coordinate"),
+            *statements,
+        ]
+
+    def _region_block_statements(self) -> List[llir.Stmt]:
+        """The workspace, its producer nest, the drain, and the last block close."""
+
+        position = self.prefix_depth
+        producer = self.loops[position]
+        produced: List[llir.Stmt]
+        if producer.kind is _DENSE:
+            produced = [llir.BlankLine(), self._lower_dense(position)]
+        elif producer.kind is _SPARSE:
+            produced = list(self._lower_sparse(position))
+        else:
+            produced = list(self._lower_merged(position))
+        preamble: List[llir.Stmt] = []
+        if self._drain_tracks_openings():
+            preamble.append(
+                llir.VarInit(
+                    var=llir.Var(
+                        name=f"{self.workspace_decl.name}_first",
+                        type=llir.DataType.BOOL,
+                    ),
+                    value=llir.Literal(True),
+                )
+            )
+        return [
+            llir.Comment("Initialize workspaces"),
+            self._workspace_init_statement(),
+            *preamble,
+            *produced,
+            *self._block_drain_statements(),
+            *self._drained_block_close_statements(),
+        ]
+
+    def _region_raw_loop_statements(self) -> List[llir.Stmt]:
+        """The prefix nest (or the region at the root) and the final closes.
+
+        ``_dense_prefix`` is the index of the first compressed level.  When it
+        is a drained level below drained dense levels, its position array has
+        one entry per cell of every dense level above it, and the drain closes
+        it only up to its last entry, so one final catch-up closes the rest --
+        the role a dense prefix loop's own close plays when it binds that
+        level's parent.
+        """
+
+        levels = self.result_decl.levels
+        prefix = self.prefix_depth
+        first_compressed = self._dense_prefix
+        statements: List[llir.Stmt]
+        if prefix == 0:
+            statements = list(self._region_block_statements())
+        elif self.loops[0].kind is _SPARSE:
+            statements = list(self._lower_sparse(0))
+        elif self.loops[0].kind is _MERGED:
+            statements = list(self._lower_merged(0))
+        else:
+            statements = [llir.BlankLine(), self._lower_dense(0)]
+        if self._coordinate_result:
+            # No root segment to close and no catch-up: a coordinate level has
+            # no position array, and every drained entry stored its own
+            # coordinates.
+            return statements
+        if levels[0].kind is LevelKind.COMPRESSED:
+            statements.extend(
+                [
+                    llir.BlankLine(),
+                    llir.Comment("Assembly compressed _level indices"),
+                    self._assembly_result_pos_set(0),
+                ]
+            )
+        elif first_compressed > prefix:
+            statements.extend(
+                [
+                    llir.BlankLine(),
+                    llir.Comment("Assembly compressed _level indices"),
+                    self._drained_catch_up(
+                        first_compressed, self._block_extent(0, first_compressed)
+                    ),
+                ]
+            )
+        elif _needs_stored_prefix_final_catch_up(self, first_compressed):
+            statements.extend(_stored_prefix_final_statements(self, first_compressed))
+        return statements
 
     def _reserve_reduction_accumulator_name(self) -> None:
         """Reserve the scalar this family's reduction sub-nest accumulates in.
@@ -12323,24 +17452,23 @@ class _MultiCompressedAssemblyLowering(_TargetLowering):
             )
 
     def _leaf_needs_structural_guard(self) -> bool:
-        """Whether the innermost result level is driven by a dense domain.
+        """Whether the leaf's append waits on the reduction sub-nest having run.
 
-        A stored stream over the leaf level visits only coordinates its operand
-        stored, so the domain itself carries the answer and the append is
-        unconditional.  A dense domain visits every coordinate, including ones
-        no operand stored anything under, so the coordinate must be appended
-        exactly when the reduction sub-nest below it ran at least once -- that
-        is, when the operands' intersected stored structure under the
-        coordinate is non-empty.  That covers one operand's position range,
-        dense levels flattened between stored ones, a zero-extent dense level,
-        and coordinate intersections alike, and it never inspects a value: a
-        stored zero, or contributions cancelling exactly, keep the key.
+        A result coordinate is stored exactly when the operands store something
+        under it.  With a reduction sub-nest below the innermost result level,
+        "something" is an entry that sub-nest visits, so the coordinate is
+        appended exactly when the sub-nest ran at least once -- whatever drives
+        the leaf loop.  A dense domain visits coordinates no operand stores
+        anything under.  A stored stream visits only stored coordinates, but a
+        stored coordinate may own an empty child segment, or a dense level of
+        extent zero, and then stores nothing either.  The flag covers one
+        operand's position range, dense levels flattened between stored ones,
+        a zero-extent dense level, and coordinate intersections alike, and it
+        never inspects a value: a stored zero, or contributions cancelling
+        exactly, keep the key.
         """
 
-        return (
-            self._reduction_depth > 0
-            and self.loops[self._assembly_depth - 1].kind is _DENSE
-        )
+        return self._reduction_depth > 0
 
     def _structural_guard_name(self) -> str:
         return f"{self.result_decl.name}_nonempty"
@@ -12354,11 +17482,7 @@ class _MultiCompressedAssemblyLowering(_TargetLowering):
     def _reduction_accumulator_var(self) -> llir.Var:
         return llir.Var(
             name=self._reduction_accumulator_name(),
-            type=(
-                llir.DataType.FLOAT32
-                if self.result_decl.dtype is ScalarType.FLOAT32
-                else llir.DataType.FLOAT64
-            ),
+            type=_scalar_llir_type(self.result_decl.dtype),
         )
 
     def _bound_prefix_leaf_statements(self, position: int) -> List[llir.Stmt]:
@@ -12398,6 +17522,21 @@ class _MultiCompressedAssemblyLowering(_TargetLowering):
             ),
             llir.Increment(var=llir.Var(name=position_name, type=llir.DataType.INT64)),
         ]
+        appends = self._coordinate_entry_appends(
+            appends, self._assembly_coordinates(leaf_level)
+        )
+        if self.result_decl.levels[leaf_level].kind is LevelKind.DENSE:
+            # A dense leaf below a compressed level: the accumulator is one
+            # cell of the block, written where a copy writes its value.  The
+            # compressed coordinate above is committed by the block commit
+            # only if a cell was written, so a guarded cell left unwritten
+            # leaves it unstored.
+            appends = self._dense_block_leaf_statements(
+                llir.Var(name=accumulator.name, type=accumulator.type),
+                llir.Increment(
+                    var=llir.Var(name=position_name, type=llir.DataType.INT64)
+                ),
+            )
         guard_init: List[llir.Stmt] = []
         if guarded:
             guard = self._structural_guard_var()
@@ -12414,7 +17553,10 @@ class _MultiCompressedAssemblyLowering(_TargetLowering):
             llir.Comment("Initialize the reduction accumulator"),
             llir.VarInit(
                 var=accumulator,
-                value=llir.Literal(0.0, accumulator.type),
+                value=llir.Literal(
+                    0.0 if self.result_decl.dtype.is_floating else 0,
+                    accumulator.type,
+                ),
             ),
             *guard_init,
             llir.BlankLine(),
@@ -12429,15 +17571,50 @@ class _MultiCompressedAssemblyLowering(_TargetLowering):
     def _lower_leaf(self) -> List[llir.Stmt]:
         """``C_reduction += <value>;`` at the bottom of the reduction sub-nest."""
 
+        if self._region_form:
+            return [self._insert_statement()]
         if not self._reduction_depth:
             return _TargetLowering._lower_leaf(self)
+        return self._accumulate_statements(
+            self._lower_value(cast(StoreReduce, self.leaf).value)
+        )
+
+    def _reduction_merged_case_stmts(
+        self, loop: _Loop, aligned: Set[CursorId]
+    ) -> Optional[List[llir.Stmt]]:
+        """One alignment case of a merged loop in the reduction sub-nest.
+
+        The same rule as a merged producer loop of a workspace region: a merge
+        above the innermost loop descends into its child only in the
+        fully-aligned case, since a one-sided branch would iterate a child
+        stream the absent operand does not carry; the innermost merge
+        accumulates the case's value, with the absent operand's identity
+        folded in by the shared merged value lowering.
+        """
+
+        position = self.loop_positions[loop.index]
+        if position != len(self.loops) - 1:
+            if aligned != {cursor.cursor for cursor in loop.cursors}:
+                _fail(
+                    "unsupported_program_shape",
+                    "a one-sided merge case above the innermost reduction "
+                    "loop would need a child stream the absent operand does "
+                    "not carry",
+                )
+            return self._loop_children(position)
+        value = self._merged_case_value(cast(StoreReduce, self.leaf).value, aligned)
+        if value is None:
+            return None
+        return self._accumulate_statements(value)
+
+    def _accumulate_statements(self, value: llir.Expr) -> List[llir.Stmt]:
+        """``C_reduction += value;`` and the structural flag the append reads."""
+
         accumulator = self._reduction_accumulator_var()
         stmts: List[llir.Stmt] = [
             llir.Assign(
                 var=llir.Var(name=accumulator.name, type=llir.DataType.NO_TYPE),
-                value=self._lower_value(
-                    cast(StoreReduce, self.leaf).value,
-                ),
+                value=value,
                 op=llir.AssignOp.ADD_ASSIGN,
             )
         ]
@@ -12524,12 +17701,49 @@ class _MultiCompressedAssemblyLowering(_TargetLowering):
             child_position_close,
         ]
 
+    def _cursors_bound_above(self, position: int) -> Set[CursorId]:
+        """The cursors every iteration of the loop at ``position`` finds bound.
+
+        A single-cursor loop binds its cursor for its whole body, and an
+        intersection runs its body only where both of its cursors align.  A
+        union is left out: which of its cursors is aligned depends on the case,
+        and its one-sided descent is lowered separately.
+        """
+
+        bound: Set[CursorId] = set()
+        for enclosing in self.loops[:position]:
+            if enclosing.kind is _SPARSE or (
+                enclosing.kind is _MERGED
+                and cast(MergedSparseFor, enclosing.node).mode is MergeMode.INTERSECTION
+            ):
+                bound.update(cursor.cursor for cursor in enclosing.cursors)
+        return bound
+
     def _merged_case_stmts(
         self, loop: _Loop, aligned: Set[CursorId]
     ) -> Optional[List[llir.Stmt]]:
         position = self.loop_positions[loop.index]
-        if position == self._assembly_depth - 1:
-            leaf_stmts = super()._merged_case_stmts(loop, aligned)
+        if self._region_form and position >= self.prefix_depth:
+            # A merged producer loop writes the workspace.  A merged prefix
+            # loop (an intersection) assembles its level like any other
+            # prefix loop, below.
+            return self._region_merged_case_stmts(loop, aligned)
+        if self._reduction_depth and position >= self._assembly_depth:
+            return self._reduction_merged_case_stmts(loop, aligned)
+        if position == self._assembly_depth - 1 and self._reduction_depth:
+            # An intersection driving the innermost bound level: its one case
+            # holds the accumulator, the reduction sub-nest and the append.
+            if not all(cursor.cursor in aligned for cursor in loop.cursors):
+                return None
+            return self._bound_prefix_leaf_statements(position)
+        if position == self._assembly_depth - 1 and not self._region_form:
+            # The leaf value may read an operand whose last stored level an
+            # enclosing loop iterates (an outer product: ``A[i, j] * B[k, l]``
+            # reads A at the ``j`` loop's cursor).  That cursor is bound here
+            # whatever this loop's case, so it is aligned, not defaulted.
+            leaf_stmts = super()._merged_case_stmts(
+                loop, aligned | self._cursors_bound_above(position)
+            )
             if leaf_stmts is None:
                 return leaf_stmts
             result_name = self.result_decl.name
@@ -12548,45 +17762,375 @@ class _MultiCompressedAssemblyLowering(_TargetLowering):
                 )
             value_store = cast(llir.Assign, leaf_stmts[0])
             coordinate_store = cast(llir.Assign, leaf_stmts[2])
+            if self.result_decl.levels[leaf_level].kind is LevelKind.DENSE:
+                return self._dense_block_leaf_statements(
+                    value_store.value, cast(llir.Increment, leaf_stmts[3])
+                )
             # This converts the base class's two indexed stores into appends and
             # keeps only their VALUES, discarding the targets -- including the
             # ``RESULT_WRITE`` access provenance the base class put on the value
             # store's ``ArrayAccess``.  So the statement marker here restates a
             # fact the conversion drops rather than duplicating a surviving one.
-            return [
-                llir.FunctionCallStmt(
-                    name=f"{result_name}_values.emplace_back",
-                    args=[value_store.value],
-                    result_storage=self._result_storage(
-                        (RESULT_VALUES, None, STORAGE_WRITE)
+            return self._coordinate_entry_appends(
+                [
+                    llir.FunctionCallStmt(
+                        name=f"{result_name}_values.emplace_back",
+                        args=[value_store.value],
+                        result_storage=self._result_storage(
+                            (RESULT_VALUES, None, STORAGE_WRITE)
+                        ),
                     ),
-                ),
-                leaf_stmts[1],
-                llir.FunctionCallStmt(
-                    name=f"{result_name}{leaf_level}_crd.emplace_back",
-                    args=[coordinate_store.value],
-                    result_storage=self._result_storage(
-                        (RESULT_CRD, leaf_level, STORAGE_WRITE)
+                    leaf_stmts[1],
+                    llir.FunctionCallStmt(
+                        name=f"{result_name}{leaf_level}_crd.emplace_back",
+                        args=[coordinate_store.value],
+                        result_storage=self._result_storage(
+                            (RESULT_CRD, leaf_level, STORAGE_WRITE)
+                        ),
                     ),
-                ),
-                leaf_stmts[3],
-            ]
+                    leaf_stmts[3],
+                ],
+                self._assembly_coordinates(leaf_level),
+            )
         aligned_tensors = {
             cursor.tensor for cursor in loop.cursors if cursor.cursor in aligned
         }
-        if len(aligned_tensors) == len({c.tensor for c in loop.cursors}):
+        loop_tensors = {cursor.tensor for cursor in loop.cursors}
+        if cast(MergedSparseFor, loop.node).mode is MergeMode.DENSE_UNION:
+            # An operand dense at this level is present at every coordinate,
+            # in every case -- unless the entry its dense level hangs from is
+            # absent (``sds`` inside a case of the union over its first level
+            # in which it did not align).  Then it stores nothing under this
+            # loop and takes no part in any case.
+            dense_side = {
+                tensor
+                for tensor in set(self._united_operands) - loop_tensors
+                if not self._operand_absent_here(
+                    tensor, self._dense_level_at_dimension(tensor, loop.dimension)
+                )
+            }
+            aligned_tensors |= dense_side
+            loop_tensors |= dense_side
+        if not aligned_tensors:
+            # No operand stores this coordinate, so the case appends nothing.
+            return None
+        if aligned_tensors == loop_tensors or len(aligned_tensors) > 1:
+            # Every operand present, or (three or more operands) several: the
+            # child levels merge as they are; an absent operand's child
+            # stream is the empty segment (its cursor's alignment is false
+            # here), so its merges run only their present operands' points.
             child_stmts = self._child_stream_statements(position)
         else:
-            # A one-sided UNION case drains the single aligned operand's
-            # whole subtree in stored order.
+            # A one-sided case drains the single present operand's whole
+            # subtree in stored order.
             child_stmts = self._one_sided_stream_statements(
                 position + 1, next(iter(aligned_tensors))
             )
+        if self.result_decl.levels[position].kind is LevelKind.DENSE:
+            # An intersection driving a dense level inside a block: the level's
+            # position is resolved from the coordinate the two cursors agree
+            # on, so the cells it skips are caught up exactly as below a stored
+            # stream, and a compressed child is closed per visited cell.
+            if self._owns_child_close(position):
+                return [
+                    *_stored_prefix_open_statements(self, position),
+                    *child_stmts,
+                    *_stored_prefix_close_statements(self, position),
+                ]
+            return child_stmts
+        return [*child_stmts, *self._compressed_level_close_statements(position)]
+
+    def _assembly_coordinates(self, levels: int) -> List[llir.Expr]:
+        """The coordinates the assembly loops bind for result levels ``0 ..
+        levels - 1``: loop ``position`` binds result level ``position``."""
+
         return [
-            *child_stmts,
+            llir.Var(
+                name=self._loop_var_name(self.loops[level]),
+                type=llir.DataType.INT64,
+            )
+            for level in range(levels)
+        ]
+
+    def _compressed_level_close_statements(self, position: int) -> List[llir.Stmt]:
+        """What a compressed level's loop body ends with, after its child.
+
+        Below it is either another compressed level, whose appends decide this
+        coordinate through the conditional parent append, or a dense block,
+        whose writes decide it through the block commit.
+        """
+
+        if self._coordinate_result:
+            # Every entry stored this level's coordinate with its own append.
+            return []
+        if self.result_decl.levels[position + 1].kind is LevelKind.DENSE:
+            return self._dense_block_commit_statements(position + 1)
+        return [
             llir.BlankLine(),
             llir.Comment("Assembly compressed _level indices"),
             *self._parent_append_statements(position),
+        ]
+
+    def _resolves_after_catch_up(self, loop: _Loop) -> bool:
+        """Whether a stored loop over dense level 0 resolves its result position late.
+
+        The catch-up of the compressed level below a stored level 0 reads only
+        the coordinate, so it and the level's own position resolve
+        (``int pC0 = i;``) are independent; the shipped compiler emits the
+        catch-up first, and so does this target, so the two emit one text.
+        """
+
+        return (
+            loop.kind is _SPARSE
+            and self._dense_prefix == 1
+            and self.loop_positions.get(loop.index) == 0
+            and self._assembly_depth > 1
+        )
+
+    def _result_resolves_at(self, loop: _Loop) -> List[llir.Stmt]:
+        if (
+            self._region_form
+            and self.loop_positions.get(loop.index, -1) >= self.prefix_depth
+        ):
+            # A producer loop writes the workspace; the drain resolves the
+            # drained levels' positions itself.
+            return []
+        if self._resolves_after_catch_up(loop):
+            # Emitted after the catch-up, by ``_loop_children``.
+            return []
+        return _TargetLowering._result_resolves_at(self, loop)
+
+    def _owns_block_catch_up(self, position: int) -> bool:
+        """Whether this loop's dense result level closes a compressed child.
+
+        A dense level below a compressed one owns one position of its
+        compressed child per cell, numbered from the pending position of the
+        compressed level above (``pC0 * C1_size + j``), so it catches the child
+        up before its cell and closes it after, exactly as the dense prefix's
+        innermost level does for the first compressed level.
+        """
+
+        levels = self.result_decl.levels
+        return (
+            self._dense_blocks
+            and self._dense_prefix < position < len(levels) - 1
+            and position < self._assembly_depth
+            and levels[position].kind is LevelKind.DENSE
+            and levels[position + 1].kind is LevelKind.COMPRESSED
+        )
+
+    def _owns_child_close(self, position: int) -> bool:
+        """Whether the assembly loop at ``position`` closes a compressed child.
+
+        The innermost dense prefix level closes the first compressed level, and
+        a dense level inside a block closes the compressed level below it.  A
+        loop past the assembly depth (a reduction or producer loop) closes
+        nothing, and neither does one whose child level is dense: with a region,
+        the first compressed level can lie below drained dense levels, and the
+        drain closes it.
+        """
+
+        levels = self.result_decl.levels
+        return (
+            position < self._assembly_depth
+            and position + 1 < len(levels)
+            and levels[position + 1].kind is LevelKind.COMPRESSED
+            and (
+                position == self._dense_prefix - 1
+                or self._owns_block_catch_up(position)
+            )
+        )
+
+    def _dense_block_leaf_statements(
+        self, value: llir.Expr, advance: llir.Increment
+    ) -> List[llir.Stmt]:
+        """Store one cell of a dense block of values below a compressed level.
+
+        The value vector grows with zeros up to the cell first, so cells the
+        loops skipped read as zero, then the cell is set in range -- the
+        shipped compiler's spelling (``dense_block_leaf_store``), so the two
+        emit one text.
+        """
+
+        return [*self._dense_cell_store(value), advance]
+
+    def _dense_cell_store(self, value: llir.Expr) -> List[llir.Stmt]:
+        """Grow the values with zeros up to the leaf position, then set it."""
+
+        result_name = self.result_decl.name
+        values_name = f"{result_name}_values"
+        leaf_level = len(self.result_decl.levels) - 1
+        position = llir.Var(
+            name=f"p{result_name}{leaf_level}", type=llir.DataType.INT64
+        )
+        write = self._result_storage((RESULT_VALUES, None, STORAGE_WRITE))
+        return [
+            llir.IfThenElse(
+                cond=llir.BinOp(
+                    op="<=",
+                    left=llir.FunctionCall(name=f"{values_name}.size", args=[]),
+                    right=position,
+                ),
+                then_body=[
+                    llir.FunctionCallStmt(
+                        name=f"{values_name}.resize",
+                        args=[
+                            llir.Add(
+                                llir.Var(name=position.name, type=position.type),
+                                llir.Literal(1),
+                            ),
+                            llir.Literal(0),
+                        ],
+                        result_storage=write,
+                    )
+                ],
+                result_storage=self._result_storage(
+                    (RESULT_VALUES, None, STORAGE_READ)
+                ),
+            ),
+            llir.FunctionCallStmt(
+                name="scorch_vector_set",
+                args=[
+                    llir.Var(name=values_name, type=llir.DataType.NO_TYPE),
+                    llir.Var(name=position.name, type=position.type),
+                    value,
+                ],
+                result_storage=self._result_storage(
+                    (RESULT_VALUES, None, STORAGE_WRITE)
+                ),
+            ),
+        ]
+
+    def _dense_block_commit_statements(self, level: int) -> List[llir.Stmt]:
+        """Commit the compressed coordinate above a dense block, if it was written.
+
+        ``level`` is the dense level directly below compressed level
+        ``level - 1``.  The dense levels from there down form one block of
+        ``B`` cells (the product of their extents) per stored coordinate, at
+        ``q * B`` where ``q`` is the coordinate's pending position.  Below the
+        block is either the value vector or a compressed level K.  The subtree
+        wrote exactly when the operands store something under the coordinate:
+        the value vector grew past the block's start, or K appended since the
+        block opened (``K_pos[q * B]`` is K's count at the block's start, because
+        every earlier block was padded to its end when it committed).
+
+        Committed: pad the block to its end, append the coordinate, advance
+        ``q``.  Not committed: drop the position entries of K the visited
+        cells closed.  The shipped compiler's spelling (``dense_block_commit``),
+        so the two emit one text.
+        """
+
+        levels = self.result_decl.levels
+        result_name = self.result_decl.name
+        block_end = level
+        while block_end < len(levels) and levels[block_end].kind is LevelKind.DENSE:
+            block_end += 1
+
+        def int64(name: str) -> llir.Var:
+            return llir.Var(name=name, type=llir.DataType.INT64)
+
+        block: llir.Expr = int64(f"{result_name}{level}_size")
+        for inner in range(level + 1, block_end):
+            block = llir.Mul(left=block, right=int64(f"{result_name}{inner}_size"))
+        parent_position = int64(f"p{result_name}{level - 1}")
+        block_start = llir.Mul(left=parent_position, right=block)
+        block_stop = llir.Mul(
+            left=llir.Add(parent_position, llir.Literal(1)), right=block
+        )
+
+        rollback: List[llir.Stmt] = []
+        if block_end == len(levels):
+            values_name = f"{result_name}_values"
+            written: llir.Expr = llir.BinOp(
+                op=">",
+                left=llir.FunctionCall(name=f"{values_name}.size", args=[]),
+                right=block_start,
+            )
+            written_marker = self._result_storage((RESULT_VALUES, None, STORAGE_READ))
+            pad: List[llir.Stmt] = [
+                llir.FunctionCallStmt(
+                    name=f"{values_name}.resize",
+                    args=[block_stop, llir.Literal(0)],
+                    result_storage=self._result_storage(
+                        (RESULT_VALUES, None, STORAGE_WRITE)
+                    ),
+                )
+            ]
+        else:
+            below = block_end
+            pos_name = f"{result_name}{below}_pos"
+            crd_size = llir.FunctionCall(name=f"{result_name}{below}_crd.size", args=[])
+            pos_index = int64(f"{result_name}{below}_pos_index")
+            written = llir.BinOp(
+                op=">",
+                left=crd_size,
+                right=llir.ArrayAccess(
+                    array=llir.Var(name=pos_name, type=llir.DataType.STD_VECTOR_C_INT),
+                    index=block_start,
+                ),
+            )
+            written_marker = self._result_storage(
+                (RESULT_CRD, below, STORAGE_READ), (RESULT_POS, below, STORAGE_READ)
+            )
+            pad = [
+                llir.ForLoop(
+                    init=None,
+                    cond=llir.BinOp(op="<", left=pos_index, right=block_stop),
+                    update=llir.Increment(var=pos_index),
+                    body=[
+                        llir.Assign(
+                            var=llir.ArrayAccess(
+                                array=llir.Var(
+                                    name=pos_name,
+                                    type=llir.DataType.STD_VECTOR_C_INT,
+                                ),
+                                index=llir.Add(pos_index, llir.Literal(1)),
+                            ),
+                            value=crd_size,
+                            result_storage=self._result_storage(
+                                (RESULT_POS, below, STORAGE_WRITE),
+                                (RESULT_CRD, below, STORAGE_READ),
+                            ),
+                        )
+                    ],
+                )
+            ]
+            rollback = [
+                llir.FunctionCallStmt(
+                    name=f"{pos_name}.resize",
+                    args=[llir.Add(block_start, llir.Literal(1))],
+                    result_storage=self._result_storage(
+                        (RESULT_POS, below, STORAGE_WRITE)
+                    ),
+                ),
+                llir.Assign(var=pos_index, value=block_start),
+            ]
+        return [
+            llir.BlankLine(),
+            llir.Comment(
+                "Commit the compressed coordinate above a written dense block"
+            ),
+            llir.IfThenElse(
+                cond=written,
+                then_body=[
+                    *pad,
+                    llir.FunctionCallStmt(
+                        name=f"{result_name}{level - 1}_crd.push_back",
+                        args=[
+                            llir.Var(
+                                name=self._loop_var_name(self.loops[level - 1]),
+                                type=llir.DataType.INT,
+                            )
+                        ],
+                        result_storage=self._result_storage(
+                            (RESULT_CRD, level - 1, STORAGE_WRITE)
+                        ),
+                    ),
+                    llir.Increment(var=parent_position),
+                ],
+                else_body=rollback or None,
+                result_storage=written_marker,
+            ),
         ]
 
     def _child_stream_statements(self, position: int) -> List[llir.Stmt]:
@@ -12599,6 +18143,8 @@ class _MultiCompressedAssemblyLowering(_TargetLowering):
         number for the first compressed level.
         """
 
+        if self._region_form and position == self.prefix_depth - 1:
+            return self._region_block_statements()
         child = self.loops[position + 1]
         if child.kind is _DENSE:
             # A dense child nests a dense loop: the next prefix loop inside the
@@ -12625,7 +18171,7 @@ class _MultiCompressedAssemblyLowering(_TargetLowering):
         dense coordinate -- so they own neither the catch-up nor the close.
         """
 
-        return loop.kind is _DENSE and position == self._dense_prefix - 1
+        return loop.kind is _DENSE and self._owns_child_close(position)
 
     def _assembly_catch_up_bound(self, loop: _Loop) -> llir.Expr:
         """The flattened dense-prefix coordinate this loop has reached.
@@ -12636,9 +18182,30 @@ class _MultiCompressedAssemblyLowering(_TargetLowering):
         loops and their own iteration bounds -- the same bound spellings the
         emitted ``for`` statements use, so the arithmetic cannot disagree with
         the iteration space.  A single dense parent degenerates to ``i0``,
-        which is the inherited spelling byte for byte.
+        which is the inherited spelling byte for byte.  A dense level below a
+        compressed one numbers its child's segments from the pending position
+        of the level above instead.
         """
 
+        position = self.loop_positions[loop.index]
+        if position >= self._dense_prefix:
+            # A dense level below a compressed one: its cell's position is the
+            # pending position of the level above times this level's extent,
+            # plus the coordinate -- what its dense position resolve assigns.
+            result_name = self.result_decl.name
+            return llir.Add(
+                llir.Mul(
+                    left=llir.Var(
+                        name=f"p{result_name}{position - 1}",
+                        type=llir.DataType.INT64,
+                    ),
+                    right=llir.Var(
+                        name=f"{result_name}{position}_size",
+                        type=llir.DataType.INT64,
+                    ),
+                ),
+                llir.Var(name=self._loop_var_name(loop), type=llir.DataType.INT),
+            )
         prefix = self._dense_prefix
         if prefix <= 1:
             return _TargetLowering._assembly_catch_up_bound(self, loop)
@@ -12660,6 +18227,163 @@ class _MultiCompressedAssemblyLowering(_TargetLowering):
             )
         return flattened
 
+    def _dense_at_dimension(self, tensor: SymbolId, dimension: DimensionId) -> bool:
+        """Whether ``tensor`` stores a dense level for ``dimension``."""
+
+        decl = self.decls[tensor]
+        return any(
+            decl.dimensions[level.mode] == dimension and level.kind is LevelKind.DENSE
+            for level in decl.levels
+        )
+
+    def _dense_level_at_dimension(
+        self, tensor: SymbolId, dimension: DimensionId
+    ) -> int:
+        """The storage level at which ``tensor`` stores ``dimension`` densely."""
+
+        decl = self.decls[tensor]
+        for number, level in enumerate(decl.levels):
+            if (
+                decl.dimensions[level.mode] == dimension
+                and level.kind is LevelKind.DENSE
+            ):
+                return number
+        _fail(
+            "unsupported_program_shape",
+            "a dense union's other operands store its coordinate densely",
+        )
+        raise AssertionError("unreachable")
+
+    def _one_sided_dense_statements(
+        self, position: int, tensor: SymbolId
+    ) -> List[llir.Stmt]:
+        """One operand's drain at a level where it is dense.
+
+        Below a dense-union case in which only the dense operand is present,
+        its subtree is drained level by level: at a level the operand stores
+        densely (the other operand's stream merged there by a DENSE_UNION)
+        every coordinate of the dimension is visited, its dense position
+        resolved, and the child drained; the leaf appends the operand's value
+        at every coordinate, because dense storage holds every cell.
+        """
+
+        loop = self.loops[position]
+        dense_union = (
+            loop.kind is _MERGED
+            and cast(MergedSparseFor, loop.node).mode is MergeMode.DENSE_UNION
+        )
+        if not (
+            (dense_union or loop.kind is _DENSE)
+            and self._dense_at_dimension(tensor, loop.dimension)
+        ):
+            _fail(
+                "unsupported_program_shape",
+                "a one-sided drain visits every coordinate only where the "
+                "operand is dense and the level is a dense union or a dense "
+                "loop",
+            )
+        dimension_name = self._loop_var_name(loop)
+        input_resolves = self._input_resolves_at(loop)
+        resolves: List[llir.Stmt] = [
+            *(
+                [llir.Comment("Resolve dense coordinates"), *input_resolves]
+                if input_resolves
+                else []
+            ),
+            *self._one_sided_result_resolves(position, loop),
+        ]
+        body: List[llir.Stmt]
+        if position == self._assembly_depth - 1:
+            leaf_stmts = self._merged_case_stmts(loop, set())
+            if leaf_stmts is None:
+                _fail(
+                    "unsupported_program_shape",
+                    "a dense drain leaf must append the dense operand's value",
+                )
+            body = [*resolves, *leaf_stmts]
+        else:
+            body = self._one_sided_level_statements(
+                position,
+                self._one_sided_stream_statements(position + 1, tensor),
+                resolves,
+            )
+        loop_var = llir.Var(name=dimension_name, type=llir.DataType.INT64)
+        for_loop = llir.ForLoop(
+            init=llir.VarInit(var=loop_var, value=llir.Literal(0)),
+            cond=llir.BinOp(
+                op="<",
+                left=loop_var,
+                right=(
+                    self._dense_union_bound(loop)
+                    if dense_union
+                    else self._loop_bound_var(loop)
+                ),
+            ),
+            update=llir.Increment(var=loop_var),
+            body=body,
+        )
+        for_loop.scorch_index_var = dimension_name
+        return [for_loop]
+
+    def _one_sided_level_statements(
+        self,
+        position: int,
+        child: List[llir.Stmt],
+        resolves: Sequence[llir.Stmt] = (),
+    ) -> List[llir.Stmt]:
+        """A one-sided drain's non-leaf level around its drained child.
+
+        A compressed level closes exactly as in a merged case (its conditional
+        parent append, or the commit of the dense block below it).  A dense
+        level stores no coordinate: when its child is compressed it owns that
+        child's segments, caught up before the cell and closed after it, as
+        the merged case does (``_owns_child_close``); otherwise the compressed
+        level above it commits the block.
+
+        ``resolves`` are the positions a dense drain's loop resolves in its
+        body.  They follow the catch-up, the order ``_lower_dense`` and the
+        legacy lattice give the same loop when every operand is present.
+        """
+
+        if self.result_decl.levels[position].kind is LevelKind.DENSE:
+            if self._owns_child_close(position):
+                return [
+                    *_stored_prefix_open_statements(self, position),
+                    *resolves,
+                    *child,
+                    *_stored_prefix_close_statements(self, position),
+                ]
+            return [*resolves, *child]
+        return [
+            *resolves,
+            *child,
+            *self._compressed_level_close_statements(position),
+        ]
+
+    def _one_sided_result_resolves(self, position: int, loop: _Loop) -> List[llir.Stmt]:
+        """A one-sided drain's result position on a dense block level.
+
+        The drain writes the dense block cell its coordinate names, so it
+        resolves that cell's position as the merged loop's body does.  A
+        compressed result level is appended, and resolves nothing here.
+        """
+
+        if self.result_decl.levels[position].kind is not LevelKind.DENSE:
+            return []
+        resolves = self._result_resolves_at(loop)
+        if not resolves:
+            return []
+        return [
+            llir.Comment("Resolve index into dense level of values array"),
+            *resolves,
+        ]
+
+    def _dense_union_splits_cases(self, position: int) -> bool:
+        # Every assembly level owns its compressed level's append, so a dense
+        # union splits by alignment at every depth, each case draining what
+        # its present operands store.
+        return True
+
     def _one_sided_cursor(self, position: int, tensor: SymbolId) -> SparseCursorDecl:
         for cursor in self.loops[position].cursors:
             if cursor.tensor == tensor:
@@ -12674,6 +18398,29 @@ class _MultiCompressedAssemblyLowering(_TargetLowering):
     def _one_sided_stream_statements(
         self, position: int, tensor: SymbolId
     ) -> List[llir.Stmt]:
+        """``_one_sided_drain_statements`` with this level's alignment fixed.
+
+        In a one-sided drain only ``tensor`` is present: its own cursor at
+        this level is aligned at every drained coordinate and every other
+        operand's cursor here is not, so a read guarded by one of those
+        cursors (a dense level below it) drops out instead of testing a
+        coordinate the drain never loads.
+        """
+
+        loop = self.loops[position]
+        saved = getattr(self, "_alignment_override", {})
+        self._alignment_override = {
+            **saved,
+            **{cursor.cursor: cursor.tensor == tensor for cursor in loop.cursors},
+        }
+        try:
+            return self._one_sided_drain_statements(position, tensor)
+        finally:
+            self._alignment_override = saved
+
+    def _one_sided_drain_statements(
+        self, position: int, tensor: SymbolId
+    ) -> List[llir.Stmt]:
         """One operand's ordered subtree drain below a one-sided union case.
 
         Emits the exact single-cursor stream loop the legacy union lattice
@@ -12685,6 +18432,8 @@ class _MultiCompressedAssemblyLowering(_TargetLowering):
         """
 
         loop = self.loops[position]
+        if all(cursor.tensor != tensor for cursor in loop.cursors):
+            return self._one_sided_dense_statements(position, tensor)
         cursor = self._one_sided_cursor(position, tensor)
         dimension_name = self._loop_var_name(loop)
         position_name = self._cursor_position_name(cursor)
@@ -12697,12 +18446,13 @@ class _MultiCompressedAssemblyLowering(_TargetLowering):
                 )
             child_body: List[llir.Stmt] = leaf_stmts
         else:
-            child_body = [
-                *self._one_sided_stream_statements(position + 1, tensor),
-                llir.BlankLine(),
-                llir.Comment("Assembly compressed _level indices"),
-                *self._parent_append_statements(position),
-            ]
+            # A coordinate result's drained entries stored this level's
+            # coordinate themselves (``_compressed_level_close_statements``).
+            child_body = self._one_sided_level_statements(
+                position, self._one_sided_stream_statements(position + 1, tensor)
+            )
+        coordinate = self._cursor_is_coordinate(cursor)
+        run_end = self._coordinate_run_end(cursor) if coordinate else None
         body: List[llir.Stmt] = [
             llir.Comment("Resolve coordinates"),
             llir.VarInit(
@@ -12713,9 +18463,48 @@ class _MultiCompressedAssemblyLowering(_TargetLowering):
                 ),
             ),
             llir.BlankLine(),
+            *(
+                self._coordinate_run_scan(
+                    cursor, llir.Var(name=dimension_name, type=llir.DataType.INT)
+                )
+                if coordinate
+                else []
+            ),
+            *self._one_sided_result_resolves(position, loop),
             *child_body,
         ]
         position_var = llir.Var(name=position_name, type=llir.DataType.INT)
+        if coordinate:
+            # A coordinate level stores no position array: the drain starts
+            # where its parent stands (level 0 at the first entry) and ends
+            # where the parent's run ends -- the run scan of the parent's
+            # loop, or the stored entry count at level 0 -- and a level with
+            # a level below it steps over the run it descended.
+            if cursor.level == 0:
+                _fail(
+                    "unsupported_program_shape",
+                    "a one-sided drain of a coordinate tensor's first level "
+                    "is lowered by the merged loop's tail",
+                )
+            for_loop = llir.ForLoop(
+                init=llir.VarInit(
+                    var=llir.Var(name=position_name, type=llir.DataType.INT),
+                    value=self._cursor_parent_var(cursor),
+                ),
+                cond=llir.BinOp(
+                    op="<",
+                    left=position_var,
+                    right=llir.Var(name=f"{position_name}_end", type=llir.DataType.INT),
+                ),
+                update=(
+                    llir.Increment(var=position_var)
+                    if run_end is None
+                    else llir.Assign(var=position_var, value=run_end)
+                ),
+                body=body,
+            )
+            for_loop.scorch_index_var = dimension_name
+            return [llir.Comment("Initialize iterators"), for_loop]
         for_loop = llir.ForLoop(
             init=llir.VarInit(
                 var=llir.Var(name=position_name, type=llir.DataType.INT),
@@ -12767,7 +18556,7 @@ class _MultiCompressedAssemblyLowering(_TargetLowering):
         loop = self.loops[position]
         if position >= self._assembly_depth:
             return _TargetLowering._loop_children(self, position)
-        if position == self._assembly_depth - 1:
+        if position == self._assembly_depth - 1 and not self._region_form:
             if self._reduction_depth:
                 return self._bound_prefix_leaf_statements(position)
             leaf_stmts = self._merged_case_stmts(
@@ -12789,22 +18578,178 @@ class _MultiCompressedAssemblyLowering(_TargetLowering):
             # existed the two agreed, and only the result level is the fact that
             # decides whether a coordinate is appended.
             children = self._child_stream_statements(position)
-            if loop.kind is _SPARSE and position == self._dense_prefix - 1:
+            if self._sparse_loop_opens_stored_prefix(position):
+                late_resolves: List[llir.Stmt] = []
+                if self._resolves_after_catch_up(loop):
+                    resolves = _TargetLowering._result_resolves_at(self, loop)
+                    if resolves:
+                        late_resolves = [
+                            llir.Comment(
+                                "Resolve index into dense level of values array"
+                            ),
+                            *resolves,
+                        ]
                 return [
                     *_stored_prefix_open_statements(self, position),
+                    # ``_run_scan_follows_catch_up``: the legacy order.
+                    *(
+                        self._coordinate_run_scan_at(position)
+                        if self._run_scan_follows_catch_up(position)
+                        else []
+                    ),
+                    *late_resolves,
                     *children,
                     *_stored_prefix_close_statements(self, position),
                 ]
             return children
         return [
             *self._child_stream_statements(position),
-            llir.BlankLine(),
-            llir.Comment("Assembly compressed _level indices"),
-            *self._parent_append_statements(position),
+            *self._compressed_level_close_statements(position),
         ]
+
+    def _sparse_loop_opens_stored_prefix(self, position: int) -> bool:
+        """Whether a sparse loop's children open with the stored prefix's
+        catch-up: it drives a dense result level that closes a compressed
+        child (the branch of :meth:`_loop_children` that emits it)."""
+
+        return (
+            position < self._assembly_depth
+            and (position != self._assembly_depth - 1 or self._region_form)
+            and self.result_decl.levels[position].kind is LevelKind.DENSE
+            and self.loops[position].kind is _SPARSE
+            and self._owns_child_close(position)
+        )
+
+    def _run_scan_follows_catch_up(self, position: int) -> bool:
+        # Only where the catch-up is the first thing the loop does: a level
+        # whose result position is resolved before its catch-up (a dense
+        # level below the first one) scans before either, in the base order.
+        return self._sparse_loop_opens_stored_prefix(
+            position
+        ) and self._resolves_after_catch_up(self.loops[position])
 
     def _dense_assembly_close_level(self, position: int) -> int:
         return position + 1
+
+    # -- assembly strategy ----------------------------------------------------
+
+    def supported_assemblies(self) -> Tuple[str, ...]:
+        """The serial single pass and the two-pass pair.
+
+        The shipped compiler assembles these programs in two parallel passes
+        around a workspace.  This family's nest needs no workspace -- each result
+        entry is one reduction appended in loop order -- and the shared two-phase
+        pass rewrites that same nest into a count loop and a fill loop, on the
+        programs :meth:`two_pass_assembly_legal` admits.  The chunked single
+        pass is not emitted by this family.
+        """
+
+        return tuple(
+            strategy
+            for strategy in SPARSE_ASSEMBLY_STRATEGIES
+            if strategy == DEFAULT_SERIAL_STRATEGY or strategy in TWO_PASS_STRATEGIES
+        )
+
+    def two_pass_assembly_legal(self) -> bool:
+        """Whether this program CAN be assembled by counting first.
+
+        Structural, extent-free, and about correctness only.  The shared pass
+        replaces the outermost loop with a count loop and a fill loop whose
+        iterations are independent, so one iteration must assemble one segment of
+        the first compressed level -- one coordinate of the dense level zero --
+        and no two iterations the same one:
+
+        * the result is one dense level with every level below it compressed,
+          which is the receiver the pass allocates, and not a coordinate result;
+        * the outermost loop binds that dense level and is a dense loop or a
+          loop over one COMPRESSED operand level, whose coordinates are distinct
+          and increasing within its one segment.  A two-cursor merge at the root
+          is a ``while`` loop, which the pass does not select, and a coordinate
+          level may store one coordinate twice;
+        * with a workspace region at the leaf, the region sits below every result
+          level but the last, so its drain appends to the last level only.  A
+          drain that opens segments of a level above it reads
+          ``{R}{L}_crd.back()``, which a phase with no coordinate vector cannot
+          (the ordered-key family declines the same shape for the same reason),
+          and a region that owns the root leaves a PRODUCER loop as the first
+          top-level loop, which is the loop the pass would replace.
+
+        A segment the outermost loop never visits -- a stored loop skips the
+        coordinates its operand does not store -- keeps a count of zero, and the
+        prefix sum gives it the equal positions the single pass writes with its
+        catch-up loops.
+        """
+
+        levels = self.result_decl.levels
+        if self._coordinate_result or self._dense_blocks:
+            return False
+        if self._dense_prefix != 1 or not _partitionable_receiver(self.result_decl):
+            return False
+        outer = self.loops[0]
+        if outer.kind is _SPARSE:
+            cursor = outer.cursors[0]
+            if (
+                self.decls[cursor.tensor].levels[cursor.level].kind
+                is not LevelKind.COMPRESSED
+            ):
+                return False
+        elif outer.kind is not _DENSE:
+            return False
+        if self._region_form and self.prefix_depth != len(levels) - 1:
+            return False
+        driver = self.level_drivers.get(self.result_symbol, {}).get(0)
+        if driver is None or self.loop_positions.get(driver) != 0:
+            # The chain binds result levels outermost first, so the outermost
+            # loop is the dense level's; checked rather than assumed, because a
+            # count indexed by any other loop's coordinate numbers no segment.
+            return False
+        if (
+            self.panel is not None
+            or self.relayout is not None
+            or self.result_tile is not None
+            or self.parallel is not None
+        ):
+            # Already None for this family; checked rather than assumed, because
+            # each would own part of the same assembly.
+            return False
+        return True
+
+    def compressed_where_pass_spec(
+        self, compile_options: CompileOptions
+    ) -> Optional[CompressedWhereOpenMPPassSpec]:
+        """The shared two-phase configuration, with this family's cell numbering.
+
+        ``None`` when the resolved strategy is not a two-pass one.  A REQUESTED
+        two-pass strategy this program cannot express fails closed with
+        ``unsupported_assembly_strategy``; an unrequested one cannot arrive
+        illegal, because the automatic rule records a strategy only from
+        :meth:`emittable_assemblies`.  The nest outside a workspace region
+        declares no workspace, and the pass is told so.
+        """
+
+        if self.assembly_strategy() not in TWO_PASS_STRATEGIES:
+            return None
+        if not self.two_pass_assembly_legal():
+            _fail(
+                UNSUPPORTED_ASSEMBLY_STRATEGY,
+                "a two-pass assembly needs a result whose level zero is dense "
+                "with every level below it compressed, an outermost loop "
+                "binding that dense level as a dense loop or a loop over one "
+                "compressed operand level, and a workspace region, if there is "
+                "one, whose drain appends to the last result level only",
+            )
+        return self._two_phase_spec(
+            compile_options,
+            self.workspace_decl if self._region_form else None,
+            self._outer_cell_domain(),
+        )
+
+    def emittable_assemblies(self) -> Tuple[str, ...]:
+        """The serial single pass, and the two-pass pair where it is legal."""
+
+        if not self.two_pass_assembly_legal():
+            return (DEFAULT_SERIAL_STRATEGY,)
+        return self.supported_assemblies()
 
     def _exact_dense_parent_positions(self) -> bool:
         """Whether the legacy assembler pre-sizes dense-parent position arrays.
@@ -12818,6 +18763,9 @@ class _MultiCompressedAssemblyLowering(_TargetLowering):
         extents — never a runtime-format probe.
         """
 
+        if self._region_form:
+            # A drained level's position arrays grow as the drain writes them.
+            return False
         if self._dense_prefix >= 2:
             # Several dense parents size the first compressed level at the
             # PRODUCT of their extents.  The pre-sized spelling names exactly
@@ -12840,19 +18788,19 @@ class _MultiCompressedAssemblyLowering(_TargetLowering):
     def _fixed_position_count(self, level: int) -> bool:
         """Whether one result position vector is pre-sized by a dense parent."""
 
+        # Level 1 under a dense level 0 only, as the shared assembler decides
+        # (``ResultTensorAssembler._has_fixed_position_count``): below a
+        # compressed ancestor the count is fixed only by assembly.
         return (
             self._exact_dense_parent_positions()
-            and level > 0
-            and self.result_decl.levels[level - 1].kind is LevelKind.DENSE
+            and level == 1
+            and self.result_decl.levels[0].kind is LevelKind.DENSE
         )
 
     def result_assembler(self) -> ResultTensorAssembler:
         return ResultTensorAssembler(
             name=self.result_decl.name,
-            level_types=tuple(
-                _LEVEL_KIND_TO_LEVEL_TYPE[level.kind]
-                for level in self.result_decl.levels
-            ),
+            level_types=self._result_level_types(),
             dtype=_SCALAR_TO_TORCH[self.result_decl.dtype],
             exact_dense_parent_positions=self._exact_dense_parent_positions(),
             result_id=SymbolId(self.result_symbol.value),
@@ -12923,6 +18871,8 @@ class _MultiCompressedAssemblyLowering(_TargetLowering):
             for level, decl in enumerate(self.result_decl.levels)
             if decl.kind is LevelKind.COMPRESSED
             and not self._fixed_position_count(level)
+            # A coordinate level has no position vector to initialize.
+            and not self._coordinate_result
         }
         prepared: List[llir.Stmt] = []
         converted: Set[str] = set()
@@ -12965,6 +18915,17 @@ class _MultiCompressedAssemblyLowering(_TargetLowering):
 
     def raw_loop_statements(self) -> List[llir.Stmt]:
         _TargetLowering._require_value_expression_unchanged(self)
+        if self._region_form:
+            return self._region_raw_loop_statements()
+        if self._coordinate_result:
+            # No root segment to close: a coordinate level has no position
+            # array, and every entry stored its own coordinates.
+            first = self.loops[0]
+            if first.kind is _MERGED:
+                return list(self._lower_merged(0))
+            if first.kind is _SPARSE:
+                return list(self._lower_sparse(0))
+            return [llir.BlankLine(), self._lower_dense(0)]
         if self.loops[0].kind in (_MERGED, _SPARSE):
             stmts: List[llir.Stmt] = (
                 list(self._lower_merged(0))
@@ -13002,6 +18963,32 @@ class _MultiCompressedAssemblyLowering(_TargetLowering):
                 *_stored_prefix_final_statements(self, self._dense_prefix),
             ]
         return [llir.BlankLine(), self._lower_dense(0)]
+
+
+class _CoordinateResultOrderedKeyLowering(_OrderedKeySparseWorkspaceLowering):
+    """The ordered-key family draining into a coordinate (COO) result.
+
+    Built on the result's all-compressed twin; see
+    ``_TargetLowering._coordinate_result``.
+    """
+
+    _coordinate_result = True
+
+
+class _CoordinateResultAssemblyLowering(_MultiCompressedAssemblyLowering):
+    """The ordered-append family assembling a coordinate (COO) result.
+
+    Built on the result's all-compressed twin; see
+    ``_TargetLowering._coordinate_result``.
+    """
+
+    _coordinate_result = True
+
+    def supported_assemblies(self) -> Tuple[str, ...]:
+        """The serial single pass: a coordinate result has no position array to
+        fill from per-segment counts."""
+
+        return (DEFAULT_SERIAL_STRATEGY,)
 
 
 _RELAYOUT_LOST = "relayout_completion_lost"
@@ -14451,13 +20438,9 @@ def _complete_result_tile_impl(
     tile_inner_name = f"{pack_dimension_name}_in"
     tile_size_name = f"kTile_{pack_dimension_name}"
     torch_dtype = _SCALAR_TO_TORCH[lowering.result_decl.dtype]
-    pointer_type = llir.DataType.ptr_type(torch_dtype)
-    if lowering.result_decl.dtype is ScalarType.FLOAT32:
-        scalar_type = llir.DataType.FLOAT32
-        zero_value = "0.0f"
-    else:
-        scalar_type = llir.DataType.FLOAT64
-        zero_value = "0.0"
+    pointer_type = _value_pointer_type(torch_dtype)
+    scalar_type = _scalar_llir_type(lowering.result_decl.dtype)
+    zero_value = _FLOATING_ZERO_SPELLINGS.get(lowering.result_decl.dtype, "0")
     try:
         (
             compact_name,
@@ -14907,12 +20890,8 @@ def _complete_relayout_impl(
     panel_axis_bound = f"{operand_name}0_size"
     pack_axis_bound = f"{operand_name}1_size"
     torch_dtype = _SCALAR_TO_TORCH[operand_decl.dtype]
-    pointer_type = llir.DataType.ptr_type(torch_dtype)
-    scalar_type = (
-        llir.DataType.FLOAT32
-        if operand_decl.dtype is ScalarType.FLOAT32
-        else llir.DataType.FLOAT64
-    )
+    pointer_type = _value_pointer_type(torch_dtype)
+    scalar_type = _scalar_llir_type(operand_decl.dtype)
     panel_scoped = decl.scope is RelayoutScope.PANEL
     used_names = _declared_names(function)
     packed_name = _unique_name(f"packed_{operand_name}", used_names)
@@ -15442,7 +21421,10 @@ def _ordered_key_expected_checkpoint(
 ) -> Optional[_OrderedKeyCompletionReference]:
     """Build the detached exact post-pipeline body before callbacks can run."""
 
-    if type(lowering) is not _OrderedKeySparseWorkspaceLowering:
+    if type(lowering) not in (
+        _OrderedKeySparseWorkspaceLowering,
+        _CoordinateResultOrderedKeyLowering,
+    ):
         return None
     if lowering.owns_two_phase_output():
         # The checkpoint's contract is "the managed pipeline did not change this
@@ -15635,15 +21617,207 @@ def _require_ordered_key_completed_body(
     )
 
 
-def _lower_loopir_to_llir_owned(
+def _has_coordinate_result(program: LoopProgram) -> bool:
+    """Whether the program's one output is stored in coordinate (COO) levels."""
+
+    if len(program.outputs) != 1:
+        return False
+    for decl in program.tensors:
+        if decl.symbol == program.outputs[0]:
+            return bool(decl.levels) and all(
+                level.kind is LevelKind.COORDINATE for level in decl.levels
+            )
+    return False
+
+
+def _compressed_result_twin(program: LoopProgram) -> LoopProgram:
+    """``program`` with every level of its coordinate result compressed.
+
+    Nothing else changes: the level nodes keep their identities and modes,
+    and no statement of a program names a level's kind.  The twin is verified
+    here, so a family built on it starts from a verified program as every
+    other one does.
+    """
+
+    twin = replace(
+        program,
+        tensors=tuple(
+            (
+                replace(
+                    decl,
+                    levels=tuple(
+                        replace(level, kind=LevelKind.COMPRESSED)
+                        for level in decl.levels
+                    ),
+                )
+                if decl.symbol == program.outputs[0]
+                else decl
+            )
+            for decl in program.tensors
+        ),
+    )
+    verify_program(twin)
+    return twin
+
+
+def _require_no_coordinate_operand_positions(
+    lowering: "_TargetLowering", statements: List[llir.Stmt]
+) -> None:
+    """Fail closed if a loop nest names a position array of a COO operand.
+
+    A coordinate level stores no position array and the kernel declares none
+    for it, so a nest that reads one was lowered by code written for a
+    compressed level, and the kernel holding it would not build.  The shared
+    single-cursor loop and the intersection merge read none; this is the
+    independent check that no other emission path was reached with one.
+    """
+
+    forbidden = tuple(
+        f"{decl.name}{level}_pos"
+        for symbol in lowering._input_symbols
+        for decl in (lowering.decls[symbol],)
+        if any(kind.kind is LevelKind.COORDINATE for kind in decl.levels)
+        for level in range(len(decl.levels) + 1)
+    )
+    if not forbidden:
+        return
+
+    class _Names(LLIRWalker):
+        def __init__(self) -> None:
+            super().__init__(
+                LLIRTraversalContext(
+                    stage="LoopIR target lowering",
+                    pass_name="check_coordinate_operand_reads",
+                )
+            )
+            self.positions: List[str] = []
+
+        def enter_node(self, node: llir.Node, path: Tuple[str, ...]) -> None:
+            name = getattr(node, "name", None)
+            if type(name) is str and any(
+                name == array or name.startswith(array + ".") for array in forbidden
+            ):
+                self.positions.append(name)
+
+    names = _Names()
+    names.walk(cast(Any, statements))
+    if names.positions:
+        _fail(
+            "unsupported_level_kind",
+            f"the loop nest names the position array {names.positions[0]!r} "
+            "of an operand whose levels are coordinate levels, which store "
+            "none",
+        )
+
+
+def _require_coordinate_result_assembly(
+    lowering: "_TargetLowering", statements: List[llir.Stmt]
+) -> None:
+    """Fail closed unless every appended entry of a coordinate result is whole.
+
+    Two properties of the emitted assembly, checked on the statements
+    themselves.  No statement names a position array of the result: a
+    coordinate level stores none, so a statement of the all-compressed twin
+    that reads or writes one was not converted and the kernel holding it would
+    not build.  And every statement list appends as many coordinates to each
+    level as it appends values: an entry stores one coordinate per level, so
+    a list that appends a value without one of them leaves that level's array
+    shorter than the values array.
+    """
+
+    result_name = lowering.result_decl.name
+    levels = len(lowering.result_decl.levels)
+    forbidden = tuple(f"{result_name}{level}_pos" for level in range(levels + 1))
+    value_append = f"{result_name}_values.emplace_back"
+    coordinate_appends = tuple(
+        (
+            f"{result_name}{level}_crd.emplace_back",
+            f"{result_name}{level}_crd.push_back",
+        )
+        for level in range(levels)
+    )
+
+    class _Assembly(LLIRWalker):
+        def __init__(self) -> None:
+            super().__init__(
+                LLIRTraversalContext(
+                    stage="LoopIR target lowering",
+                    pass_name="check_coordinate_result_assembly",
+                )
+            )
+            self.positions: List[str] = []
+            self.partial: List[int] = []
+            self.entries = 0
+
+        def enter_node(self, node: llir.Node, path: Tuple[str, ...]) -> None:
+            name = getattr(node, "name", None)
+            if type(name) is str and any(
+                name == array or name.startswith(array + ".") for array in forbidden
+            ):
+                self.positions.append(name)
+
+        def enter_statement_sequence(
+            self, statements: Sequence[object], path: Tuple[str, ...]
+        ) -> None:
+            calls = [
+                statement.name
+                for statement in statements
+                if type(statement) is llir.FunctionCallStmt
+            ]
+            values = calls.count(value_append)
+            self.entries += values
+            for level, spellings in enumerate(coordinate_appends):
+                if sum(calls.count(spelling) for spelling in spellings) != values:
+                    self.partial.append(level)
+
+    assembly = _Assembly()
+    assembly.walk(cast(Any, statements))
+    if assembly.positions:
+        _fail(
+            "unsupported_sparse_output",
+            f"the assembly of coordinate result {result_name!r} names the "
+            f"position array {assembly.positions[0]!r}, which a coordinate "
+            "level does not store",
+        )
+    if assembly.partial:
+        _fail(
+            "unsupported_sparse_output",
+            f"the assembly of coordinate result {result_name!r} appends a "
+            f"value without a coordinate on level {assembly.partial[0]}",
+        )
+    if not assembly.entries:
+        _fail(
+            "unsupported_sparse_output",
+            f"the assembly of coordinate result {result_name!r} appends no entry",
+        )
+
+
+def _require_reads_in_scope(function: llir.Function) -> None:
+    """Refuse a kernel that reads a variable outside the block declaring it.
+
+    Such a kernel is a defect of this lowering, and the C++ compiler would
+    reject it at JIT time with an error that names no program.  Until
+    2026-10-12 three four-dimensional sums reached it that way: a union case
+    that drains one operand computed a dense position of the operand it does
+    not iterate.
+    """
+
+    found = reads_out_of_scope(function)
+    if not found:
+        return
+    names = ", ".join(sorted({name for name, _ in found}))
+    _fail(
+        "variable_read_out_of_scope",
+        f"the lowered kernel reads {names} outside the block that declares "
+        f"it (first at {'/'.join(found[0][1])})",
+    )
+
+
+def _owned_input_shapes(
     program: LoopProgram,
-    *,
     input_shapes: Mapping[SymbolId, Tuple[int, ...]],
-    result_shape: Tuple[int, ...],
-    compile_options: CompileOptions,
-    compilation_context: Optional[CompilationContext],
-) -> llir.Function:
-    """Execute target lowering under an already-owned timing boundary."""
+) -> Dict[SymbolId, Tuple[int, ...]]:
+    """Verify the program and snapshot its shape bindings into an exact dict."""
 
     # Preserve the target's cheap malformed-program boundary before invoking
     # caller-controlled Mapping code. A second verification below closes the
@@ -15700,9 +21874,90 @@ def _lower_loopir_to_llir_owned(
     # a frozen program in untrusted state.
     if mapping_callbacks_possible:
         verify_program(program)
+    return owned_input_shapes
+
+
+def _select_lowering(
+    program: LoopProgram,
+    owned_input_shapes: Dict[SymbolId, Tuple[int, ...]],
+    result_shape: Tuple[int, ...],
+) -> Tuple[_TargetLowering, bool]:
+    """Build the target family's lowering for a verified program.
+
+    Returns it with whether the result is a coordinate (COO) result, which is
+    lowered on its all-compressed twin.
+    """
+
+    # An append out of its result's storage order is a relabelled copy of one
+    # input (an operand conversion).  Only the two-pass relabelled-copy target
+    # builds one; every other family appends in order, so the program goes
+    # there or nowhere, and that target refuses with a code what it does not
+    # emit.
+    if _relabelled_copy_chain(program):
+        return (
+            _RelabelledCopyAssemblyLowering(program, owned_input_shapes, result_shape),
+            False,
+        )
+
+    # A coordinate level has no position array.  The generic, ordered-key
+    # and multi-compressed families walk every operand through the shared
+    # single-cursor loop (``_TargetLowering._lower_sparse``), which lowers
+    # one.  The two narrow workspace families and the dense-domain family
+    # spell their own loops over an operand's position arrays: the narrow
+    # ones are skipped, so the program falls to the families below exactly as
+    # one they decline does, and the dense-domain one fails closed.
+    coordinate_tensors = [
+        decl.name
+        for decl in program.tensors
+        if any(level.kind is LevelKind.COORDINATE for level in decl.levels)
+    ]
+
+    # A coordinate (COO) result is lowered on its all-compressed twin: the
+    # same program with every result level compressed.  The twin's entries
+    # are appended one per stored cell in lexicographic order of the storage
+    # levels, which is the order a COO result stores them in, so the family
+    # chosen for the twin, its loop nest, its workspace and its drain are the
+    # COO program's too.  The chosen lowering is then told the result is
+    # coordinate by its class (``_coordinate_result``), which changes only what
+    # an append stores.  ``coordinate_tensors`` above still names the result,
+    # so the families that spell their own result assembly are not chosen for
+    # it.
+    coordinate_result = _has_coordinate_result(program)
+    if coordinate_result:
+        program = _compressed_result_twin(program)
+    ordered_key_family: Type[_TargetLowering] = (
+        _CoordinateResultOrderedKeyLowering
+        if coordinate_result
+        else _OrderedKeySparseWorkspaceLowering
+    )
+    assembly_family: Type[_TargetLowering] = (
+        _CoordinateResultAssemblyLowering
+        if coordinate_result
+        else _MultiCompressedAssemblyLowering
+    )
 
     lowering: _TargetLowering
-    if _sparse_workspace_chain(program):
+    narrow: Optional[_TargetLowering] = None
+    dense_union = _contains_dense_union(program.body)
+    # A loop that visits every coordinate of a dimension while following
+    # sorted streams is lowered by the generic target (dense results) and by
+    # the united assembly (an elementwise sum into compressed levels); no
+    # other family target has its iteration.
+    dense_union_assembly = (
+        dense_union
+        and any(
+            level.kind is LevelKind.COMPRESSED
+            for decl in program.tensors
+            if program.outputs and decl.symbol == program.outputs[0]
+            for level in decl.levels
+        )
+        and _multi_compressed_assembly_chain(program)
+    )
+    if dense_union and not dense_union_assembly:
+        lowering = _TargetLowering(program, owned_input_shapes, result_shape)
+    elif coordinate_tensors:
+        pass
+    elif _sparse_workspace_chain(program):
         result_decl = next(
             (
                 decl
@@ -15714,35 +21969,195 @@ def _lower_loopir_to_llir_owned(
         row_scope = result_decl is not None and tuple(
             level.kind for level in result_decl.levels
         ) == (LevelKind.DENSE, LevelKind.COMPRESSED)
-        if row_scope:
-            lowering = _RowScopeSparseWorkspaceLowering(
-                program, owned_input_shapes, result_shape
-            )
-        else:
-            lowering = _SparseWorkspaceLowering(
-                program, owned_input_shapes, result_shape
-            )
+        narrow = _narrow_family_lowering(
+            (
+                _RowScopeSparseWorkspaceLowering
+                if row_scope
+                else _SparseWorkspaceLowering
+            ),
+            program,
+            owned_input_shapes,
+            result_shape,
+        )
     elif _parallel_sparse_workspace_chain(program):
-        lowering = _ParallelSparseWorkspaceLowering(
-            program, owned_input_shapes, result_shape
+        narrow = _narrow_family_lowering(
+            _ParallelSparseWorkspaceLowering,
+            program,
+            owned_input_shapes,
+            result_shape,
         )
+    if dense_union and not dense_union_assembly:
+        pass
+    elif dense_union_assembly:
+        lowering = assembly_family(program, owned_input_shapes, result_shape)
+    elif narrow is not None:
+        lowering = narrow
     elif _ordered_key_sparse_workspace_chain(program):
-        lowering = _OrderedKeySparseWorkspaceLowering(
-            program, owned_input_shapes, result_shape
-        )
+        if _ordered_key_target_admits(program):
+            lowering = ordered_key_family(program, owned_input_shapes, result_shape)
+        else:
+            lowering = assembly_family(program, owned_input_shapes, result_shape)
     elif _dense_domain_mixed_chain(program):
+        if coordinate_tensors:
+            _fail(
+                "unsupported_level_kind",
+                f"tensor {coordinate_tensors[0]!r} has coordinate levels, "
+                "which the dense-domain target family does not lower",
+            )
         lowering = _DenseDomainMixedLowering(program, owned_input_shapes, result_shape)
     elif _multi_compressed_assembly_chain(program) or _bound_prefix_assembly_chain(
         program
     ):
-        lowering = _MultiCompressedAssemblyLowering(
-            program, owned_input_shapes, result_shape
+        lowering = assembly_family(program, owned_input_shapes, result_shape)
+    elif coordinate_result:
+        # No family that assembles a coordinate result admits the twin.  The
+        # generic family states why it refuses the twin, which is why this
+        # program is refused; were it to admit the twin, it would assemble
+        # compressed levels, so that fails closed too.
+        _TargetLowering(program, owned_input_shapes, result_shape)
+        _fail(
+            "unsupported_sparse_output",
+            "a coordinate result is assembled by the ordered-key and "
+            "ordered-append target families only, and neither admits this "
+            "program",
         )
     else:
         lowering = _TargetLowering(program, owned_input_shapes, result_shape)
+    return lowering, coordinate_result
+
+
+def assembles_sparse_result(program: LoopProgram) -> bool:
+    """Whether a result of ``program`` has a level that is not dense.
+
+    Only such a program assembles anything an assembly strategy describes: a
+    result with dense levels only is written by coordinate.
+    """
+
+    return any(
+        level.kind is not LevelKind.DENSE
+        for decl in program.tensors
+        if decl.symbol in program.outputs
+        for level in decl.levels
+    )
+
+
+@dataclass(frozen=True)
+class AssemblyChoices:
+    """The sparse-assembly strategies one program can be emitted with.
+
+    ``host`` names the target family that lowers the program.  ``emittable`` is
+    every strategy a plan can record for it and get a kernel, in the order
+    :data:`SPARSE_ASSEMBLY_STRATEGIES` lists them; a recorded strategy outside
+    it is refused.  ``split_extent`` is the extent of the result's first level,
+    the one a parallel assembly is split over, as the target reads it (``None``
+    for a scalar result).  ``sparse_result`` says whether the result has a level
+    that is not dense: only then does the program assemble anything a strategy
+    describes.  Nothing here weighs that extent, a density or a thread count:
+    which emittable strategy to use is the scheduler's decision.
+    """
+
+    host: str
+    emittable: Tuple[str, ...]
+    split_extent: Optional[int]
+    sparse_result: bool
+
+
+def assembly_choices(
+    program: LoopProgram,
+    *,
+    input_shapes: Mapping[SymbolId, Tuple[int, ...]],
+    result_shape: Tuple[int, ...],
+) -> AssemblyChoices:
+    """Which assembly strategies the target can emit ``program`` with.
+
+    Asked of a scheduled program that records no strategy yet, by the layer that
+    is about to choose one.  The answer comes from a lowering built for the
+    question and discarded, because a family may have to emit its serial body to
+    give it; the lowering that emits the kernel is built afterwards, from the
+    program that records the choice.
+    """
+
+    owned_input_shapes = _owned_input_shapes(program, input_shapes)
+    if program.assembly is not None:
+        _fail(
+            INVALID_SCHEDULE_ASSEMBLY,
+            "the program already records an assembly strategy; the strategies "
+            "it can be emitted with are asked before one is recorded",
+        )
+    lowering, _ = _select_lowering(program, owned_input_shapes, result_shape)
+    return AssemblyChoices(
+        host=type(lowering).__name__,
+        emittable=lowering.emittable_assemblies(),
+        split_extent=next(iter(lowering.shapes[lowering.result_symbol]), None),
+        sparse_result=assembles_sparse_result(program),
+    )
+
+
+def with_recorded_assembly(
+    program: LoopProgram,
+    *,
+    input_shapes: Mapping[SymbolId, Tuple[int, ...]],
+    result_shape: Tuple[int, ...],
+) -> Tuple[LoopProgram, Optional[AssemblyChoices]]:
+    """``program`` with an assembly strategy recorded, if it assembles a sparse result.
+
+    A program reaches target lowering without a strategy when no automatic plan
+    was completed for it: it was not scheduled, or its plan was written by a
+    caller who named none.  The strategy is then the automatic rule's, from
+    the same two facts the assembly stage reads for an automatic plan (the
+    strategies this program can be emitted with, and its result's first
+    extent), so the kernel does not depend on which route compiled the program.
+    The strategy is recorded on the returned copy; the caller's program is not
+    changed.  A program that already records a strategy, and one whose result
+    has dense levels only, are returned as they are, with ``None`` for the
+    choices that were not asked.
+    """
+
+    if program.assembly is not None or not assembles_sparse_result(program):
+        return program, None
+    choices = assembly_choices(
+        program, input_shapes=input_shapes, result_shape=result_shape
+    )
+    if not choices.emittable:
+        _fail(
+            UNSUPPORTED_ASSEMBLY_HOST,
+            f"{choices.host} reports no assembly strategy for a result with a "
+            "level that is not dense",
+        )
+    recorded = replace(
+        program,
+        assembly=AssemblyStrategy(
+            automatic_assembly(choices.emittable, choices.split_extent)
+        ),
+    )
+    return recorded, choices
+
+
+def _lower_loopir_to_llir_owned(
+    program: LoopProgram,
+    *,
+    input_shapes: Mapping[SymbolId, Tuple[int, ...]],
+    result_shape: Tuple[int, ...],
+    compile_options: CompileOptions,
+    compilation_context: Optional[CompilationContext],
+) -> llir.Function:
+    """Execute target lowering under an already-owned timing boundary."""
+
+    # A direct caller may hand over a program with no strategy; the pipeline's
+    # assembly stage has already recorded one.
+    program, _ = with_recorded_assembly(
+        program, input_shapes=input_shapes, result_shape=result_shape
+    )
+    owned_input_shapes = _owned_input_shapes(program, input_shapes)
+    lowering, coordinate_result = _select_lowering(
+        program, owned_input_shapes, result_shape
+    )
     raw_statements = lowering.raw_loop_statements()
     kernel_abi = lowering.kernel_abi()
     assembler = lowering.result_assembler()
+    if coordinate_result:
+        _require_coordinate_result_assembly(lowering, raw_statements)
+    _require_no_coordinate_operand_positions(lowering, raw_statements)
 
     validation_stmts = kernel_abi.emit_validation()
     size_stmts = lowering.result_size_inits()
@@ -15890,6 +22305,7 @@ def _lower_loopir_to_llir_owned(
         pipeline_result.artifact.value,
         ordered_key_completion_reference,
     )
+    _require_reads_in_scope(returned)
     return returned
 
 

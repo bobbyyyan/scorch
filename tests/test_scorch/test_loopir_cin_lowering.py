@@ -6,6 +6,8 @@ never mutate its input, and fail closed with stable codes on everything
 outside the families.
 """
 
+import difflib
+
 import pytest
 import torch
 
@@ -23,7 +25,7 @@ from scorch.compiler.cin import (
 )
 from scorch.compiler.cin_analysis import canonical_cin_dump, normalize_cin
 from scorch.compiler.compile_options import CompileOptions
-from scorch.compiler.diagnostics import VerificationError
+from scorch.compiler.diagnostics import InvalidSchedule, VerificationError
 from scorch.compiler.loopir.build import LoopIRBuilder
 from scorch.compiler.loopir.lower_cin import (
     LoopIRLoweringError,
@@ -40,12 +42,15 @@ from scorch.compiler.loopir.nodes import (
 )
 from scorch.compiler.loopir.printer import canonical_program_dump
 from scorch.compiler.loopir.pipeline import (
+    compare_generated_sources,
     compile_cin_via_loopir,
     execute_cin_via_loopir,
     execute_shadow,
+    legacy_generated_cpp,
 )
 from scorch.compiler.loopir.verifier import verify_program
 from scorch.compiler.scheduler import Schedule, Scheduler
+from scorch.stensor import STensor
 
 
 def build_elementwise_add():
@@ -211,7 +216,7 @@ def test_where_fails_closed():
     a = TensorVar("A", fmt="dd")
     x = TensorVar("x", fmt="d")
     y = TensorVar("y", fmt="d")
-    workspace = Workspace(name="wksp", dim=0)
+    workspace = Workspace(name="wksp", dim=0, dtype=y.dtype)
     producer = ForAll(
         j,
         TensorAssign(
@@ -263,15 +268,60 @@ def test_unsupported_expression_unary():
     expect_code("unsupported_expression", ForAll(i, assign))
 
 
-def test_unsupported_format():
-    # Phase 5 opened DENSE/COMPRESSED level compositions, so the recorded
-    # unsupported-format boundary moved to COORDINATE levels and to dense
-    # value-bearing leaves below compressed structure.
+@pytest.mark.parametrize("fmt", ["compressed,singleton", "singleton,singleton"])
+def test_unsupported_format(fmt):
+    # Phase 5 opened DENSE/COMPRESSED level compositions, and all-coordinate
+    # operands and results are lowered, so the recorded unsupported-format
+    # boundary is a level type outside those three: a singleton level.
+    i, j = IndexVar("i"), IndexVar("j")
+    a = TensorVar("A", fmt=fmt)
+    c = TensorVar("C", fmt="dd")
+    assign = TensorAssign(c[i, j], a[i, j])
+    expect_code("unsupported_format", ForAll(i, ForAll(j, assign)))
+
+
+def test_an_all_coordinate_result_is_declared_with_coordinate_levels():
+    from scorch.compiler.loopir.nodes import AppendEntry, LevelKind
+
+    i, j = IndexVar("i"), IndexVar("j")
+    a = TensorVar("A", fmt="oo")
+    c = TensorVar("C", fmt="oo")
+    assign = TensorAssign(c[i, j], a[i, j])
+    program = lower_normalized_cin_to_loopir(
+        normalize_cin(ForAll(i, ForAll(j, assign)))
+    ).program
+    verify_program(program)
+    result = next(decl for decl in program.tensors if decl.name == "C")
+    assert [level.kind for level in result.levels] == [LevelKind.COORDINATE] * 2
+    appends = [
+        node for node in _walk_statements(program.body) if type(node) is AppendEntry
+    ]
+    assert len(appends) == 1 and appends[0].tensor == result.symbol
+
+
+@pytest.mark.parametrize("fmt", ["do", "od", "so", "os"])
+def test_a_coordinate_level_beside_another_kind_is_refused(fmt):
+    i, j = IndexVar("i"), IndexVar("j")
+    a = TensorVar("A", fmt=fmt)
+    c = TensorVar("C", fmt="dd")
+    assign = TensorAssign(c[i, j], a[i, j])
+    expect_code("unsupported_mixed_coordinate_hierarchy", ForAll(i, ForAll(j, assign)))
+
+
+def test_an_all_coordinate_operand_lowers_to_one_sparse_loop_per_level():
+    from scorch.compiler.loopir.nodes import LevelKind, SparseFor
+
     i, j = IndexVar("i"), IndexVar("j")
     a = TensorVar("A", fmt="oo")
     c = TensorVar("C", fmt="dd")
     assign = TensorAssign(c[i, j], a[i, j])
-    expect_code("unsupported_format", ForAll(i, ForAll(j, assign)))
+    program = lower_normalized_cin_to_loopir(
+        normalize_cin(ForAll(i, ForAll(j, assign)))
+    ).program
+    loops = [node for node in _walk_statements(program.body) if type(node) is SparseFor]
+    assert [loop.cursor.level for loop in loops] == [0, 1]
+    operand = next(decl for decl in program.tensors if decl.name == "A")
+    assert [level.kind for level in operand.levels] == [LevelKind.COORDINATE] * 2
 
 
 def test_dense_leaf_below_compressed_operand_lowers_to_position_load():
@@ -309,34 +359,52 @@ def test_dense_leaf_below_compressed_operand_lowers_to_position_load():
     assert spine.parent.position == outer.position
 
 
-def test_mode_order_boundaries():
-    """Dense layouts are level-mapped; the rest of the space fails closed.
-
-    A permuted all-dense operand is admitted exactly when its physical
-    levels are nest-consistent, so the elementwise copy below now reports
-    the loop-order conflict its physical storage actually has.  Permuted
-    compressed structure and non-permutation orders keep their own stable
-    code.  A permuted result is level-mapped too, so an incompatible nest
-    reports the same physical storage-order conflict as an input.
-    """
+def permuted_dense_operand_copy():
+    """``C[i,j] = A[i,j]`` in the nest ``i, j`` with ``A`` stored ``(j, i)``."""
 
     i, j = IndexVar("i"), IndexVar("j")
     a = TensorVar("A", fmt="dd", mode_order=[1, 0])
     c = TensorVar("C", fmt="dd")
-    assign = TensorAssign(c[i, j], a[i, j])
-    expect_code("unsupported_loop_order", ForAll(i, ForAll(j, assign)))
+    return ForAll(i, ForAll(j, TensorAssign(c[i, j], a[i, j])))
+
+
+def permuted_dense_result_copy():
+    """``C[i,j] = A[i,j]`` in the nest ``i, j`` with ``C`` stored ``(j, i)``."""
+
+    i, j = IndexVar("i"), IndexVar("j")
+    a = TensorVar("A", fmt="dd")
+    c = TensorVar("C", fmt="dd", mode_order=[1, 0])
+    return ForAll(i, ForAll(j, TensorAssign(c[i, j], a[i, j])))
+
+
+def test_mode_order_boundaries():
+    """Dense layouts are level-mapped; the rest of the space fails closed.
+
+    A permuted all-dense operand or result is read or written by its
+    coordinates through its level map, in any loop order.  The two copies
+    below visit a permuted dense tensor against its physical storage order;
+    they reported that conflict (``unsupported_loop_order``) until the
+    lowering stopped requiring a storage-order visit of a tensor with no
+    compressed level, and now lower.  Permuted compressed structure handed
+    straight to this lowering keeps its own stable code (the pipeline rewrites
+    such a program into storage-order form before it gets here,
+    ``loop_plan.storage_order_form``), and so does a non-permutation order.
+    """
+
+    for build, name in (
+        (permuted_dense_operand_copy, "A"),
+        (permuted_dense_result_copy, "C"),
+    ):
+        lowered = lower_normalized_cin_to_loopir(normalize_cin(build()))
+        verify_program(lowered.program)
+        decl = next(decl for decl in lowered.program.tensors if decl.name == name)
+        assert tuple(level.mode for level in decl.levels) == (1, 0), name
 
     i, j = IndexVar("i"), IndexVar("j")
     a = TensorVar("A", fmt="ds", mode_order=[1, 0])
     c = TensorVar("C", fmt="dd")
     assign = TensorAssign(c[i, j], a[i, j])
     expect_code("unsupported_mode_order", ForAll(i, ForAll(j, assign)))
-
-    i, j = IndexVar("i"), IndexVar("j")
-    a = TensorVar("A", fmt="dd")
-    c = TensorVar("C", fmt="dd", mode_order=[1, 0])
-    assign = TensorAssign(c[i, j], a[i, j])
-    expect_code("unsupported_loop_order", ForAll(i, ForAll(j, assign)))
 
     # The shared structural boundary owns permutation totality before
     # scheduling or lowering can perform an unsafe lookup; the lowering's
@@ -348,6 +416,133 @@ def test_mode_order_boundaries():
     with pytest.raises(VerificationError) as error:
         lower_normalized_cin_to_loopir(ForAll(i, ForAll(j, assign)))
     assert "invalid_cin_field" in str(error.value)
+
+
+@pytest.mark.parametrize("regblock_enabled", [False, True], ids=["plain", "blocked"])
+def test_a_permuted_dense_tensor_visited_against_its_storage_order_compiles(
+    regblock_enabled,
+):
+    """The two copies above, compiled as written, against the shipped compiler.
+
+    A shape is bound per storage level: ``A`` stored ``(j, i)`` is ``(4, 3)``
+    for a ``3 x 4`` result, and ``C`` stored ``(j, i)`` is ``(4, 3)`` for a
+    ``3 x 4`` operand.  Each position is computed through the level map.  The
+    result copy is the shipped compiler's kernel byte for byte; the operand
+    copy is its kernel with one comment line more.
+    """
+
+    options = CompileOptions.from_environment().with_regblock_enabled(regblock_enabled)
+    read = compare_generated_sources(
+        permuted_dense_operand_copy(),
+        (3, 4),
+        [((4, 3), torch.float32)],
+        compile_options=options,
+    )
+    assert "int pA0 = j;" in read.loopir_cpp
+    assert "int pA1 = pA0 * A1_size + i;" in read.loopir_cpp
+    changed = [
+        line
+        for line in difflib.ndiff(
+            read.legacy_cpp.splitlines(), read.loopir_cpp.splitlines()
+        )
+        if line[:2] in ("- ", "+ ")
+    ]
+    assert [(line[:2], line[2:].strip()) for line in changed] == [
+        ("+ ", "// Resolve dense coordinates")
+    ]
+
+    written = compare_generated_sources(
+        permuted_dense_result_copy(),
+        (4, 3),
+        [((3, 4), torch.float32)],
+        compile_options=options,
+    )
+    assert "int pC0 = j;" in written.loopir_cpp
+    assert "int pC1 = pC0 * C1_size + i;" in written.loopir_cpp
+    assert written.identical
+
+
+@pytest.mark.parametrize("regblock_enabled", [False, True], ids=["plain", "blocked"])
+def test_the_automatic_plan_of_a_permuted_dense_copy(regblock_enabled):
+    """The same two copies under the automatic plan, against the shipped compiler.
+
+    The operand copy compiles on both compilers, to different text.  The
+    result copy compiles on the new compiler only: the shipped compiler's
+    automatic plan stops at ``result_storage_order``, so there is no shipped
+    text to compare with.
+    """
+
+    options = CompileOptions.from_environment(
+        requested_schedule=Schedule()
+    ).with_regblock_enabled(regblock_enabled)
+    read = compare_generated_sources(
+        permuted_dense_operand_copy(),
+        (3, 4),
+        [((4, 3), torch.float32)],
+        compile_options=options,
+    )
+    assert not read.identical
+
+    kernel = compile_cin_via_loopir(
+        permuted_dense_result_copy(),
+        (4, 3),
+        [((3, 4), torch.float32)],
+        compile_options=options,
+    )
+    assert tuple(kernel.result_mode_order) == (1, 0)
+    with pytest.raises(InvalidSchedule) as refusal:
+        legacy_generated_cpp(
+            permuted_dense_result_copy(),
+            (4, 3),
+            [((3, 4), torch.float32)],
+            compile_options=options,
+        )
+    assert [d.code for d in refusal.value.diagnostics] == ["result_storage_order"]
+
+
+@pytest.mark.parametrize("arm", [0, 1], ids=["plain", "blocked"])
+@pytest.mark.parametrize(
+    "loop_order", [("i", "j"), None], ids=["requested-ij", "automatic"]
+)
+def test_a_permuted_dense_operand_matches_pytorch(loop_order, arm):
+    """``A`` stored ``(j, i)``, executed in float64 on an operand stored that way.
+
+    The requested order ``i, j`` is the nest above: it reads ``A`` against its
+    storage order, by coordinate.  The automatic plan is free to pick another.
+    """
+
+    from tests.test_scorch.loopir_executed_programs import (
+        assert_program_matches_pytorch,
+    )
+
+    kernel, _ = assert_program_matches_pytorch(
+        (("A", "dd", "ij", (1, 0)),),
+        ("ij", "dd", None),
+        arm,
+        loop_order=loop_order,
+    )
+    if loop_order is not None:
+        assert "int pA1 = pA0 * A1_size + i;" in kernel.cpp_source
+
+
+@pytest.mark.parametrize("arm", [0, 1], ids=["plain", "blocked"])
+def test_a_permuted_dense_result_matches_pytorch(arm):
+    """``C`` stored ``(j, i)``, executed in float64 and read back in that order.
+
+    Only the automatic plan runs: a requested order that writes a result
+    against its storage order is refused by the plan's ``result_storage_order``
+    rule for every result layout, so the nest above is reachable as written
+    only, where its kernel is the shipped compiler's byte for byte.
+    """
+
+    from tests.test_scorch.loopir_executed_programs import (
+        assert_program_matches_pytorch,
+    )
+
+    kernel, _ = assert_program_matches_pytorch(
+        (("A", "dd", "ij", None),), ("ij", "dd", (1, 0)), arm
+    )
+    assert tuple(kernel.result_mode_order) == (1, 0)
 
 
 def test_permuted_dense_result_lowers_with_level_mapped_modes():
@@ -408,9 +603,10 @@ def test_permuted_dense_operand_lowers_with_level_mapped_modes():
 
 
 def test_unsupported_dtype():
+    # int16 is outside the six element types the shipped compiler builds.
     i = IndexVar("i")
-    a = TensorVar("a", fmt="d", dtype=torch.int32)
-    c = TensorVar("c", fmt="d", dtype=torch.int32)
+    a = TensorVar("a", fmt="d", dtype=torch.int16)
+    c = TensorVar("c", fmt="d", dtype=torch.int16)
     assign = TensorAssign(c[i], a[i])
     expect_code("unsupported_dtype", ForAll(i, assign))
 
@@ -529,7 +725,7 @@ def test_implicit_bridge_keeps_repeated_operand_rejection():
     expect_code("unsupported_repeated_operand", ForAll(i, ForAll(j, assign)))
 
 
-def test_unsupported_loop_order_kij():
+def dense_matmul_kij():
     i, k, j = IndexVar("i"), IndexVar("k"), IndexVar("j")
     a = TensorVar("A", fmt="dd")
     b = TensorVar("B", fmt="dd")
@@ -537,7 +733,47 @@ def test_unsupported_loop_order_kij():
     assign = TensorAssign(
         c[i, j], CINBinaryOp(Operation.MUL, a[i, k], b[k, j]), op=Operation.ADD
     )
-    expect_code("unsupported_loop_order", ForAll(k, ForAll(i, ForAll(j, assign))))
+    return ForAll(k, ForAll(i, ForAll(j, assign)))
+
+
+@pytest.mark.parametrize("regblock_enabled", [False, True], ids=["plain", "blocked"])
+def test_dense_matmul_lowers_in_kij_order(regblock_enabled):
+    """The nest ``k, i, j`` reads ``A[i, k]`` against its storage order.
+
+    That was ``unsupported_loop_order``.  An all-dense operand is read by its
+    coordinates in any loop order, so the nest lowers, to the shipped
+    compiler's kernel byte for byte.
+    """
+
+    lowered = lower_normalized_cin_to_loopir(normalize_cin(dense_matmul_kij()))
+    verify_program(lowered.program)
+    comparison = compare_generated_sources(
+        dense_matmul_kij(),
+        (3, 4),
+        [((3, 5), torch.float32), ((5, 4), torch.float32)],
+        compile_options=CompileOptions.from_environment().with_regblock_enabled(
+            regblock_enabled
+        ),
+    )
+    assert "int pA1 = pA0 * A1_size + k;" in comparison.loopir_cpp
+    assert comparison.identical
+
+
+@pytest.mark.parametrize("arm", [0, 1], ids=["plain", "blocked"])
+def test_dense_matmul_requested_in_kij_order_matches_pytorch(arm):
+    """The same order through the scheduled route, executed in float64."""
+
+    from tests.test_scorch.loopir_executed_programs import (
+        assert_program_matches_pytorch,
+    )
+
+    kernel, _ = assert_program_matches_pytorch(
+        (("A", "dd", "ik", None), ("B", "dd", "kj", None)),
+        ("ij", "dd", None),
+        arm,
+        loop_order=("k", "i", "j"),
+    )
+    assert "int pA1 = pA0 * A1_size + k;" in kernel.cpp_source
 
 
 def test_unsupported_repeated_operand():
@@ -791,88 +1027,203 @@ def test_sparse_lowering_is_deterministic():
     assert first == second
 
 
-def test_unsupported_sparse_output_layout():
-    """An INTERLEAVED dense level keeps the layout seam.
+@pytest.mark.parametrize("arm", [False, True], ids=["plain", "blocked"])
+def test_reduction_into_a_layout_with_a_dense_level_below_a_compressed_one(arm):
+    """A reduction whose result coordinate is bound below the reduced loop.
 
-    Three earlier occupants of this lock have since been migrated: the
-    dense-prefix/multi-compressed copy became the single-cursor assembly
-    family, the rank-1 compressed output became the degenerate
-    ordered-stream family (``test_loopir_rank1_assembly_target.py``), and a
-    single compressed level under two or more dense parents became the
-    flattened-prefix family
-    (``test_loopir_multi_dense_prefix_target.py``).
-
-    The seam itself still holds for an interleaved layout -- a compressed
-    level ABOVE a dense one.  A dense prefix flattens to a static product
-    of extents, which is what the migrated family sizes its position
-    vectors from; a dense level whose parent is a compressed level has a
-    DYNAMIC stored-coordinate parent count instead, so no such flattened
-    segment number exists for it.
+    ``C[i,j,l] = sum_k A[i,j,k,l]`` into ``sds`` was refused until 2026-10-12
+    (``unsupported_sparse_output``): the result coordinate ``l`` is bound
+    below the reduced loop ``k``, so the sums must be accumulated in a sorted
+    coordinate workspace and drained below the dense level ``j``.  It lowers
+    now, and is judged on the dense-below-compressed table's inputs.
     """
 
-    i, j, k = IndexVar("i"), IndexVar("j"), IndexVar("k")
-    c = TensorVar("C", fmt="sds")
-    a = TensorVar("A", fmt="sds")
-    assign = TensorAssign(c[i, j, k], a[i, j, k])
-    expect_code("unsupported_sparse_output", ForAll(i, ForAll(j, ForAll(k, assign))))
+    from tests.test_scorch.test_loopir_dense_below_compressed_target import (
+        assert_statement_matches_pytorch,
+    )
 
-
-def test_unsupported_sparse_output_reduction():
-    i, j, k = IndexVar("i"), IndexVar("j"), IndexVar("k")
-    c = TensorVar("C", fmt="ds")
-    a = TensorVar("A", fmt="dss")
-    assign = TensorAssign(c[i, j], a[i, j, k], op=Operation.ADD)
-    expect_code(
-        "unsupported_sparse_output_reduction",
-        ForAll(i, ForAll(j, ForAll(k, assign))),
+    i, j, k, ell = IndexVar("i"), IndexVar("j"), IndexVar("k"), IndexVar("l")
+    c = TensorVar("C", fmt="sds", dtype=torch.float32)
+    a = TensorVar("A", fmt="ssss", dtype=torch.float32)
+    assign = TensorAssign(c[i, j, ell], a[i, j, k, ell], op=Operation.ADD)
+    assert_statement_matches_pytorch(
+        ForAll(i, ForAll(j, ForAll(k, ForAll(ell, assign)))), arm
     )
 
 
-def test_unsupported_sparse_output_domain_dense_column():
+@pytest.mark.parametrize(
+    "operand_format,result_format", (("ds", "ss"), ("ss", "ds"), ("ds", "sd"))
+)
+def test_a_sum_into_a_layout_its_rows_do_not_drive_lowers(
+    operand_format, result_format
+):
+    """``C[i,j] = A[i,j] + B[i,j]`` whose result rows are not the operands'.
+
+    These kept a refusal code until the united assembly learned a dense row
+    loop above a compressed result row (``ds + ds -> ss``), a union driving a
+    dense result row (``ss + ss -> ds``) and a dense block below a compressed
+    level (``ds + ds -> sd``).  ``test_loopir_dense_union.py``'s sparse-result
+    table executes each on both compilers against float64.
+    """
+
     i, j = IndexVar("i"), IndexVar("j")
-    c = TensorVar("C", fmt="ds")
-    a = TensorVar("A", fmt="dd")
-    b = TensorVar("B", fmt="dd")
+    c = TensorVar("C", fmt=result_format, dtype=torch.float32)
+    a = TensorVar("A", fmt=operand_format, dtype=torch.float32)
+    b = TensorVar("B", fmt=operand_format, dtype=torch.float32)
     assign = TensorAssign(c[i, j], CINBinaryOp(Operation.ADD, a[i, j], b[i, j]))
-    expect_code("unsupported_sparse_output_domain", ForAll(i, ForAll(j, assign)))
+    lower_normalized_cin_to_loopir(normalize_cin(ForAll(i, ForAll(j, assign))))
 
 
-def test_unsupported_sparse_output_domain_sparse_row():
-    i, j = IndexVar("i"), IndexVar("j")
-    c = TensorVar("C", fmt="ds")
-    a = TensorVar("A", fmt="ss")
-    assign = TensorAssign(c[i, j], a[i, j])
-    expect_code("unsupported_sparse_output_domain", ForAll(i, ForAll(j, assign)))
-
-
-def test_unsupported_merged_reduction():
-    i, j = IndexVar("i"), IndexVar("j")
-    y = TensorVar("y", fmt="d")
-    a = TensorVar("A", fmt="ds")
-    b = TensorVar("B", fmt="ds")
-    assign = TensorAssign(
-        y[i], CINBinaryOp(Operation.ADD, a[i, j], b[i, j]), op=Operation.ADD
+def test_copy_into_a_layout_with_a_dense_level_below_a_compressed_one_lowers():
+    i, j, k = IndexVar("i"), IndexVar("j"), IndexVar("k")
+    c = TensorVar("C", fmt="sds", dtype=torch.float32)
+    a = TensorVar("A", fmt="sds", dtype=torch.float32)
+    assign = TensorAssign(c[i, j, k], a[i, j, k])
+    lower_normalized_cin_to_loopir(
+        normalize_cin(ForAll(i, ForAll(j, ForAll(k, assign))))
     )
-    expect_code("unsupported_merged_reduction", ForAll(i, ForAll(j, assign)))
 
 
-def test_unsupported_merged_update():
-    """A merged RESULT coordinate under a reduction elsewhere stays refused.
+@pytest.mark.parametrize("arm", [False, True], ids=["plain", "blocked"])
+def test_reduction_into_csr_lowers(arm):
+    """``C[i,j] = sum_k A[i,j,k]`` into CSR, once refused as
+    ``unsupported_sparse_output_reduction``.
 
-    ``C[j] += A[i, j] + B[i, j]`` sums over ``i`` while ``j`` is a union.  The
-    shape this test used to hold, ``C[i, j] += A[i, j] + B[i, j]``, has no
+    Both result coordinates are bound above the reduced loop, so each stored
+    ``(i, j)`` is one scalar accumulation committed after its ``k`` loop.
+    ``test_sparse_output_reduction_sweep.py`` also runs this cell (``dss
+    ijk->ij as ds``) against the shipped compiler.
+    """
+
+    from tests.test_scorch.test_loopir_dense_below_compressed_target import (
+        assert_statement_matches_pytorch,
+    )
+
+    i, j, k = IndexVar("i"), IndexVar("j"), IndexVar("k")
+    c = TensorVar("C", fmt="ds", dtype=torch.float32)
+    a = TensorVar("A", fmt="dss", dtype=torch.float32)
+    assign = TensorAssign(c[i, j], a[i, j, k], op=Operation.ADD)
+    assert_statement_matches_pytorch(ForAll(i, ForAll(j, ForAll(k, assign))), arm)
+
+
+@pytest.mark.parametrize("arm", [False, True], ids=["plain", "blocked"])
+def test_sum_of_dense_matrices_into_csr(arm):
+    """``C[i,j] = A[i,j] + B[i,j]`` with dense operands into CSR.
+
+    Refused as ``unsupported_sparse_output_domain`` until 2026-10-12 because
+    the column loop iterates a dense domain.  A dense operand stores every
+    cell, so the result stores every coordinate of every row, explicit zeros
+    included, and each value is the float32 sum.
+    """
+
+    from tests.test_scorch.test_loopir_sparse_workspace_target import auto_options
+
+    i, j = IndexVar("i"), IndexVar("j")
+    c = TensorVar("C", fmt="ds", dtype=torch.float32)
+    a = TensorVar("A", fmt="dd", dtype=torch.float32)
+    b = TensorVar("B", fmt="dd", dtype=torch.float32)
+    assign = TensorAssign(c[i, j], CINBinaryOp(Operation.ADD, a[i, j], b[i, j]))
+    for rows, columns in ((3, 4), (0, 3), (2, 0), (1, 1)):
+        generator = torch.Generator().manual_seed(rows * 7 + columns)
+        left = torch.rand(rows, columns, generator=generator)
+        right = torch.rand(rows, columns, generator=generator)
+        left[left < 0.4] = 0.0
+        right[:, :1] = -left[:, :1]  # the first column sums to an exact zero
+        result, _ = execute_cin_via_loopir(
+            ForAll(i, ForAll(j, assign)),
+            (rows, columns),
+            STensor.from_torch(left),
+            STensor.from_torch(right),
+            compile_options=auto_options(arm, jit=True),
+        )
+        assert str(result.format) == "d,s"
+        positions, coordinates = result.storage.index.mode_indices[1]
+        assert positions.tolist() == [columns * row for row in range(rows + 1)]
+        assert coordinates.tolist() == list(range(columns)) * rows
+        torch.testing.assert_close(
+            result.to_torch(in_place=False), left + right, atol=0.0, rtol=0.0
+        )
+
+
+@pytest.mark.parametrize("arm", [False, True], ids=["plain", "blocked"])
+def test_dcsr_copy_into_csr(arm):
+    """``C[i,j] = A[i,j]`` from DCSR into CSR, once refused as
+    ``unsupported_sparse_output_domain`` because the row loop iterates a
+    stored row stream.  It lowers now and is judged on the
+    dense-below-compressed table's inputs."""
+
+    from tests.test_scorch.test_loopir_dense_below_compressed_target import (
+        assert_statement_matches_pytorch,
+    )
+
+    i, j = IndexVar("i"), IndexVar("j")
+    c = TensorVar("C", fmt="ds", dtype=torch.float32)
+    a = TensorVar("A", fmt="ss", dtype=torch.float32)
+    assert_statement_matches_pytorch(
+        ForAll(i, ForAll(j, TensorAssign(c[i, j], a[i, j]))), arm
+    )
+
+
+def _united_csr_reduction(reduced, arm):
+    """Run ``out[kept] += A[i,j] + B[i,j]`` for CSR ``A`` and ``B`` into a
+    dense vector, summing over ``reduced`` (``"j"`` or ``"i"``), and compare
+    it with the float64 sum of the dense operands."""
+
+    from tests.test_scorch.test_loopir_sparse_workspace_target import auto_options
+
+    i, j = IndexVar("i"), IndexVar("j")
+    kept = i if reduced == "j" else j
+    out = TensorVar("y", fmt="d", dtype=torch.float32)
+    a = TensorVar("A", fmt="ds", dtype=torch.float32)
+    b = TensorVar("B", fmt="ds", dtype=torch.float32)
+    assign = TensorAssign(
+        out[kept], CINBinaryOp(Operation.ADD, a[i, j], b[i, j]), op=Operation.ADD
+    )
+    for rows, columns in ((3, 4), (0, 3), (2, 0), (1, 1), (4, 5)):
+        generator = torch.Generator().manual_seed(rows * 11 + columns)
+        left = torch.rand(rows, columns, generator=generator)
+        right = torch.rand(rows, columns, generator=generator)
+        left[left < 0.5] = 0.0
+        right[right < 0.6] = 0.0
+        if rows > 1:
+            left[1], right[1] = 0.0, 0.0  # a row neither operand stores
+        result, _ = execute_cin_via_loopir(
+            ForAll(i, ForAll(j, assign)),
+            (rows if reduced == "j" else columns,),
+            STensor.from_torch(left.to_sparse_csr()),
+            STensor.from_torch(right.to_sparse_csr()),
+            compile_options=auto_options(arm, jit=True),
+        )
+        expected = (left.double() + right.double()).sum(1 if reduced == "j" else 0)
+        torch.testing.assert_close(
+            result.to_torch(in_place=False).double(), expected, atol=1e-6, rtol=1e-6
+        )
+
+
+@pytest.mark.parametrize("arm", [False, True], ids=["plain", "blocked"])
+def test_reduction_over_a_union_into_a_dense_result(arm):
+    """``y[i] += A[i,j] + B[i,j]``: the reduced loop is a union.
+
+    Refused as ``unsupported_merged_reduction`` until 2026-10-12.  A dense
+    result addresses every cell by its coordinates, so each case of the union
+    (both operands store ``j``, or only one does) adds its own term into
+    ``y[i]``.
+    """
+
+    _united_csr_reduction("j", arm)
+
+
+@pytest.mark.parametrize("arm", [False, True], ids=["plain", "blocked"])
+def test_union_result_coordinate_under_a_reduction(arm):
+    """``C[j] += A[i,j] + B[i,j]``: the result coordinate is a union and the
+    outer loop is summed over.  Refused as ``unsupported_merged_update`` until
+    2026-10-12; the dense result takes ``+=`` in every case of the union.  The
+    shape this test held before that, ``C[i, j] += A[i, j] + B[i, j]``, has no
     reduction loop, so its update is plain assignment (see
     ``test_a_merged_add_copy_is_plain_assignment``).
     """
 
-    i, j = IndexVar("i"), IndexVar("j")
-    c = TensorVar("C", fmt="d")
-    a = TensorVar("A", fmt="ds")
-    b = TensorVar("B", fmt="ds")
-    assign = TensorAssign(
-        c[j], CINBinaryOp(Operation.ADD, a[i, j], b[i, j]), op=Operation.ADD
-    )
-    expect_code("unsupported_merged_update", ForAll(i, ForAll(j, assign)))
+    _united_csr_reduction("i", arm)
 
 
 def test_a_merged_add_copy_is_plain_assignment():
@@ -883,7 +1234,9 @@ def test_a_merged_add_copy_is_plain_assignment():
     assign = TensorAssign(
         c[i, j], CINBinaryOp(Operation.ADD, a[i, j], b[i, j]), op=Operation.ADD
     )
-    lowered = lower_normalized_cin_to_loopir(normalize_cin(ForAll(i, ForAll(j, assign))))
+    lowered = lower_normalized_cin_to_loopir(
+        normalize_cin(ForAll(i, ForAll(j, assign)))
+    )
     stores = [
         node
         for node in _walk_statements(lowered.program.body)
@@ -900,10 +1253,12 @@ def test_analysis_codes_surface_through_the_lowering():
     sub = TensorAssign(c[i, j], CINBinaryOp(Operation.SUB, a[i, j], b[i, j]))
     expect_code("unsupported_sparse_subtraction", ForAll(i, ForAll(j, sub)))
 
+    # A sum with an invariant term stored compressed: the coordinates of j
+    # it covers depend on whether x stores i.
     c2 = TensorVar("C2", fmt="dd")
-    dense_b = TensorVar("B2", fmt="dd")
-    mixed = TensorAssign(c2[i, j], CINBinaryOp(Operation.ADD, a[i, j], dense_b[i, j]))
-    expect_code("unsupported_union_with_dense", ForAll(i, ForAll(j, mixed)))
+    x = TensorVar("x", fmt="s")
+    mixed = TensorAssign(c2[i, j], CINBinaryOp(Operation.ADD, a[i, j], x[i]))
+    expect_code("unsupported_union_operand", ForAll(i, ForAll(j, mixed)))
 
 
 def test_permuted_layout_canonical_identity_is_distinct():

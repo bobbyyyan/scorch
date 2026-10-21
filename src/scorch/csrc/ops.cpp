@@ -644,7 +644,12 @@ void bind_sddmm_variants(py::module_& m) {
 
 }  // namespace
 
+// sealed_values.cpp: the stored state of scorch.format's and scorch.layout's value types.
+int register_sealed_values(PyObject* module);
+
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
+    if (register_sealed_values(m.ptr()) < 0) throw py::error_already_set();
+
     // Whether the SpMM A/B tune hooks (SCORCH_SPMM_WORKSPACE and friends) are
     // compiled in. A harness that selects between two kernel paths by environment
     // variable has no way to tell a build without them from a build where the change
@@ -664,11 +669,10 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
 
     // The ABI validation memo, reachable from Python so tests can force the cold
     // path and so a caller under memory pressure can drop the narrowed int32 copies.
-    // Scope: THIS extension's memo only. native_abi.h holds its maps in inline
-    // function-local statics, and Python dlopens extension modules with RTLD_LOCAL,
-    // so every JIT-compiled kernel carries its own copy. Each amortizes over its own
-    // calls, which is all the fix needs; the cost is that a tensor used by both a
-    // prebuilt and a generated kernel is narrowed once per module.
+    // Scope: every memo this extension can reach. Under gcc on Linux that is the one
+    // memo of the process, shared with every JIT-compiled kernel module; where each
+    // module has its own, it is this extension's only (see the note on abi_memo_clear in
+    // native_abi.h).
     m.def("abi_memo_clear", &scorch_native::abi_memo_clear,
           "Drop every cached index-validation verdict and narrowed index copy");
     m.def("abi_memo_size", &scorch_native::abi_memo_size,
@@ -693,8 +697,8 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           "Calls run as row panels since the module loaded. For tests");
 
     // Write witnesses (native_abi.h). The capsule is how a JIT-compiled kernel module, which
-    // carries its own memo, reads the epochs this module keeps; the functions are what Python's
-    // caches over a torch sparse operand's index arrays use.
+    // compiles its own copy of native_abi.h, reads the epochs this module keeps; the functions
+    // are what Python's caches over a torch sparse operand's index arrays use.
     m.attr("_abi_watch_api") =
         py::capsule(static_cast<const void*>(scorch_native::abi_watch_owner_api()),
                     "scorch_ops._abi_watch_api");
@@ -1051,7 +1055,8 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           py::arg("coordinates"), py::arg("extent"),
           py::arg("grain") = SCORCH_ABI_VALIDATE_GRAIN);
 
-    // "COO coordinates ascend lexicographically across the levels, in level order".
+    // "COO coordinates ascend strictly lexicographically across the levels, in level
+    // order": no tuple is smaller than, or equal to, the one before it.
     //
     // This one replaces the worst loop in the validator: the COO branch of
     // `_validate_index_storage` called .tolist() on every mode's index array and then
@@ -1061,7 +1066,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     //
     // The comparison is the same one the Python loop performs: the first level that
     // differs decides, so this is a lexicographic test over the levels in order, not a
-    // per-level ordering test.
+    // per-level ordering test. An equal tuple (one coordinate stored twice) is flagged.
     m.def("abi_screen_lex_levels",
           [](const std::vector<torch::Tensor>& levels, int64_t n,
              int64_t grain) -> bool {
@@ -1080,7 +1085,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
               // The parameter layout of the call boundary's COO order check.
               scorch_native::AbiStructEntry want;
               for (const auto& level : levels) want.add(level);
-              want.params = {scorch_native::AbiCheckLex, n};
+              want.params = {scorch_native::AbiCheckLexStrict, n};
               return scorch_native::abi_screen_through_memo(std::move(want), [&] {
                 if (width == torch::kInt32) {
                   std::vector<const int32_t*> data;
@@ -1099,7 +1104,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
               return true;
             }
           },
-          "Screen COO lexicographic order: false = the coordinates ascend",
+          "Screen COO lexicographic order: false = the coordinates strictly ascend",
           py::call_guard<py::gil_scoped_release>(),
           py::arg("levels"), py::arg("n"),
           py::arg("grain") = SCORCH_ABI_VALIDATE_GRAIN);

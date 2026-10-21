@@ -815,6 +815,90 @@ def test_mixed_union_and_intersection_chain_fails_closed():
     assert error.value.defect.code == "unsupported_program_shape"
 
 
+# -- unions that were refused until 2026-10-12 -------------------------------
+
+
+def _union_cin(fmt, operands):
+    """C = (A + B) + D ... over ``operands`` tensors of one shared format."""
+
+    ivars = tuple(IndexVar(name) for name in "ijkl"[: len(fmt)])
+    total = TensorVar("A", fmt=fmt)[ivars]
+    for name in "BDE"[: operands - 1]:
+        total = CINBinaryOp(Operation.ADD, total, TensorVar(name, fmt=fmt)[ivars])
+    stmt = TensorAssign(TensorVar("C", fmt=fmt)[ivars], total)
+    for index_var in reversed(ivars):
+        stmt = ForAll(index_var, stmt)
+    return stmt
+
+
+def _subset_inputs(shape, operands, shift, seed=20261012):
+    """Dense operands in which first-mode coordinate ``c`` is stored by the operands
+    whose bit is set in ``(c + shift) mod 2**operands``: over the shifts every subset
+    of the operands, the empty one included, is the set storing some coordinate."""
+
+    generator = torch.Generator().manual_seed(seed + shift)
+    out = []
+    for position in range(operands):
+        dense = torch.randn(shape, generator=generator) * (
+            torch.rand(shape, generator=generator) < 0.6
+        )
+        for coordinate in range(shape[0]):
+            if not ((coordinate + shift) % (1 << operands)) >> position & 1:
+                dense[coordinate] = 0
+        out.append(dense)
+    return out
+
+
+@pytest.mark.parametrize("regblock_enabled", [False, True])
+@pytest.mark.parametrize("shift", [0, 3, 5])
+@pytest.mark.parametrize(
+    "fmt,operands,shape",
+    [
+        ("ss", 3, (4, 5)),
+        ("sds", 2, (3, 4, 5)),
+        ("ss", 3, (9, 5)),
+        ("sds", 2, (6, 4, 5)),
+    ],
+    ids=["ss+ss+ss", "sds+sds", "ss+ss+ss nine rows", "sds+sds six slices"],
+)
+def test_unions_lowered_since_2026_10_12_execute(
+    fmt, operands, shape, shift, regblock_enabled
+):
+    """The three-operand union and the union into a dense level below a compressed
+    one were refused here (``unsupported_program_shape``,
+    ``unsupported_sparse_output_domain``); both are lowered now.  Each result is
+    checked against the dense sum and, level array by level array, against the
+    reference interpreter."""
+
+    cin = _union_cin(fmt, operands)
+    denses = _subset_inputs(shape, operands, shift)
+    result = executed(
+        cin,
+        shape,
+        tuple(sparse(dense, name, fmt) for dense, name in zip(denses, "ABDE")),
+        regblock_enabled,
+    )
+    pieces, values = validated_storage_pieces(result, fmt, shape)
+    assert torch.allclose(result.to_torch(), sum(denses), atol=1e-6, rtol=1e-5)
+
+    kernel = compile_cin_via_loopir(
+        cin,
+        shape,
+        tuple((shape, torch.float32) for _ in denses),
+        compile_options=auto_options(regblock_enabled),
+    )
+    oracle = oracle_storage(kernel, denses, fmt, shape)
+    for level, ch in enumerate(fmt):
+        if ch != "s":
+            continue
+        pos, crd = pieces[level]
+        assert tuple(pos) == oracle.positions[level]
+        assert tuple(crd) == oracle.coordinates[level]
+    assert len(values) == len(oracle.values)
+    for got, expected in zip(values, oracle.values):
+        assert got == pytest.approx(expected, abs=1e-5, rel=1e-5)
+
+
 # -- adjacent seams stay fail-closed -----------------------------------------
 
 
@@ -831,66 +915,6 @@ def _seam_cells():
                     Operation.SUB,
                     TensorVar("A", fmt="ss")[i, j],
                     TensorVar("B", fmt="ss")[i, j],
-                ),
-            ),
-        ),
-    )
-    union_with_dense = ForAll(
-        i,
-        ForAll(
-            j,
-            TensorAssign(
-                TensorVar("C", fmt="ss")[i, j],
-                CINBinaryOp(
-                    Operation.ADD,
-                    TensorVar("A", fmt="ss")[i, j],
-                    TensorVar("B", fmt="dd")[i, j],
-                ),
-            ),
-        ),
-    )
-    three = ForAll(
-        i,
-        ForAll(
-            j,
-            TensorAssign(
-                TensorVar("C", fmt="ss")[i, j],
-                CINBinaryOp(
-                    Operation.ADD,
-                    CINBinaryOp(
-                        Operation.ADD,
-                        TensorVar("A", fmt="ss")[i, j],
-                        TensorVar("B", fmt="ss")[i, j],
-                    ),
-                    TensorVar("D", fmt="ss")[i, j],
-                ),
-            ),
-        ),
-    )
-    # Recorded seam move (second time on this seam).  The rank-1 united
-    # output that first sat here became the degenerate ordered-stream family
-    # (``test_loopir_rank1_assembly_target.py``); its replacement -- a united
-    # result whose single compressed level sits under two or more dense
-    # parents -- is now the admitted flattened-prefix family
-    # (``test_loopir_multi_dense_prefix_target.py``).  The neighbour that
-    # still occupies the seam is the INTERLEAVED united result: a compressed
-    # level above a dense one, whose dense level's parent count is a dynamic
-    # stored-coordinate count instead of a static product, so no flattened
-    # segment number exists for it.
-    k = IndexVar("k")
-    interleaved_union = ForAll(
-        i,
-        ForAll(
-            j,
-            ForAll(
-                k,
-                TensorAssign(
-                    TensorVar("C", fmt="sds")[i, j, k],
-                    CINBinaryOp(
-                        Operation.ADD,
-                        TensorVar("A", fmt="sds")[i, j, k],
-                        TensorVar("B", fmt="sds")[i, j, k],
-                    ),
                 ),
             ),
         ),
@@ -921,31 +945,11 @@ def _seam_cells():
             (((4, 5), f32), ((4, 5), f32)),
             "unsupported_sparse_subtraction",
         ),
-        (
-            "union_with_dense",
-            union_with_dense,
-            (4, 5),
-            (((4, 5), f32), ((4, 5), f32)),
-            "unsupported_union_with_dense",
-        ),
-        # The three-operand union previously died at the layout seam
-        # (unsupported_sparse_output); the united classification now admits
-        # its domains, and the target's two-cursor boundary owns the
-        # rejection, exactly like the three-operand intersection.
-        (
-            "three_operand_union",
-            three,
-            (4, 5),
-            (((4, 5), f32), ((4, 5), f32), ((4, 5), f32)),
-            "unsupported_program_shape",
-        ),
-        (
-            "interleaved_dense_union_output",
-            interleaved_union,
-            (3, 4, 5),
-            (((3, 4, 5), f32), ((3, 4, 5), f32)),
-            "unsupported_sparse_output",
-        ),
+        # ``ss + dd`` into ``ss`` (a dense union into compressed levels) sat
+        # here until 2026-10-12; test_loopir_dense_union.py runs it.
+        # ``ss + ss + ss`` into ``ss`` and ``sds + sds`` into ``sds`` sat here
+        # until 2026-10-12; ``test_unions_lowered_since_2026_10_12_execute``
+        # above runs them.
         # (A + B) * D over a dense factor keeps 2-cursor united domains
         # (the dense operand defers in the lattice), but the united leaf
         # envelope is exactly the two-operand sum; the wider expression

@@ -65,9 +65,10 @@ The three separated spaces the sparse schema rests on (proven by the spike):
   :class:`PositionValue`).  Positions are never recovered from coordinates,
   rendered names, callbacks, or interpreter state.
 
-Scalar typing, reduction-without-accumulators, and the declared-but-
-fail-closed disposition of ``COORDINATE``/``SINGLETON`` levels are unchanged
-from Phase 4; ``COMPRESSED`` becomes executable in this subset.
+Scalar typing and reduction-without-accumulators are unchanged from Phase 4;
+``COMPRESSED`` becomes executable in this subset.  ``COORDINATE`` levels are
+executable on inputs whose levels are all ``COORDINATE`` (a COO tensor, see
+:class:`LevelKind`); ``SINGLETON`` stays declared and fail-closed.
 """
 
 from __future__ import annotations
@@ -172,21 +173,81 @@ class ResultTileId:
 
 @unique
 class ScalarType(Enum):
-    """Scalar value type of a declared tensor, target-neutrally."""
+    """Scalar value type of a declared tensor, target-neutrally.
+
+    The element types the shipped compiler builds kernels for.  A program's
+    tensors may hold different types: every value expression has the type
+    :func:`promoted_scalar_type` gives its operands, and a stored value must
+    have the type of the tensor or workspace it is stored in (the verifier's
+    ``mixed_dtype``).  Integer arithmetic is exact and wraps to the declared
+    width wherever a value is stored, as the C++ conversion to the element
+    type does.
+    """
 
     FLOAT32 = "float32"
     FLOAT64 = "float64"
+    INT64 = "int64"
+    INT32 = "int32"
+    INT8 = "int8"
+    UINT8 = "uint8"
+
+    @property
+    def is_floating(self) -> bool:
+        return self in (ScalarType.FLOAT32, ScalarType.FLOAT64)
+
+
+# Bits of each integer type, for promotion.
+_INTEGER_BITS = {
+    ScalarType.INT64: 64,
+    ScalarType.INT32: 32,
+    ScalarType.INT8: 8,
+    ScalarType.UINT8: 8,
+}
+
+
+def promoted_scalar_type(lhs: ScalarType, rhs: ScalarType) -> Optional[ScalarType]:
+    """The type of a binary operation on values of ``lhs`` and ``rhs``.
+
+    PyTorch's promotion rule (``torch.promote_types``) over the types Scorch
+    stores: a floating-point type wins over an integer one, and the wider of
+    two types of one kind wins.  ``None`` for int8 with uint8, which promotes
+    to int16, a type Scorch does not store.  C++ computes each admitted pair
+    in this type too, except that int8 and uint8 operands are computed in
+    ``int``; for ADD, SUB and MUL that value wraps to the same result where
+    it is stored.  So the emitted arithmetic needs no casts.
+    """
+
+    if lhs is rhs:
+        return lhs
+    if lhs.is_floating or rhs.is_floating:
+        if lhs.is_floating and rhs.is_floating:
+            return ScalarType.FLOAT64
+        return lhs if lhs.is_floating else rhs
+    if {lhs, rhs} == {ScalarType.INT8, ScalarType.UINT8}:
+        return None
+    return lhs if _INTEGER_BITS[lhs] > _INTEGER_BITS[rhs] else rhs
 
 
 @unique
 class LevelKind(Enum):
     """Per-level storage layout of a declared tensor, target-neutrally.
 
-    ``DENSE`` and ``COMPRESSED`` are the kinds this subset represents and
-    executes.  ``COORDINATE`` and ``SINGLETON`` are declared so their
-    disposition is explicit and the schema does not change shape when a
-    later phase represents them; the verifier fails closed on them with the
-    stable ``unsupported_level_kind`` defect until then.
+    ``DENSE`` and ``COMPRESSED`` are executed on inputs and outputs.
+
+    ``COORDINATE`` is executed on an input whose levels are all
+    ``COORDINATE``: a COO tensor.  Such a tensor stores ``n`` entries; every
+    level holds one coordinate per entry and all levels share the position
+    space ``0 .. n - 1``; the entries are in lexicographic order of their
+    coordinates, read in level order.  Level 0 is a compressed level whose
+    coordinates may repeat and whose one segment is every entry; each later
+    level is a singleton level: its segment is the run of entries that share
+    the coordinates of the levels above it (TACO's COO level formats).  A
+    coordinate level beside a level of another kind has no such segment and
+    fails closed, as does a coordinate level of an output.
+
+    ``SINGLETON`` is declared so its disposition is explicit and the schema
+    does not change shape when a later phase represents it; the verifier
+    fails closed on it with the stable ``unsupported_level_kind`` defect.
     """
 
     DENSE = "dense"
@@ -199,21 +260,30 @@ class LevelKind(Enum):
 #: model's level type, in one place.  Two independent copies of it already
 #: existed (one per direction) and a third was about to be written; a mapping
 #: between two enums is vocabulary, so it belongs beside the enum that needs
-#: translating.  Only the two executable kinds appear: ``COORDINATE`` and
-#: ``SINGLETON`` are declared so their disposition is explicit, and every
-#: consumer must fail closed on their absence rather than defaulting.
+#: translating.  Only the executable kinds appear: ``SINGLETON`` is declared
+#: so its disposition is explicit, and every consumer must fail closed on its
+#: absence rather than defaulting.
 LEVEL_KIND_TO_LEVEL_TYPE: Dict[LevelKind, LevelType] = {
     LevelKind.DENSE: LevelType.DENSE,
     LevelKind.COMPRESSED: LevelType.COMPRESSED,
+    LevelKind.COORDINATE: LevelType.COORDINATE,
 }
 
 
 @unique
 class MergeMode(Enum):
-    """Body-emission policy of a :class:`MergedSparseFor`."""
+    """Body-emission policy of a :class:`MergedSparseFor`.
+
+    ``DENSE_UNION`` is the union of the cursors' stored coordinates with
+    every coordinate of the merged dimension: the iteration of a sum one of
+    whose terms is present at every coordinate (a dense operand, or an
+    operand that does not depend on the loop variable and stores nothing
+    sparse).
+    """
 
     UNION = "union"
     INTERSECTION = "intersection"
+    DENSE_UNION = "dense_union"
 
 
 @unique
@@ -340,6 +410,18 @@ class FloatConst(Expr):
 
 
 @dataclass(frozen=True)
+class IntegerConst(Expr):
+    """A value-typed integer constant, the counterpart of :class:`FloatConst`
+    in a program whose scalar type is an integer type.
+
+    A program holds value constants of its own kind only: ``FloatConst`` in a
+    floating-point program, ``IntegerConst`` in an integer one.
+    """
+
+    value: int
+
+
+@dataclass(frozen=True)
 class RootPosition(Expr):
     """The unique physical root position that dominates every level-0 level.
 
@@ -389,9 +471,9 @@ class CursorValue(Expr):
     Inside a :class:`SparseFor` or an INTERSECTION :class:`MergedSparseFor`
     the owning cursor is aligned with the loop coordinate whenever the body
     runs, so ``default`` must be ``None`` (it could never be observed).
-    Inside a UNION merge the cursor may be unaligned at the emitted
-    coordinate, so a value-typed ``default`` is required and is evaluated
-    exactly when the cursor is not aligned.
+    Inside a UNION or DENSE_UNION merge the cursor may be unaligned at the
+    emitted coordinate, so a value-typed ``default`` is required and is
+    evaluated exactly when the cursor is not aligned.
     """
 
     cursor: CursorId
@@ -405,14 +487,24 @@ class PositionLoad(Expr):
     ``position`` must be position-typed for the final physical level of
     ``tensor``.  Unlike :class:`Load`, this is a physical level access, so it
     is valid for a DENSE leaf below sparse structural levels and for an
-    independently bound compressed-leaf position.  Unlike
-    :class:`CursorValue`, it carries no merge-alignment/default semantics;
-    cursor-owned reads remain the canonical form whenever those semantics are
-    required.
+    independently bound compressed-leaf position.
+
+    Without ``guard`` the load is unconditional: its address must be bound
+    wherever the load runs.  A DENSE leaf below a level that a UNION or
+    DENSE_UNION merge iterates has an address only where that merge's
+    cursor aligned (the operand stores nothing at a one-sided coordinate).
+    Such a load names that cursor as ``guard``: the cursor of the deepest
+    compressed level of ``tensor``, every level below it DENSE.  The load is
+    evaluated exactly when the guard is aligned at its merge's current
+    coordinate, and the value-typed ``default`` is evaluated otherwise, as
+    for a UNION :class:`CursorValue`.  ``guard`` and ``default`` are both
+    set or both ``None``.
     """
 
     tensor: SymbolId
     position: Expr
+    guard: Optional[CursorId] = None
+    default: Optional[Expr] = None
 
 
 @dataclass(frozen=True)
@@ -465,15 +557,25 @@ class DenseFor(Stmt):
 
 @dataclass(frozen=True)
 class SparseCursorDecl(LoopIRNode):
-    """One sparse cursor over a COMPRESSED level of a declared input tensor.
+    """One sparse cursor over a COMPRESSED or COORDINATE level of an input.
 
     ``parent`` is the explicit dominating physical position that selects the
     stored segment the cursor walks: the root position for level 0, or a
     position of level ``level - 1`` of the same tensor (a
     :class:`DensePosition` for a dense parent, a :class:`PositionValue`
-    bound by an enclosing :class:`SparseFor` for a compressed parent).
-    Coordinate search, rendered names, callbacks, and implicit state are not
-    admissible parents.
+    bound by an enclosing :class:`SparseFor` for a compressed or coordinate
+    parent).  Coordinate search, rendered names, callbacks, and implicit
+    state are not admissible parents.
+
+    On a COMPRESSED level the segment is the position range the parent
+    selects, and the cursor visits every position in it.  A parent that
+    hangs from a UNION-bound position whose cursor did not align, directly
+    or through dense levels, selects the empty segment.  On a COORDINATE
+    level the segment is every entry (level 0) or the parent's run of
+    entries (a later level); the cursor visits each distinct coordinate once,
+    at the first entry that stores it, and that entry's position is what a
+    child level names as its parent.  On the last level it visits every
+    entry.
     """
 
     node_id: LoopIRNodeId
@@ -490,8 +592,9 @@ class SparseFor(Stmt):
     Each iteration binds ``position`` to the cursor's current physical
     storage position and ``coord_index`` to the stored coordinate (whose
     domain is the dimension of the cursor level's logical mode), then runs
-    ``body`` once per stored entry, in storage order.  The bound position is
-    what a compressed child level references as its dominating parent.
+    ``body`` once per position the cursor visits, in storage order.  The
+    bound position is what a compressed or coordinate child level references
+    as its dominating parent.
     There is exactly one cursor, so this node never exercises sparse-sparse
     merge semantics.
     """
@@ -968,7 +1071,8 @@ class TiledReduce(Stmt):
 
 @dataclass(frozen=True)
 class MergedSparseFor(Stmt):
-    """Coordinate-synchronized iteration over two or more sparse cursors.
+    """Coordinate-synchronized iteration over sparse cursors (two or more, or
+    one or more beside a dense domain under ``DENSE_UNION``).
 
     Every cursor level must store the same logical dimension — the merged
     coordinate domain.  A merge admits non-leaf cursors when the loop binds
@@ -980,10 +1084,12 @@ class MergedSparseFor(Stmt):
     is always its aligned entry; a position-binding UNION merge must bind
     every cursor, and an entry anchors descent only while its cursor is
     aligned — a child stream chained from an unaligned parent is the empty
-    segment for that candidate coordinate.  A possibly absent UNION position
-    is therefore valid only as the direct parent of the next compressed-level
-    cursor; it is not an unconditional scalar-load address or a base for
-    dense-position arithmetic.  ``positions`` is empty in the historical
+    segment for that candidate coordinate, also through dense levels between
+    the two.  A possibly absent UNION position, and a dense position computed
+    from one, is therefore valid only as the parent of a compressed-level
+    cursor or as the address of a :class:`PositionLoad` guarded by the
+    union's cursor; it is not an unconditional scalar-load address.
+    ``positions`` is empty in the historical
     no-descent form; when nonempty it has one entry (a ``PositionId`` or
     ``None``) per cursor.
 
@@ -1003,6 +1109,17 @@ class MergedSparseFor(Stmt):
       exhausted; INTERSECTION terminates as soon as any cursor is exhausted;
     - progress: every step advances at least one cursor by one position, so
       the loop terminates after at most the sum of the segment lengths.
+
+    ``DENSE_UNION`` differs only in coordinate selection: the candidate
+    coordinates are every coordinate of the merged dimension, ``0 .. extent
+    - 1`` in order, whatever the cursors store; a cursor is aligned when it
+    is not exhausted and its current coordinate equals the candidate; the
+    body runs at every candidate and aligned cursors advance after it.  It
+    terminates after the last coordinate, when every cursor is exhausted
+    because stored coordinates lie in the dimension's domain.  It needs one
+    cursor or more, and reads and binds positions exactly as UNION does
+    (an unaligned cursor's bound position anchors only the empty child
+    stream).
 
     ``coord_index`` binds the candidate coordinate for the body.
     """
@@ -1057,6 +1174,14 @@ class AppendEntry(Stmt):
     canonical container is assembled from that stream alone, so no node
     encodes positions arrays, offsets, or target storage layout.  The
     oracle fails closed on out-of-order appends at runtime.
+
+    One exception, which the verifier admits structurally: under a recorded
+    two-pass assembly strategy, the appends of a relabelled copy of one input
+    -- one loop per input level in its storage order, appending each stored
+    entry at a permutation of its coordinates -- may arrive in any order.
+    Every coordinate is appended once, and the container is assembled from the
+    appended entries in coordinate order (count, prefix sum, place), which is
+    what an operand conversion needs (``verifier._check_append_order``).
     """
 
     tensor: SymbolId

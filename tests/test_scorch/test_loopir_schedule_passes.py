@@ -23,6 +23,7 @@ from scorch.compiler.cin import (
     TensorVar,
 )
 from scorch.compiler.cin_analysis import normalize_cin
+from scorch.compiler.diagnostics import InvalidSchedule
 from scorch.compiler.identity import IndexId
 from scorch.compiler.loop_plan import (
     AUTO_ORIGIN_POLICY_SCHEMA,
@@ -1088,8 +1089,14 @@ def test_apply_schedule_plan_enforces_auto_policy_provenance():
     )
 
 
-def test_apply_schedule_plan_rejects_the_tiled_auto_family():
-    """Recorded heuristic tiles/workspace stay on the legacy path."""
+def test_apply_schedule_plan_replays_the_tiled_stack_form_on_either_setting():
+    """The stack form: one tile, on the dense workspace's axis.
+
+    Until 2026-10-12 it was replayed only with register blocking on (the
+    tile under the row loop); the other setting records the same tile
+    outermost and is replayed too.
+    ``test_loopir_tiled_dense_reductions.py`` executes both settings.
+    """
 
     from scorch.compiler.loop_plan import WorkspaceInsertion
 
@@ -1121,12 +1128,12 @@ def test_apply_schedule_plan_rejects_the_tiled_auto_family():
         ),
         provenance="auto",
     )
-    expect_code(
-        "unsupported_schedule_auto_family",
-        apply_schedule_plan,
-        lowering.program,
-        tiled,
-    )
+    scheduled = apply_schedule_plan(lowering.program, tiled)
+    assert type(scheduled) is ScheduledLoopIR
+    assert scheduled.plan == tiled
+    assert canonical_program_dump(
+        erase_schedule(scheduled.program)
+    ) == canonical_program_dump(lowering.program)
     # The tile-free sparse-workspace fact is now an admitted automatic
     # family; on this dense-output program the pass itself still fails
     # closed with its structural target code.
@@ -1546,8 +1553,34 @@ def test_reduce_out_oracle_covers_multiple_reductions_and_four_tiles(
     )
 
 
+def _replays_like_the_base_program(lowering, plan):
+    """``plan`` is applied, erases to the base program and computes its result."""
+
+    scheduled = apply_schedule_plan(lowering.program, plan)
+    assert scheduled.plan == plan
+    assert canonical_program_dump(
+        erase_schedule(scheduled.program)
+    ) == canonical_program_dump(lowering.program)
+    # Both extents exceed the 32-wide tile, so a full tile and a tail both run.
+    rows, inner, cols = 3, 35, 37
+    bindings = {
+        lowering.input_symbols[0]: [
+            [float((row * 3 + red) % 7 - 3) for red in range(inner)]
+            for row in range(rows)
+        ],
+        lowering.input_symbols[1]: [
+            [float((red * 5 + col) % 9 - 4) for col in range(cols)]
+            for red in range(inner)
+        ],
+    }
+    shapes = {lowering.result_symbol: (rows, cols)}
+    assert run_program(scheduled.program, bindings, shapes) == run_program(
+        lowering.program, bindings, shapes
+    )
+
+
 def test_reduce_out_form_shape_is_exact():
-    """Every deviation from the reduce-out form stays fail-closed."""
+    """A deviation from the reduce-out form is refused unless it is another form."""
 
     cin, (i, k, j) = build_matmul_ikj()
     lowering = lower(cin)
@@ -1578,9 +1611,22 @@ def test_reduce_out_form_shape_is_exact():
     # A width outside the recorded policy is not the automatic decision.
     rejected(tiles=(replace(base.tiles[0], width=16), base.tiles[1]))
     rejected(tiles=(replace(base.tiles[0], unroll=False), base.tiles[1]))
-    # Dropping the reduction or axis tile leaves an unmigrated shape.
-    rejected(tiles=(base.tiles[1],))
-    rejected(tiles=(base.tiles[0],))
+    # Dropping a tile gives another replayed form, not a deviation: the axis
+    # tile alone is the stack form, the reduction tile alone the
+    # reduction-tiled form.  With register blocking off the pass refused both
+    # until 2026-10-12.  For this program neither reaches the pass through the
+    # compile entry: the plan verifier refuses an automatic plan whose tiles
+    # are not exactly the ones its policy derives, and for a dense product
+    # that is both tiles.  ``test_loopir_tiled_dense_reductions.py`` compiles
+    # and runs the two forms on the programs whose automatic plans record them.
+    for kept in base.tiles:
+        single = _reduce_out_auto_plan(
+            lowering, i, k, j, regblock_enabled=False, tiles=(kept,)
+        )
+        _replays_like_the_base_program(lowering, single)
+        with pytest.raises(InvalidSchedule) as refused:
+            verify_loop_plan(cin, single)
+        assert [d.code for d in refused.value.diagnostics] == ["auto_tile_decision"]
     # The sparse-workspace family stays fail-closed.
     rejected(workspace=replace(base.workspace, dense=False))
     rejected(workspace=None)

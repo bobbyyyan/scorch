@@ -18,6 +18,8 @@ LoopIR oracle and the PyTorch dense reference — the B1/B3 discipline.
 The family is serial: the legacy route emits no OpenMP marking for it.
 """
 
+from dataclasses import replace
+
 import pytest
 import torch
 
@@ -38,7 +40,7 @@ from scorch.compiler.loopir.lower_llir import (
     LoopIRTargetError,
     lower_loopir_to_llir,
 )
-from scorch.compiler.loopir.nodes import LevelKind, ScalarType
+from scorch.compiler.loopir.nodes import AssemblyStrategy, LevelKind, ScalarType
 from scorch.compiler.loopir.oracle import run_program
 from scorch.compiler.loopir.pipeline import (
     compare_generated_sources,
@@ -47,6 +49,7 @@ from scorch.compiler.loopir.pipeline import (
 )
 from scorch.compiler.loopir.printer import canonical_program_dump
 from scorch.compiler.loopir.schedule_passes import erase_schedule
+from scorch.compiler.loopir.verifier import LoopIRVerificationError
 from scorch.stensor import STensor
 from scorch.storage import TensorIndex
 from tests.test_scorch.test_loopir_multi_compressed_target import (
@@ -827,20 +830,46 @@ def _seam_cells():
             trailing_dense_leaf,
             (3, 4, 5),
             (((3, 4, 5), f32),),
-            "unsupported_sparse_output_domain",
+            None,  # an ``sdd`` copy into ``sdd``: lowered since 2026-10-11
         ),
         (
             "interleaved_dense_sparse_output",
             interleaved_prefix,
             (3, 4, 5),
             (((3, 4, 5), f32),),
-            "unsupported_sparse_output",
+            None,  # an ``sds`` copy into ``sds``: lowered since 2026-10-11
         ),
     ]
 
 
+_REFUSED_CELLS = [cell for cell in _seam_cells() if cell[4] is not None]
+_LOWERED_CELLS = [cell for cell in _seam_cells() if cell[4] is None]
+
+
 @pytest.mark.parametrize("regblock_enabled", [False, True])
-@pytest.mark.parametrize("cell", _seam_cells(), ids=[cell[0] for cell in _seam_cells()])
+@pytest.mark.parametrize(
+    "cell", _LOWERED_CELLS, ids=[cell[0] for cell in _LOWERED_CELLS]
+)
+def test_neighbours_lowered_since_2026_10_11_match_pytorch(regblock_enabled, cell):
+    """Results with a dense level below a compressed one are lowered now.
+
+    These programs were refused here until the ordered assembly learned to
+    commit a compressed coordinate after the dense block below it is written
+    (``test_loopir_dense_below_compressed_target.py``).
+    """
+
+    # Imported here: that module imports this one's ``auto_options`` chain.
+    from tests.test_scorch.test_loopir_dense_below_compressed_target import (
+        assert_statement_matches_pytorch,
+    )
+
+    assert_statement_matches_pytorch(cell[1], regblock_enabled)
+
+
+@pytest.mark.parametrize("regblock_enabled", [False, True])
+@pytest.mark.parametrize(
+    "cell", _REFUSED_CELLS, ids=[cell[0] for cell in _REFUSED_CELLS]
+)
 def test_adjacent_seams_stay_fail_closed(regblock_enabled, cell):
     _, cin, result_shape, bindings, expected = cell
     with pytest.raises((LoopIRLoweringError, LoopIRTargetError)) as error:
@@ -853,8 +882,29 @@ def test_adjacent_seams_stay_fail_closed(regblock_enabled, cell):
     assert error.value.defect.code == expected
 
 
-def test_permuted_mode_order_stays_fail_closed():
-    """Nonidentity compressed mode order keeps the recorded boundary."""
+@pytest.mark.parametrize(
+    "assembly, refused_by, expected",
+    [
+        (None, LoopIRVerificationError, "unordered_append"),
+        (AssemblyStrategy.TWO_PASS_SERIAL, LoopIRTargetError, "unsupported_mode_order"),
+        (
+            AssemblyStrategy.TWO_PASS_PARALLEL,
+            LoopIRTargetError,
+            "unsupported_mode_order",
+        ),
+    ],
+    ids=["no_strategy", "two_pass_serial", "two_pass_parallel"],
+)
+def test_permuted_mode_order_stays_fail_closed(assembly, refused_by, expected):
+    """Nonidentity compressed mode order keeps the recorded boundary.
+
+    The program walks ``A`` in its column-major storage order and appends each
+    stored entry to the row-major ``C``, so the appends arrive out of ``C``'s
+    storage order.  Without a recorded two-pass assembly the verifier refuses
+    that append.  With one the verifier admits it as a relabelled copy of one
+    input, and the target still refuses the operand's permuted compressed
+    structure, which is the boundary this test records.
+    """
 
     builder = LoopIRBuilder()
     dim_i = builder.dimension("i")
@@ -904,8 +954,10 @@ def test_permuted_mode_order_stays_fail_closed():
         (c,),
         builder.block((outer,)),
     )
+    if assembly is not None:
+        program = replace(program, assembly=assembly)
     options = CompileOptions.from_environment(environ={})
-    with pytest.raises(LoopIRTargetError) as error:
+    with pytest.raises(refused_by) as error:
         lower_loopir_to_llir(
             program,
             input_shapes={a: (4, 5)},
@@ -913,4 +965,4 @@ def test_permuted_mode_order_stays_fail_closed():
             compile_options=options,
             compilation_context=CompilationContext(options),
         )
-    assert error.value.defect.code == "unsupported_mode_order"
+    assert error.value.defect.code == expected

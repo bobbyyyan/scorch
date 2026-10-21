@@ -1,4 +1,5 @@
 from __future__ import annotations
+import re
 from dataclasses import dataclass, field
 from enum import Enum
 from typing import List, Optional, Any, Union, TypeVar, Sequence, Tuple, cast
@@ -24,6 +25,24 @@ Cast, Load, Malloc, Sizeof, Store, Scope
 """
 
 LLIR_STMT = TypeVar("LLIR_STMT", bound="Stmt")
+
+# The scalar spellings a rank-N coordinate workspace is declared over, with the
+# part each contributes to its ``DataType`` member's name.  Module level because
+# a plain name in an ``Enum`` body becomes a member.
+_COO_WORKSPACE_ELEMENT_NAMES = {
+    "int": "INT",
+    "float": "FLOAT32",
+    "double": "FLOAT64",
+    "int32_t": "INT32",
+    "int64_t": "INT64",
+    "int8_t": "INT8",
+    "uint8_t": "UINT8",
+}
+_COO_WORKSPACE_RANK_N = re.compile(
+    "coo_workspace<("
+    + "|".join(re.escape(spelling) for spelling in _COO_WORKSPACE_ELEMENT_NAMES)
+    + "), ([1-9][0-9]*)>"
+)
 
 
 class Node:
@@ -209,6 +228,40 @@ class DataType(Enum):
     AUTO_REF = "auto&"
 
     @classmethod
+    def _missing_(cls, value: object) -> Optional[DataType]:
+        """``coo_workspace<T, N>`` for a rank ``N`` the table does not list.
+
+        The C++ ``coo_workspace<T, N>`` is a template over its rank, and a
+        workspace is keyed by as many index variables as the program gives it:
+        a reduction over a rank-7 operand into a rank-6 compressed result, or
+        the reordering of a rank-6 operand's levels, keys one by six.  The table
+        above lists ranks 1 to 5, and looking up rank 6 by value raised
+        ``ValueError`` out of the lowering.
+
+        A lookup that misses the table lands here.  Exactly the spelling the
+        table's own entries have -- one of their seven scalar types, a comma, a
+        space, a positive decimal rank with no leading zero -- yields a member;
+        anything else still returns ``None`` and the lookup raises, so free-form
+        C++ type text cannot become a typed declaration.  The member is made
+        once per spelling and kept, so two lookups return one object and ``is``
+        comparison holds, as it does for the listed ranks.  It is not added to
+        ``__members__``: iterating the enum gives the listed table on every run.
+        """
+
+        if type(value) is not str:
+            return None
+        spelled = _COO_WORKSPACE_RANK_N.fullmatch(value)
+        if spelled is None:
+            return None
+        member = object.__new__(cls)
+        member._name_ = (
+            f"COO_WORKSPACE_{_COO_WORKSPACE_ELEMENT_NAMES[spelled.group(1)]}"
+            f"_{spelled.group(2)}"
+        )
+        member._value_ = value
+        return cast("DataType", cls._value2member_map_.setdefault(value, member))
+
+    @classmethod
     def std_vector_type(cls, dtype: DataType) -> DataType:
         """
         A standard-library vector with the requested C++ element type.
@@ -249,7 +302,12 @@ class DataType(Enum):
     @classmethod
     def coo_workspace_type_with_dim(cls, dtype: DataType, dim: int) -> DataType:
         """
-        A custom vector type for C++.
+        The coordinate workspace over ``dtype`` keyed by ``dim`` coordinates.
+
+        Any positive ``dim``: ranks 1 to 5 are the listed members, a higher rank
+        is the member :meth:`_missing_` makes for it.  A scalar type the table
+        has no workspace for, or a ``dim`` that is not a positive integer, raises
+        ``ValueError``.
         """
         # if dimension is 0, then simply return the scalar type
         if dim == 0:

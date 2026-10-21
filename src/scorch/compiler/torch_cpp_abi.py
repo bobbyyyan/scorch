@@ -1,7 +1,7 @@
 """Structured Torch/C++ ABI construction shared by compiler lowering stages."""
 
 from dataclasses import dataclass
-from typing import List, Optional, Tuple, cast
+from typing import List, Optional, Sequence, Tuple, cast
 
 import torch
 
@@ -662,11 +662,17 @@ class ResultTensorAssembler:
         return all(level_type == LevelType.DENSE for level_type in self.level_types)
 
     def _has_fixed_position_count(self, level: int) -> bool:
-        """A compressed level below a dense parent has parent_size + 1 slots."""
+        """A compressed level below exactly one dense level has that extent + 1 slots.
+
+        Level 1 under a dense level 0 only.  Under several dense levels the
+        count is the product of their extents, and under a compressed ancestor
+        it is fixed only by assembly; both are append-built, as the typed
+        lowering builds them.
+        """
         return (
             self.exact_dense_parent_positions
-            and level > 0
-            and self.level_types[level - 1] == LevelType.DENSE
+            and level == 1
+            and self.level_types[0] == LevelType.DENSE
         )
 
     def emit_first_compressed_position_allocation(
@@ -1794,3 +1800,94 @@ class ResultTensorAssembler:
         stmts.extend(self.emit_storage_epilogue())
 
         return stmts
+
+    def emit_position_tail_close(
+        self, extent_names: Optional[Sequence[str]] = None
+    ) -> List[llir.Stmt]:
+        """Close the position entries no loop reached, for an append-built level.
+
+        The first compressed level below one or more dense levels has one
+        position entry per cell of those levels.  A loop over a dense level
+        that visits only stored coordinates stops at the last one it has, and
+        the catch-up that closes skipped cells runs only when a later cell is
+        visited -- so the cells after the last visited one were never closed
+        and the array ended short.  This closes them at the final coordinate
+        count: they are empty.
+
+        A pre-sized position array (one entry per cell, allocated before the
+        loops) needs the same close: its unreached entries hold the zero it was
+        allocated with, which leaves the array decreasing.  It is written in
+        bounds by construction there, so the indexed store stays as it is; an
+        append-built array has it rewritten into a checked set downstream.
+        """
+
+        if type(self) is not ResultTensorAssembler:
+            raise TypeError(
+                "position tail close requires an exact ResultTensorAssembler"
+            )
+        self.validate()
+        level = next(
+            (
+                index
+                for index, level_type in enumerate(self.level_types)
+                if level_type != LevelType.DENSE
+            ),
+            0,
+        )
+        if (
+            level == 0
+            or self.level_types[level] != LevelType.COMPRESSED
+            or self.known_nnz_var is not None
+        ):
+            return []
+        # Each dense level's extent under the name its loop runs to, when the
+        # caller knows one; the result's own extent variable otherwise.
+        names = [f"{self.name}{above}_size" for above in range(level)]
+        if extent_names is not None:
+            if len(extent_names) < level or any(
+                type(name) is not str or not name.isidentifier()
+                for name in extent_names[:level]
+            ):
+                raise TypeError(
+                    "position tail close extent names must be one identifier "
+                    "per dense level above the compressed level"
+                )
+            names = list(extent_names[:level])
+        cells: llir.Expr = llir.Var(name=names[0], type=llir.DataType.INT64)
+        for above in range(1, level):
+            cells = llir.Mul(
+                left=cells,
+                right=llir.Var(name=names[above], type=llir.DataType.INT64),
+            )
+        pos_index = llir.Var(
+            name=f"{self.name}{level}_pos_index", type=llir.DataType.INT64
+        )
+        # Spelled as the typed lowering spells the same close
+        # (``_stored_prefix_final_statements``), so the two emit one text.
+        return [
+            llir.BlankLine(),
+            llir.Comment("Assembly compressed _level indices"),
+            llir.ForLoop(
+                init=None,
+                cond=llir.BinOp(op="<", left=pos_index, right=cells),
+                update=llir.Increment(var=pos_index),
+                body=[
+                    llir.Assign(
+                        var=llir.ArrayAccess(
+                            array=llir.Var(
+                                name=f"{self.name}{level}_pos",
+                                type=llir.DataType.STD_VECTOR_C_INT,
+                            ),
+                            index=llir.Add(pos_index, llir.Literal(1)),
+                        ),
+                        value=llir.FunctionCall(
+                            name=f"{self.name}{level}_crd.size", args=[]
+                        ),
+                        result_storage=self.result_storage_marker(
+                            (llir.ResultStorageArray.POS, level, True),
+                            (llir.ResultStorageArray.CRD, level, False),
+                        ),
+                    )
+                ],
+            ),
+        ]

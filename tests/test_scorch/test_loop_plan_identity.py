@@ -21,8 +21,12 @@ from scorch.compiler.cin import (
 )
 from scorch.compiler.compile_options import CompileOptions
 from scorch.compiler.compilation_context import CompilationContext, CompilerStageId
-from scorch.compiler.diagnostics import VerificationError
-from scorch.compiler.loop_plan import LoopRef, WorkspaceInsertion
+from scorch.compiler.diagnostics import (
+    InvalidSchedule,
+    UnsupportedFeature,
+    VerificationError,
+)
+from scorch.compiler.loop_plan import LoopRef, WorkspaceInsertion, verify_loop_plan
 from scorch.compiler.loopir.plan_identity import (
     CANONICAL_PLAN_SCHEMA,
     CANONICAL_REQUEST_SCHEMA,
@@ -490,7 +494,9 @@ def test_request_dtype_identity_is_exact_and_never_calls_str() -> None:
             artifact.normalized_cin,
             artifact.verified_loop_plan,
             (4, 6),
-            (((4, 5), torch.int32), ((5, 6), torch.int32)),
+            # int16: outside the element types the lowering accepts (int32
+            # joined them on 2026-10-12).
+            (((4, 5), torch.int16), ((5, 6), torch.int16)),
             compile_options=IDENTITY_OPTIONS,
         )
 
@@ -759,6 +765,68 @@ def test_identity_failure_is_owned_by_the_frontend_request_stage() -> None:
     ]
 
 
+def test_a_refused_plan_keeps_its_type_and_code_at_the_request_boundary() -> None:
+    """The request dump verifies the plan, and the verifier's refusal passes through.
+
+    A plan ``verify_loop_plan`` refuses is a refused request, not malformed
+    request state, so the request dump raises exactly what the verifier raises:
+    the same type, message and coded diagnostics, as ``canonical_plan_dump``
+    already did.  Until 2026-10-12 the request dump wrapped it in an uncoded
+    VerificationError ("could not serialize verified request state"), and a
+    compile whose first plan verification was this boundary (an automatic plan
+    with a policy-derived tile dropped, refused ``auto_tile_decision``) kept the
+    code only on ``__cause__``.
+    """
+
+    artifact = scheduled(build_matmul, BASE_SCHEDULE)
+    cin = artifact.normalized_cin
+    plan = artifact.verified_loop_plan
+    foreign_axis = replace(
+        plan,
+        workspace=WorkspaceInsertion(
+            reduction_loop=LoopRef(plan.loop_order[0]),
+            axis_loops=(LoopRef(plan.loop_order[1]),),
+            dense=True,
+        ),
+    )
+    with pytest.raises((InvalidSchedule, UnsupportedFeature)) as direct:
+        verify_loop_plan(cin, foreign_axis, dense_results_any_order=True)
+    assert direct.value.diagnostics, "the verifier's refusal names its code"
+    for serialize in (
+        lambda: loopir_request_dump(
+            cin,
+            foreign_axis,
+            (4, 6),
+            MATMUL_BINDINGS,
+            compile_options=IDENTITY_OPTIONS,
+        ),
+        lambda: loopir_request_identity(
+            cin,
+            foreign_axis,
+            (4, 6),
+            MATMUL_BINDINGS,
+            compile_options=IDENTITY_OPTIONS,
+        ),
+        lambda: canonical_plan_dump(cin, foreign_axis),
+    ):
+        with pytest.raises(Exception) as at_boundary:
+            serialize()
+        assert type(at_boundary.value) is type(direct.value)
+        assert str(at_boundary.value) == str(direct.value)
+        assert [d.code for d in at_boundary.value.diagnostics] == [
+            d.code for d in direct.value.diagnostics
+        ]
+    # Malformed request state still becomes the boundary's VerificationError.
+    with pytest.raises(VerificationError, match="nonnegative int64"):
+        loopir_request_dump(
+            cin,
+            foreign_axis,
+            (4, -1),
+            MATMUL_BINDINGS,
+            compile_options=IDENTITY_OPTIONS,
+        )
+
+
 def test_identity_is_the_hash_of_the_retained_dump() -> None:
     """Collision handling: the dump is authoritative, the digest is derived."""
 
@@ -838,3 +906,15 @@ def test_pipeline_owns_the_request_identity_at_the_compile_boundary() -> None:
     )
     with pytest.raises(TypeError, match="must hash the retained request_dump"):
         replace(first, request_identity="0" * 64)
+
+
+def test_every_element_type_the_lowering_accepts_has_a_request_token() -> None:
+    # Request serialization raises for a dtype outside its table, so an element
+    # type added to the lowering and not here would fail as an unstructured
+    # error at serialization instead of compiling.
+    from scorch.compiler.loopir import lower_cin, plan_identity
+
+    assert set(plan_identity._DTYPE_TOKENS) == set(lower_cin._TORCH_TO_SCALAR)
+    assert len(set(plan_identity._DTYPE_TOKENS.values())) == len(
+        plan_identity._DTYPE_TOKENS
+    )

@@ -1,5 +1,15 @@
 from dataclasses import dataclass, replace
-from typing import TYPE_CHECKING, Dict, List, Optional, Tuple, Union, cast
+from typing import (
+    TYPE_CHECKING,
+    Dict,
+    List,
+    NoReturn,
+    Optional,
+    Sequence,
+    Tuple,
+    Union,
+    cast,
+)
 
 from . import llir
 from .cin import (
@@ -21,8 +31,13 @@ from .cin import (
     PostOps,
     _is_index_expr_instance,
     _is_index_stmt_instance,
+    coordinate_result_driver,
 )
-from .iter_lattice import IterationLattice
+from .iter_lattice import (
+    IterationLattice,
+    compressed_child_catch_up,
+    dense_block_commit,
+)
 from .iterator import (
     collect_mode_position_arrays,
 )
@@ -53,6 +68,7 @@ from .compile_options import CompileOptions
 from .compressed_where_openmp_pass import (
     CompressedWhereOpenMPContext,
     CompressedWhereOpenMPPolicy,
+    OuterCellDomain,
 )
 from .dense_pointer_hoist_pass import DensePointerHoistContext
 from .llir_pass_manager import (
@@ -76,6 +92,7 @@ from .parallel_marking_pass import (
     ParallelWorkspacePoolSpec,
     apply_parallel_policy,
     mark_first_for_loop_parallel,
+    serial_workspace_cluster_placement,
 )
 from .torch_cpp_abi import (
     KernelTensorABI,
@@ -172,6 +189,79 @@ def _torch_cpp_kernel_abi(
     )
 
 
+def dense_leaf_below_compressed(level_types: Sequence[LevelType]) -> bool:
+    """Whether a result's last level is dense with a compressed level above it.
+
+    Such a leaf is one cell of a dense block: each stored position of the
+    nearest compressed level above it owns ``prod(extent)`` consecutive
+    values, in the dense levels' lexicographic order, so a value is placed at
+    its computed position rather than appended.  Cells the loops never visit
+    (a stored stream driving a dense level skips them) are zeros of the block.
+    """
+
+    return (
+        len(level_types) >= 2
+        and level_types[-1] == LevelType.DENSE
+        and any(level_type == LevelType.COMPRESSED for level_type in level_types[:-1])
+    )
+
+
+def dense_block_leaf_store(
+    values_name: str,
+    position: llir.Expr,
+    value: llir.Expr,
+    accumulate: bool,
+    result_storage: Optional[llir.ResultStorageMetadata],
+    read_storage: Optional[llir.ResultStorageMetadata],
+) -> List[llir.Stmt]:
+    """Store one dense-block cell of a sparse result's value vector.
+
+    The vector grows with zeros up to the cell first, so skipped cells read as
+    zero; the store is then an in-range set.  It is spelled as a call rather
+    than an indexed ``Assign`` because the dynamic-vector pass rewrites every
+    indexed store into a ``*_values`` vector as an append, which is right only
+    for values written one per position in order.
+    """
+
+    grow = llir.IfThenElse(
+        cond=llir.BinOp(
+            op="<=",
+            left=llir.FunctionCall(name=f"{values_name}.size", args=[]),
+            right=position,
+        ),
+        then_body=[
+            llir.FunctionCallStmt(
+                name=f"{values_name}.resize",
+                args=[llir.Add(position, llir.Literal(1)), llir.Literal(0)],
+                result_storage=result_storage,
+            )
+        ],
+        result_storage=read_storage,
+    )
+    target = llir.ArrayAccess(
+        array=llir.Var(name=values_name, type=llir.DataType.NO_TYPE),
+        index=position,
+    )
+    if accumulate:
+        store: llir.Stmt = llir.Assign(
+            var=target,
+            value=value,
+            op=AssignOp.ADD_ASSIGN,
+            result_storage=result_storage,
+        )
+    else:
+        store = llir.FunctionCallStmt(
+            name="scorch_vector_set",
+            args=[
+                llir.Var(name=values_name, type=llir.DataType.NO_TYPE),
+                position,
+                value,
+            ],
+            result_storage=result_storage,
+        )
+    return [grow, store]
+
+
 class CINLowerer:
     """
     This is a class to lower a CIN to LLIR
@@ -240,6 +330,9 @@ class CINLowerer:
         self.result_value_array_sparse_index_llir = None
         self._scalar_accum_mode = False
         self._used_scalar_accum = False
+        # The input whose stored entries the scalar-accumulation loops walk, one
+        # result entry each (``cin.coordinate_result_driver``).
+        self._scalar_accum_driver: Optional[TensorVar] = None
         self.index_var_to_rhs_tensor_level_type = None
         self.index_var_to_result_tensor_level_type = None
 
@@ -250,6 +343,26 @@ class CINLowerer:
         self._parallel_workspace_cluster: ParallelWorkspaceCluster = (
             EMPTY_PARALLEL_WORKSPACE_CLUSTER
         )
+        # Every Where's cluster that owns a workspace pool and that no parallel
+        # marking has placed yet.  A kernel that stays serial places what is
+        # left here before its outermost loop; see
+        # ``_place_unplaced_workspace_clusters``.
+        self._unplaced_workspace_clusters: List[ParallelWorkspaceCluster] = []
+        self._kernel_has_parallel_region = False
+        # Whether some loop over a DENSE result level visits only stored
+        # coordinates (set by the lattice that emits such a loop).
+        self.result_dense_level_sparse_driven = False
+        # Dense result level -> the bound variable of the dense loop over it,
+        # when a dense loop drives it (set by the lattice that emits the loop).
+        self.result_dense_level_bound_names: Dict[int, str] = {}
+        self._outermost_loop_name: Optional[str] = None
+        # The ForAlls whose bodies are being lowered right now, outermost first.
+        # ``defined_index_vars`` is not this: it only grows, so it also holds
+        # the loops of sibling nests already finished.
+        self._enclosing_forall_vars: List[IndexVar] = []
+        # Dense workspace name -> the flag its producer sets when it writes,
+        # for a workspace copied out to a dense level below a compressed one.
+        self._workspace_written_flags: Dict[str, str] = {}
 
         # Two-phase parallel compressed output state
         self._where_producer_stmts: Optional[List[llir.Stmt]] = None
@@ -395,6 +508,43 @@ class CINLowerer:
                 "stage=legacy CIN lowering: "
                 "unsupported_mixed_coordinate_hierarchy for tensor "
                 f"{tensor.get_name()!r}",
+                diagnostics=(diagnostic,),
+            )
+
+    @staticmethod
+    def _validate_tensor_ranks(stmt: IndexStmt) -> None:
+        """Reject a rank-0 tensor, which the legacy position model cannot lower.
+
+        A scalar is a valid tensor: ``TensorVar(fmt="")`` declares the format of
+        rank 0.  This lowering addresses every tensor through the position of
+        its last level, so it has no rule for one with no levels.  Left to run,
+        it emitted a kernel that reads an undeclared ``y0_size`` and assigns to
+        an undeclared ``y`` for a scalar result, and raised ``IndexError`` for a
+        scalar operand.  Refused here, at the same ownership boundary as the
+        mixed coordinate hierarchies, with a code of its own.  A workspace of
+        dimension 0 is the scalar accumulator and is not a tensor in this sense.
+        """
+
+        for tensor_access in stmt.tensor_accesses:
+            tensor = tensor_access.get_tensor()
+            if isinstance(tensor, Workspace) or tensor.format is None:
+                continue
+            if tensor.format.get_order() != 0:
+                continue
+            diagnostic = CINDiagnostic(
+                code="unsupported_scalar_tensor",
+                message=(
+                    "legacy CIN lowering addresses a tensor through its levels "
+                    f"and has no rule for the rank-0 tensor {tensor.get_name()!r}"
+                ),
+                path=("root",),
+                entity_id=tensor.symbol_id,
+                stage="legacy_cin_lowering",
+                pass_name="prepare_stmt",
+            )
+            raise UnsupportedFeature(
+                "stage=legacy CIN lowering: "
+                f"unsupported_scalar_tensor for tensor {tensor.get_name()!r}",
                 diagnostics=(diagnostic,),
             )
 
@@ -720,6 +870,18 @@ class CINLowerer:
                                 op=AssignOp.ADD_ASSIGN,
                             )
                         )
+                        written_flag = self._workspace_written_flags.get(
+                            self.result_tensor_var.name
+                        )
+                        if written_flag is not None:
+                            llir_stmts.append(
+                                llir.Assign(
+                                    var=llir.Var(
+                                        name=written_flag, type=llir.DataType.BOOL
+                                    ),
+                                    value=llir.Literal(True, llir.DataType.BOOL),
+                                )
+                            )
 
                     else:
                         # <workspace name>.insert(<C++ array of indices>, <rhs_llir>);
@@ -742,6 +904,27 @@ class CINLowerer:
                                 ],
                             )
                         )
+                elif not self.result_tensor_access.is_workspace() and (
+                    dense_leaf_below_compressed(
+                        self.result_tensor_var.get_level_types()
+                    )
+                ):
+                    llir_stmts.extend(
+                        dense_block_leaf_store(
+                            values_llir_name,
+                            tensor_access_llir.index,
+                            rhs_llir,
+                            stmt.op == Operation.ADD,
+                            self._result_storage(
+                                self.result_tensor_access,
+                                (RESULT_VALUES, None, STORAGE_WRITE),
+                            ),
+                            self._result_storage(
+                                self.result_tensor_access,
+                                (RESULT_VALUES, None, STORAGE_READ),
+                            ),
+                        )
+                    )
                 else:
                     if stmt.op == Operation.ADD:
                         # llir_stmts.append(
@@ -774,19 +957,26 @@ class CINLowerer:
                 last_ivar = self.defined_index_vars[-1]
                 last_level_type = self.result_tensor_access.level_types()[-1]
                 if last_level_type in [LevelType.COMPRESSED, LevelType.COORDINATE]:
-                    if not self.result_tensor_access.has_index_var(last_ivar):
-                        # The innermost loop sums over a variable the result
+                    reductions = self._reductions_around_consumer(
+                        self.result_tensor_access
+                    )
+                    if reductions:
+                        # An enclosing loop sums over a variable the result
                         # does not have, so appending here would store one
-                        # partial sum per iteration of it.  Only the scheduler's
-                        # accumulation workspace makes such a program lowerable.
+                        # partial sum per iteration of it: under the innermost
+                        # loop one entry per summand, under an outer one the same
+                        # coordinate once per iteration, out of order.  Only the
+                        # scheduler's accumulation workspace makes such a
+                        # program lowerable.
+                        names = ", ".join(loop.name for loop in reductions)
                         diagnostic = CINDiagnostic(
                             code="unscheduled_sparse_result_reduction",
                             message=(
-                                f"the innermost loop sums over {last_ivar.name}, "
-                                "which the sparse result does not have; lower the "
+                                f"the loops over {names} sum over variables the "
+                                "sparse result does not have; lower the "
                                 "scheduled program (scorch.einsum or "
                                 "Scheduler.auto_schedule), whose workspace "
-                                "accumulates it"
+                                "accumulates them"
                             ),
                             path=("root",),
                             stage="legacy_cin_lowering",
@@ -830,7 +1020,16 @@ class CINLowerer:
                     # if the last _level is COORDINATE, we might need to set the coordinates
                     # or previous levels as well
                     if last_level_type == LevelType.COORDINATE:
+                        # ``defined_index_vars`` only grows, and a merge lowers
+                        # the loops under it once per branch, so a variable is
+                        # listed once per branch already lowered.  Each store
+                        # becomes an append, so a variable is stored once: the
+                        # walk meets its innermost definition first.
+                        stored_ivars = {last_ivar}
                         for defined_ivar in self.defined_index_vars[-2::-1]:
+                            if defined_ivar in stored_ivars:
+                                continue
+                            stored_ivars.add(defined_ivar)
                             level_type = (
                                 self.result_tensor_access.level_type_of_index_var(
                                     defined_ivar
@@ -889,6 +1088,160 @@ class CINLowerer:
                 ]
 
         return llir_stmts
+
+    def _dense_level_extent_accesses(
+        self, stmt: Where, index_var: IndexVar
+    ) -> List[TensorAccess]:
+        """The tensors a dense workspace over ``index_var`` may size itself from.
+
+        Used only when no all-dense tensor has the variable.  The consumer's
+        result comes first, then any other tensor storing the variable at a
+        dense level; either declares that level's extent.
+
+        Two refusals, both structured.  None of those tensors exists.  Or the
+        producer loops over some operand's COMPRESSED level outside the loop
+        over a level above it: a compressed level's segment is read at its
+        parent's position, so such a nest would read a position nothing has
+        declared.  A dense level looped outside the level above it is lowered:
+        its position is the parent's position times its extent plus its
+        coordinate, and the dense positions are declared parents first once
+        the loops have bound their coordinates (``_parents_first`` in
+        ``iter_lattice.py``).
+        """
+
+        consumer_results = [
+            access
+            for access in stmt.consumer.get_result_tensor_accesses()
+            if not access.is_workspace()
+        ]
+        candidates = [
+            access
+            for access in [*consumer_results, *index_var.tensor_accesses]
+            if not access.is_workspace()
+            and index_var in access.indices
+            and access.level_type_of_index_var(index_var) == LevelType.DENSE
+        ]
+        if not candidates:
+            raise UnsupportedFeature(
+                "stage=CIN lowering: "
+                "dense_workspace_without_extent for index variable "
+                f"{index_var.name!r}",
+                diagnostics=(
+                    CINDiagnostic(
+                        code="dense_workspace_without_extent",
+                        message=(
+                            f"a dense workspace over {index_var.name!r} has no "
+                            "tensor storing that index variable at a dense "
+                            "level to take its extent from"
+                        ),
+                        path=("root",),
+                        stage="legacy_cin_lowering",
+                        pass_name="lower_Where",
+                    ),
+                ),
+            )
+        misplaced = self._compressed_level_outside_its_parent_loop(stmt)
+        if misplaced is not None:
+            code, tensor_name = misplaced
+            raise UnsupportedFeature(
+                f"stage=CIN lowering: {code} for tensor {tensor_name!r}",
+                diagnostics=(
+                    CINDiagnostic(
+                        code=code,
+                        message=(
+                            f"the producer of the dense workspace over "
+                            f"{index_var.name!r} reads {tensor_name!r} at a "
+                            "level this lowering cannot place: "
+                            + (
+                                "a compressed level looped outside the loop "
+                                "over a level above it"
+                                if code == "compressed_level_outside_parent_loop"
+                                else "a level no loop binds by its own name"
+                            )
+                        ),
+                        path=("root",),
+                        stage="legacy_cin_lowering",
+                        pass_name="lower_Where",
+                    ),
+                ),
+            )
+        return candidates
+
+    def _compressed_level_outside_its_parent_loop(
+        self, stmt: Where
+    ) -> Optional[Tuple[str, str]]:
+        """``(code, tensor)`` for an operand level this lowering cannot place.
+
+        Read off the lowering's own position: the loops being lowered around
+        the Where, outermost first, then the producer's own.  A compressed
+        level reads its segment at the position of the level above it, so its
+        loop must lie inside the loops of every level above it; ``None`` when
+        every operand's compressed levels do.  A dense level may be looped
+        anywhere: its position is computed once its own coordinate and the
+        levels above it are bound.  An operand level whose variable no loop
+        here binds by its own name is reported too, since this lowering cannot
+        place its position.
+
+        The enclosing loops come from ``_enclosing_forall_vars`` and not from
+        the statement's ``parent`` links, which the scheduled route that
+        ``scorch.einsum`` takes does not set.
+        """
+
+        order = list(self._enclosing_forall_vars)
+        body: IndexStmt = stmt.producer
+        while isinstance(body, ForAll):
+            order.append(body.get_index_var())
+            body = body.stmt
+        logical = [
+            index_var.parent if index_var.has_parent else index_var
+            for index_var in order
+        ]
+        for access in stmt.producer.get_rhs_tensor_accesses():
+            if access.is_workspace():
+                continue
+            level_vars = access.get_sorted_index_vars()
+            if any(level_var not in logical for level_var in level_vars):
+                return ("operand_level_unbound_in_producer", access.tensor.get_name())
+            depths = [logical.index(level_var) for level_var in level_vars]
+            for level, level_type in enumerate(access.level_types()):
+                if level_type != LevelType.DENSE and any(
+                    depth > depths[level] for depth in depths[:level]
+                ):
+                    return (
+                        "compressed_level_outside_parent_loop",
+                        access.tensor.get_name(),
+                    )
+        return None
+
+    def _dense_block_workspace_flag(
+        self, stmt: Where, workspace_name: str, workspace_index_var: IndexVar
+    ) -> Optional[str]:
+        """Name the flag a dense workspace's producer sets, if its copy-out needs one.
+
+        A dense workspace copied out to a dense result level that has a
+        compressed level above it writes into a block whose coordinate is
+        stored only when the operands store something under it.  The
+        workspace's values cannot say that -- a stored structure may sum to
+        zero -- so the producer records that it ran.  Structure, never value.
+        """
+
+        consumer_accesses = stmt.consumer.get_result_tensor_accesses()
+        if not consumer_accesses:
+            return None
+        result_access = consumer_accesses[0]
+        if result_access.is_workspace() or not result_access.has_index_var(
+            workspace_index_var
+        ):
+            return None
+        level = result_access.level_of_index_var(workspace_index_var)
+        level_types = result_access.level_types()
+        if level != len(level_types) - 1 or not dense_leaf_below_compressed(
+            level_types
+        ):
+            return None
+        flag = f"{workspace_name}_written"
+        self._workspace_written_flags[workspace_name] = flag
+        return flag
 
     def lower_Where(self, stmt: Where) -> Union[llir.Stmt, List[llir.Stmt]]:
         """
@@ -953,13 +1306,25 @@ class CINLowerer:
                             if wa.indices and len(wa.indices) == 1
                         ][0]
                         idx_var = wksp_access.indices[0]
-                        dense_ta = [
+                        # The extent comes from an all-dense tensor that has
+                        # this index variable, as always.  A sparse result
+                        # with a dense last level has none to borrow from when
+                        # every operand is sparse too, so it then comes from a
+                        # tensor that stores the variable at a DENSE level --
+                        # the result itself first.  A lookup that found nothing
+                        # raised a bare IndexError here before.
+                        extent_accesses = [
                             ta
                             for ta in idx_var.tensor_accesses
                             if ta.is_dense()
                             and idx_var in ta.indices
                             and not ta.is_workspace()
-                        ][0]
+                        ]
+                        if not extent_accesses:
+                            extent_accesses = self._dense_level_extent_accesses(
+                                stmt, idx_var
+                            )
+                        dense_ta = extent_accesses[0]
                         level = dense_ta.level_of_index_var(idx_var)
                         actual_size = f"{dense_ta.tensor.name}{level}_size"
 
@@ -971,19 +1336,26 @@ class CINLowerer:
                                 extent=actual_size,
                             )
                         )
-                        workspace_alloc_stmts.extend(
-                            [
-                                # Both statements are typed: the extent alias
-                                # and the restrict-qualified per-worker slice
-                                # borrowed from the RAII pool owner declared
-                                # by the typed before-parallel construction.
+                        if size_var != actual_size:
+                            # The extent alias.  Skipped when the workspace's
+                            # size variable IS the extent's own name: the
+                            # alias would then read ``int64_t n = n;``, a
+                            # declaration initialized from itself.
+                            workspace_alloc_stmts.append(
                                 llir.VarInit(
                                     var=size_llir,
                                     value=llir.Var(
                                         name=actual_size,
                                         type=llir.DataType.INT64,
                                     ),
-                                ),
+                                )
+                            )
+                        workspace_alloc_stmts.extend(
+                            [
+                                # Typed: the restrict-qualified per-worker
+                                # slice borrowed from the RAII pool owner
+                                # declared by the typed before-parallel
+                                # construction.
                                 llir.VarInit(
                                     var=llir.Var(
                                         name=wname,
@@ -1017,6 +1389,18 @@ class CINLowerer:
                                 ),
                             ]
                         )
+                        written_flag = self._dense_block_workspace_flag(
+                            stmt, wname, idx_var
+                        )
+                        if written_flag is not None:
+                            workspace_memset_stmts.append(
+                                llir.VarInit(
+                                    var=llir.Var(
+                                        name=written_flag, type=llir.DataType.BOOL
+                                    ),
+                                    value=llir.Literal(False, llir.DataType.BOOL),
+                                )
+                            )
                         workspace_memset_stmts.append(
                             llir.FunctionCallStmt(
                                 name="memset",
@@ -1095,6 +1479,8 @@ class CINLowerer:
             free=tuple(workspace_free_stmts),
             pool_specs=tuple(workspace_pool_specs),
         )
+        if workspace_pool_specs:
+            self._unplaced_workspace_clusters.append(self._parallel_workspace_cluster)
 
         producer_stmts = self.lower_ProducerIndexStmt(stmt.producer)
         consumer_stmts = self.lower_ConsumerIndexStmt(stmt.consumer)
@@ -1112,8 +1498,18 @@ class CINLowerer:
     def _sparse_workspace_extents(stmt: Where, wksp: Workspace) -> llir.Expr:
         """The extents ``coo_workspace`` flattens its keys by, one per key component.
 
-        ``coo_workspace<T, N>`` requires exactly ``N`` extents, in key order.  A
-        workspace keyed on the whole result in index order is given the kernel's
+        ``coo_workspace<T, N>`` requires exactly ``N`` extents, in key order.  Both
+        sides of that pairing are storage orders.  The key is inserted in the
+        workspace's own storage order (its access permuted by its mode order), and
+        the kernel's ``result_shape`` holds the result's extents by storage level.
+        So a key component's extent is the entry at its variable's level of the
+        result.  Reading either side in access order instead is right only while
+        the workspace and the result carry the same mode order: a mode-order
+        conversion permutes both alike, and ``einsum('abc->cb')`` does not -- it
+        stores its result as ``(b, c)`` under a workspace keyed ``(b, c)`` in
+        identity order.
+
+        A workspace keyed on the whole result in storage order is given
         ``result_shape`` itself.  One keyed on fewer or reordered result variables
         -- a drain under an enclosing result loop, such as ``einsum('ijkl->ikl')``
         keyed on ``(k, l)`` -- is given those variables' own entries of
@@ -1134,12 +1530,12 @@ class CINLowerer:
         ]
         if len(results) != 1 or not keyed:
             return result_shape
-        logical = list(results[0].get_index_vars())
-        key = list(keyed[0].get_index_vars())
-        if any(index_var not in logical for index_var in key):
+        levels = list(results[0].get_sorted_index_vars())
+        key = list(keyed[0].get_sorted_index_vars())
+        if any(index_var not in levels for index_var in key):
             return result_shape
-        positions = [logical.index(index_var) for index_var in key]
-        if positions == list(range(len(logical))):
+        positions = [levels.index(index_var) for index_var in key]
+        if positions == list(range(len(levels))):
             return result_shape
         return llir.Array(
             values=[
@@ -1540,6 +1936,279 @@ class CINLowerer:
             *result_conversion_stmts,
         ]
 
+    def _dense_block_workspace_copy_out(
+        self,
+        result_tensor_access: TensorAccess,
+        wksp: Workspace,
+        wksp_index_var: IndexVar,
+        level: int,
+        parent_index_var: Optional[IndexVar],
+        parent_level_type: Optional[LevelType],
+        written_flag: str,
+    ) -> List[llir.Stmt]:
+        """Copy a dense workspace into a result row below a compressed level.
+
+        ``level`` is the result's last level, dense, with a compressed level
+        somewhere above it.  The row sits at ``q * E`` in an append-built
+        value array, ``q`` the position of the level above and ``E`` this
+        level's extent, so the array is grown to hold the row before the copy.
+        Nothing is written unless the producer ran: a row the operands store
+        nothing under is not stored, whatever the workspace holds.
+
+        When the level above is the compressed one, the row is the
+        coordinate's whole block and the copy commits it -- the coordinate is
+        appended and its position advances.  When dense levels lie between,
+        the block spans several rows and the commit after the loop over the
+        block's first dense level pads and appends once for all of them.
+        """
+
+        assert parent_index_var is not None and parent_level_type is not None
+        result_name = result_tensor_access.get_tensor().get_name()
+        values_name = f"{result_name}_values"
+        scalar_type = dtype_to_c_datatype(wksp.dtype)
+        parent_position = llir.Var(
+            name=f"p{result_name}{level - 1}", type=llir.DataType.INT64
+        )
+        extent = llir.Var(name=f"{result_name}{level}_size", type=llir.DataType.INT64)
+        row_start = llir.Mul(left=parent_position, right=extent)
+        row_stop = llir.Mul(
+            left=llir.Add(parent_position, llir.Literal(1)), right=extent
+        )
+        values_write = self._result_storage(
+            result_tensor_access, (RESULT_VALUES, None, STORAGE_WRITE)
+        )
+        grow: llir.Stmt = llir.FunctionCallStmt(
+            name=f"{values_name}.resize",
+            args=[row_stop, llir.Literal(0)],
+            result_storage=values_write,
+        )
+        if parent_level_type != LevelType.COMPRESSED:
+            # Rows of one block arrive in increasing order, so this only ever
+            # grows; the test keeps a later block's first row from shrinking
+            # nothing and an already-padded array from being cut.
+            grow = llir.IfThenElse(
+                cond=llir.BinOp(
+                    op="<",
+                    left=llir.FunctionCall(name=f"{values_name}.size", args=[]),
+                    right=row_stop,
+                ),
+                then_body=[grow],
+                result_storage=self._result_storage(
+                    result_tensor_access, (RESULT_VALUES, None, STORAGE_READ)
+                ),
+            )
+        body: List[llir.Stmt] = [
+            grow,
+            llir.FunctionCallStmt(
+                name="memcpy",
+                args=[
+                    llir.AddressOf(
+                        operand=llir.ArrayAccess(
+                            array=llir.Var(
+                                name=values_name,
+                                type=llir.DataType.ptr_type(scalar_type),
+                            ),
+                            index=row_start,
+                        ),
+                    ),
+                    llir.Var(
+                        name=wksp.get_name(), type=llir.DataType.ptr_type(scalar_type)
+                    ),
+                    llir.Mul(
+                        llir.Var(
+                            name=wksp_index_var.size_llir_var.name,
+                            type=llir.DataType.INT64,
+                        ),
+                        llir.Sizeof(data_type=scalar_type),
+                    ),
+                ],
+                result_storage=values_write,
+            ),
+        ]
+        if parent_level_type == LevelType.COMPRESSED:
+            body.extend(
+                [
+                    llir.FunctionCallStmt(
+                        name=f"{result_name}{level - 1}_crd.push_back",
+                        args=[
+                            llir.Var(name=parent_index_var.name, type=llir.DataType.INT)
+                        ],
+                        result_storage=self._result_storage(
+                            result_tensor_access,
+                            (RESULT_CRD, level - 1, STORAGE_WRITE),
+                        ),
+                    ),
+                    llir.Increment(var=parent_position),
+                ]
+            )
+        return [
+            llir.BlankLine(),
+            llir.Comment("Write workspace to its result row, if the producer ran"),
+            llir.IfThenElse(
+                cond=llir.Var(name=written_flag, type=llir.DataType.BOOL),
+                then_body=body,
+            ),
+        ]
+
+    def _refuse_consumer_result_cell(
+        self, result_tensor_access: TensorAccess, level: int, why: str
+    ) -> NoReturn:
+        """Refuse a dense workspace whose entries have no result cell to go to."""
+
+        result_tensor = result_tensor_access.get_tensor()
+        diagnostic = CINDiagnostic(
+            code="unsupported_workspace_result_level",
+            message=(
+                f"a dense workspace is copied into level {level} of "
+                f"{result_tensor.get_name()!r}, and {why}"
+            ),
+            path=("root",),
+            entity_id=result_tensor.symbol_id,
+            stage="legacy_cin_lowering",
+            pass_name="workspace_consumer",
+        )
+        raise UnsupportedFeature(
+            "stage=legacy CIN lowering: unsupported_workspace_result_level for "
+            f"result {result_tensor.get_name()!r} (level {level})",
+            diagnostics=(diagnostic,),
+        )
+
+    def _consumer_result_cell(
+        self, result_tensor_access: TensorAccess, level: int
+    ) -> Tuple[List[llir.Stmt], llir.Var]:
+        """Positions of the result cell one entry of a dense workspace goes to.
+
+        ``level`` is the result level the workspace's variable indexes.  The
+        cell's position is the position of the result's LAST level, which is
+        ``level`` itself only when the loops bind the result's levels outermost
+        first.  A result dense in every level is not held to that order
+        (``IterationLattice._dense_result_levels_resolved_at``):
+        ``einsum('abc,dc->adb', format='ddd')`` loops ``a, b`` around a
+        workspace over ``d``, the result's middle level.  The copy-out wrote
+        ``C_values[pC1]`` there, the position of a row, not of a cell.
+
+        Returned are the declarations of the position at ``level`` and at every
+        deeper level, each from the one above it, and the last one's variable.
+        With ``level`` the last level these are the declarations this lowering
+        always emitted.  The first level's position is its coordinate.
+
+        Refused, with ``unsupported_workspace_result_level``: a level from
+        ``level`` down that is not dense (its position is a counter, not
+        arithmetic), and a level above or below whose variable no enclosing
+        loop binds.
+        """
+
+        level_types = result_tensor_access.level_types()
+        level_vars = result_tensor_access.get_sorted_index_vars()
+        name = result_tensor_access.get_tensor().get_name()
+        bound = [
+            loop.parent if loop.has_parent else loop
+            for loop in self._enclosing_forall_vars
+        ]
+        if level_types[level] != LevelType.DENSE:
+            self._refuse_consumer_result_cell(
+                result_tensor_access,
+                level,
+                f"that level is {level_types[level].name.lower()}",
+            )
+        above = level - 1
+        while above >= 0 and level_types[above] == LevelType.DENSE:
+            if level_vars[above] not in bound:
+                self._refuse_consumer_result_cell(
+                    result_tensor_access,
+                    level,
+                    f"no enclosing loop binds {level_vars[above].name}, the "
+                    f"variable of level {above} above it",
+                )
+            above -= 1
+        stmts: List[llir.Stmt] = []
+        if level == 0:
+            stmts.append(
+                llir.VarInit(
+                    var=llir.Var(name=f"p{name}0", type=llir.DataType.INT64),
+                    value=llir.Var(name=level_vars[0].name, type=llir.DataType.INT64),
+                )
+            )
+        else:
+            stmts.extend(
+                result_tensor_access.get_level_iterator_resolve_stmts(level=level)
+            )
+        for deeper in range(level + 1, len(level_types)):
+            if level_types[deeper] != LevelType.DENSE:
+                self._refuse_consumer_result_cell(
+                    result_tensor_access,
+                    level,
+                    f"level {deeper} below it is "
+                    f"{level_types[deeper].name.lower()}",
+                )
+            if level_vars[deeper] not in bound:
+                self._refuse_consumer_result_cell(
+                    result_tensor_access,
+                    level,
+                    f"no enclosing loop binds {level_vars[deeper].name}, the "
+                    f"variable of level {deeper} below it",
+                )
+            stmts.extend(
+                result_tensor_access.get_level_iterator_resolve_stmts(level=deeper)
+            )
+        return stmts, llir.Var(
+            name=f"p{name}{len(level_types) - 1}", type=llir.DataType.INT64
+        )
+
+    def _reductions_around_consumer(
+        self, result_tensor_access: TensorAccess
+    ) -> List[IndexVar]:
+        """The loops around a Where whose index variable the result lacks.
+
+        The scheduler inserts a workspace at one reduction loop
+        (``Scheduler.insert_workspace``) and leaves the loops above it where
+        they were, reductions included.  ``einsum('abce,cef->abf')`` over a
+        compressed ``A`` puts the workspace over ``f`` inside the loop over
+        ``c``; ``einsum('bce,cef->bf')`` puts it inside the outer loop of a
+        tiled ``e``.  The workspace then holds one iteration's share of the sum
+        over that variable, and the consumer runs once per iteration.  A tile
+        loop counts as the loop over its parent variable.
+
+        Empty for a consumer that writes a workspace: a loop around it may be
+        free in the final result and still absent from that workspace.
+        """
+
+        if result_tensor_access.is_workspace():
+            return []
+        result_vars = set(result_tensor_access.get_index_vars())
+        return [
+            loop
+            for loop in self._enclosing_forall_vars
+            if (loop.parent if loop.has_parent else loop) not in result_vars
+        ]
+
+    def _refuse_consumer_inside_reduction(
+        self,
+        result_tensor_access: TensorAccess,
+        reductions: List[IndexVar],
+        what: str,
+    ) -> NoReturn:
+        """Refuse a workspace copy-out that cannot add partial sums."""
+
+        result_tensor = result_tensor_access.get_tensor()
+        names = ", ".join(loop.name for loop in reductions)
+        diagnostic = CINDiagnostic(
+            code="unsupported_workspace_inside_reduction",
+            message=(
+                f"the consumer of a workspace for {result_tensor.get_name()!r} "
+                f"runs inside the reduction loops {names} and {what}"
+            ),
+            path=("root",),
+            entity_id=result_tensor.symbol_id,
+            stage="legacy_cin_lowering",
+            pass_name="workspace_consumer",
+        )
+        raise UnsupportedFeature(
+            "stage=legacy CIN lowering: unsupported_workspace_inside_reduction "
+            f"for result {result_tensor.get_name()!r} (loops {names})",
+            diagnostics=(diagnostic,),
+        )
+
     def lower_ConsumerIndexStmt(self, stmt: IndexStmt) -> List[llir.Stmt]:
         """
         Lower a ConsumerIndexStmt to LLIR
@@ -1560,6 +2229,10 @@ class CINLowerer:
             result_tensor_access,
             llir.TensorAccessRole.RESULT_WRITE,
         )
+        # A reduction loop around the Where runs this consumer once per
+        # iteration, each time with that iteration's partial sums, so every
+        # copy-out below must add into the zeroed result instead of storing.
+        reductions_around = self._reductions_around_consumer(result_tensor_access)
 
         # If the wksp_index_var is None, that means we just have a scalar
         # workspace
@@ -1598,6 +2271,11 @@ class CINLowerer:
                                     tensor_access=result_value_metadata,
                                 ),
                                 value=wksp_var,
+                                op=(
+                                    AssignOp.ADD_ASSIGN
+                                    if reductions_around
+                                    else AssignOp.ASSIGN
+                                ),
                                 result_storage=self._result_storage(
                                     result_tensor_access,
                                     (RESULT_VALUES, None, STORAGE_WRITE),
@@ -1607,6 +2285,13 @@ class CINLowerer:
                         # The guard tests the WORKSPACE scalar against zero, so
                         # the conditional itself names no result storage.
                     )
+                )
+            elif reductions_around:
+                self._refuse_consumer_inside_reduction(
+                    result_tensor_access,
+                    reductions_around,
+                    f"appends the scalar workspace to {level_type.name.lower()} "
+                    f"level {level}",
                 )
             elif level_type == LevelType.COMPRESSED:
                 stmts.append(
@@ -1751,7 +2436,37 @@ class CINLowerer:
                     result_level_type is not None and result_level_type.name == "DENSE"
                 )
 
-                if result_is_dense:
+                written_flag = self._workspace_written_flags.get(wksp.get_name())
+                last_level = result_tensor_access.num_levels - 1
+                if written_flag is not None and level != last_level:
+                    self._refuse_consumer_result_cell(
+                        result_tensor_access,
+                        level,
+                        "its row is appended below a compressed level and is "
+                        "not the result's last level",
+                    )
+                if reductions_around and (
+                    not result_is_dense
+                    or written_flag is not None
+                    or (self.post_ops is not None and self.post_ops.ops)
+                ):
+                    self._refuse_consumer_inside_reduction(
+                        result_tensor_access,
+                        reductions_around,
+                        "copies the dense workspace into a result row that is "
+                        "appended or post-processed, which partial sums cannot be",
+                    )
+                if result_is_dense and written_flag is not None:
+                    return self._dense_block_workspace_copy_out(
+                        result_tensor_access,
+                        wksp,
+                        wksp_index_var,
+                        level,
+                        parent_index_var,
+                        parent_level_type,
+                        written_flag,
+                    )
+                if result_is_dense and not reductions_around and level == last_level:
                     # Emit memcpy: the workspace has the full row, write once.
                     wname = wksp.get_name()
                     size_var = wksp_index_var.size_llir_var.name
@@ -1815,7 +2530,9 @@ class CINLowerer:
                         ),
                     ]
 
-                # Fallback: element-by-element assignment (= not +=)
+                # Fallback: element-by-element assignment, ``=`` when the
+                # workspace holds the whole sum, ``+=`` when it holds one
+                # iteration's share of a reduction around the Where.
                 loop_var = llir.Var(
                     name=f"{wksp_index_var.name}",
                     type=llir.DataType.INT64,
@@ -1823,9 +2540,10 @@ class CINLowerer:
 
                 loop_body: List[llir.Stmt] = []
 
-                loop_body.extend(
-                    result_tensor_access.get_level_iterator_resolve_stmts(level=level)
+                position_stmts, cell = self._consumer_result_cell(
+                    result_tensor_access, level
                 )
+                loop_body.extend(position_stmts)
 
                 loop_body.append(
                     llir.Assign(
@@ -1834,17 +2552,18 @@ class CINLowerer:
                                 name=f"{result_tensor_name}_values",
                                 type=llir.DataType.NO_TYPE,
                             ),
-                            index=llir.Var(
-                                name=result_level_iterator_name,
-                                type=llir.DataType.INT64,
-                            ),
+                            index=cell,
                             tensor_access=result_value_metadata,
                         ),
                         value=llir.Var(
                             name=f"{wksp.get_name()}[{loop_var.name}]",
                             type=llir.DataType.NO_TYPE,
                         ),
-                        op=AssignOp.ASSIGN,
+                        op=(
+                            AssignOp.ADD_ASSIGN
+                            if reductions_around
+                            else AssignOp.ASSIGN
+                        ),
                         result_storage=self._result_storage(
                             result_tensor_access,
                             (RESULT_VALUES, None, STORAGE_WRITE),
@@ -1856,7 +2575,7 @@ class CINLowerer:
                 loop_body.extend(
                     self._emit_post_ops(
                         f"{result_tensor_name}_values",
-                        result_level_iterator_name,
+                        cell.name,
                         result_value_metadata,
                     )
                 )
@@ -1918,9 +2637,10 @@ class CINLowerer:
                 )
             )
 
-            loop_body.extend(
-                result_tensor_access.get_level_iterator_resolve_stmts(level=level)
+            position_stmts, cell = self._consumer_result_cell(
+                result_tensor_access, level
             )
+            loop_body.extend(position_stmts)
 
             loop_body.append(
                 llir.Assign(
@@ -1929,10 +2649,7 @@ class CINLowerer:
                             name=f"{result_tensor_name}_values",
                             type=llir.DataType.NO_TYPE,
                         ),
-                        index=llir.Var(
-                            name=result_level_iterator_name,
-                            type=llir.DataType.INT64,
-                        ),
+                        index=cell,
                         tensor_access=result_value_metadata,
                     ),
                     value=llir.ArrayAccess(
@@ -1979,12 +2696,38 @@ class CINLowerer:
                 for_loop,
             ]
 
+        if reductions_around:
+            self._refuse_consumer_inside_reduction(
+                result_tensor_access,
+                reductions_around,
+                "drains a sparse workspace into stored coordinates",
+            )
+
         first_key_level = self._nested_ordered_key_level(
             wksp_access, result_tensor_access
         )
         if first_key_level is not None:
             return self._lower_nested_ordered_key_drain(
                 wksp, wksp_access, result_tensor_access, first_key_level
+            )
+
+        mixed_key_level = self._mixed_key_drain_level(wksp_access, result_tensor_access)
+        if mixed_key_level is not None:
+            return self._lower_mixed_key_drain(
+                wksp, wksp_access, result_tensor_access, mixed_key_level
+            )
+
+        if level_type not in (LevelType.COMPRESSED, LevelType.COORDINATE):
+            # The drain below appends one value and one coordinate per sorted
+            # key at ``level``, which is assembly for a level that stores
+            # coordinates.  A dense level stores none: the loop would write a
+            # coordinate array the result does not have, and the kernel did
+            # not build.
+            raise UnsupportedFeature(
+                "stage=CIN lowering: a sparse workspace is drained into result "
+                f"level {level} of {result_tensor_name!r}, which is "
+                f"{level_type.name.lower()}; the drain assembles a compressed or "
+                "coordinate level"
             )
 
         # For loop
@@ -2104,8 +2847,11 @@ class CINLowerer:
                         type=llir.DataType.INT64,
                     ),
                 ),
+                # The drained level is the workspace key's last variable.  A
+                # one-variable key has no other; with a longer key this stored
+                # the key's FIRST variable in the last level.
                 value=llir.Var(
-                    name=f"{wksp_access.get_index_vars()[0].name}",
+                    name=f"{wksp_index_vars[-1].name}",
                     type=llir.DataType.NO_TYPE,
                 ),
                 result_storage=self._result_storage(
@@ -2115,13 +2861,79 @@ class CINLowerer:
             )
         )
 
-        # If the parent level is COORDINATE, also set the parent level's coordinate
-        if parent_level_type == LevelType.COORDINATE:
+        # A coordinate level stores one coordinate per entry, so every
+        # coordinate level above this one, up to the first that is not, gets
+        # its coordinate with each entry: the drained key's when the level's
+        # variable is part of the key, the enclosing loop's otherwise.  Only
+        # the parent's was set, and a result coordinate in three or more
+        # levels -- ``einsum('abc,cd->abd', format='ooo')`` -- came back with
+        # no coordinates in its outer levels.
+        level_vars = result_tensor_access.get_sorted_index_vars()
+        level_types = result_tensor_access.level_types()
+        bound = [
+            loop.parent if loop.has_parent else loop
+            for loop in self._enclosing_forall_vars
+        ]
+        key_vars = [
+            key_var.parent if key_var.has_parent else key_var
+            for key_var in wksp_index_vars
+        ]
+        if len(key_vars) > 1 and level_type == LevelType.COORDINATE:
+            # The drain visits keys in sorted order, which is the result's
+            # order only when the key's variables are the result's last
+            # levels in level order.
+            key_levels = [
+                result_tensor_access.level_of_index_var(key_var) for key_var in key_vars
+            ]
+            if key_levels != list(range(level - len(key_vars) + 1, level + 1)):
+                diagnostic = CINDiagnostic(
+                    code="unsupported_coordinate_drain_key_order",
+                    message=(
+                        f"the workspace key ({', '.join(v.name for v in key_vars)}) "
+                        f"is drained into levels {key_levels} of "
+                        f"{result_tensor_name!r}; a sorted drain stores a "
+                        "coordinate result in order only when the key's "
+                        "variables are its last levels, in level order"
+                    ),
+                    path=("root",),
+                    entity_id=result_tensor_access.get_tensor().symbol_id,
+                    stage="legacy_cin_lowering",
+                    pass_name="workspace_consumer",
+                )
+                raise UnsupportedFeature(
+                    "stage=legacy CIN lowering: "
+                    "unsupported_coordinate_drain_key_order for result "
+                    f"{result_tensor_name!r}",
+                    diagnostics=(diagnostic,),
+                )
+        ancestor = level - 1
+        while ancestor >= 0 and level_types[ancestor] == LevelType.COORDINATE:
+            ancestor_var = level_vars[ancestor]
+            if ancestor_var not in bound and ancestor_var not in key_vars:
+                diagnostic = CINDiagnostic(
+                    code="unsupported_coordinate_drain_unbound_level",
+                    message=(
+                        f"the drain into coordinate level {level} of "
+                        f"{result_tensor_name!r} needs the coordinate of level "
+                        f"{ancestor} ({ancestor_var.name}), which no enclosing "
+                        "loop binds"
+                    ),
+                    path=("root",),
+                    entity_id=result_tensor_access.get_tensor().symbol_id,
+                    stage="legacy_cin_lowering",
+                    pass_name="workspace_consumer",
+                )
+                raise UnsupportedFeature(
+                    "stage=legacy CIN lowering: "
+                    "unsupported_coordinate_drain_unbound_level for result "
+                    f"{result_tensor_name!r}",
+                    diagnostics=(diagnostic,),
+                )
             loop_body.append(
                 llir.Assign(
                     var=llir.ArrayAccess(
                         array=llir.Var(
-                            name=f"{result_tensor_name}{level - 1}_crd",
+                            name=f"{result_tensor_name}{ancestor}_crd",
                             type=llir.DataType.NO_TYPE,
                         ),
                         index=llir.Var(
@@ -2130,15 +2942,20 @@ class CINLowerer:
                         ),
                     ),
                     value=llir.Var(
-                        name=f"{parent_index_var.name}",
+                        name=(
+                            wksp_index_vars[key_vars.index(ancestor_var)].name
+                            if ancestor_var in key_vars
+                            else ancestor_var.name
+                        ),
                         type=llir.DataType.NO_TYPE,
                     ),
                     result_storage=self._result_storage(
                         result_tensor_access,
-                        (RESULT_CRD, level - 1, STORAGE_WRITE),
+                        (RESULT_CRD, ancestor, STORAGE_WRITE),
                     ),
                 )
             )
+            ancestor -= 1
 
         # <result level iterator>++;
         loop_body.append(
@@ -2436,6 +3253,358 @@ class CINLowerer:
             ),
         ]
 
+    @staticmethod
+    def _mixed_key_drain_level(
+        wksp_access: WorkspaceAccess, result_tensor_access: TensorAccess
+    ) -> Optional[int]:
+        """First result level of a drain whose key levels are not all compressed.
+
+        The drain under :meth:`_lower_mixed_key_drain` handles a sparse
+        workspace keyed on unsplit index variables that are, in order, the
+        result's trailing levels, below at least one result level bound by an
+        enclosing loop, when at least one of those trailing levels is dense.
+        None for every other drain, which keeps its existing lowering.
+        """
+
+        key = list(wksp_access.get_index_vars())
+        if not key or wksp_access.is_dense():
+            return None
+        if any(index_var.has_parent for index_var in key):
+            return None
+        levels = result_tensor_access.get_sorted_index_vars()
+        first = len(levels) - len(key)
+        if first < 1 or list(levels[first:]) != key:
+            return None
+        level_types = result_tensor_access.level_types()
+        if any(
+            level_type not in (LevelType.DENSE, LevelType.COMPRESSED)
+            for level_type in level_types
+        ):
+            return None
+        if all(
+            level_type == LevelType.COMPRESSED for level_type in level_types[first:]
+        ):
+            return None
+        return first
+
+    def _lower_mixed_key_drain(
+        self,
+        wksp: Workspace,
+        wksp_access: WorkspaceAccess,
+        result_tensor_access: TensorAccess,
+        first_level: int,
+    ) -> List[llir.Stmt]:
+        """Drain a sorted sparse workspace into trailing levels of mixed kinds.
+
+        The sorted workspace visits its keys in result level order, so the
+        drain is the loop nest over those levels with its loops flattened: a
+        run of keys sharing a prefix is one subtree below that prefix.  Each
+        key level is assembled as the loop over it would assemble it.
+
+        A dense key level stores no coordinates.  Its position is its parent's
+        position times its extent plus its coordinate, where a compressed
+        parent's position is the count of coordinates that level has stored so
+        far -- the position its pending coordinate will take.  A compressed
+        level directly below it owns one segment per dense cell, so the cells
+        the keys skip are closed before the visited one is appended to.
+
+        A compressed key level above a dense one records its coordinate once
+        the keys under it are drained, by the same commit a loop emits
+        (:func:`~scorch.compiler.iter_lattice.dense_block_commit`): the block
+        of dense cells below is padded to its full width and the coordinate
+        appended.  A compressed level above a compressed one closes exactly as
+        :meth:`_lower_nested_ordered_key_drain` closes it.
+
+        A dense leaf is one cell of its block and is stored at its position
+        with the cells before it zero-filled; a compressed leaf appends.
+
+        Every key came from an insertion, so a subtree the drain opens always
+        holds something.  The closing statements are nevertheless the
+        conditional ones the loops use, so that they are no-ops before the
+        first key and after an empty workspace.
+        """
+
+        result_tensor_name = result_tensor_access.get_tensor().get_name()
+        level_types = result_tensor_access.level_types()
+        result_value_metadata = self._tensor_access_metadata(
+            result_tensor_access,
+            llir.TensorAccessRole.RESULT_WRITE,
+        )
+        key = list(wksp_access.get_index_vars())
+        leaf_level = first_level + len(key) - 1
+        wksp_name = wksp.get_name()
+        loop_var = llir.Var(name="it", type=llir.DataType.CONST_AUTO_REF)
+
+        def position(level: int) -> llir.Var:
+            # A dense level's position, or the count of coordinates a
+            # compressed level has stored.
+            return llir.Var(
+                name=f"p{result_tensor_name}{level}", type=llir.DataType.INT64
+            )
+
+        def previous(key_position: int) -> llir.Var:
+            return llir.Var(
+                name=f"{wksp_name}_prev{key_position}", type=llir.DataType.INT64
+            )
+
+        def key_coordinate(key_position: int) -> llir.Var:
+            return llir.Var(name=key[key_position].name, type=llir.DataType.INT64)
+
+        def close_node(level: int, coordinate: llir.Expr) -> List[llir.Stmt]:
+            # The subtree under ``coordinate`` at ``level`` has been drained.
+            child = level + 1
+            if level_types[level] != LevelType.COMPRESSED:
+                # A dense cell: the compressed level below it closes the cell
+                # when the catch-up reaches the next one.
+                return []
+            if level_types[child] == LevelType.DENSE:
+                return dense_block_commit(
+                    self, result_tensor_access, child, coordinate
+                )[1:]
+            return [
+                llir.IfThenElse(
+                    cond=llir.BinOp(
+                        op="<",
+                        left=llir.FunctionCall(
+                            name=f"{result_tensor_name}{child}_pos.back",
+                            args=[],
+                        ),
+                        right=position(child),
+                    ),
+                    then_body=[
+                        llir.FunctionCallStmt(
+                            name=f"{result_tensor_name}{level}_crd.push_back",
+                            args=[coordinate],
+                            result_storage=self._result_storage(
+                                result_tensor_access,
+                                (RESULT_CRD, level, STORAGE_WRITE),
+                            ),
+                        ),
+                        llir.Increment(var=position(level)),
+                    ],
+                    result_storage=self._result_storage(
+                        result_tensor_access,
+                        (RESULT_POS, child, STORAGE_READ),
+                    ),
+                ),
+                llir.Assign(
+                    var=llir.ArrayAccess(
+                        array=llir.Var(
+                            name=f"{result_tensor_name}{child}_pos",
+                            type=llir.DataType.STD_VECTOR_C_INT,
+                        ),
+                        index=llir.FunctionCall(
+                            name=f"{result_tensor_name}{level}_crd.size",
+                            args=[],
+                        ),
+                    ),
+                    value=llir.FunctionCall(
+                        name=f"{result_tensor_name}{child}_crd.size",
+                        args=[],
+                    ),
+                    result_storage=self._result_storage(
+                        result_tensor_access,
+                        (RESULT_POS, child, STORAGE_WRITE),
+                        (RESULT_CRD, level, STORAGE_READ),
+                        (RESULT_CRD, child, STORAGE_READ),
+                    ),
+                ),
+            ]
+
+        # The key levels that own a subtree, deepest first, with their closes.
+        closes = [
+            (level, close_node(level, previous(level - first_level)))
+            for level in range(leaf_level - 1, first_level - 1, -1)
+        ]
+        closes = [(level, stmts) for level, stmts in closes if stmts]
+        tracked = max((level - first_level for level, _ in closes), default=-1) + 1
+
+        loop_body: List[llir.Stmt] = []
+        for key_position, index_var in enumerate(key):
+            entry_key: llir.Expr = llir.MemberAccess(
+                base=llir.Var(name=loop_var.name, type=loop_var.type),
+                member="first",
+            )
+            if len(key) > 1:
+                entry_key = llir.ArrayAccess(
+                    array=entry_key,
+                    index=llir.Literal(key_position, llir.DataType.INT64),
+                )
+            loop_body.append(
+                llir.VarInit(
+                    var=llir.Var(name=index_var.name, type=llir.DataType.INT64),
+                    value=entry_key,
+                )
+            )
+        loop_body.append(
+            llir.VarInit(
+                var=llir.Var(
+                    name=f"{wksp_name}_value",
+                    type=dtype_to_c_datatype(wksp.dtype),
+                ),
+                value=llir.MemberAccess(
+                    base=llir.Var(name=loop_var.name, type=loop_var.type),
+                    member="second",
+                ),
+            )
+        )
+        loop_body.append(llir.BlankLine())
+
+        # Close, deepest first, every subtree whose own prefix changed.
+        for level, stmts in closes:
+            changed: Optional[llir.Expr] = None
+            for key_position in range(level - first_level + 1):
+                differs = llir.BinOp(
+                    op="!=",
+                    left=key_coordinate(key_position),
+                    right=previous(key_position),
+                )
+                changed = (
+                    differs
+                    if changed is None
+                    else llir.BinOp(op="||", left=changed, right=differs)
+                )
+            assert changed is not None
+            loop_body.append(llir.IfThenElse(cond=changed, then_body=list(stmts)))
+        for key_position in range(tracked):
+            loop_body.append(
+                llir.Assign(
+                    var=previous(key_position), value=key_coordinate(key_position)
+                )
+            )
+
+        # Resolve each dense key level's position, closing the cells the keys
+        # skipped in the compressed level below it.
+        for level in range(first_level, leaf_level + 1):
+            if level_types[level] != LevelType.DENSE:
+                continue
+            resolve = result_tensor_access.get_level_iterator_resolve_stmts(level=level)
+            assert resolve, "a dense level below another level resolves its position"
+            loop_body.extend(resolve)
+            if level < leaf_level and level_types[level + 1] == LevelType.COMPRESSED:
+                loop_body.extend(
+                    compressed_child_catch_up(
+                        self, result_tensor_access, level + 1, position(level)
+                    )
+                )
+
+        if level_types[leaf_level] == LevelType.DENSE:
+            loop_body.extend(
+                dense_block_leaf_store(
+                    f"{result_tensor_name}_values",
+                    position(leaf_level),
+                    llir.Var(name=f"{wksp_name}_value", type=llir.DataType.NO_TYPE),
+                    False,
+                    self._result_storage(
+                        result_tensor_access,
+                        (RESULT_VALUES, None, STORAGE_WRITE),
+                    ),
+                    self._result_storage(
+                        result_tensor_access,
+                        (RESULT_VALUES, None, STORAGE_READ),
+                    ),
+                )
+            )
+        else:
+            # The leaf entry, written exactly as the one-level drain writes it.
+            loop_body.append(
+                llir.Assign(
+                    var=llir.ArrayAccess(
+                        array=llir.Var(
+                            name=f"{result_tensor_name}_values",
+                            type=llir.DataType.NO_TYPE,
+                        ),
+                        index=position(leaf_level),
+                        tensor_access=result_value_metadata,
+                    ),
+                    value=llir.Var(
+                        name=f"{wksp_name}_value", type=llir.DataType.NO_TYPE
+                    ),
+                    result_storage=self._result_storage(
+                        result_tensor_access,
+                        (RESULT_VALUES, None, STORAGE_WRITE),
+                    ),
+                )
+            )
+            loop_body.append(
+                llir.Assign(
+                    var=llir.ArrayAccess(
+                        array=llir.Var(
+                            name=f"{result_tensor_name}{leaf_level}_crd",
+                            type=llir.DataType.NO_TYPE,
+                        ),
+                        index=position(leaf_level),
+                    ),
+                    value=llir.Var(name=key[-1].name, type=llir.DataType.NO_TYPE),
+                    result_storage=self._result_storage(
+                        result_tensor_access,
+                        (RESULT_CRD, leaf_level, STORAGE_WRITE),
+                    ),
+                )
+            )
+            loop_body.append(llir.Increment(var=position(leaf_level)))
+
+        closing: List[llir.Stmt] = []
+        for _, stmts in closes:
+            closing.extend(stmts)
+
+        # The outermost key level, against the loop that encloses the drain.
+        parent_index_var = result_tensor_access.get_parent_index_var(key[0])
+        assert parent_index_var is not None, "a mixed drain has an enclosing level"
+        parent_level_type = level_types[first_level - 1]
+        outer: List[llir.Stmt]
+        if level_types[first_level] == LevelType.COMPRESSED:
+            outer = self._drained_segment_assembly(
+                result_tensor_access,
+                first_level,
+                LevelType.COMPRESSED,
+                parent_index_var,
+                parent_level_type,
+            )
+        elif parent_level_type == LevelType.COMPRESSED:
+            outer = dense_block_commit(
+                self,
+                result_tensor_access,
+                first_level,
+                llir.Var(name=parent_index_var.name, type=llir.DataType.INT),
+            )
+        else:
+            # Dense levels all the way up to the enclosing loop, so the drain
+            # itself closes nothing here.  A compressed level below the run
+            # has its visited cells closed by the next catch-up.  The cells
+            # after the last visited one are closed by the commit of the
+            # nearest compressed level above (it pads the block to its end)
+            # or, with none above, by the close that follows the whole nest.
+            # Writing the last visited cell's end here as well would write
+            # position entry 1 of a level that has no cells at all when a
+            # dense level above it has extent zero.
+            below = first_level
+            while below <= leaf_level and level_types[below] == LevelType.DENSE:
+                below += 1
+            outer = []
+            if below <= leaf_level and all(
+                level_type == LevelType.DENSE for level_type in level_types[:below]
+            ):
+                self.result_dense_level_sparse_driven = True
+
+        return [
+            llir.BlankLine(),
+            llir.Comment("Lower consumer CIN"),
+            llir.FunctionCallStmt(name=f"{wksp_name}.sort", args=[]),
+            *[
+                # Coordinates are non-negative, so -1 differs from every first key.
+                llir.VarInit(var=previous(key_position), value=llir.Literal(-1))
+                for key_position in range(tracked)
+            ],
+            llir.ForLoopAuto(
+                var=loop_var,
+                array=llir.Var(name=wksp_name, type=llir.DataType.AUTO),
+                body=loop_body,
+            ),
+            *closing,
+            *outer,
+        ]
+
     def _drained_segment_assembly(
         self,
         result_tensor_access: TensorAccess,
@@ -2701,6 +3870,7 @@ class CINLowerer:
                 prepared_stmt
             )
         self._validate_index_stmt(prepared_stmt)
+        self._validate_tensor_ranks(prepared_stmt)
         self._validate_coordinate_hierarchies(prepared_stmt)
         verify_cin_enabled = self.compile_options.verification.verify_cin
         if legacy_schedule_aliases and verify_cin_enabled and not ownership_transferred:
@@ -3197,18 +4367,24 @@ class CINLowerer:
                     and self.final_result_tensor_var
                     and not self.final_result_tensor_var.is_dense()
                 ):
-                    # Scalar accumulation preserves the driving sparse leaf. Its
-                    # value tensor has the exact output cardinality for either COO
-                    # or a compressed-leaf format such as CSR.
+                    # Scalar accumulation stores one result entry per stored
+                    # entry of the driving input, so that input's value tensor
+                    # has the exact output cardinality when its leaf is
+                    # compressed or coordinate.  It is the input the loops were
+                    # checked to walk (``_require_scalar_accumulation_driver``),
+                    # not the first input with such a leaf: a compressed
+                    # operand over the REDUCED index stores an unrelated number
+                    # of entries, and sizing the result by it wrote past the
+                    # arrays or left their tail unwritten.
                     sparse_values_tensor = None
-                    for tensor in rhs_tensor_vars:
-                        level_types = tensor.get_level_types()
+                    driver = self._scalar_accum_driver
+                    if driver is not None:
+                        level_types = driver.get_level_types()
                         if level_types and level_types[-1] in (
                             LevelType.COMPRESSED,
                             LevelType.COORDINATE,
                         ):
-                            sparse_values_tensor = f"{tensor.get_name()}_values"
-                            break
+                            sparse_values_tensor = f"{driver.get_name()}_values"
 
                     if sparse_values_tensor:
                         self._known_nnz_var = "_known_nnz"
@@ -3302,6 +4478,17 @@ class CINLowerer:
                         exact_dense_parent_positions=exact_dense_parent_positions,
                         reserve_hint_var=reserve_hint_var,
                     )
+                    if self.result_dense_level_sparse_driven:
+                        body_stmts.extend(
+                            final_assembler.emit_position_tail_close(
+                                tuple(
+                                    self.result_dense_level_extent_name(
+                                        final_assembler.name, level
+                                    )
+                                    for level in range(final_assembler.levels)
+                                )
+                            )
+                        )
                     body_stmts.extend(final_assembler.emit_final_assembly())
 
                 return LLIRRewriteArtifact(body_stmts)
@@ -3378,7 +4565,10 @@ class CINLowerer:
     ) -> Union[llir.Stmt, List[llir.Stmt]]:
         """Apply an existing LoopPlan after CIN lowering has completed."""
 
-        if self.loop_plan is None or not isinstance(lowered, llir.Function):
+        if not isinstance(lowered, llir.Function):
+            return lowered
+        if self.loop_plan is None:
+            self._place_unplaced_workspace_clusters(lowered)
             return lowered
         compilation_context = self._compilation_context
         schedule_lowering_token = (
@@ -3399,6 +4589,7 @@ class CINLowerer:
                 result_tile_plan,
             ) = materialize_legacy_schedule(self.normalized_cin or stmt, self.loop_plan)
             self._apply_explicit_parallel_schedule(lowered, legacy_schedule)
+            self._place_unplaced_workspace_clusters(lowered)
             from .schedule_lowerer import apply_schedule_to_llir
 
             scheduled = apply_schedule_to_llir(
@@ -3427,6 +4618,75 @@ class CINLowerer:
                 stmt.producer
             ) or CINLowerer._contains_explicit_parallel(stmt.consumer)
         return False
+
+    def _require_scalar_accumulation_driver(
+        self, result_tensor_access: TensorAccess, for_all_stmt: ForAll
+    ) -> None:
+        """Refuse scalar accumulation into a coordinate result that has no driver.
+
+        The path appends one result entry per iteration of the loops over the
+        result's indices and sizes the result by one input's stored entries.
+        That is the result only when those loops walk exactly that input's
+        entries (:func:`~scorch.compiler.cin.coordinate_result_driver`).
+
+        Anything else was lowered all the same.  ``x[a] * B[a,b]`` into a
+        coordinate ``C[a]`` with a coordinate ``B`` stored ``a`` once per stored
+        entry of ``B`` and never summed over ``b``, through a counter shared by
+        the threads of a parallel loop; with a compressed ``B`` the arrays were
+        sized by ``B``'s entries and filled with one entry per row.  A raw
+        reduction ``A[i,j]`` into a coordinate ``C[i]`` returned its arrays
+        untrimmed.  Each is a valid program this path cannot lower; a schedule
+        that reduces through a workspace can.
+        """
+
+        statement: IndexStmt = for_all_stmt
+        while isinstance(statement, ForAll):
+            statement = statement.stmt
+        driver = (
+            coordinate_result_driver(result_tensor_access, statement.rhs)
+            if isinstance(statement, TensorAssign)
+            else None
+        )
+        # The loops around the accumulation must be the result's, one each, in
+        # its storage order.  A reduction loop outside them appends every entry
+        # once per iteration of that loop, and loops out of storage order append
+        # coordinates out of order.  An outer tile loop is part of the loop over
+        # its parent variable.
+        enclosing = [
+            loop.parent if loop.has_parent else loop
+            for loop in self._enclosing_forall_vars
+            if not (loop.tile_size_var and loop.is_outer)
+        ]
+        if driver is not None and enclosing == list(
+            result_tensor_access.get_sorted_index_vars()
+        ):
+            self._scalar_accum_driver = driver.get_tensor()
+            return
+        result_tensor = result_tensor_access.get_tensor()
+        reason = (
+            "no input has exactly the result's indices with every other input "
+            "dense along them"
+            if driver is None
+            else "the enclosing loops are not the result's indices in its "
+            "storage order"
+        )
+        diagnostic = CINDiagnostic(
+            code="unsupported_coordinate_result_reduction",
+            message=(
+                "legacy CIN lowering reduces into the all-coordinate result "
+                f"{result_tensor.get_name()!r} one stored entry of a driving "
+                f"input at a time, and {reason}"
+            ),
+            path=("root",),
+            entity_id=result_tensor.symbol_id,
+            stage="legacy_cin_lowering",
+            pass_name="scalar_accumulation",
+        )
+        raise UnsupportedFeature(
+            "stage=legacy CIN lowering: unsupported_coordinate_result_reduction "
+            f"for result {result_tensor.get_name()!r}",
+            diagnostics=(diagnostic,),
+        )
 
     def _should_parallelize_outer_forall(self, index_var: IndexVar) -> bool:
         if (
@@ -3485,6 +4745,90 @@ class CINLowerer:
             if tv != self.final_result_tensor_var and not isinstance(tv, Workspace)
         )
         return has_sparse_input
+
+    @staticmethod
+    def _outer_loop_is_counted(iter_lattice: IterationLattice) -> bool:
+        """Whether the outermost loop is one counted ``for`` loop.
+
+        The two-pass assembly of a compressed result splits the outermost loop's
+        iterations across threads, so that loop has to be a ``for`` loop whose
+        iterations are known before it runs: a dense range, or the stored
+        coordinates of one operand (:meth:`_compressed_where_outer_cell` says
+        which row each of those assembles).
+
+        A merge of several operands' stored coordinates is neither.  It lowers to
+        a ``while`` loop that advances one cursor per operand, preceded by one
+        group of cursor declarations per operand, and the transform rejected that
+        statement list (``invalid_compressed_where_root_member``):
+        ``einsum('ij,ik->ij', A, B, format='ds')`` with both operands
+        doubly compressed did not compile.  Such a kernel is assembled serially,
+        by the statements the loop nest already carries.
+        """
+
+        if iter_lattice.dense_index_var_llir is not None:
+            return True
+        lattice_point = iter_lattice.get_lattice_points()[0]
+        return (
+            len(lattice_point.get_iterators()) <= 1
+            and not lattice_point.parent_lattice_point
+        )
+
+    @staticmethod
+    def _compressed_where_outer_cell(
+        iter_lattice: IterationLattice, result_tensor: TensorVar
+    ) -> Optional[OuterCellDomain]:
+        """Which result row one iteration of the outermost loop assembles.
+
+        The two-pass assembly keeps one slot per row of the result's dense level
+        zero: a count in the first pass, an offset in the second, and one entry
+        of the first compressed level's position array.  A loop over a dense
+        range numbers the rows with its own variable and bound, which is what
+        the pass derives when it is told nothing (``None`` here, and the
+        emission of every such kernel is unchanged).
+
+        A loop over one operand's stored coordinates does not.  Its variable is
+        a position in that operand's coordinate array and its bound is how many
+        coordinates the operand stores.  Numbering rows with them puts row
+        ``crd[p]`` in slot ``p`` and gives the position array one entry per
+        STORED row, so every row after the first row the operand does not store
+        is assembled one row early and the array is too short for the level --
+        ``einsum('ij,jk->ik', A, B, format='ds')`` with a doubly-compressed
+        ``A`` that has an empty row.  For that loop the row is the coordinate at
+        the position, and the row count is the result's own level-zero extent.
+        The coordinates of one compressed segment are distinct, so two
+        iterations never share a slot.
+
+        The index is spelled as the subscript into the coordinate array rather
+        than as the variable the loop body declares for it, because the second
+        pass reads its offsets in the body's first statements.
+        """
+
+        if iter_lattice.dense_index_var_llir is not None:
+            # The loop runs over the dense range and co-iterates the operand.
+            return None
+        lattice_point = iter_lattice.get_lattice_points()[0]
+        iterators = lattice_point.get_iterators()
+        if len(iterators) != 1 or lattice_point.parent_lattice_point:
+            # A dense range, or a merge of several operands, which lowers to a
+            # while loop the pass does not select.
+            return None
+        iterator = iterators[0]
+        if iterator.level_type != LevelType.COMPRESSED:
+            return None
+        position = iterator.get_iterator_var_llir()
+        return OuterCellDomain(
+            index=llir.ArrayAccess(
+                array=llir.Var(
+                    name=f"{iterator.tensor_var.name}{iterator.level}_crd",
+                    type=llir.DataType.PTR_INT,
+                ),
+                index=llir.Var(name=position.name, type=position.type),
+            ),
+            count=llir.Var(
+                name=f"{result_tensor.get_name()}0_size",
+                type=llir.DataType.INT64,
+            ),
+        )
 
     @staticmethod
     def _rewrite_val_refs(stmts: list, replacements: dict) -> None:
@@ -3635,6 +4979,79 @@ class CINLowerer:
             return CINLowerer._find_val_array_access(expr.right, pos_to_stride)
         return None
 
+    def result_dense_level_extent_name(self, result_name: str, level: int) -> str:
+        """The variable holding a dense result level's extent, as its loop names it.
+
+        A dense loop over the level runs to its own bound variable, which is
+        an operand's when an operand supplies the domain; a loop over stored
+        coordinates has none, and the result's own extent variable stands.
+        One spelling per level keeps every count of the level's cells -- the
+        flattened position and the cell total -- in agreement with the loop.
+        """
+
+        return self.result_dense_level_bound_names.get(
+            level, f"{result_name}{level}_size"
+        )
+
+    def _mark_parallel(self, stmts: List[llir.Stmt]) -> None:
+        """Mark the first compatible loop parallel and record what it placed."""
+
+        cluster = self._parallel_workspace_cluster
+        if not mark_first_for_loop_parallel(stmts, cluster):
+            return
+        self._kernel_has_parallel_region = True
+        self._unplaced_workspace_clusters = [
+            unplaced
+            for unplaced in self._unplaced_workspace_clusters
+            if unplaced is not cluster
+        ]
+
+    def _place_unplaced_workspace_clusters(self, function: llir.Function) -> None:
+        """Allocate, serially, each dense workspace no parallel loop placed.
+
+        A dense workspace is allocated by the loop the parallel marking
+        selects.  A kernel with a sparse result selects none, so its dense
+        workspace was used and never declared, and the kernel did not build.
+        Such a kernel runs on one worker; its workspaces are allocated once,
+        before its outermost loop.
+
+        A kernel that does have a parallel region and still left a workspace
+        unplaced is refused: placed serially, that workspace would be shared
+        by every worker of the region.
+        """
+
+        if not self._unplaced_workspace_clusters:
+            return
+        clusters = self._unplaced_workspace_clusters
+        self._unplaced_workspace_clusters = []
+        if self._kernel_has_parallel_region or self._outermost_loop_name is None:
+            raise CompilerInvariantError(
+                "stage=CIN lowering pass=workspace placement: a dense workspace "
+                "was placed by no parallel loop in a kernel that has a parallel "
+                "region or no outermost loop"
+            )
+        before: List[llir.Stmt] = []
+        after: List[llir.Stmt] = []
+        for cluster in clusters:
+            cluster_before, cluster_after = serial_workspace_cluster_placement(cluster)
+            before.extend(cluster_before)
+            after.extend(cluster_after)
+        # At function scope, around the statement that is or holds the
+        # outermost loop: the owner then outlives every use, and nothing is
+        # allocated per iteration of a loop a schedule wrapped around it.
+        for position, candidate in enumerate(function.body):
+            if (
+                self._find_tagged_loop([candidate], self._outermost_loop_name)
+                is not None
+            ):
+                function.body[position + 1 : position + 1] = after
+                function.body[position:position] = before
+                return
+        raise CompilerInvariantError(
+            "stage=CIN lowering pass=workspace placement: the outermost loop "
+            "is not in the lowered function"
+        )
+
     @staticmethod
     def _tag_first_loop(stmts: List[llir.Stmt], index_var: IndexVar) -> None:
         """Attach a stable logical loop name for post-lowering schedule passes."""
@@ -3642,6 +5059,40 @@ class CINLowerer:
             if isinstance(stmt, (llir.ForLoop, llir.WhileLoop)):
                 stmt.scorch_index_var = index_var.name
                 return
+
+    @staticmethod
+    def _find_tagged_loop(
+        stmts: List[llir.Stmt], loop_name: str
+    ) -> Optional[Union[llir.ForLoop, llir.WhileLoop]]:
+        """The loop ``_tag_first_loop`` named ``loop_name``, of either kind.
+
+        The outermost loop is a ``while`` loop when it merges the coordinates
+        of two compressed levels -- ``einsum('bij,bjk->bik')`` with ``b``
+        compressed in both operands -- and ``_tag_first_loop`` tags it all the
+        same.  ``_find_tagged_for_loop`` looks only for a counted loop, the
+        kind a parallel schedule can mark; a placement before or after the
+        loop needs the loop whatever its kind.
+        """
+        for stmt in stmts:
+            if isinstance(stmt, (llir.ForLoop, llir.WhileLoop)):
+                if getattr(stmt, "scorch_index_var", None) == loop_name:
+                    return stmt
+                nested = CINLowerer._find_tagged_loop(stmt.body, loop_name)
+                if nested is not None:
+                    return nested
+            elif isinstance(stmt, llir.IfThenElse):
+                bodies = []
+                if stmt.then_body:
+                    bodies.append(stmt.then_body)
+                if stmt.else_body:
+                    bodies.append(stmt.else_body)
+                if stmt.then_body_list:
+                    bodies.extend(stmt.then_body_list)
+                for body in bodies:
+                    nested = CINLowerer._find_tagged_loop(body, loop_name)
+                    if nested is not None:
+                        return nested
+        return None
 
     @staticmethod
     def _find_tagged_for_loop(
@@ -3695,7 +5146,7 @@ class CINLowerer:
         if not loop.omp_parallel_for and not getattr(
             loop, "_use_atomic_scheduling", False
         ):
-            mark_first_for_loop_parallel([loop], self._parallel_workspace_cluster)
+            self._mark_parallel([loop])
 
     # Min work per thread for the SpGEMM 2-phase path, where `work` is the true flop
     # (A_nnz*avg_B_row). Emitted by NAME (not as a literal) so the codegen flop grain
@@ -3928,10 +5379,18 @@ class CINLowerer:
         if not self.final_result_tensor_var or not self.final_result_tensor_access:
             return False
         # Output must be all-coordinate (COO)
-        for lt in self.final_result_tensor_var.get_level_types():
+        level_types = self.final_result_tensor_var.get_level_types()
+        for lt in level_types:
             if lt != LevelType.COORDINATE:
                 return False
-        return True
+        # ``_transform_coo_loop_for_openmp`` flattens the outermost coordinate
+        # level and the level below it into one loop over stored entries.  A
+        # third coordinate level keeps its own loop, which then reads the
+        # positions the flattening removed: ``einsum('abc,abd->abc')`` with a
+        # coordinate ``A`` and a coordinate result used ``pA1`` and ``pA1_end``
+        # with no declaration and did not build.  A result of three or more
+        # levels runs its nested loops serially.
+        return len(level_types) <= 2
 
     def _transform_coo_loop_for_openmp(self, stmts: List[llir.Stmt]) -> List[llir.Stmt]:
         """Transform the outer COO WhileLoop into a group-indexed ForLoop
@@ -4450,34 +5909,48 @@ class CINLowerer:
             ):
                 assert self.result_tensor_var, "Result tensor variable not set"
 
-        stmts.extend(
-            [
-                *iter_lattice.get_iterator_init_stmts(),
-                llir.BlankLine(),
-                *iter_lattice.get_lattice_loops(),
-            ]
-        )
+        self._enclosing_forall_vars.append(index_var)
+        try:
+            stmts.extend(
+                [
+                    *iter_lattice.get_iterator_init_stmts(),
+                    llir.BlankLine(),
+                    *iter_lattice.get_lattice_loops(),
+                ]
+            )
+        finally:
+            self._enclosing_forall_vars.pop()
         self._tag_first_loop(stmts, index_var)
+        if is_outermost_forall and any(
+            isinstance(candidate, (llir.ForLoop, llir.WhileLoop)) for candidate in stmts
+        ):
+            # The tag ``_tag_first_loop`` just attached; it survives the
+            # detaching rewrites between here and the lowered function, which
+            # the loop object's identity does not.
+            self._outermost_loop_name = index_var.name
         if stmt.parallel is True:
-            mark_first_for_loop_parallel(stmts, self._parallel_workspace_cluster)
+            self._mark_parallel(stmts)
         elif (
             is_outermost_forall
             and not self.has_explicit_parallel_loop
             and self._should_parallelize_outer_forall(index_var)
         ):
-            mark_first_for_loop_parallel(stmts, self._parallel_workspace_cluster)
+            self._mark_parallel(stmts)
         elif (
             is_outermost_forall
             and not self.has_explicit_parallel_loop
             and self._used_scalar_accum
             and self._should_parallelize_coo_outer(index_var)
         ):
+            self._kernel_has_parallel_region = True
             stmts = self._transform_coo_loop_for_openmp(stmts)
         elif (
             is_outermost_forall
             and not self.has_explicit_parallel_loop
             and self._should_parallelize_compressed_where(index_var)
+            and self._outer_loop_is_counted(iter_lattice)
         ):
+            self._kernel_has_parallel_region = True
             result_tensor = self.final_result_tensor_var
             result_access = self.final_result_tensor_access
             workspace_name = self._where_workspace_name
@@ -4512,6 +5985,9 @@ class CINLowerer:
                             flop_grain=self._CG_FLOP_GRAIN,
                         ),
                         compile_options=self.compile_options,
+                        outer_cell=self._compressed_where_outer_cell(
+                            iter_lattice, result_tensor
+                        ),
                         # The plan's decision, carried rather than re-derived.
                         # ``None`` -- no plan, or a plan that records nothing --
                         # leaves this pass substituting exactly where it

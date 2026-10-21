@@ -19,10 +19,10 @@ What is locked here:
   (``ds ij->ij`` has it too) and is equivalent on every accepted input, because
   the generated-kernel validator rejects a repeated coordinate inside a
   compressed level before the kernel runs;
-* one declared arm difference: ``ssd ijk->k`` on the regblock arm stops at the
-  dense-workspace copy-out rule (a rank-1 result has no parent level), exactly
-  as the single-compressed ``dsd ijk->k`` already does there, and legacy's
-  comparand fails on it too;
+* no declared refusal: ``ssd ijk->k`` on the regblock arm used to stop at the
+  dense-workspace copy-out rule (a rank-1 result has no parent level), where
+  legacy's comparand failed on it too.  Both compilers now emit it, the same
+  kernel byte for byte, and it runs here in float64 as well;
 * every admitted cell executes correctly against a float64 reference.
 """
 
@@ -44,13 +44,19 @@ from scorch.compiler.loopir.pipeline import (
 )
 from scorch.compiler.scheduler import Schedule
 from scorch.stensor import STensor
+from tests.test_scorch.loopir_executed_programs import (
+    assert_program_matches_pytorch,
+)
 
 ATOL = RTOL = 1e-3
 SHAPES = {2: (4, 5), 3: (3, 4, 5)}
 ARMS = [False, True]
 
-# (operand, result, operand format, arm) -> the one declared refusal code.
-DECLARED_REFUSALS = {("ijk", "k", "ssd", True): "unsupported_program_shape"}
+# (operand, result, operand format, arm) -> the declared refusal code.  Empty:
+# its one entry, ``("ijk", "k", "ssd", True): "unsupported_program_shape"``,
+# compiles, and the emission test below now holds that cell to byte identity
+# with the legacy kernel like every other.
+DECLARED_REFUSALS: dict = {}
 
 
 def _options(regblock_enabled, *, jit=False):
@@ -244,3 +250,17 @@ def test_a_dcsr_operand_multiplies_a_dense_vector(arm):
         atol=ATOL,
         rtol=RTOL,
     )
+
+
+@pytest.mark.parametrize("arm", [0, 1], ids=["direct", "regblock"])
+def test_the_formerly_refused_cell_matches_pytorch_in_float64(arm):
+    """``ssd ijk->k``, the cell ``DECLARED_REFUSALS`` used to hold, to 1e-12.
+
+    ``test_every_admitted_cell_executes_correctly`` runs every cell in float32
+    to 1e-3; this runs the cell in float64, on operands holding stored zeros.
+    """
+
+    kernel, _ = assert_program_matches_pytorch(
+        (("A", "ssd", "ijk", None),), ("k", "d", None), arm
+    )
+    assert not kernel.conversions

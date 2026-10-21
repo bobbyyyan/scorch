@@ -5,6 +5,7 @@ import enum
 from typing import Any
 
 import pytest
+import torch
 
 import scorch.compiler.analysis_runner as analysis_runner_module  # type: ignore[import-untyped]
 import scorch.compiler.cin_analysis as cin_analysis_module  # type: ignore[import-untyped]
@@ -148,8 +149,8 @@ def test_cin_mutable_state_is_owned_per_instance() -> None:
     second_i = IndexVar("i")
     first_tensor = TensorVar("A", fmt="d")
     second_tensor = TensorVar("A", fmt="d")
-    first_workspace = Workspace("tmp", dim=1, dense=True)
-    second_workspace = Workspace("tmp", dim=1, dense=True)
+    first_workspace = Workspace("tmp", dim=1, dtype=first_tensor.dtype, dense=True)
+    second_workspace = Workspace("tmp", dim=1, dtype=second_tensor.dtype, dense=True)
     first_access = first_tensor[first_i]
     first_expr = first_access * first_access
 
@@ -177,7 +178,7 @@ def test_access_construction_has_no_backreference_side_effects() -> None:
     i = IndexVar("i")
     result = TensorVar("C", fmt="d")
     source = TensorVar("A", fmt="d")
-    workspace = Workspace("tmp", dim=1, dense=True)
+    workspace = Workspace("tmp", dim=1, dtype=result.dtype, dense=True)
 
     lhs = result[i]
     rhs = source[i]
@@ -197,7 +198,7 @@ def test_workspace_index_rewrite_does_not_materialize_tile_backlink() -> None:
     inner = IndexVar("i_in")
     logical.expr = outer + inner
     TileSizeVar(outer, inner, size=4)
-    workspace = Workspace("tmp", dim=1, dense=True)
+    workspace = Workspace("tmp", dim=1, dtype=torch.float32, dense=True)
     access = WorkspaceAccess(workspace, logical)
 
     access.update_indices([inner])
@@ -453,8 +454,8 @@ def test_same_name_symbols_in_distinct_scopes_keep_distinct_identity() -> None:
     i = IndexVar("i")
     source = TensorVar("A", fmt="d")
     result = TensorVar("C", fmt="d")
-    first = Workspace("tmp", dim=1, dense=True)
-    second = Workspace("tmp", dim=1, dense=True)
+    first = Workspace("tmp", dim=1, dtype=result.dtype, dense=True)
+    second = Workspace("tmp", dim=1, dtype=result.dtype, dense=True)
 
     first_region = Where(
         producer=TensorAssign(first[i], source[i]),
@@ -503,7 +504,10 @@ def test_canonical_dump_renumbers_ids_and_normalization_is_idempotent() -> None:
     assert canonical_cin_dump(first_normalized) == canonical_cin_dump(second_normalized)
 
 
-def test_normalization_detaches_tensor_formats_across_artifacts() -> None:
+def test_normalized_artifacts_hold_formats_that_cannot_change() -> None:
+    """Normalization may hold the caller's format itself: a TensorFormat cannot change
+    once built (format.py, "Read-only stored state"), so sharing it cannot let a write
+    through the caller's object reach the normalized programs."""
     caller_format = TensorFormat("d")
 
     def build(prefix: str) -> ForAll:
@@ -518,11 +522,11 @@ def test_normalization_detaches_tensor_formats_across_artifacts() -> None:
     second_formats = tuple(access.tensor.format for access in second.tensor_accesses)
     before = (canonical_cin_dump(first), canonical_cin_dump(second))
 
-    assert all(tensor_format is not caller_format for tensor_format in first_formats)
-    assert all(tensor_format is not caller_format for tensor_format in second_formats)
-    assert all(left is not right for left in first_formats for right in second_formats)
+    assert all(tensor_format == caller_format for tensor_format in first_formats)
+    assert all(tensor_format == caller_format for tensor_format in second_formats)
 
-    object.__setattr__(caller_format, "_level_formats", (LevelFormat("s"),))
+    with pytest.raises(AttributeError):
+        object.__setattr__(caller_format, "_level_formats", (LevelFormat("s"),))
     assert (canonical_cin_dump(first), canonical_cin_dump(second)) == before
     verify_cin(first)
     verify_cin(second)
@@ -574,7 +578,7 @@ def test_workspace_normalization_is_idempotent_and_strips_backreferences() -> No
     i = IndexVar("i")
     source = TensorVar("A", fmt="d")
     result = TensorVar("C", fmt="d")
-    workspace = Workspace("tmp", dim=1, dense=True)
+    workspace = Workspace("tmp", dim=1, dtype=result.dtype, dense=True)
     program = ForAll(
         i,
         Where(
@@ -1606,7 +1610,7 @@ def test_verifier_reports_out_of_scope_index_reference() -> None:
     producer_i = IndexVar("i")
     result = TensorVar("C", fmt="d")
     source = TensorVar("A", fmt="d")
-    workspace = Workspace("tmp", dim=1, dense=True)
+    workspace = Workspace("tmp", dim=1, dtype=result.dtype, dense=True)
     program = Where(
         producer=ForAll(
             producer_i,
@@ -1724,7 +1728,7 @@ def test_workspace_access_requires_one_authoritative_workspace() -> None:
         i = IndexVar("i")
         source = TensorVar("A", fmt="d")
         result = TensorVar("C", fmt="d")
-        workspace = Workspace("tmp", dim=1, dense=True)
+        workspace = Workspace("tmp", dim=1, dtype=result.dtype, dense=True)
         producer_access = WorkspaceAccess(workspace, i)
         program = ForAll(
             i,
@@ -1742,7 +1746,9 @@ def test_workspace_access_requires_one_authoritative_workspace() -> None:
     assert _assert_structured_diagnostics(error) == {"missing_cin_field"}
 
     divergent, divergent_access = build()
-    divergent_access.wksp = Workspace("other", dim=1, dense=True)
+    divergent_access.wksp = Workspace(
+        "other", dim=1, dtype=divergent_access.wksp.dtype, dense=True
+    )
     with pytest.raises(VerificationError) as error:
         normalize_cin(divergent, compile_options=release_options)
     assert _assert_structured_diagnostics(error) == {"invalid_cin_field"}
@@ -1799,7 +1805,11 @@ def test_structural_preflight_owns_malformed_mode_order_entries() -> None:
 
     malformed_format = TensorVar("D", fmt="dd")
     assert malformed_format._format is not None
-    object.__setattr__(malformed_format._format, "_level_formats", object())
+    with pytest.raises(AttributeError):
+        object.__setattr__(malformed_format._format, "_level_formats", object())
+    # The TensorVar is a CIN node, so the reference it holds can still be replaced:
+    # with a format made by __new__ alone, which holds no levels.
+    object.__setattr__(malformed_format, "_format", TensorFormat.__new__(TensorFormat))
     malformed = ForAll(
         i,
         ForAll(
@@ -1812,54 +1822,126 @@ def test_structural_preflight_owns_malformed_mode_order_entries() -> None:
     assert _assert_structured_diagnostics(error) == {"invalid_cin_field"}
 
 
+def _forge_level_formats(tensor_format):
+    object.__setattr__(tensor_format, "_level_formats", (object(),))
+
+
+def _forge_mode(tensor_format):
+    object.__setattr__(tensor_format.get_level_formats()[0], "_mode", object())
+
+
+def _forge_bit_width(tensor_format):
+    object.__setattr__(tensor_format.get_level_formats()[0], "_bit_width", 0)
+
+
+def _forge_extra_attribute(tensor_format):
+    object.__setattr__(tensor_format, "_extra", object())
+
+
+def _forge_by_setstate(tensor_format):
+    tensor_format.__setstate__({"_level_formats": (object(),)})
+
+
+def _forge_unbuilt_by_setstate(tensor_format):
+    TensorFormat.__new__(TensorFormat).__setstate__({"_level_formats": (object(),)})
+
+
 @pytest.mark.parametrize(
-    ("mutate_format", "mode_order"),
+    "forge",
     (
-        (
-            lambda tensor_format: object.__setattr__(
-                tensor_format,
-                "_level_formats",
-                (object(),),
-            ),
-            None,
-        ),
-        (
-            lambda tensor_format: object.__setattr__(
-                tensor_format.get_level_formats()[0],
-                "_mode",
-                object(),
-            ),
-            [0],
-        ),
-        (
-            lambda tensor_format: object.__setattr__(
-                tensor_format.get_level_formats()[0],
-                "_bit_width",
-                0,
-            ),
-            [0],
-        ),
+        _forge_level_formats,
+        _forge_mode,
+        _forge_bit_width,
+        _forge_extra_attribute,
+        _forge_by_setstate,
+        _forge_unbuilt_by_setstate,
     ),
 )
-def test_structural_preflight_validates_complete_stored_tensor_format(
-    mutate_format,
-    mode_order,
-) -> None:
-    """Malformed exact format objects fail before format helper methods run."""
+def test_stored_tensor_format_state_cannot_be_forged(forge) -> None:
+    """The preflight no longer audits a format's stored state, because nothing can
+    give an exact format state its constructor would not: every way in fails at the
+    type -- a field write, a new attribute, ``__setstate__`` on a built format, and
+    ``__setstate__`` on an unbuilt one (which runs the constructor's validation)."""
 
     i = IndexVar("i")
     source = TensorVar("A", fmt="d")
-    source.mode_order = mode_order
     assert source._format is not None
-    mutate_format(source._format)
+    with pytest.raises((AttributeError, TypeError, ValueError)):
+        forge(source._format)
     program = ForAll(i, TensorAssign(TensorVar("C", fmt="d")[i], source[i]))
+    assert not analyze_cin(program).diagnostics
+    normalize_cin(program)
+
+
+class _CountingLevel(LevelFormat):
+    """A LevelFormat subclass that counts every attribute read made on it."""
+
+    reads = 0
+
+    def __getattribute__(self, name):
+        type(self).reads += 1
+        return super().__getattribute__(name)
+
+
+class _CountingFormat(TensorFormat):
+    reads = 0
+
+    def __getattribute__(self, name):
+        type(self).reads += 1
+        return super().__getattribute__(name)
+
+
+def _unbuilt_format_var() -> TensorVar:
+    tensor = TensorVar("A", fmt="d")
+    object.__setattr__(tensor, "_format", TensorFormat.__new__(TensorFormat))
+    return tensor
+
+
+@pytest.mark.parametrize(
+    ("make_source", "message"),
+    (
+        (
+            lambda: TensorVar("A", fmt=TensorFormat([_CountingLevel("d")])),
+            "TensorFormat levels must be exact LevelFormat values",
+        ),
+        (
+            lambda: TensorVar("A", fmt=_CountingFormat("d")),
+            "TensorVar._format must be an exact TensorFormat or None",
+        ),
+        (
+            lambda: TensorVar("A", fmt="d" * 65),
+            "TensorVar._format exceeds the supported rank",
+        ),
+        (
+            lambda: TensorVar("A", fmt=[LevelFormat("d", bit_width=1 << 63)]),
+            "LevelFormat._bit_width must be a positive signed-int64 integer or None",
+        ),
+        (_unbuilt_format_var, "TensorVar._format has malformed stored state"),
+    ),
+)
+def test_structural_preflight_checks_what_the_constructor_allows(
+    make_source, message
+) -> None:
+    """What a format's constructor accepts but CIN does not -- a subclass, a level
+    subclass, a rank past the supported one, a bit width past a signed int64 -- and a
+    format never built still fail closed, with the same diagnostics as before, and
+    without running any of a subclass's code."""
+
+    i = IndexVar("i")
+    source = make_source()
+    program = ForAll(i, TensorAssign(TensorVar("C", fmt="d")[i], source[i]))
+    _CountingLevel.reads = _CountingFormat.reads = 0
 
     analysis = analyze_cin(program)
 
-    assert analysis.diagnostics[0].code == "invalid_cin_field"
+    assert ("invalid_cin_field", message) in {
+        (diagnostic.code, diagnostic.message) for diagnostic in analysis.diagnostics
+    }
     with pytest.raises(VerificationError) as error:
         normalize_cin(program)
-    assert _assert_structured_diagnostics(error) == {"invalid_cin_field"}
+    assert "invalid_cin_field" in _assert_structured_diagnostics(error)
+    assert _CountingLevel.reads == 0
+    assert _CountingFormat.reads == 0
 
 
 @pytest.mark.parametrize(
@@ -1945,7 +2027,7 @@ def test_structural_preflight_bounds_integer_domains_before_formatting() -> None
         TensorAssign(TensorVar("F", fmt="d")[i], huge_width[i]),
     )
 
-    workspace = Workspace("tmp", dim=1, dense=True)
+    workspace = Workspace("tmp", dim=1, dtype=torch.float32, dense=True)
     workspace.dim = 10**10000
     workspace_program = ForAll(
         i,
@@ -2148,20 +2230,21 @@ def test_structural_preflight_rejects_hostile_stored_state(target: str) -> None:
     i = IndexVar("i")
     source = TensorVar("A", fmt="d")
     program = ForAll(i, TensorAssign(TensorVar("C", fmt="d")[i], source[i]))
-    if target == "node":
-        object.__setattr__(program, "__dict__", HostileDict(program.__dict__))
-    else:
+    if target != "node":
+        # A format and a level hold no instance dict to replace.
         assert source._format is not None
         format_target = (
             source._format
             if target == "format"
             else source._format.get_level_formats()[0]
         )
-        object.__setattr__(
-            format_target,
-            "__dict__",
-            HostileDict(format_target.__dict__),
-        )
+        with pytest.raises(AttributeError):
+            object.__getattribute__(format_target, "__dict__")
+        with pytest.raises(AttributeError):
+            object.__setattr__(format_target, "__dict__", HostileDict())
+        assert not analyze_cin(program).diagnostics
+        return
+    object.__setattr__(program, "__dict__", HostileDict(program.__dict__))
 
     analysis = analyze_cin(program)
 

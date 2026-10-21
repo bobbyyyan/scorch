@@ -16,19 +16,27 @@ automatic tile heuristic was fixed in only one of its two layers, so the tokens
 and the ``PARTITIONABLE`` predicate live in ``sparse_assembly`` and every layer
 imports them.
 
-**No recorded strategy means the target chooses, and that keeps the automatic
-origin byte-neutral.**  The origin writes nothing into the field, so an ordinary
-automatic compilation records ``None``, target lowering runs its own
-per-receiver choice, and the emitted kernel is unchanged.  The neutrality is
-structural rather than empirical, and a lock here says so on the plan and the
-program.
+**The automatic origin records no strategy, and the new compiler's assembly
+stage completes its plan.**  The scheduler writes nothing into the field: its
+plans are shared with the shipped compiler, and the request identity is computed
+from them.  The stage that follows schedule application records a strategy for
+every sparse result (``loopir/assembly_selection.py``): below
+``2 * ROWS_PER_THREAD`` first-level coordinates the serial single pass, whose
+kernel is the one these programs emitted before plans recorded a strategy; from
+there a parallel strategy where the target can emit one -- the two-pass
+parallel assembly, which is the shipped compiler's, before the chunked single
+pass.  The rule has one definition (``loopir/assembly_rule.py``).  An explicit
+plan that names no strategy and an unscheduled program get the same rule, with
+the decision recorded on the kernel and the plan left as written, and so does
+a program handed straight to target lowering.  No target family holds a default
+of its own.
 
 **Legality and cost are different predicates in different places.**  The
 receiver contract is legality: structural, extent-free, refused with a code.  The
 ``2 * ROWS_PER_THREAD`` extent test is COST -- a 16-row receiver assembles
-correctly from one chunk -- so it moved out of the legality predicate into the
-default choice, which is the seam a selector replaces.  An explicit request at a
-small extent is therefore honoured.
+correctly from one chunk -- so it is part of the automatic rule and not of any
+legality predicate; the rule is what a selector replaces.  An explicit request
+at a small extent is therefore honoured.
 
 **A request that cannot be honoured is REFUSED, never silently downgraded.**  A
 caller who asks for one strategy and gets another has no way to find out.  Every
@@ -55,12 +63,24 @@ from scorch.compiler.cin import (
     TensorAssign,
     TensorVar,
 )
+from scorch.compiler.compilation_context import CompilationContext, CompilerStageId
 from scorch.compiler.compile_options import CompileOptions
 from scorch.compiler.diagnostics import InvalidSchedule, UnsupportedFeature
 from scorch.compiler.loop_plan import LoopPlan, verify_loop_plan
+from scorch.compiler.loopir import assembly_selection
 from scorch.compiler.loopir import lower_llir as lower_llir_module
+from scorch.compiler.loopir import pipeline as pipeline_module
+from scorch.compiler.loopir.assembly_selection import (
+    AUTOMATIC_PARALLEL_PREFERENCE,
+    PARALLEL_FROM_EXTENT,
+    AssemblyDecision,
+    automatic_assembly,
+    complete_automatic_plan,
+)
 from scorch.compiler.loopir.nodes import AssemblyStrategy
+from scorch.compiler.loopir.parallel_chunk_assembly import ROWS_PER_THREAD
 from scorch.compiler.loopir.pipeline import compile_cin_via_loopir
+from scorch.compiler.loopir.schedule_passes import apply_schedule_plan
 from scorch.compiler.loopir.plan_identity import (
     CANONICAL_PLAN_SCHEMA,
     canonical_plan_dump,
@@ -205,28 +225,43 @@ def test_the_contract_matches_the_shared_two_phase_passs_own_requirement():
         assert compressed_levels_of(levels) == tuple(range(1, rank))
 
 
-# -- no recorded strategy: the automatic origin stays neutral ------------------
+# -- the automatic origin records no strategy; the assembly stage does ---------
 
 
 def test_the_automatic_origin_records_no_strategy():
-    """The origin chooses nothing, so the plan and the program carry nothing.
+    """The scheduler chooses nothing; the stage after schedule application does.
 
-    This is the milestone's central safety property, and it is structural: the
-    cost model never writes this field, ``None`` routes to target lowering's own
-    per-receiver choice, and that choice is the code that ran before the field
-    existed.
+    The cost model never writes this field, so the plan the scheduler returns
+    carries nothing and the request identity is computed from that plan.  The
+    plan the kernel keeps is the completed one, and the kernel carries the
+    record of the decision.
     """
+
+    options = auto_options()
+    scheduled = Scheduler.apply_schedule(
+        ttm_cin("dss", "ss", "dss"), Schedule(), compile_options=options
+    )
+    assert scheduled.verified_loop_plan.assembly is None
 
     kernel = compile_cin_via_loopir(
         ttm_cin("dss", "ss", "dss"),
         (4, 5, 3),
         (((4, 5, 6), _F32), ((6, 3), _F32)),
-        compile_options=auto_options(),
+        compile_options=options,
     )
     assert kernel.schedule is not None
-    assert kernel.schedule.plan.assembly is None
-    assert kernel.schedule.program.assembly is None
-    assert '"assembly":null' in kernel.program_dump
+    assert '"assembly":null' in kernel.request_dump
+    assert kernel.schedule.plan.assembly == "single_pass_serial"
+    assert kernel.schedule.program.assembly is AssemblyStrategy.SINGLE_PASS_SERIAL
+    assert '"assembly":"single_pass_serial"' in kernel.program_dump
+    assert kernel.assembly_decision == AssemblyDecision(
+        host="_OrderedKeySparseWorkspaceLowering",
+        sparse_result=True,
+        emittable=SPARSE_ASSEMBLY_STRATEGIES,
+        split_extent=4,
+        parallel_from=2 * ROWS_PER_THREAD,
+        strategy="single_pass_serial",
+    )
 
 
 def test_a_requested_strategy_reaches_the_program_as_a_typed_fact():
@@ -265,8 +300,12 @@ def test_a_schedule_carrying_only_a_strategy_is_not_silently_treated_as_empty():
         (((4, 5, 6), _F32), ((6, 3), _F32)),
         compile_options=auto_options(assembly="single_pass_chunk_parallel"),
     )
-    assert plan_free.schedule.plan.assembly is None
+    # Four rows: the stage records the serial single pass for the plan that
+    # asks for nothing, and does not run for the plan that asks.
+    assert plan_free.schedule.plan.assembly == "single_pass_serial"
+    assert plan_free.assembly_decision is not None
     assert requested.schedule.plan.assembly == "single_pass_chunk_parallel"
+    assert requested.assembly_decision is None
 
 
 # -- legality is not cost -----------------------------------------------------
@@ -276,15 +315,18 @@ def test_the_extent_test_is_cost_and_no_longer_gates_legality():
     """A receiver too small to reach two threads is still LEGAL.
 
     ``scorch_nthreads``'s row term alone caps the count at one below
-    ``2 * ROWS_PER_THREAD``, so the target's own choice declines the chunked
-    strategy there -- that is a judgement about whether the transformation pays,
-    and it keeps those kernels byte-identical.  It is not a claim that the
-    program cannot be assembled that way, so an explicit request is honoured and
-    emits the gate.  Keeping the two answers apart is what lets a selector
-    replace the cost half without touching correctness.
+    ``2 * ROWS_PER_THREAD``, so the automatic rule records a serial strategy
+    there -- that is a judgement about whether a parallel assembly pays, and it
+    keeps those kernels byte-identical.  It is not a claim that the program
+    cannot be assembled in chunks, so an explicit request is honoured and emits
+    the gate.  Keeping the two answers apart is what lets a selector replace the
+    cost half without touching correctness.  At the threshold the rule records
+    the two-pass parallel assembly, the shipped compiler's strategy, which this
+    program can also be emitted with; the chunked single pass is then reached
+    by request only.
     """
 
-    rows = 2 * lower_llir_module.PARALLEL_CHUNK_ROWS_PER_THREAD
+    rows = 2 * ROWS_PER_THREAD
     small, large = rows - 1, rows
 
     def emit(outer, assembly):
@@ -295,10 +337,11 @@ def test_the_extent_test_is_cost_and_no_longer_gates_legality():
             compile_options=auto_options(assembly=assembly),
         ).cpp_source
 
-    # Cost: below the threshold the automatic choice declines, and the emission
-    # is the serial builder.  At the threshold it takes the chunked strategy.
-    assert "_assembly_chunks" not in emit(small, None)
-    assert "_assembly_chunks" in emit(large, None)
+    # Cost: below the threshold the automatic choice is the serial builder.  At
+    # the threshold it is the two-pass parallel assembly, not the chunked one.
+    assert emit(small, None) == emit(small, "single_pass_serial")
+    assert emit(large, None) == emit(large, "two_pass_parallel")
+    assert "_assembly_chunks" not in emit(large, None)
     # Legality: the request is honoured on BOTH sides of that threshold.
     assert "_assembly_chunks" in emit(small, "single_pass_chunk_parallel")
     assert "_assembly_chunks" in emit(large, "single_pass_chunk_parallel")
@@ -316,7 +359,7 @@ def test_requesting_the_serial_strategy_emits_the_ungated_nest():
     how the ``legacy_serial`` column had to be built before this existed.
     """
 
-    rows = 2 * lower_llir_module.PARALLEL_CHUNK_ROWS_PER_THREAD
+    rows = 2 * ROWS_PER_THREAD
 
     def emit(assembly):
         return compile_cin_via_loopir(
@@ -408,6 +451,19 @@ def test_a_host_that_cannot_emit_a_legal_strategy_says_so_by_name():
     assert "_ParallelSparseWorkspaceLowering" in raised.value.defect.message
 
 
+def _ttm_second_mode_cin():
+    """``C[i,l,k] += A[i,j,k] * B[j,l]``: a contraction of the middle mode."""
+
+    i, j, k, l = (IndexVar(name) for name in ("i", "j", "k", "l"))  # noqa: E741
+    a = TensorVar("A", fmt="dss", dtype=_F32)[i, j, k]
+    b = TensorVar("B", fmt="dd", dtype=_F32)[j, l]
+    c = TensorVar("C", fmt="dss", dtype=_F32)[i, l, k]
+    statement = TensorAssign(c, CINBinaryOp(Operation.MUL, a, b), op=Operation.ADD)
+    for variable in (k, l, j, i):
+        statement = ForAll(variable, statement)
+    return statement
+
+
 def _matmul_cin(a_fmt, b_fmt, c_fmt):
     i, j, k = (IndexVar(name) for name in ("i", "j", "k"))
     a = TensorVar("A", fmt=a_fmt, dtype=_F32)[i, j]
@@ -417,6 +473,698 @@ def _matmul_cin(a_fmt, b_fmt, c_fmt):
     for variable in (k, j, i):
         statement = ForAll(variable, statement)
     return statement
+
+
+# -- what the target can emit, asked before a strategy is chosen --------------
+
+
+_REFUSAL_CODES = {
+    "unsupported_schedule_assembly",
+    "unsupported_assembly_strategy",
+    "unsupported_assembly_host",
+}
+
+# (program, result shape, operand shapes by name, host, strategies emitted)
+_CHOICE_CASES = {
+    # A dense outer loop over the result's dense level, and a position array
+    # indexed by its bound: every strategy.
+    "dense outer loop": (
+        lambda: ttm_cin("dss", "ss", "dss"),
+        (4, 5, 3),
+        {"A": (4, 5, 6), "B": (6, 3)},
+        "_OrderedKeySparseWorkspaceLowering",
+        SPARSE_ASSEMBLY_STRATEGIES,
+    ),
+    # A stored outer loop does not partition the dense extent, so no chunks.
+    "stored outer loop": (
+        lambda: reduction_cin("sss", "ds", "ijk", "ik"),
+        (2, 4),
+        {"A": (2, 3, 4)},
+        "_OrderedKeySparseWorkspaceLowering",
+        ("single_pass_serial", "two_pass_serial", "two_pass_parallel"),
+    ),
+    # A dense outer loop whose body's first position array hangs from TWO dense
+    # levels: the chunked strategy is legal by shape and its gate has no
+    # estimate of the stored entries to open on.
+    "no estimate for the gate": (
+        lambda: ttm_cin("dds", "dd", "dss"),
+        (4, 5, 3),
+        {"A": (4, 5, 6), "B": (6, 3)},
+        "_OrderedKeySparseWorkspaceLowering",
+        ("single_pass_serial", "two_pass_serial", "two_pass_parallel"),
+    ),
+    # A drain that assembles two compressed levels: the two-pass strategies
+    # decline that shape, so the chunked single pass is the only parallel one.
+    "only the chunked pass is parallel": (
+        _ttm_second_mode_cin,
+        (4, 3, 6),
+        {"A": (4, 5, 6), "B": (5, 3)},
+        "_OrderedKeySparseWorkspaceLowering",
+        ("single_pass_serial", "single_pass_chunk_parallel"),
+    ),
+    # The two-phase family emits its own strategy only.
+    "two-phase family": (
+        lambda: _matmul_cin("ds", "ds", "ds"),
+        (2, 4),
+        {"A": (2, 3), "B": (3, 4)},
+        "_ParallelSparseWorkspaceLowering",
+        ("two_pass_parallel",),
+    ),
+    # A family that appends in loop order has no workspace; the shared two-phase
+    # pass turns its nest into a count loop and a fill loop.
+    "ordered-append family": (
+        lambda: reduction_cin("dss", "ds", "ijk", "ij"),
+        (2, 3),
+        {"A": (2, 3, 4)},
+        "_MultiCompressedAssemblyLowering",
+        ("single_pass_serial", "two_pass_serial", "two_pass_parallel"),
+    ),
+    # A coordinate result has no position array to fill from per-row counts.
+    "coordinate result": (
+        lambda: reduction_cin("dss", "oo", "ijk", "ij"),
+        (2, 3),
+        {"A": (2, 3, 4)},
+        "_CoordinateResultAssemblyLowering",
+        ("single_pass_serial",),
+    ),
+    # No dense level zero to split by.
+    "compressed level zero": (
+        lambda: reduction_cin("ss", "s", "ij", "j"),
+        (3,),
+        {"A": (2, 3)},
+        "_OrderedKeySparseWorkspaceLowering",
+        ("single_pass_serial",),
+    ),
+}
+
+
+def _compile_choice_case(case, assembly=None):
+    program, result_shape, shapes, _, _ = _CHOICE_CASES[case]
+    return compile_cin_via_loopir(
+        program(),
+        result_shape,
+        tuple((shapes[name], _F32) for name in sorted(shapes)),
+        compile_options=auto_options(assembly=assembly),
+    )
+
+
+def _choices(case):
+    """The case's scheduled program before a strategy is recorded, and the target's
+    answer for it."""
+
+    _, result_shape, shapes, _, _ = _CHOICE_CASES[case]
+    schedule = _compile_choice_case(case).schedule
+    program = apply_schedule_plan(
+        schedule.base_program, replace(schedule.plan, assembly=None)
+    ).program
+    assert program.assembly is None
+    return program, lower_llir_module.assembly_choices(
+        program,
+        input_shapes={
+            decl.symbol: shapes[decl.name]
+            for decl in program.tensors
+            if decl.symbol in program.inputs
+        },
+        result_shape=result_shape,
+    )
+
+
+@pytest.mark.parametrize("case", sorted(_CHOICE_CASES))
+def test_the_target_reports_exactly_the_strategies_a_request_emits(case):
+    """``assembly_choices`` is the list a scheduler may choose from.
+
+    A scheduler that records a strategy needs to know, before it records one,
+    which strategies this program is emitted with: a recorded strategy outside
+    the list is refused, and the automatic route must not turn a program the
+    serial builder handles into a refusal.  So the list is checked against what
+    a request for each strategy does, on one program per kind of answer.
+    """
+
+    _, _, _, host, expected = _CHOICE_CASES[case]
+    _, choices = _choices(case)
+    assert choices.host == host
+    assert choices.emittable == expected
+    assert choices.sparse_result
+    for strategy in SPARSE_ASSEMBLY_STRATEGIES:
+        try:
+            _compile_choice_case(case, strategy)
+        except (
+            lower_llir_module.LoopIRTargetError,
+            UnsupportedFeature,
+            InvalidSchedule,
+        ) as refusal:
+            codes = {
+                getattr(diagnostic, "code", None)
+                for diagnostic in getattr(refusal, "diagnostics", ())
+            } | {getattr(getattr(refusal, "defect", None), "code", None)}
+            assert codes & _REFUSAL_CODES, (strategy, refusal)
+            assert strategy not in choices.emittable, strategy
+        else:
+            assert strategy in choices.emittable, strategy
+
+
+def test_a_requested_chunked_strategy_with_no_gate_estimate_is_refused():
+    """``unsupported_assembly_strategy``, where the serial kernel used to come back.
+
+    The chunked builder opens its parallel arm on ``scorch_nthreads(work,
+    rows)``, with ``work`` the stored entries under the outermost loop: the
+    first position array of the loop body, read at the loop's bound.  In
+    ``TTM dds x dd -> dss`` that array hangs from two dense levels, so it is not
+    indexed by the outer loop's bound and the builder declines.  For a request,
+    declining returned the serial kernel under the requested strategy's name;
+    it is refused now.  The automatic plan does not record the chunked strategy
+    for this program, because the target does not list it: it records the
+    two-pass parallel assembly, whose thread count needs no such estimate.
+    """
+
+    rows = 2 * ROWS_PER_THREAD
+
+    def emit(assembly):
+        return compile_cin_via_loopir(
+            ttm_cin("dds", "dd", "dss"),
+            (rows, 5, 3),
+            (((rows, 5, 6), _F32), ((6, 3), _F32)),
+            compile_options=auto_options(assembly=assembly),
+        ).cpp_source
+
+    with pytest.raises(lower_llir_module.LoopIRTargetError) as raised:
+        emit("single_pass_chunk_parallel")
+    assert raised.value.defect.code == "unsupported_assembly_strategy"
+    assert "the estimate cannot be derived" in raised.value.defect.message
+    assert emit(None) == emit("two_pass_parallel")
+
+
+def test_the_choices_are_asked_before_a_strategy_is_recorded():
+    """A program that already records a strategy is not asked what it could be."""
+
+    program, _ = _choices("dense outer loop")
+    _, result_shape, shapes, _, _ = _CHOICE_CASES["dense outer loop"]
+    with pytest.raises(lower_llir_module.LoopIRTargetError) as raised:
+        lower_llir_module.assembly_choices(
+            replace(program, assembly=AssemblyStrategy.SINGLE_PASS_SERIAL),
+            input_shapes={
+                decl.symbol: shapes[decl.name]
+                for decl in program.tensors
+                if decl.symbol in program.inputs
+            },
+            result_shape=result_shape,
+        )
+    assert raised.value.defect.code == "invalid_schedule_assembly"
+
+
+def _compile_with_rows(case, rows, assembly=None):
+    """The case's program with ``rows`` coordinates along the result's first level."""
+
+    program, result_shape, shapes, _, _ = _CHOICE_CASES[case]
+    shapes = dict(shapes, A=(rows,) + shapes["A"][1:])
+    return compile_cin_via_loopir(
+        program(),
+        (rows,) + result_shape[1:],
+        tuple((shapes[name], _F32) for name in sorted(shapes)),
+        compile_options=auto_options(assembly=assembly),
+    )
+
+
+@pytest.mark.parametrize(
+    ("case", "chosen"),
+    [
+        ("dense outer loop", "two_pass_parallel"),
+        ("stored outer loop", "two_pass_parallel"),
+        ("no estimate for the gate", "two_pass_parallel"),
+        ("only the chunked pass is parallel", "single_pass_chunk_parallel"),
+        ("ordered-append family", "two_pass_parallel"),
+    ],
+)
+def test_the_automatic_plan_records_a_parallel_strategy_from_32_rows(case, chosen):
+    """The choice is the plan's, made from what the target can emit.
+
+    From ``2 * ROWS_PER_THREAD`` first-level coordinates the automatic plan
+    records the two-pass parallel assembly -- the shipped compiler's strategy
+    for these results -- wherever the target can emit it, the chunked single
+    pass included among the alternatives or not, and the chunked single pass
+    only where it is the one parallel strategy the program has.  The kernel is
+    the one a request for that strategy emits.  One coordinate below, the plan
+    records the serial single pass, and the kernel is the serial builder these
+    programs emitted before the plan chose at all.
+    """
+
+    rows = 2 * ROWS_PER_THREAD
+    assert rows == PARALLEL_FROM_EXTENT
+    automatic = _compile_with_rows(case, rows)
+    assert automatic.schedule.plan.assembly == chosen
+    assert automatic.schedule.program.assembly is AssemblyStrategy(chosen)
+    assert automatic.assembly_decision.strategy == chosen
+    assert automatic.assembly_decision.split_extent == rows
+    assert "#pragma omp" in automatic.cpp_source
+    assert automatic.cpp_source == _compile_with_rows(case, rows, chosen).cpp_source
+
+    below = _compile_with_rows(case, rows - 1)
+    assert below.schedule.plan.assembly == "single_pass_serial"
+    assert below.schedule.program.assembly is AssemblyStrategy.SINGLE_PASS_SERIAL
+    assert below.assembly_decision.emittable == automatic.assembly_decision.emittable
+    assert "#pragma omp" not in below.cpp_source
+    assert (
+        below.cpp_source
+        == _compile_with_rows(case, rows - 1, "single_pass_serial").cpp_source
+    )
+
+
+def _cpp_through_the_target_entry(program, shapes, result_shape):
+    """The C++ of ``program`` handed to target lowering directly, as it is."""
+
+    from scorch.ops import _lower_generated_llir
+
+    options = auto_options()
+    context = CompilationContext(options)
+    function = lower_llir_module.lower_loopir_to_llir(
+        program,
+        input_shapes={
+            decl.symbol: shapes[decl.name]
+            for decl in program.tensors
+            if decl.symbol in program.inputs
+        },
+        result_shape=result_shape,
+        compile_options=options,
+        compilation_context=context,
+    )
+    return _lower_generated_llir(function, options, context)
+
+
+@pytest.mark.parametrize("rows", [PARALLEL_FROM_EXTENT - 1, PARALLEL_FROM_EXTENT])
+@pytest.mark.parametrize(
+    "case", sorted(case for case in _CHOICE_CASES if case != "compressed level zero")
+)
+def test_a_program_without_a_strategy_is_lowered_with_the_rules(case, rows):
+    """One rule, whichever way a program reaches target lowering.
+
+    The stage records the rule's strategy in an automatic plan.  A caller can
+    also hand target lowering a program that records none -- a scheduled
+    program whose plan names no strategy.  The target entry then applies the
+    same rule to the same two facts, so the kernel is the one the automatic
+    plan compiled to, on both sides of the extent the rule turns parallel at.
+    Before the rule had one definition each family answered for itself there,
+    and the ordered-key family's answer was never a two-pass strategy.
+    """
+
+    program, result_shape, shapes, _, _ = _CHOICE_CASES[case]
+    shapes = dict(shapes, A=(rows,) + shapes["A"][1:])
+    result_shape = (rows,) + result_shape[1:]
+    kernel = _compile_with_rows(case, rows)
+    schedule = kernel.schedule
+    unrecorded = apply_schedule_plan(
+        schedule.base_program, replace(schedule.plan, assembly=None)
+    ).program
+    assert unrecorded.assembly is None
+    assert (
+        _cpp_through_the_target_entry(unrecorded, shapes, result_shape)
+        == kernel.cpp_source
+    )
+    recorded, choices = lower_llir_module.with_recorded_assembly(
+        unrecorded,
+        input_shapes={
+            decl.symbol: shapes[decl.name]
+            for decl in unrecorded.tensors
+            if decl.symbol in unrecorded.inputs
+        },
+        result_shape=result_shape,
+    )
+    assert unrecorded.assembly is None, "the caller's program is not changed"
+    assert recorded.assembly.value == kernel.assembly_decision.strategy
+    assert choices.emittable == kernel.assembly_decision.emittable
+    # A program that already records a strategy is returned as it is.
+    again, unasked = lower_llir_module.with_recorded_assembly(
+        recorded,
+        input_shapes={
+            decl.symbol: shapes[decl.name]
+            for decl in recorded.tensors
+            if decl.symbol in recorded.inputs
+        },
+        result_shape=result_shape,
+    )
+    assert again is recorded and unasked is None
+
+
+def test_no_target_family_answers_for_itself():
+    """The rule is the only place an unrequested strategy is chosen.
+
+    A target family used to carry a default of its own (the ordered-key
+    family's read the first extent), which an unscheduled program and an
+    explicit plan reached while an automatic plan got the rule.  No family
+    defines one now, and what a lowering assumes of a program without a
+    strategy is one method on the base class that reads no extent.
+    """
+
+    def families(cls):
+        for child in cls.__subclasses__():
+            yield child
+            yield from families(child)
+
+    base = lower_llir_module._TargetLowering
+    assert not hasattr(base, "default_assembly")
+    for family in families(base):
+        assert "default_assembly" not in vars(family), family.__name__
+        assert "unrecorded_assembly" not in vars(family), family.__name__
+    assert lower_llir_module.automatic_assembly is automatic_assembly
+    assert assembly_selection.automatic_assembly is automatic_assembly
+
+
+@pytest.mark.parametrize("route", ["unscheduled", "explicit plan"])
+@pytest.mark.parametrize("rows", [PARALLEL_FROM_EXTENT - 1, 4 * ROWS_PER_THREAD])
+def test_the_stage_records_its_decision_on_every_route(route, rows):
+    """An unscheduled program and an explicit plan get the rule and a record.
+
+    Neither has an automatic plan to complete: the plan, where there is one, is
+    left as its caller wrote it and the program the kernel shows records no
+    strategy.  The decision record is where the strategy is written down, and
+    the kernel is the one the automatic plan compiles to: the serial single pass
+    below ``2 * ROWS_PER_THREAD`` rows and two parallel passes from there.
+    (``dss ijk->ij [ds]`` is lowered by the ordered-append family on all three
+    routes; the workspace families are reached by the automatic schedule only.)
+    """
+
+    case = "ordered-append family"
+    program, result_shape, shapes, host, _ = _CHOICE_CASES[case]
+    shapes = dict(shapes, A=(rows,) + shapes["A"][1:])
+    options = CompileOptions.from_environment(environ={}).with_regblock_enabled(False)
+    if route == "explicit plan":
+        options = replace(
+            options, requested_schedule=Schedule(loop_order=("i", "j", "k"))
+        )
+    context = CompilationContext(options)
+    kernel = compile_cin_via_loopir(
+        program(),
+        (rows,) + result_shape[1:],
+        tuple((shapes[name], _F32) for name in sorted(shapes)),
+        compile_options=options,
+        compilation_context=context,
+    )
+    decision = kernel.assembly_decision
+    assert decision is not None
+    assert decision.host == host
+    assert decision.strategy == (
+        "two_pass_parallel" if rows >= PARALLEL_FROM_EXTENT else "single_pass_serial"
+    )
+    assert decision.split_extent == rows
+    assert '"assembly":null' in kernel.program_dump
+    if route == "explicit plan":
+        assert kernel.schedule.plan.provenance == "explicit"
+        assert kernel.schedule.plan.assembly is None
+        assert kernel.schedule.program.assembly is None
+    else:
+        assert kernel.schedule is None
+    stages = [record.stage_id for record in context.stage_run_records]
+    at = stages.index(CompilerStageId.LOOPIR_ASSEMBLY_SELECTION)
+    assert stages[at + 1] is CompilerStageId.LOOPIR_TO_LLIR_LOWERING
+    assert stages.count(CompilerStageId.LOOPIR_ASSEMBLY_SELECTION) == 1
+    assert kernel.cpp_source == _compile_with_rows(case, rows).cpp_source
+
+
+def test_the_automatic_plan_records_the_serial_pass_where_no_parallel_one_is_emitted():
+    """A family that emits the serial single pass only records exactly that.
+
+    ``dss ijk->ij [oo]`` assembles a coordinate result, which has no parallel
+    assembly, so at any extent the plan records the serial single pass and the
+    kernel is the serial one.
+    """
+
+    rows = 4 * ROWS_PER_THREAD
+    kernel = _compile_with_rows("coordinate result", rows)
+    assert kernel.schedule.plan.assembly == "single_pass_serial"
+    assert kernel.assembly_decision.emittable == ("single_pass_serial",)
+    assert kernel.assembly_decision.split_extent == rows
+    assert "#pragma omp" not in kernel.cpp_source
+
+
+def test_erasing_the_schedule_erases_the_recorded_strategy():
+    """A recorded strategy is schedule state, like a parallel selection.
+
+    ``dss ijk->ij [ds]`` has no tile, panel or workspace region, so its scheduled
+    program differs from the base program only in the strategy the assembly
+    stage recorded; the erased program is the base program.
+    """
+
+    from scorch.compiler.loopir.printer import canonical_program_dump
+    from scorch.compiler.loopir.schedule_passes import erase_schedule
+
+    kernel = _compile_choice_case("ordered-append family")
+    schedule = kernel.schedule
+    assert schedule.program.assembly is AssemblyStrategy.SINGLE_PASS_SERIAL
+    assert schedule.base_program.assembly is None
+    erased = erase_schedule(schedule.program)
+    assert erased.assembly is None
+    assert canonical_program_dump(erased) == canonical_program_dump(
+        schedule.base_program
+    )
+    assert erase_schedule(schedule.base_program) is schedule.base_program
+
+
+def test_a_family_with_one_strategy_records_it_at_every_extent():
+    """The two-phase family emits the two-pass parallel assembly only.
+
+    Two rows is far below the extent from which the rule prefers a parallel
+    strategy, and the serial single pass is not among the strategies the target
+    lists, so the plan records the family's one strategy.  The kernel is the
+    one the family emitted when the plan recorded nothing.
+    """
+
+    kernel = _compile_choice_case("two-phase family")
+    assert kernel.assembly_decision.emittable == ("two_pass_parallel",)
+    assert kernel.assembly_decision.split_extent == 2
+    assert kernel.schedule.plan.assembly == "two_pass_parallel"
+    assert (
+        kernel.cpp_source
+        == _compile_choice_case("two-phase family", "two_pass_parallel").cpp_source
+    )
+    schedule = kernel.schedule
+    unrecorded = apply_schedule_plan(
+        schedule.base_program, replace(schedule.plan, assembly=None)
+    ).program
+    _, result_shape, shapes, _, _ = _CHOICE_CASES["two-phase family"]
+    options = auto_options()
+    context = CompilationContext(options)
+    function = lower_llir_module.lower_loopir_to_llir(
+        unrecorded,
+        input_shapes={
+            decl.symbol: shapes[decl.name]
+            for decl in unrecorded.tensors
+            if decl.symbol in unrecorded.inputs
+        },
+        result_shape=result_shape,
+        compile_options=options,
+        compilation_context=context,
+    )
+    from scorch.ops import _lower_generated_llir
+
+    assert _lower_generated_llir(function, options, context) == kernel.cpp_source
+
+
+@pytest.mark.parametrize(
+    ("emittable", "extent", "expected"),
+    [
+        (SPARSE_ASSEMBLY_STRATEGIES, PARALLEL_FROM_EXTENT, "two_pass_parallel"),
+        (
+            ("single_pass_serial", "single_pass_chunk_parallel"),
+            PARALLEL_FROM_EXTENT,
+            "single_pass_chunk_parallel",
+        ),
+        (SPARSE_ASSEMBLY_STRATEGIES, PARALLEL_FROM_EXTENT - 1, "single_pass_serial"),
+        (SPARSE_ASSEMBLY_STRATEGIES, 0, "single_pass_serial"),
+        (SPARSE_ASSEMBLY_STRATEGIES, None, "single_pass_serial"),
+        (
+            ("single_pass_serial", "two_pass_serial", "two_pass_parallel"),
+            PARALLEL_FROM_EXTENT,
+            "two_pass_parallel",
+        ),
+        (("single_pass_serial",), 10 * PARALLEL_FROM_EXTENT, "single_pass_serial"),
+        (("two_pass_serial", "two_pass_parallel"), 1, "two_pass_serial"),
+        (("two_pass_parallel",), 1, "two_pass_parallel"),
+        (
+            ("single_pass_chunk_parallel", "two_pass_parallel"),
+            1,
+            "single_pass_chunk_parallel",
+        ),
+    ],
+)
+def test_the_rule_answers_for_every_set_of_strategies(emittable, extent, expected):
+    """The rule is total: any non-empty set of strategies and any extent."""
+
+    assert automatic_assembly(emittable, extent) == expected
+
+
+def test_the_rule_answers_for_every_subset_of_the_vocabulary():
+    """Every non-empty subset, on both sides of the extent, gets a member of it."""
+
+    count = len(SPARSE_ASSEMBLY_STRATEGIES)
+    for mask in range(1, 1 << count):
+        emittable = tuple(
+            strategy
+            for bit, strategy in enumerate(SPARSE_ASSEMBLY_STRATEGIES)
+            if mask >> bit & 1
+        )
+        for extent in (None, 0, PARALLEL_FROM_EXTENT - 1, PARALLEL_FROM_EXTENT, 4096):
+            chosen = automatic_assembly(emittable, extent)
+            assert chosen in emittable
+            parallel = [s for s in AUTOMATIC_PARALLEL_PREFERENCE if s in emittable]
+            if extent is not None and extent >= PARALLEL_FROM_EXTENT and parallel:
+                assert chosen == parallel[0]
+    with pytest.raises(ValueError):
+        automatic_assembly((), PARALLEL_FROM_EXTENT)
+
+
+def test_a_dense_result_records_no_strategy():
+    """The strategies describe a sparse assembly; a dense result has none.
+
+    The pipeline does not begin the assembly stage for it, so its kernel has no
+    decision record and its stage list is the one it had before the stage
+    existed.  Asked directly, the stage's function reports what the target said
+    and returns the plan it was given.
+    """
+
+    options = auto_options()
+    context = CompilationContext(options)
+    kernel = compile_cin_via_loopir(
+        _matmul_cin("ds", "dd", "dd"),
+        (64, 4),
+        (((64, 3), _F32), ((3, 4), _F32)),
+        compile_options=options,
+        compilation_context=context,
+    )
+    assert kernel.schedule.plan.assembly is None
+    assert kernel.schedule.program.assembly is None
+    assert kernel.assembly_decision is None
+    assert CompilerStageId.LOOPIR_ASSEMBLY_SELECTION not in [
+        record.stage_id for record in context.stage_run_records
+    ]
+
+    schedule = kernel.schedule
+    completed, decision = complete_automatic_plan(
+        schedule,
+        schedule.plan,
+        input_shapes={
+            decl.symbol: {"A": (64, 3), "B": (3, 4)}[decl.name]
+            for decl in schedule.program.tensors
+            if decl.symbol in schedule.program.inputs
+        },
+        result_shape=(64, 4),
+    )
+    assert completed is schedule.plan
+    assert not decision.sparse_result
+    assert decision.strategy is None and decision.split_extent == 64
+
+
+def test_the_decision_record_is_canonical_text():
+    kernel = _compile_with_rows("stored outer loop", PARALLEL_FROM_EXTENT)
+    assert kernel.assembly_decision.dump() == (
+        '{"emittable":["single_pass_serial","two_pass_serial","two_pass_parallel"],'
+        '"host":"_OrderedKeySparseWorkspaceLowering","parallel_from":32,'
+        '"sparse_result":true,"split_extent":32,"strategy":"two_pass_parallel"}'
+    )
+
+
+def test_the_assembly_stage_is_recorded_between_schedule_and_target_lowering():
+    """Its own stage, begun only for an automatic plan that records no strategy."""
+
+    def stages(assembly):
+        options = auto_options(assembly=assembly)
+        context = CompilationContext(options)
+        compile_cin_via_loopir(
+            ttm_cin("dss", "ss", "dss"),
+            (4, 5, 3),
+            (((4, 5, 6), _F32), ((6, 3), _F32)),
+            compile_options=options,
+            compilation_context=context,
+        )
+        return [record.stage_id for record in context.stage_run_records]
+
+    automatic = stages(None)
+    at = automatic.index(CompilerStageId.LOOPIR_ASSEMBLY_SELECTION)
+    assert automatic[at - 1] is CompilerStageId.LOOPIR_SCHEDULE_APPLICATION
+    assert automatic[at + 1] is CompilerStageId.LOOPIR_TO_LLIR_LOWERING
+    assert automatic.count(CompilerStageId.LOOPIR_ASSEMBLY_SELECTION) == 1
+    requested = stages("single_pass_serial")
+    assert CompilerStageId.LOOPIR_ASSEMBLY_SELECTION not in requested
+    assert requested == [
+        stage
+        for stage in automatic
+        if stage is not CompilerStageId.LOOPIR_ASSEMBLY_SELECTION
+    ]
+
+
+def test_the_completed_plan_is_verified_before_it_is_applied(monkeypatch):
+    """The stage's plan is a new plan and takes the plan verifier's refusals.
+
+    The verifier sees the completed plan, conversions included, before the
+    schedule passes apply it; a refusal fails the assembly stage and nothing
+    is lowered.
+    """
+
+    seen = []
+    real_verify = pipeline_module.verify_loop_plan
+    real_apply = pipeline_module.apply_schedule_plan
+
+    def verify(cin, plan, **keywords):
+        seen.append(("verify", plan.assembly, keywords))
+        return real_verify(cin, plan, **keywords)
+
+    def apply(program, plan):
+        seen.append(("apply", plan.assembly, {}))
+        return real_apply(program, plan)
+
+    monkeypatch.setattr(pipeline_module, "verify_loop_plan", verify)
+    monkeypatch.setattr(pipeline_module, "apply_schedule_plan", apply)
+    kernel = _compile_with_rows("stored outer loop", PARALLEL_FROM_EXTENT)
+    assert kernel.schedule.plan.assembly == "two_pass_parallel"
+    assert [entry[:2] for entry in seen if entry[0] == "apply"] == [
+        ("apply", None),
+        ("apply", "two_pass_parallel"),
+    ]
+    completed = [n for n, entry in enumerate(seen) if entry[1] == "two_pass_parallel"]
+    assert [seen[n][0] for n in completed] == ["verify", "apply"]
+    assert seen[completed[0]][2] == {"dense_results_any_order": True}
+
+    def refuse(cin, plan, **keywords):
+        if plan.assembly is not None:
+            raise RuntimeError("refused by the verifier")
+        return real_verify(cin, plan, **keywords)
+
+    monkeypatch.setattr(pipeline_module, "verify_loop_plan", refuse)
+    options = auto_options()
+    context = CompilationContext(options)
+    program, result_shape, shapes, _, _ = _CHOICE_CASES["stored outer loop"]
+    shapes = dict(shapes, A=(PARALLEL_FROM_EXTENT,) + shapes["A"][1:])
+    with pytest.raises(RuntimeError, match="refused by the verifier"):
+        compile_cin_via_loopir(
+            program(),
+            (PARALLEL_FROM_EXTENT,) + result_shape[1:],
+            tuple((shapes[name], _F32) for name in sorted(shapes)),
+            compile_options=options,
+            compilation_context=context,
+        )
+    recorded = [record.stage_id for record in context.stage_run_records]
+    assert CompilerStageId.LOOPIR_ASSEMBLY_SELECTION not in recorded
+    assert CompilerStageId.LOOPIR_TO_LLIR_LOWERING not in recorded
+    assert recorded[-1] is CompilerStageId.LOOPIR_SCHEDULE_APPLICATION
+
+
+def test_the_extent_constant_is_the_runtime_policys():
+    """``ROWS_PER_THREAD`` mirrors ``SCORCH_ROWS_PER_THREAD`` in ``scorch_policy.h``.
+
+    The rule's extent and the kernels' runtime thread gate must read the same
+    number: with a smaller mirror the plan would record a parallel strategy the
+    gate never opens, with a larger one it would keep serial a kernel the gate
+    would have opened.
+    """
+
+    import pathlib
+
+    import scorch
+
+    header = pathlib.Path(scorch.__file__).parent / "csrc" / "scorch_policy.h"
+    defined = re.findall(
+        r"^#\s*define\s+SCORCH_ROWS_PER_THREAD\s+(\d+)L?\b", header.read_text(), re.M
+    )
+    assert defined == [str(ROWS_PER_THREAD)]
+    assert assembly_selection.PARALLEL_FROM_EXTENT == 2 * ROWS_PER_THREAD
 
 
 # -- the two-pass strategies: cells are numbered by coordinate ----------------
@@ -575,7 +1323,7 @@ def test_the_two_pass_strategies_reproduce_the_single_pass_storage(
     from scorch.compiler.loopir.pipeline import execute_cin_via_loopir
     from scorch.stensor import STensor
 
-    rows = 2 * lower_llir_module.PARALLEL_CHUNK_ROWS_PER_THREAD
+    rows = 2 * ROWS_PER_THREAD
     generator = torch.Generator().manual_seed(20260816)
     operand_shape = (rows,) + shape
     dense = torch.rand(operand_shape, generator=generator, dtype=torch.float64)

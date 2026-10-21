@@ -20,7 +20,9 @@ The invariant families stated locally for this subset:
   at the root (``parent_position_mismatch``).  Positions are bound by
   ``SparseFor``, ``SparseWindowFor``, and position-binding merges
   (``duplicate_position_binding`` / ``unbound_position``); a UNION-bound
-  position may be absent and can only select the next compressed child.
+  position may be absent, and it and the dense positions computed from it
+  can only select a compressed child's segment or address a load guarded
+  by the union's cursor.
 - **Leaf value ownership.**  Only a cursor over the value-bearing leaf
   level of its tensor owns scalars (``non_leaf_value``); UNION-merged reads
   require an explicit default and always-aligned reads must not carry one
@@ -31,9 +33,16 @@ The invariant families stated locally for this subset:
   (``unsupported_sparse_hierarchy``), and one shared merged dimension;
   aligned advancement, exhaustion, and guaranteed progress are intrinsic
   node semantics stated on :class:`MergedSparseFor`.
-- **Scalar typing.**  Every tensor declares an exact :class:`ScalarType`,
-  and this slice requires one uniform scalar type across the whole program
-  (``mixed_dtype``); binary operands and stored values must be value-typed.
+- **Scalar typing.**  Every tensor and workspace declares an exact
+  :class:`ScalarType`; they may differ.  Every value expression has a type:
+  a read has its tensor's or workspace's, a binary operation the
+  :func:`promoted_scalar_type` of its operands (int8 with uint8 has none),
+  and a value constant the type of the value it stands for -- its cursor's
+  or guarded load's tensor as a default, the result's elsewhere.  A
+  constant has that type's kind (``FloatConst`` for a floating-point type,
+  ``IntegerConst`` within an integer type's range), a default has its
+  read's type, and every stored, combined or inserted value has exactly
+  the type of what it is written to (``mixed_dtype``).
 - **Output semantics.**  Inputs are never written, outputs are never read,
   every output is written, ``StoreReduce`` admits only ADD (the operator
   whose identity matches the explicit dense-output zero-initialization
@@ -124,7 +133,19 @@ from __future__ import annotations
 
 import math
 from dataclasses import dataclass, fields
-from typing import Any, Callable, Dict, List, NoReturn, Optional, Set, Tuple, cast
+from typing import (
+    Any,
+    Callable,
+    Dict,
+    FrozenSet,
+    List,
+    NoReturn,
+    Optional,
+    Sequence,
+    Set,
+    Tuple,
+    cast,
+)
 
 from ...format import LevelType
 from ..identity import IndexId, SymbolId
@@ -145,6 +166,7 @@ from .nodes import (
     DimensionId,
     Expr,
     FloatConst,
+    IntegerConst,
     IndexValue,
     LevelDecl,
     LevelKind,
@@ -196,6 +218,7 @@ from .nodes import (
     WorkspaceRead,
     WorkspaceReduce,
     WorkspaceRegion,
+    promoted_scalar_type,
 )
 
 MAX_NESTING_DEPTH = 64
@@ -212,7 +235,11 @@ machine-specific limit.
 
 _MISSING = object()
 
-_EXECUTABLE_LEVEL_KINDS = (LevelKind.DENSE, LevelKind.COMPRESSED)
+_EXECUTABLE_LEVEL_KINDS = (
+    LevelKind.DENSE,
+    LevelKind.COMPRESSED,
+    LevelKind.COORDINATE,
+)
 
 _CANONICAL_CSR_KINDS = (LevelKind.DENSE, LevelKind.COMPRESSED)
 _CANONICAL_CSR_MODES = (0, 1)
@@ -248,7 +275,13 @@ class _CoordType(_ExprType):
 
 @dataclass(frozen=True)
 class _ScalarValueType(_ExprType):
-    """Value-typed (a stored or computed scalar)."""
+    """Value-typed (a stored or computed scalar) of one scalar type.
+
+    ``dtype`` is ``None`` only for a constant checked before any output is
+    declared.
+    """
+
+    dtype: Optional[ScalarType] = None
 
 
 @dataclass(frozen=True)
@@ -257,10 +290,11 @@ class _PositionType(_ExprType):
 
     The root position carries ``tensor=None, level=-1``; it dominates every
     level-0 level of every tensor.  ``may_be_absent`` is true only for a
-    position bound by a UNION merge: at a one-sided coordinate that cursor
-    has no physical entry.  Such a position may select the empty segment of
-    the next COMPRESSED level, but it is not an unconditional load address or
-    a base for dense-position arithmetic.
+    position bound by a UNION merge (at a one-sided coordinate that cursor
+    has no physical entry) and for a dense position computed from one.  Such
+    a position may select the empty segment of the next COMPRESSED level, or
+    be the address of a load guarded by the union's cursor, but it is not an
+    unconditional load address.
     """
 
     tensor: Optional[SymbolId]
@@ -268,7 +302,6 @@ class _PositionType(_ExprType):
     may_be_absent: bool = False
 
 
-_VALUE = _ScalarValueType()
 _ROOT_POSITION = _PositionType(None, -1)
 
 
@@ -373,7 +406,15 @@ class _Context:
         self.ever_result_tile_ids: Set[ResultTileId] = set()
         self.producer_depth = 0
         self.in_cursor_default = False
-        self.program_dtype: Optional[ScalarType] = None
+        # The tensor a guarded PositionLoad reads, while its address is
+        # being checked.
+        self.guarded_load_tensor: Optional[SymbolId] = None
+        # The tensor a SparseCursorDecl walks, while its parent is being
+        # checked.
+        self.cursor_parent_tensor: Optional[SymbolId] = None
+        # The type a value constant takes where it is checked: the result's,
+        # or the read's while a default is checked.
+        self.constant_dtype: Optional[ScalarType] = None
         self.seen_node_ids: Set[LoopIRNodeId] = set()
         self.visited_objects: Set[int] = set()
         self.path_objects: Set[int] = set()
@@ -381,6 +422,12 @@ class _Context:
         # checks use object identity here rather than reconstructing ownership
         # from lexical path strings.
         self.statement_stack: List[Stmt] = []
+        # The program's recorded assembly strategy, read by the append check: an
+        # append out of its result's storage order is admitted only under a
+        # two-pass record (``_check_append_order``).
+        self.assembly: object = None
+        # Outputs whose append was verified as a relabelled copy of one input.
+        self.relabelled_outputs: Set[SymbolId] = set()
 
     def dimension_name(self, dimension: DimensionId) -> str:
         decl = self.dimensions.get(dimension)
@@ -502,9 +549,24 @@ def _leave(ctx: _Context, node: object) -> None:
     ctx.path_objects.discard(id(node))
 
 
-def _require_value(kind: _ExprType, path: str, what: str) -> None:
+def _require_value(
+    kind: _ExprType,
+    path: str,
+    what: str,
+    expected: Optional[ScalarType] = None,
+) -> None:
+    """``kind`` is a value; of exactly the type ``expected`` when it is given."""
+
     if type(kind) is not _ScalarValueType:
         _fail("type_mismatch", path, f"{what} must be value-typed")
+    dtype = cast(_ScalarValueType, kind).dtype
+    if expected is not None and dtype is not None and dtype is not expected:
+        _fail(
+            "mixed_dtype",
+            path,
+            f"{what} is {dtype.value}, but what it is written to holds "
+            f"{expected.value}",
+        )
 
 
 def _require_coord(
@@ -560,7 +622,58 @@ def _check_float_const(
         _fail("malformed_state", path, "FloatConst.value must be an exact float")
     if not math.isfinite(expr.value):
         _fail("malformed_state", path, "FloatConst.value must be finite")
-    return _VALUE
+    _require_constant_kind(ctx, path, floating=True)
+    return _ScalarValueType(ctx.constant_dtype)
+
+
+# The values each integer scalar type holds, for IntegerConst.
+_INTEGER_RANGES: Dict[ScalarType, Tuple[int, int]] = {
+    ScalarType.INT64: (-(2**63), 2**63 - 1),
+    ScalarType.INT32: (-(2**31), 2**31 - 1),
+    ScalarType.INT8: (-(2**7), 2**7 - 1),
+    ScalarType.UINT8: (0, 2**8 - 1),
+}
+
+
+def _check_integer_const(
+    ctx: _Context, expr: IntegerConst, path: str, depth: int
+) -> _ExprType:
+    if type(expr.value) is not int:
+        _fail("malformed_state", path, "IntegerConst.value must be an exact int")
+    _require_constant_kind(ctx, path, floating=False)
+    dtype = cast(ScalarType, ctx.constant_dtype)
+    low, high = _INTEGER_RANGES[dtype]
+    if not low <= expr.value <= high:
+        _fail(
+            "malformed_state",
+            path,
+            f"IntegerConst.value {expr.value} is outside {dtype.value}",
+        )
+    return _ScalarValueType(dtype)
+
+
+def _require_constant_kind(ctx: _Context, path: str, *, floating: bool) -> None:
+    """A value constant has the kind of the type it takes: a FloatConst for a
+    floating-point type, an IntegerConst for an integer one.
+
+    Every output is declared before any expression is checked, so the type
+    is known here.  A FloatConst checked with no output declared keeps the
+    meaning it always had; an IntegerConst needs the type whose range it is
+    checked against."""
+
+    dtype = ctx.constant_dtype
+    if dtype is None:
+        if floating:
+            return
+        _fail("malformed_state", path, "an IntegerConst precedes every output")
+    assert dtype is not None
+    if dtype.is_floating is not floating:
+        _fail(
+            "mixed_dtype",
+            path,
+            f"{'FloatConst' if floating else 'IntegerConst'} standing for a "
+            f"{dtype.value} value",
+        )
 
 
 def _check_root_position(
@@ -578,8 +691,11 @@ def _check_parent_position(
     level: int,
     *,
     allow_maybe_absent: bool = False,
-) -> None:
-    """The dominance rule: a level's parent is the position one level up."""
+) -> _PositionType:
+    """The dominance rule: a level's parent is the position one level up.
+
+    Returns the parent's position type.
+    """
 
     kind = _check_expr(ctx, parent, path, depth)
     if type(kind) is not _PositionType:
@@ -593,7 +709,7 @@ def _check_parent_position(
             "unsupported_sparse_hierarchy",
             path,
             "a UNION-bound position that may be absent can only select "
-            "the next COMPRESSED child segment",
+            "a COMPRESSED child segment or address a guarded load",
         )
     if level == 0:
         if kind.tensor is not None:
@@ -609,6 +725,7 @@ def _check_parent_position(
             f"level {level} needs the dominating position of level "
             f"{level - 1} of the same tensor",
         )
+    return kind
 
 
 def _check_dense_position(
@@ -639,8 +756,20 @@ def _check_dense_position(
             path,
             "dense positions are only defined on DENSE levels",
         )
-    _check_parent_position(
-        ctx, expr.parent, f"{path}.parent", depth + 1, tensor, expr.level
+    # Inside a guarded PositionLoad of this tensor, or the parent of one of
+    # its cursors, the dense spine may hang from a union-bound position that
+    # is absent at a one-sided coordinate.  The guard makes the address
+    # observable only where it is present; the cursor walks the empty
+    # segment where it is absent.
+    parent_kind = _check_parent_position(
+        ctx,
+        expr.parent,
+        f"{path}.parent",
+        depth + 1,
+        tensor,
+        expr.level,
+        allow_maybe_absent=tensor
+        in (ctx.guarded_load_tensor, ctx.cursor_parent_tensor),
     )
     coord_type = _check_expr(ctx, expr.coord, f"{path}.coord", depth + 1)
     _require_coord(
@@ -650,7 +779,7 @@ def _check_dense_position(
         "the dense-level coordinate",
         ctx.level_dimension(tensor, expr.level),
     )
-    return _PositionType(tensor, expr.level)
+    return _PositionType(tensor, expr.level, parent_kind.may_be_absent)
 
 
 def _check_position_value(
@@ -690,19 +819,23 @@ def _check_cursor_value(
             "only the value-bearing leaf level owns scalar values; "
             f"level {decl.level} is structural",
         )
-    if mode is MergeMode.UNION:
+    if mode in (MergeMode.UNION, MergeMode.DENSE_UNION):
         if expr.default is None:
             _fail(
                 "missing_union_default",
                 path,
                 "a UNION-merged cursor read requires a default value",
             )
+        read_dtype = ctx.tensors[decl.tensor].dtype
+        saved_constant_dtype = ctx.constant_dtype
         ctx.in_cursor_default = True
+        ctx.constant_dtype = read_dtype
         try:
             default_type = _check_expr(ctx, expr.default, f"{path}.default", depth + 1)
         finally:
             ctx.in_cursor_default = False
-        _require_value(default_type, f"{path}.default", "a cursor default")
+            ctx.constant_dtype = saved_constant_dtype
+        _require_value(default_type, f"{path}.default", "a cursor default", read_dtype)
     else:
         if expr.default is not None:
             _fail(
@@ -710,7 +843,7 @@ def _check_cursor_value(
                 path,
                 "a default is unobservable outside a UNION merge",
             )
-    return _VALUE
+    return _ScalarValueType(ctx.tensors[decl.tensor].dtype)
 
 
 def _check_position_load(
@@ -721,19 +854,79 @@ def _check_position_load(
         _fail("undefined_tensor", path, "PositionLoad references an undeclared tensor")
     if tensor not in ctx.inputs:
         _fail("output_read", path, "PositionLoad may only read declared inputs")
-    position_type = _check_expr(ctx, expr.position, f"{path}.position", depth + 1)
+    if (expr.guard is None) != (expr.default is None):
+        _fail(
+            "malformed_guard",
+            path,
+            "a PositionLoad guard and its default are set together",
+        )
+    if expr.guard is not None:
+        cursor = _check_cursor_id(expr.guard, f"{path}.guard")
+        if cursor not in ctx.cursors:
+            _fail(
+                "unbound_cursor",
+                f"{path}.guard",
+                f"cursor {_diagnostic_int(cursor.value)} is not in scope",
+            )
+        decl, mode = ctx.cursors[cursor]
+        if mode not in (MergeMode.UNION, MergeMode.DENSE_UNION):
+            _fail(
+                "dead_default",
+                f"{path}.guard",
+                "a guard is unobservable outside a UNION merge",
+            )
+        levels = ctx.tensors[tensor].levels
+        if decl.tensor != tensor or any(
+            level.kind is not LevelKind.DENSE for level in levels[decl.level + 1 :]
+        ):
+            _fail(
+                "position_load_mismatch",
+                f"{path}.guard",
+                "the guard must be the loaded tensor's cursor at its deepest "
+                "compressed level",
+            )
+        if ctx.in_cursor_default:
+            _fail(
+                "default_contains_cursor",
+                path,
+                "a default must not read another cursor",
+            )
+        read_dtype = ctx.tensors[tensor].dtype
+        saved_constant_dtype = ctx.constant_dtype
+        ctx.in_cursor_default = True
+        ctx.constant_dtype = read_dtype
+        try:
+            default_type = _check_expr(ctx, expr.default, f"{path}.default", depth + 1)
+        finally:
+            ctx.in_cursor_default = False
+            ctx.constant_dtype = saved_constant_dtype
+        _require_value(
+            default_type, f"{path}.default", "a guarded load default", read_dtype
+        )
+    saved_guarded = ctx.guarded_load_tensor
+    ctx.guarded_load_tensor = tensor if expr.guard is not None else None
+    try:
+        position_type = _check_expr(ctx, expr.position, f"{path}.position", depth + 1)
+    finally:
+        ctx.guarded_load_tensor = saved_guarded
     if type(position_type) is not _PositionType:
         _fail(
             "type_mismatch",
             f"{path}.position",
             "PositionLoad.position must be position-typed",
         )
-    if position_type.may_be_absent:
+    if position_type.may_be_absent and expr.guard is None:
         _fail(
             "unsupported_sparse_hierarchy",
             f"{path}.position",
             "a UNION-bound position that may be absent cannot be used as "
-            "an unconditional scalar load address; use CursorValue defaults",
+            "an unconditional scalar load address; name its cursor as guard",
+        )
+    if expr.guard is not None and not position_type.may_be_absent:
+        _fail(
+            "dead_default",
+            f"{path}.guard",
+            "the load's address is bound wherever it runs; a guard is " "unobservable",
         )
     if position_type.tensor != tensor:
         _fail(
@@ -749,7 +942,7 @@ def _check_position_load(
             "only the value-bearing leaf position owns a scalar; "
             f"level {position_type.level} is structural",
         )
-    return _VALUE
+    return _ScalarValueType(ctx.tensors[tensor].dtype)
 
 
 def _check_load(ctx: _Context, expr: Load, path: str, depth: int) -> _ExprType:
@@ -782,7 +975,7 @@ def _check_load(ctx: _Context, expr: Load, path: str, depth: int) -> _ExprType:
             "a load index",
             decl.dimensions[position],
         )
-    return _VALUE
+    return _ScalarValueType(decl.dtype)
 
 
 def _check_binary_expr(
@@ -790,10 +983,22 @@ def _check_binary_expr(
 ) -> _ExprType:
     if type(expr.op) is not BinaryOp:
         _fail("malformed_state", path, "BinaryExpr.op must be a BinaryOp member")
+    dtypes = []
     for name, operand in (("lhs", expr.lhs), ("rhs", expr.rhs)):
         operand_type = _check_expr(ctx, operand, f"{path}.{name}", depth + 1)
         _require_value(operand_type, f"{path}.{name}", "a binary operand")
-    return _VALUE
+        dtypes.append(cast(_ScalarValueType, operand_type).dtype)
+    lhs, rhs = dtypes
+    if lhs is None or rhs is None:
+        return _ScalarValueType(lhs if rhs is None else rhs)
+    promoted = promoted_scalar_type(lhs, rhs)
+    if promoted is None:
+        _fail(
+            "mixed_dtype",
+            path,
+            f"{lhs.value} with {rhs.value} promotes to a type Scorch does " "not store",
+        )
+    return _ScalarValueType(promoted)
 
 
 def _check_workspace_id(value: object, path: str) -> WorkspaceId:
@@ -852,7 +1057,7 @@ def _check_workspace_read(
         )
     _check_workspace_coord(ctx, state, expr.coord, f"{path}.coord", depth + 1)
     state.consumed = True
-    return _VALUE
+    return _ScalarValueType(state.decl.dtype)
 
 
 def _check_sparse_workspace_value(
@@ -875,7 +1080,7 @@ def _check_sparse_workspace_value(
             "workspace's drain loop",
         )
     state.consumed = True
-    return _VALUE
+    return _ScalarValueType(state.decl.dtype)
 
 
 def _check_relayout_id(value: object, path: str) -> RelayoutId:
@@ -970,12 +1175,13 @@ def _check_staged_read(
             "coordinate, bound by its TileInnerFor",
         )
     state.read = True
-    return _VALUE
+    return _ScalarValueType(operand_decl.dtype)
 
 
 _EXPR_CHECKERS: Dict[type, Callable[[_Context, Any, str, int], _ExprType]] = {
     IndexValue: _check_index_value,
     FloatConst: _check_float_const,
+    IntegerConst: _check_integer_const,
     RootPosition: _check_root_position,
     DensePosition: _check_dense_position,
     PositionValue: _check_position_value,
@@ -1088,21 +1294,30 @@ def _check_cursor_decl(
                 f"level {_diagnostic_int(decl.level)} outside "
                 f"rank-{len(levels)} tensor",
             )
-        if levels[decl.level].kind is not LevelKind.COMPRESSED:
+        if levels[decl.level].kind not in (
+            LevelKind.COMPRESSED,
+            LevelKind.COORDINATE,
+        ):
             _fail(
                 "layout_mismatch",
                 path,
-                "sparse cursors are only defined on COMPRESSED levels",
+                "sparse cursors are only defined on COMPRESSED and "
+                "COORDINATE levels",
             )
-        _check_parent_position(
-            ctx,
-            decl.parent,
-            f"{path}.parent",
-            depth + 1,
-            tensor,
-            decl.level,
-            allow_maybe_absent=True,
-        )
+        saved_parent_tensor = ctx.cursor_parent_tensor
+        ctx.cursor_parent_tensor = tensor
+        try:
+            _check_parent_position(
+                ctx,
+                decl.parent,
+                f"{path}.parent",
+                depth + 1,
+                tensor,
+                decl.level,
+                allow_maybe_absent=True,
+            )
+        finally:
+            ctx.cursor_parent_tensor = saved_parent_tensor
         return decl
     finally:
         _leave(ctx, decl)
@@ -1405,6 +1620,7 @@ def _check_sparse_window_for(
             "PanelOuterFor in scope",
         )
     decl = _check_cursor_decl(ctx, stmt.cursor, f"{path}.cursor", depth + 1)
+    _require_compressed_cursor(ctx, decl, f"{path}.cursor", "a coordinate window")
     coord = _check_index_id(stmt.coord_index, path, "SparseWindowFor.coord_index")
     coord_dimension = ctx.level_dimension(decl.tensor, decl.level)
     if coord != panel.index or coord_dimension != panel.dimension:
@@ -1456,15 +1672,6 @@ def _check_workspace_decl(
                 "invalid_scalar_type",
                 path,
                 "WorkspaceDecl.dtype must be a ScalarType member",
-            )
-        if ctx.program_dtype is None:
-            ctx.program_dtype = decl.dtype
-        elif decl.dtype is not ctx.program_dtype:
-            _fail(
-                "mixed_dtype",
-                path,
-                "this subset requires one uniform scalar type per program; "
-                f"got {decl.dtype.value} beside {ctx.program_dtype.value}",
             )
         _check_tile_id(decl.tile, f"{path}.tile")
         return decl
@@ -1549,15 +1756,6 @@ def _check_sparse_workspace_decl(
                 "invalid_scalar_type",
                 path,
                 "SparseWorkspaceDecl.dtype must be a ScalarType member",
-            )
-        if ctx.program_dtype is None:
-            ctx.program_dtype = decl.dtype
-        elif decl.dtype is not ctx.program_dtype:
-            _fail(
-                "mixed_dtype",
-                path,
-                "this subset requires one uniform scalar type per program; "
-                f"got {decl.dtype.value} beside {ctx.program_dtype.value}",
             )
         key_dimensions = decl.key_dimensions
         if type(key_dimensions) is not tuple or not key_dimensions:
@@ -1936,7 +2134,9 @@ def _check_tiled_reduce(
             "point coordinate, bound by its TileInnerFor",
         )
     value_type = _check_expr(ctx, stmt.value, f"{path}.value", depth + 1)
-    _require_value(value_type, f"{path}.value", "a combined value")
+    _require_value(
+        value_type, f"{path}.value", "a combined value", ctx.tensors[decl.result].dtype
+    )
     state.reduced = True
     ctx.written_outputs.add(decl.result)
 
@@ -1966,7 +2166,7 @@ def _check_workspace_reduce(
         _fail("malformed_state", path, "WorkspaceReduce.op must be a ReduceOp member")
     _check_workspace_coord(ctx, state, stmt.coord, f"{path}.coord", depth + 1)
     value_type = _check_expr(ctx, stmt.value, f"{path}.value", depth + 1)
-    _require_value(value_type, f"{path}.value", "a combined value")
+    _require_value(value_type, f"{path}.value", "a combined value", state.decl.dtype)
     state.produced = True
 
 
@@ -2016,7 +2216,7 @@ def _check_sparse_workspace_insert(
             dimension,
         )
     value_type = _check_expr(ctx, stmt.value, f"{path}.value", depth + 1)
-    _require_value(value_type, f"{path}.value", "an inserted value")
+    _require_value(value_type, f"{path}.value", "an inserted value", state.decl.dtype)
     state.inserted = True
 
 
@@ -2084,11 +2284,12 @@ def _check_merged_sparse_for(
         _fail("malformed_state", path, "mode must be a MergeMode member")
     if type(stmt.cursors) is not tuple:
         _fail("malformed_state", path, "cursors must be an owned tuple")
-    if len(stmt.cursors) < 2:
+    if len(stmt.cursors) < (1 if stmt.mode is MergeMode.DENSE_UNION else 2):
         _fail(
             "degenerate_merge",
             path,
-            "a merged loop needs at least two sparse cursors",
+            "a merged loop needs at least two sparse cursors (one beside "
+            "the dense domain of a DENSE_UNION)",
         )
     if type(stmt.positions) is not tuple:
         _fail("malformed_state", path, "positions must be an owned tuple")
@@ -2106,7 +2307,7 @@ def _check_merged_sparse_for(
                 "a nonempty merge position tuple must bind at least one "
                 "position; use the canonical empty tuple otherwise",
             )
-        if stmt.mode is MergeMode.UNION:
+        if stmt.mode in (MergeMode.UNION, MergeMode.DENSE_UNION):
             if any(bound is None for bound in stmt.positions):
                 _fail(
                     "unsupported_sparse_hierarchy",
@@ -2167,7 +2368,7 @@ def _check_merged_sparse_for(
                 "MergedSparseFor.positions entry",
                 decl.tensor,
                 decl.level,
-                may_be_absent=stmt.mode is MergeMode.UNION,
+                may_be_absent=stmt.mode in (MergeMode.UNION, MergeMode.DENSE_UNION),
             )
         )
     for decl in decls:
@@ -2254,7 +2455,9 @@ def _check_store(ctx: _Context, stmt: Store, path: str, depth: int) -> None:
     _require_dense_store_target(ctx, tensor, path)
     _check_output_write_indices(ctx, stmt, tensor, path, depth)
     value_type = _check_expr(ctx, stmt.value, f"{path}.value", depth + 1)
-    _require_value(value_type, f"{path}.value", "a stored value")
+    _require_value(
+        value_type, f"{path}.value", "a stored value", ctx.tensors[tensor].dtype
+    )
     ctx.written_outputs.add(tensor)
 
 
@@ -2274,14 +2477,12 @@ def _check_store_reduce(
         # adding its explicit output-initialization identity check here.
         _fail("malformed_state", path, "StoreReduce.op must be a ReduceOp member")
     decl = ctx.tensors[tensor]
-    if any(
-        level.kind is not LevelKind.DENSE and level.kind is not LevelKind.COMPRESSED
-        for level in decl.levels
-    ):
+    if any(level.kind not in _EXECUTABLE_LEVEL_KINDS for level in decl.levels):
         _fail(
             "layout_mismatch",
             path,
-            "reductions are only defined on DENSE/COMPRESSED-level outputs",
+            "reductions are only defined on DENSE/COMPRESSED/COORDINATE-level "
+            "outputs",
         )
     # An all-dense target is the executable dense reduction.  A target with
     # compressed levels is the SEMANTIC accumulation form of the sparse
@@ -2290,7 +2491,7 @@ def _check_store_reduce(
     # into ordered assembly.
     _check_output_write_indices(ctx, stmt, tensor, path, depth)
     value_type = _check_expr(ctx, stmt.value, f"{path}.value", depth + 1)
-    _require_value(value_type, f"{path}.value", "a combined value")
+    _require_value(value_type, f"{path}.value", "a combined value", decl.dtype)
     ctx.written_outputs.add(tensor)
 
 
@@ -2304,11 +2505,16 @@ def _check_append_entry(
         _fail("output_scope", path, "AppendEntry may only assemble declared outputs")
     _require_outside_producer(ctx, path)
     decl = ctx.tensors[tensor]
-    if all(level.kind is not LevelKind.COMPRESSED for level in decl.levels):
+    if all(
+        level.kind is not LevelKind.COMPRESSED
+        and level.kind is not LevelKind.COORDINATE
+        for level in decl.levels
+    ):
         _fail(
             "layout_mismatch",
             path,
-            "appended assembly needs an output with a COMPRESSED level",
+            "appended assembly needs an output with a COMPRESSED or "
+            "COORDINATE level",
         )
     if type(stmt.coords) is not tuple:
         _fail("malformed_state", path, "AppendEntry.coords must be an owned tuple")
@@ -2328,8 +2534,195 @@ def _check_append_entry(
             decl.dimensions[position],
         )
     value_type = _check_expr(ctx, stmt.value, f"{path}.value", depth + 1)
-    _require_value(value_type, f"{path}.value", "an appended value")
+    _require_value(value_type, f"{path}.value", "an appended value", decl.dtype)
+    _check_append_order(ctx, stmt, path)
     ctx.written_outputs.add(tensor)
+
+
+_TWO_PASS = (AssemblyStrategy.TWO_PASS_SERIAL, AssemblyStrategy.TWO_PASS_PARALLEL)
+
+
+def append_binding_depths(
+    ancestors: Sequence[object], stmt: AppendEntry, decl: TensorDecl
+) -> Optional[List[int]]:
+    """Per storage level of the appended result, the depth of the loop binding it.
+
+    ``ancestors`` are the statements enclosing ``stmt``, outermost first; the
+    depth counts only dense, sparse and merged loops among them.  ``None`` when
+    some appended coordinate is not bound by such a loop (a drain, a tile), for
+    which no order is judged.  The append is in its result's storage order
+    exactly when the depths do not decrease.
+    """
+
+    depth: Dict[IndexId, int] = {}
+    for node in ancestors:
+        if type(node) is DenseFor:
+            depth[cast(DenseFor, node).index] = len(depth)
+        elif type(node) in (SparseFor, MergedSparseFor):
+            depth[cast(SparseFor, node).coord_index] = len(depth)
+    bound: List[int] = []
+    for level in decl.levels:
+        coord = stmt.coords[level.mode]
+        if type(coord) is not IndexValue or coord.index not in depth:
+            return None
+        bound.append(depth[coord.index])
+    return bound
+
+
+def unordered_append_outputs(program: LoopProgram) -> FrozenSet[SymbolId]:
+    """The outputs a verified program appends to out of their storage order.
+
+    Each is a relabelled copy of one input under a two-pass record
+    (:func:`_check_append_order`): its entries are assembled from the set
+    appended, in coordinate order, rather than in arrival order.
+    """
+
+    # Only a two-pass record admits such an append; without one, an append
+    # out of order is a defect the oracle reports when it reaches it.
+    if program.assembly not in _TWO_PASS:
+        return frozenset()
+    decls = {decl.symbol: decl for decl in program.tensors}
+    unordered: Set[SymbolId] = set()
+
+    def walk(node: object, ancestors: List[object]) -> None:
+        if type(node) is AppendEntry:
+            append = cast(AppendEntry, node)
+            bound = append_binding_depths(ancestors, append, decls[append.tensor])
+            if bound is not None and bound != sorted(bound):
+                unordered.add(append.tensor)
+            return
+        if not isinstance(node, Stmt):
+            return
+        ancestors.append(node)
+        for field in fields(node):
+            value = getattr(node, field.name)
+            children = value if type(value) is tuple else (value,)
+            for child in children:
+                if isinstance(child, Stmt):
+                    walk(child, ancestors)
+        ancestors.pop()
+
+    walk(program.body, [])
+    return frozenset(unordered)
+
+
+def _check_append_order(ctx: _Context, stmt: AppendEntry, path: str) -> None:
+    """Admit an append out of its result's storage order only as a relabelled copy.
+
+    An ordered append builds a compressed level entry by entry, so it is
+    correct only when the loops binding its coordinates are nested in the
+    result's storage order.  An append whose coordinates are all bound by
+    enclosing dense, sparse or merged loops in another nesting is admitted only
+    when the result can still be built, and built exactly once per entry:
+
+    (a) the program records a two-pass assembly strategy, under which the
+        entries are counted per segment, the counts prefix-summed and each
+        entry stored at its slot, so arrival order does not matter;
+    (b) the append is a relabelled copy of one input: the nest is one dense or
+        single-cursor loop per level of that input, in its storage order, the
+        appended coordinates are a permutation of the loops' coordinates and
+        the value is the input's stored value at the walk's position, so every
+        stored entry is appended once at a coordinate no other entry has;
+    (c) the result stores only the entries put in it (no dense level below a
+        compressed or coordinate one), so no cell is left unwritten.
+
+    An append whose coordinates are bound some other way (a drain, a tile) is
+    not judged here, exactly as before this rule.
+    """
+
+    decl = ctx.tensors[stmt.tensor]
+    bound = append_binding_depths(ctx.statement_stack, stmt, decl)
+    if bound is None or bound == sorted(bound):
+        return
+
+    def refuse(message: str) -> NoReturn:
+        _fail(
+            "unordered_append",
+            path,
+            "an append out of its result's storage order " + message,
+        )
+
+    if ctx.assembly not in _TWO_PASS:
+        refuse("needs a recorded two-pass assembly strategy")
+    kinds = [level.kind for level in decl.levels]
+    first_sparse = next(
+        (level for level, kind in enumerate(kinds) if kind is not LevelKind.DENSE),
+        len(kinds),
+    )
+    if any(kind is LevelKind.DENSE for kind in kinds[first_sparse:]):
+        refuse("needs a result that stores only its entries")
+    chain = [node for node in ctx.statement_stack if type(node) is not Block]
+    if chain and chain[-1] is stmt:
+        chain = chain[:-1]
+    if any(type(node) not in (DenseFor, SparseFor) for node in chain) or any(
+        type(node) is Block and len(cast(Block, node).statements) != 1
+        for node in ctx.statement_stack
+    ):
+        refuse("must be the only statement of a dense and sparse loop nest")
+    value = stmt.value
+    if type(value) is CursorValue:
+        source = ctx.cursors[cast(CursorValue, value).cursor][0].tensor
+    elif type(value) is PositionLoad:
+        source = cast(PositionLoad, value).tensor
+    else:
+        refuse("must append an input's stored value")
+    source_levels = ctx.tensors[source].levels
+    if len(chain) != len(source_levels):
+        refuse("needs one loop per level of the input it copies")
+    # Walk the position the value is read at back to the root: each level of
+    # the input must be bound by the loop at its own depth.
+    level = len(source_levels) - 1
+    expr: Expr
+    if type(value) is CursorValue:
+        last = chain[-1]
+        if (
+            type(last) is not SparseFor
+            or last.cursor.cursor != cast(CursorValue, value).cursor
+            or last.cursor.level != level
+        ):
+            refuse("must read the value at the innermost loop's cursor")
+        expr = last.cursor.parent
+        level -= 1
+    else:
+        expr = cast(PositionLoad, value).position
+    while level >= 0:
+        loop = chain[level]
+        if source_levels[level].kind is LevelKind.DENSE:
+            if not (
+                type(loop) is DenseFor
+                and type(expr) is DensePosition
+                and expr.tensor == source
+                and expr.level == level
+                and type(expr.coord) is IndexValue
+                and expr.coord.index == loop.index
+            ):
+                refuse(
+                    f"must bind level {level} of the input it copies at depth {level}"
+                )
+            expr = expr.parent
+        else:
+            if not (
+                type(loop) is SparseFor
+                and loop.cursor.tensor == source
+                and loop.cursor.level == level
+                and type(expr) is PositionValue
+                and expr.position == loop.position
+            ):
+                refuse(
+                    f"must walk level {level} of the input it copies at depth {level}"
+                )
+            expr = loop.cursor.parent
+        level -= 1
+    if type(expr) is not RootPosition:
+        refuse("must walk the input it copies from its root")
+    appended = [cast(IndexValue, coord).index for coord in stmt.coords]
+    walked = [
+        loop.index if type(loop) is DenseFor else cast(SparseFor, loop).coord_index
+        for loop in chain
+    ]
+    if len(set(appended)) != len(appended) or set(appended) != set(walked):
+        refuse("must append a permutation of the copied input's coordinates")
+    ctx.relabelled_outputs.add(stmt.tensor)
 
 
 _STMT_CHECKERS: Dict[type, Callable[[_Context, Any, str, int], None]] = {
@@ -2377,6 +2770,27 @@ def _check_dimension_decl(ctx: _Context, decl: object, path: str, depth: int) ->
         ctx.dimensions[dimension] = decl
     finally:
         _leave(ctx, decl)
+
+
+def _require_compressed_cursor(
+    ctx: _Context, decl: SparseCursorDecl, path: str, what: str
+) -> None:
+    """Refuse a cursor over a COORDINATE level where only a segment walk fits.
+
+    A coordinate window steps a cursor one position at a time and assumes a
+    coordinate is met once per segment.  A coordinate level with a level below
+    it repeats coordinates and is walked run by run, which :class:`SparseFor`
+    and both merge modes represent (an aligned cursor steps over its run, and
+    under a union an unaligned one's run is empty).
+    """
+
+    if ctx.tensors[decl.tensor].levels[decl.level].kind is LevelKind.COORDINATE:
+        _fail(
+            "unsupported_level_kind",
+            path,
+            f"{what} over a coordinate level is not represented; only a "
+            "single-cursor sparse loop or a merge walks one",
+        )
 
 
 def _check_level_decl(
@@ -2438,15 +2852,6 @@ def _check_tensor_decl(ctx: _Context, decl: object, path: str, depth: int) -> No
                 path,
                 "TensorDecl.dtype must be a ScalarType member",
             )
-        if ctx.program_dtype is None:
-            ctx.program_dtype = decl.dtype
-        elif decl.dtype is not ctx.program_dtype:
-            _fail(
-                "mixed_dtype",
-                path,
-                "this subset requires one uniform scalar type per program; "
-                f"got {decl.dtype.value} beside {ctx.program_dtype.value}",
-            )
         if type(decl.dimensions) is not tuple or not decl.dimensions:
             _fail(
                 "malformed_state",
@@ -2488,6 +2893,20 @@ def _check_tensor_decl(ctx: _Context, decl: object, path: str, depth: int) -> No
                 path,
                 "level modes must be a permutation of the logical modes; "
                 f"got {tuple(modes)}",
+            )
+        kinds = [level.kind for level in decl.levels]
+        if LevelKind.COORDINATE in kinds and any(
+            kind is not LevelKind.COORDINATE for kind in kinds
+        ):
+            # A coordinate level holds one coordinate per stored entry and no
+            # position array.  Its segment is every entry (level 0) or the
+            # run its coordinate parent selects; under a level of another
+            # kind there is neither.
+            _fail(
+                "unsupported_level_kind",
+                path,
+                "a coordinate level requires every level of its tensor to be "
+                "a coordinate level",
             )
         ctx.tensors[symbol] = decl
     finally:
@@ -2902,6 +3321,7 @@ def verify_program(program: object) -> None:
             f"expected a LoopProgram, got {type(program).__name__}",
         )
     ctx = _Context()
+    ctx.assembly = program.assembly
     _enter(ctx, program, "program", 0)
     try:
         if type(program.dimensions) is not tuple:
@@ -2948,6 +3368,9 @@ def verify_program(program: object) -> None:
                 (ctx.inputs if role == "inputs" else ctx.outputs).add(checked)
         if not ctx.outputs:
             _fail("output_scope", "program.outputs", "a program needs an output")
+        output_dtypes = {ctx.tensors[symbol].dtype for symbol in ctx.outputs}
+        if len(output_dtypes) == 1:
+            (ctx.constant_dtype,) = output_dtypes
         unassigned = set(ctx.tensors) - ctx.inputs - ctx.outputs
         if unassigned:
             _fail(
@@ -2962,18 +3385,19 @@ def verify_program(program: object) -> None:
                 continue
             modes = tuple(level.mode for level in decl.levels)
             if any(
-                kind is not LevelKind.DENSE and kind is not LevelKind.COMPRESSED
-                for kind in kinds
+                kind not in _EXECUTABLE_LEVEL_KINDS for kind in kinds
             ) or modes != tuple(range(len(kinds))):
                 # The generalized ordered-assembly stream admits identity-
-                # ordered DENSE/COMPRESSED output levels; every other sparse
-                # output layout stays fail-closed.
+                # ordered DENSE/COMPRESSED output levels and identity-ordered
+                # all-COORDINATE ones (a COORDINATE level beside another
+                # kind was refused with the tensor's declaration); every
+                # other sparse output layout stays fail-closed.
                 _fail(
                     "unsupported_sparse_output",
                     f"program.outputs[{position}]",
                     f"output {decl.name!r} declares a sparse layout outside "
-                    "the identity-ordered DENSE/COMPRESSED families; this "
-                    "subset fails closed on it",
+                    "the identity-ordered DENSE/COMPRESSED and all-COORDINATE "
+                    "families; this subset fails closed on it",
                 )
         _check_body(ctx, program.body, "program.body", 1)
         unwritten = ctx.outputs - ctx.written_outputs
@@ -3020,6 +3444,13 @@ def _check_assembly_strategy(ctx: "_Context", program: LoopProgram) -> None:
     if strategy is AssemblyStrategy.SINGLE_PASS_SERIAL:
         return
     for position, symbol in enumerate(program.outputs):
+        if strategy in _TWO_PASS and symbol in ctx.relabelled_outputs:
+            # A relabelled copy's two passes number its segments by the
+            # flattened dense prefix, not by an outer loop, and its parallel
+            # form splits the input's walk, not the receiver's rows; so any
+            # receiver that stores only its entries (checked with the append)
+            # is legal under either.
+            continue
         decl = ctx.tensors[symbol]
         levels = tuple(
             LEVEL_KIND_TO_LEVEL_TYPE.get(level.kind) for level in decl.levels

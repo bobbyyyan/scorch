@@ -748,12 +748,12 @@ def _seam_cells():
                         # its place; blocker 3 migrates THAT too, because a
                         # dense level owes only that its child's position array
                         # be closed at every logical cell, which the row-scope
-                        # catch-up supplies.  Its neighbour on the same seam
-                        # keeps not just the code but the same RULE: a dense
-                        # result prefix level driven by an INTERSECTION, which
-                        # has no single cursor whose coordinate advances a
-                        # catch-up, so no ordered assembly is defined.  ``i``
-                        # is shared by both operands and therefore intersected.
+                        # catch-up supplies.  This neighbour on the same seam
+                        # -- a dense result prefix level driven by an
+                        # INTERSECTION (``i`` is shared by both operands) --
+                        # was refused until 2026-10-12, when an intersection
+                        # could drive a dense prefix level
+                        # (``test_loopir_merged_drivers.py``).
                         TensorVar("C", fmt="dss")[i4, j4, l4],
                         CINBinaryOp(
                             Operation.MUL,
@@ -792,7 +792,7 @@ def _seam_cells():
             ttm,
             (3, 4, 5),
             (((3, 4, 6), f32), ((3, 6, 5), f32)),
-            "unsupported_sparse_output_domain",
+            None,  # lowered since 2026-10-12: a merged reduction below the result
         ),
         # Recorded seam move: the two-dense-prefix ``ddss`` intersection that
         # used to sit here is the admitted flattened-prefix family
@@ -806,20 +806,50 @@ def _seam_cells():
             interleaved,
             (3, 4, 5),
             (((3, 4, 5), f32), ((3, 4, 5), f32)),
-            "unsupported_sparse_output",
+            None,  # ``sds * sds`` into ``sds``: lowered since 2026-10-11
         ),
         (
             "three_operand_chain",
             three,
             (4, 5),
             (((4, 5), f32), ((4, 5), f32), ((4, 5), f32)),
-            "unsupported_program_shape",
+            None,  # lowered since 2026-10-12: an intersection of three cursors
         ),
     ]
 
 
+_REFUSED_CELLS = [cell for cell in _seam_cells() if cell[4] is not None]
+_LOWERED_CELLS = [cell for cell in _seam_cells() if cell[4] is None]
+
+
 @pytest.mark.parametrize("regblock_enabled", [False, True])
-@pytest.mark.parametrize("cell", _seam_cells(), ids=[cell[0] for cell in _seam_cells()])
+@pytest.mark.parametrize(
+    "cell", _LOWERED_CELLS, ids=[cell[0] for cell in _LOWERED_CELLS]
+)
+def test_neighbours_lowered_since_2026_10_11_match_pytorch(regblock_enabled, cell):
+    """Neighbours that used to be refused here and are lowered now.
+
+    The interleaved ``sds`` product was refused until the ordered assembly
+    learned to commit a compressed coordinate after the dense block below it
+    is written (``test_loopir_dense_below_compressed_target.py``,
+    2026-10-11).  The TTM reduction over an intersected level and the
+    three-operand chain were refused until the sparse-result targets accepted
+    a merged reduction loop and merges of three or more cursors
+    (``test_loopir_merged_drivers.py``, 2026-10-12).
+    """
+
+    # Imported here: that module imports this one's ``auto_options`` chain.
+    from tests.test_scorch.test_loopir_dense_below_compressed_target import (
+        assert_statement_matches_pytorch,
+    )
+
+    assert_statement_matches_pytorch(cell[1], regblock_enabled)
+
+
+@pytest.mark.parametrize("regblock_enabled", [False, True])
+@pytest.mark.parametrize(
+    "cell", _REFUSED_CELLS, ids=[cell[0] for cell in _REFUSED_CELLS]
+)
 def test_adjacent_seams_stay_fail_closed(regblock_enabled, cell):
     _, cin, result_shape, bindings, expected = cell
     with pytest.raises((LoopIRLoweringError, LoopIRTargetError)) as error:

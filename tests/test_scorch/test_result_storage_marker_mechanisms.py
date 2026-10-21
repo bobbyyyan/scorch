@@ -337,6 +337,32 @@ _MECHANISMS: Tuple[Mechanism, ...] = (
     # The one reader that sees the marker and must keep ignoring it
     # ------------------------------------------------------------------
     Mechanism(
+        "compiler/loop_invariant_factor_pass.py::_spelling_count",
+        KIND_READER,
+        BLIND_BY_DESIGN,
+        "recurses vars(value) to count the spellings of one identifier, so it "
+        "DOES visit result_storage and falls off the end: the marker is not a "
+        "str, not a sequence and not an llir.Node.  It answers one question, "
+        "whether a scalar accumulator is named between its zero-initializing "
+        "declaration and a loop or elsewhere in that loop, and the marker "
+        "identifies result storage vectors by SymbolId, never by spelling.  It "
+        "decides only whether a hoist is applied; it rebuilds no statement.",
+    ),
+    Mechanism(
+        "compiler/single_iteration_loop_pass.py::_IdentifierSearch.enter_node",
+        KIND_READER,
+        BLIND_BY_DESIGN,
+        "reads every stored field of every node through vars(node) for the "
+        "strings it holds, so it DOES visit result_storage and reads nothing "
+        "from it: ResultStorageMetadata is not a str, a list or a tuple.  It "
+        "answers one question, whether an identifier (a loop variable or its "
+        "end bound) is still spelled anywhere in a statement list once a "
+        "single-iteration loop has been inlined, and the marker identifies "
+        "result storage vectors by SymbolId, never by spelling.  It decides "
+        "only whether the inlining is kept and whether a bound's declaration is "
+        "dropped; it rebuilds no statement.",
+    ),
+    Mechanism(
         "compiler/codegen.py::LLIRLowerer._validate_exact_codegen_tree",
         KIND_READER,
         BLIND_BY_DESIGN,
@@ -490,6 +516,15 @@ _MECHANISMS: Tuple[Mechanism, ...] = (
         "excludes and no lowering marks",
         unthreaded_constructions=1,
     ),
+    Mechanism(
+        "compiler/loopir/lower_llir.py::_RelabelledCopyAssemblyLowering._restricted",
+        KIND_REBUILD,
+        UNTHREADED_BY_DESIGN,
+        "the parallel relabelled copy's twin of _body_lambda: rebuilds the "
+        "operand walk's outermost loop's own init VarInit with one chunk's lower "
+        "bound; a loop iterator declaration, unthreaded for the same reason",
+        unthreaded_constructions=1,
+    ),
     # ------------------------------------------------------------------
     # Detector false positives: the copied attribute is not a statement field
     # ------------------------------------------------------------------
@@ -519,10 +554,11 @@ _MECHANISMS: Tuple[Mechanism, ...] = (
     ),
     Mechanism(
         "compiler/loopir/lower_llir.py::"
-        "_OrderedKeySparseWorkspaceLowering._workspace_init_statement",
+        "_OrderedKeyRegionEmission._workspace_init_statement",
         KIND_REBUILD,
         INERT,
-        "not a rebuild: two 'element_type.value' reads",
+        "not a rebuild: two 'element_type.value' reads (the region emission "
+        "shared by the ordered-key and multi-compressed targets)",
         unthreaded_constructions=2,
     ),
     Mechanism(
@@ -531,6 +567,24 @@ _MECHANISMS: Tuple[Mechanism, ...] = (
         KIND_REBUILD,
         INERT,
         "not a rebuild: 'element_type.value' again",
+        unthreaded_constructions=1,
+    ),
+    Mechanism(
+        "compiler/loopir/lower_llir.py::_RelabelledCopyAssemblyLowering._radix_passes",
+        KIND_REBUILD,
+        INERT,
+        "not a rebuild: 'count.name' is the name of the radix sort's histogram "
+        "vector, spelled into the emitted 'assign' call, which collides with "
+        "FunctionCallStmt.name",
+        unthreaded_constructions=1,
+    ),
+    Mechanism(
+        "compiler/loopir/lower_llir.py::"
+        "_RelabelledCopyAssemblyLowering._parallel_radix_passes",
+        KIND_REBUILD,
+        INERT,
+        "not a rebuild: 'histogram.name', the per-thread histogram vector's name "
+        "in the same emitted 'assign' call",
         unthreaded_constructions=1,
     ),
     Mechanism(

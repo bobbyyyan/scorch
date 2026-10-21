@@ -9,6 +9,7 @@ pipelines on real tensors; nothing enables shadow execution globally.
 """
 
 import copy
+import difflib
 from dataclasses import replace
 
 import pytest
@@ -45,6 +46,9 @@ from scorch.compiler.loopir.pipeline import (
 from scorch.format import TensorFormat
 from scorch.stensor import STensor
 
+from tests.test_scorch.loopir_executed_programs import (
+    assert_program_matches_pytorch,
+)
 from tests.test_scorch.test_kernels_comprehensive import assert_close
 
 
@@ -452,7 +456,7 @@ def test_direct_result_contract_ignores_workspace_results(monkeypatch):
     a = TensorVar("A", fmt="dd")
     b = TensorVar("B", fmt="dd")
     c = TensorVar("C", fmt="dd")
-    workspace = Workspace("wksp", dim=1, dense=True)
+    workspace = Workspace("wksp", dim=1, dtype=c.dtype, dense=True)
     cin = ForAll(
         i,
         Where(
@@ -732,40 +736,40 @@ def test_reduce_out_family_byte_parity_across_shapes(regblock_enabled):
 
 
 @pytest.mark.parametrize("regblock_enabled", [False, True])
-def test_reduce_out_keeps_invalid_legacy_dense_position_order_fail_closed(
+def test_a_rank_six_dense_reduce_out_matches_pytorch_on_both_compilers(
     regblock_enabled,
 ):
-    """A broader dense auto plan is not evidence for target compatibility.
+    """``C[a,b,c,f] += A[a,b,c,d,e] * B[d,e,f]``, all dense, automatic plan.
 
-    Legacy scheduling can choose ``a,b,d,c,e,f`` for this rank-6
-    contraction and records a dense reduce-out workspace, but its emitted
-    position chain uses ``pA2`` before declaring it.  LoopIR must keep the
-    pre-existing ``unsupported_loop_order`` target boundary instead of
-    reproducing invalid C++ or letting the reduce-out family gate over-admit
-    the program.
+    Legacy scheduling chooses ``a,b,d,c,e,f`` for this contraction with a
+    dense reduce-out workspace.  Its C++ used ``pA2`` before declaring it, and
+    LoopIR refused the plan (``unsupported_loop_order``).  On the merge tree
+    the shipped text declares ``pA2`` first and LoopIR lowers the plan; both
+    kernels are executed here against float64 ``torch.einsum``.
     """
 
     from scorch.compiler.loopir.pipeline import legacy_generated_cpp
     from scorch.compiler.scheduler import Schedule, Scheduler
+    from scorch.ops import lower_and_exec_cin
+    from scorch.stensor import STensor
 
-    a, b, c, d, e, f = (IndexVar(name) for name in "abcdef")
-    left = TensorVar("A", fmt="ddddd")
-    right = TensorVar("B", fmt="ddd")
-    result = TensorVar("C", fmt="dddd")
-    cin: IndexStmt = TensorAssign(
-        result[a, b, c, f],
-        CINBinaryOp(
-            Operation.MUL,
-            left[a, b, c, d, e],
-            right[d, e, f],
-        ),
-        op=Operation.ADD,
-    )
-    for index in reversed((a, b, c, d, e, f)):
-        cin = ForAll(index, cin)
+    def build() -> IndexStmt:
+        a, b, c, d, e, f = (IndexVar(name) for name in "abcdef")
+        cin: IndexStmt = TensorAssign(
+            TensorVar("C", fmt="dddd")[a, b, c, f],
+            CINBinaryOp(
+                Operation.MUL,
+                TensorVar("A", fmt="ddddd")[a, b, c, d, e],
+                TensorVar("B", fmt="ddd")[d, e, f],
+            ),
+            op=Operation.ADD,
+        )
+        for index in reversed((a, b, c, d, e, f)):
+            cin = ForAll(index, cin)
+        return cin
 
     plan = Scheduler.auto_schedule_plan(
-        cin, regblock_enabled=regblock_enabled
+        build(), regblock_enabled=regblock_enabled
     ).verified_loop_plan
     assert plan.workspace is not None and plan.workspace.dense
     assert len(plan.tiles) == 5
@@ -781,20 +785,39 @@ def test_reduce_out_keeps_invalid_legacy_dense_position_order_fail_closed(
         requested_schedule=Schedule(),
     )
     legacy_cpp = legacy_generated_cpp(
-        cin,
+        build(),
         (2, 3, 4, 7),
         bindings,
         compile_options=options,
     )
-    assert legacy_cpp.index("int pA3 = pA2") < legacy_cpp.index("int pA2 =")
-    with pytest.raises(Exception) as error:
-        compile_cin_via_loopir(
-            cin,
-            (2, 3, 4, 7),
-            bindings,
-            compile_options=options,
+    assert legacy_cpp.index("int pA2 =") < legacy_cpp.index("int pA3 = pA2")
+
+    generator = torch.Generator().manual_seed(0)
+    left = torch.randn(2, 3, 4, 5, 6, generator=generator, dtype=torch.float64)
+    right = torch.randn(5, 6, 7, generator=generator, dtype=torch.float64)
+    reference = torch.einsum("abcde,def->abcf", left, right)
+    run_options = replace(
+        CompileOptions.from_environment().with_regblock_enabled(regblock_enabled),
+        requested_schedule=Schedule(),
+    )
+    new, _ = execute_cin_via_loopir(
+        build(),
+        (2, 3, 4, 7),
+        STensor.from_torch(left, "A"),
+        STensor.from_torch(right, "B"),
+        compile_options=run_options,
+    )
+    shipped = lower_and_exec_cin(
+        build(),
+        (2, 3, 4, 7),
+        STensor.from_torch(left, "A"),
+        STensor.from_torch(right, "B"),
+        compile_options=run_options,
+    )
+    for result in (new, shipped):
+        assert torch.allclose(
+            result.to_torch().to(torch.float64), reference, rtol=1e-12, atol=1e-12
         )
-    assert getattr(error.value, "defect").code == "unsupported_loop_order"
 
 
 _SPARSE_WORKSPACE_DIMS = {"i": 4, "j": 5, "k": 6}
@@ -821,7 +844,7 @@ def _build_boundary_cin(fmt_result, result_indices, operands, nest):
 
 @pytest.mark.parametrize("regblock_enabled", [False, True])
 @pytest.mark.parametrize(
-    ("family", "spec", "expected"),
+    ("family", "spec"),
     [
         # The ss@ss->ds row-scope cell left this fail-closed census when
         # its sound typed slice landed; its no-parity admission, sizing
@@ -834,21 +857,19 @@ def _build_boundary_cin(fmt_result, result_indices, operands, nest):
         (
             "reduce_to_csr",
             ("ds", "ik", (("ds", "ij"), ("dd", "jk")), "ijk"),
-            "unsupported_sparse_output_reduction",
         ),
         (
             "merged_reduction_dense_out",
             ("dd", "ik", (("ss", "ij"), ("ss", "jk")), "ijk"),
-            "unsupported_merged_reduction",
         ),
         # ``merged_update_dense_out`` was ``C[i,j] += A[i,j] * B[i,j]``; with no
         # reduction loop its ADD update is plain assignment since 2026-10-11,
-        # and the intersection emits legacy's kernel.  The code itself is still
-        # reached by a merged RESULT coordinate under a reduction elsewhere.
+        # and the intersection emits legacy's kernel.  The cell below, a merged
+        # result coordinate under a reduction elsewhere, compiles since
+        # 2026-10-12.
         (
             "merged_update_dense_out",
             ("d", "j", (("ds", "ij"), ("ds", "ij")), "ij"),
-            "unsupported_merged_update",
         ),
         # Recorded seam move: the rank-1 sparse root reduced over an OUTER
         # dense loop that used to sit here is the admitted ordered-key
@@ -862,45 +883,46 @@ def _build_boundary_cin(fmt_result, result_indices, operands, nest):
         (
             "dense_domain_to_csr",
             ("ds", "ij", (("dd", "ij"),), "ij"),
-            "unsupported_sparse_output_domain",
         ),
         (
             "sparse_row_to_csr",
             ("ds", "ij", (("ss", "ij"),), "ij"),
-            "unsupported_sparse_output_domain",
         ),
         (
             "mixed_level_dense_axis_reduction",
             ("sd", "ij", (("dd", "ij"),), "ij"),
-            None,
         ),
         (
             "mixed_level_merged_operand_chain",
             ("sd", "ij", (("dd", "ij"),), "ij"),
-            None,
         ),
     ],
 )
-def test_sparse_workspace_families_fail_closed_with_exact_codes(
-    regblock_enabled, family, spec, expected
+def test_former_sparse_workspace_seam_cells_match_pytorch(
+    regblock_enabled, family, spec
 ):
-    """The sparse-result/workspace boundary is exact in both policy arms.
+    """The cells that bounded the sparse-result/workspace families compile.
 
-    The B2 mixed dense-leaf assembly family compiles (its battery is
-    ``test_loopir_sparse_workspace_target.py``), and the mixed dense-leaf
-    OPERAND chain now lowers through declared physical position loads (its
-    battery is ``test_loopir_mixed_operand_target.py``); the adjacent seams
-    stay fail-closed at precise codes: reducing into a compressed-parent/
-    dense-leaf result carries the dense-workspace F2/F4 plan whose mixed
-    twin is not migrated (``unsupported_sparse_output_reduction``), and
-    merging two mixed dense-leaf operands needs a bound position no merged
-    loop provides (``unsupported_sparse_hierarchy``).  True sparse
-    ``coo_workspace`` families — row-scope SpMSpM, reduction-to-CSR, merged
-    sparse reductions, and sparse-output roots — fail closed at their own
-    stable codes, including the early ``unsupported_sparse_output``
-    boundary this census audits explicitly.
+    Each cell exited with a structured code until 2026-10-12:
+    ``reduce_to_csr`` (``unsupported_sparse_output_reduction``),
+    ``merged_reduction_dense_out`` (``unsupported_merged_reduction``),
+    ``merged_update_dense_out`` (``unsupported_merged_update``), the two CSR
+    copies (``unsupported_sparse_output_domain``),
+    ``mixed_level_dense_axis_reduction``
+    (``unsupported_sparse_output_reduction``) and
+    ``mixed_level_merged_operand_chain`` (``unsupported_sparse_hierarchy``).
+    A dense result now takes a merge at any depth, a CSR copy with any drivers
+    but a dense row over a merged column is the rank-2 ordered assembly, and a
+    reduction into these layouts drains a sorted workspace or accumulates one
+    scalar per result cell.  Each cell is compiled on the automatic route and
+    then judged on the dense-below-compressed table's inputs: values against
+    float64 ``torch.einsum``, canonical level arrays, and stored coordinates
+    equal to what the operands' stored entries imply.
     """
 
+    from tests.test_scorch.test_loopir_dense_below_compressed_target import (
+        assert_statement_matches_pytorch,
+    )
     from scorch.compiler.scheduler import Schedule
 
     if family == "mixed_level_dense_axis_reduction":
@@ -919,7 +941,6 @@ def test_sparse_workspace_families_fail_closed_with_exact_codes(
         )
         bindings = (((6, 4, 5), torch.float32),)
         out_shape = (6, 5)
-        expected = "unsupported_sparse_output_reduction"
     elif family == "mixed_level_merged_operand_chain":
         i, j = IndexVar("i"), IndexVar("j")
         result = TensorVar("C", fmt="dd")
@@ -937,7 +958,6 @@ def test_sparse_workspace_families_fail_closed_with_exact_codes(
         )
         bindings = (((4, 5), torch.float32), ((4, 5), torch.float32))
         out_shape = (4, 5)
-        expected = "unsupported_sparse_hierarchy"
     elif family in ("dense_domain_to_csr", "sparse_row_to_csr"):
         i, j = IndexVar("i"), IndexVar("j")
         result = TensorVar("C", fmt="ds")
@@ -961,14 +981,13 @@ def test_sparse_workspace_families_fail_closed_with_exact_codes(
         ),
         requested_schedule=Schedule(),
     )
-    with pytest.raises(Exception) as error:
-        compile_cin_via_loopir(
-            cin,
-            out_shape,
-            bindings,
-            compile_options=options,
-        )
-    assert getattr(error.value, "defect").code == expected
+    compile_cin_via_loopir(
+        cin,
+        out_shape,
+        bindings,
+        compile_options=options,
+    )
+    assert_statement_matches_pytorch(cin, regblock_enabled)
 
 
 @pytest.mark.parametrize("regblock_enabled", [False, True])
@@ -1492,12 +1511,15 @@ def test_requested_schedules_route_through_the_strangler_entry():
     supported schedules compile (an identity order reproduces the
     unscheduled source exactly); illegal orders still fail closed at the
     shared scheduler boundary, including through the forced-schedule seam;
-    and a legacy-accepted order the migrated families cannot emit (the
-    recorded dense-ijk erratum, invalid C++ on the legacy path) fails
-    closed with the family's stable code."""
+    and the dense matmul requested in the order ``i, j, k`` compiles.  That
+    order reads ``B[k, j]`` against its storage order and used to fail closed
+    with ``unsupported_loop_order`` (the recorded dense-ijk erratum); an
+    all-dense operand is now read by its coordinates in any loop order.  The
+    kernel is the shipped compiler's for the same request with one comment
+    line more, and ``test_the_dense_matmul_requested_in_ijk_order_matches_pytorch``
+    runs it."""
 
     from scorch.compiler.diagnostics import InvalidSchedule
-    from scorch.compiler.loopir.lower_cin import LoopIRLoweringError
     from scorch.compiler.scheduler import Schedule, schedule_force
 
     options = CompileOptions.from_environment(
@@ -1546,17 +1568,50 @@ def test_requested_schedules_route_through_the_strangler_entry():
             ),
         ),
     )
-    erratum_options = CompileOptions.from_environment(
-        requested_schedule=Schedule(loop_order=["i", "j", "k"])
-    )
-    with pytest.raises(LoopIRLoweringError) as error:
-        compile_cin_via_loopir(
-            matmul,
+    erratum_bindings = [((3, 5), torch.float32), ((5, 4), torch.float32)]
+    for regblock_enabled in (False, True):
+        erratum_options = CompileOptions.from_environment(
+            requested_schedule=Schedule(loop_order=["i", "j", "k"])
+        ).with_regblock_enabled(regblock_enabled)
+        erratum_kernel = compile_cin_via_loopir(
+            copy.deepcopy(matmul),
             (3, 4),
-            [((3, 5), torch.float32), ((5, 4), torch.float32)],
+            erratum_bindings,
             compile_options=erratum_options,
         )
-    assert error.value.defect.code == "unsupported_loop_order"
+        assert erratum_kernel.schedule.plan.provenance == "explicit"
+        # ``B[k, j]`` is read by coordinate inside the ``k`` loop.
+        assert "int pB1 = pB0 * B1_size + j;" in erratum_kernel.cpp_source
+        shipped = legacy_generated_cpp(
+            copy.deepcopy(matmul),
+            (3, 4),
+            erratum_bindings,
+            compile_options=erratum_options,
+        )
+        changed = [
+            line
+            for line in difflib.ndiff(
+                shipped.splitlines(), erratum_kernel.cpp_source.splitlines()
+            )
+            if line[:2] in ("- ", "+ ")
+        ]
+        assert [(line[:2], line[2:].strip()) for line in changed] == [
+            ("+ ", "// Resolve dense coordinates")
+        ], regblock_enabled
+
+
+@pytest.mark.parametrize("arm", [0, 1], ids=["direct", "regblock"])
+def test_the_dense_matmul_requested_in_ijk_order_matches_pytorch(arm):
+    """``C[i,j] += A[i,k] * B[k,j]`` requested as ``i, j, k``, in float64 to 1e-12."""
+
+    kernel, _ = assert_program_matches_pytorch(
+        (("A", "dd", "ik", None), ("B", "dd", "kj", None)),
+        ("ij", "dd", None),
+        arm,
+        loop_order=("i", "j", "k"),
+    )
+    assert kernel.schedule.plan.provenance == "explicit"
+    assert not kernel.conversions
 
 
 # -- Phase-5 sparse families: compiled execution differentials ----------------

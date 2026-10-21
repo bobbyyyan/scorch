@@ -15,7 +15,10 @@ malformed storage. When they disagree the test prints both outcomes.
 The reference is a frozen copy on purpose: it is what shipped, and it must not be
 refactored alongside the production code it exists to check. Its ordering rule is the
 refactor line's (7fd9116): coordinates strictly increasing within a parent, so a repeated
-coordinate is rejected like a descent. That loop is copied as it shipped there.
+coordinate is rejected like a descent. That loop is copied as it shipped there. Its COO
+loop carries one later rule, added with it on purpose (2026-10-12, Bobby's decision): a
+coordinate tuple stored twice is refused as a RepeatedCoordinateError, where it used to
+pass.
 """
 
 import copy
@@ -27,9 +30,12 @@ import torch
 
 from scorch import TensorLayout
 from scorch.exceptions import (
+    COALESCE_ADVICE,
+    RepeatedCoordinateError,
     TensorDeviceError,
     TensorIndexError,
     TensorStorageError,
+    format_coordinate,
 )
 from scorch.format import LevelType
 from scorch import storage as storage_module
@@ -114,6 +120,13 @@ def reference_validate(
             if current < previous:
                 raise TensorIndexError(
                     "COO coordinates must be lexicographically ordered"
+                )
+            if current == previous:  # the repeat rule of 2026-10-12
+                raise RepeatedCoordinateError(
+                    f"COO coordinate {format_coordinate(current)} is stored at "
+                    f"positions {position - 1} and {position}; {COALESCE_ADVICE}",
+                    position,
+                    current,
                 )
         return
 
@@ -761,11 +774,13 @@ def test_the_screen_is_actually_being_consulted(monkeypatch):
 # --------------------------------------------------------------------------- #
 
 
-def lex(levels, count=None):
+def lex(levels, count=None, grain=None):
     if storage_module._NATIVE_LEX is None:
         pytest.skip("extension has no lexicographic screen")
     n = levels[0].numel() if count is None else count
-    return storage_module._NATIVE_LEX(list(levels), int(n))
+    if grain is None:
+        return storage_module._NATIVE_LEX(list(levels), int(n))
+    return storage_module._NATIVE_LEX(list(levels), int(n), int(grain))
 
 
 def i32(values):
@@ -786,10 +801,20 @@ def test_lex_screen_ignores_deeper_levels_once_a_level_decides():
     assert lex([i32([0, 0, 1, 2]), i32([0, 3, 1, 0])]) is False
 
 
-def test_lex_screen_treats_duplicates_as_ordered():
-    """Equal coordinates are not a descent, and the Python loop agrees (`<` not `<=`)."""
-    assert lex([i32([0, 0]), i32([1, 1])]) is False
-    assert lex([i32([0, 0, 0]), i32([2, 2, 2])]) is False
+@pytest.mark.parametrize("width", [torch.int32, torch.int64])
+def test_lex_screen_flags_a_repeated_coordinate(width):
+    """An equal tuple is one coordinate stored twice: flagged like a descent (`<=`), and
+    the Python loop agrees. Before 2026-10-12 both passed it."""
+
+    def levels(*rows):
+        return [torch.tensor(row, dtype=width) for row in rows]
+
+    assert lex(levels([0, 0], [1, 1])) is True
+    assert lex(levels([0, 0, 0], [2, 2, 2])) is True
+    assert lex(levels([0, 1, 1], [2, 0, 0])) is True  # the repeat is not at the start
+    assert lex(levels([4, 4])) is True  # one level
+    assert lex(levels([0, 0], [1, 1], [3, 3])) is True  # three levels, all tied
+    assert lex(levels([0, 0], [1, 1], [3, 4])) is False  # only the deepest level differs
 
 
 def test_lex_screen_on_a_single_level():
@@ -816,6 +841,143 @@ def test_lex_screen_declines_what_it_cannot_serve():
     assert lex([rows, cols.repeat(2)[::2]]) is True  # non-contiguous
 
 
+# The screen takes 256 positions at a time (native_abi.h, kLexBlock), reads a deeper level
+# only while some position of a block still equals its predecessor, and above its grain
+# hands each torch thread a share of the positions.  The cases below put a defect at every
+# position in turn, so at the first and the last position of every block and of every
+# share and inside the last, partial block, for each number of levels and each index width.
+
+
+def ascending_levels(depth, count, width, seed):
+    """``count`` strictly ascending coordinate tuples over ``depth`` levels.
+
+    The tuples are the digits of strictly increasing integers (base 5 below the first
+    level), so every level is the one that decides somewhere, and every level below the
+    first lies in 1..5 (a descent planted there stays a valid coordinate)."""
+
+    generator = torch.Generator().manual_seed(seed)
+    key = torch.cumsum(torch.randint(1, 4, (count,), generator=generator), 0)
+    levels = []
+    for _ in range(depth - 1):
+        levels.append((key % 5 + 1).to(width).contiguous())
+        key = torch.div(key, 5, rounding_mode="floor")
+    levels.append(key.to(width).contiguous())
+    return levels[::-1]
+
+
+def with_defect(base, position, descent):
+    """Fresh copies of ``base`` in which ``position`` repeats the tuple before it, or,
+    for ``descent``, is smaller than it at the last level."""
+
+    levels = [level.clone() for level in base]
+    for level in levels:
+        level[position] = level[position - 1]
+    if descent:
+        levels[-1][position] -= 1
+    return levels
+
+
+@pytest.mark.parametrize("threads", [1, 2, 3])
+@pytest.mark.parametrize("depth", [1, 2, 3, 4])
+@pytest.mark.parametrize("width", [torch.int32, torch.int64])
+def test_lex_screen_flags_one_defect_at_any_position(width, depth, threads):
+    count = 1030  # four whole blocks and a partial one
+    base = ascending_levels(depth, count, width, seed=depth)
+    before = torch.get_num_threads()
+    torch.set_num_threads(threads)
+    try:
+        for grain in (65536, 1):  # one share; a share per thread
+            assert lex([level.clone() for level in base], count, grain) is False
+            for position in range(1, count):
+                for descent in (False, True):
+                    flagged = lex(with_defect(base, position, descent), count, grain)
+                    assert flagged is True, (position, descent, grain)
+    finally:
+        torch.set_num_threads(before)
+
+
+@pytest.mark.parametrize("depth", [1, 2, 3, 4])
+@pytest.mark.parametrize("width", [torch.int32, torch.int64])
+def test_lex_screen_agrees_with_tuple_comparison_on_random_levels(width, depth):
+    """Valid arrays, sorted arrays that repeat tuples, and unordered ones, of lengths
+    around the block size, against the comparison the Python loop makes."""
+
+    generator = torch.Generator().manual_seed(40 + depth)
+    for trial in range(240):
+        count = int(torch.randint(2, 800, (1,), generator=generator))
+        if trial % 3 == 0:
+            levels = ascending_levels(depth, count, width, seed=1000 + trial)
+        else:
+            levels = [
+                torch.randint(0, 4, (count,), generator=generator).to(width)
+                for _ in range(depth)
+            ]
+            if trial % 3 == 1:  # sorted, with repeats
+                columns = [level.tolist() for level in levels]
+                order = sorted(range(count), key=lambda p: [c[p] for c in columns])
+                levels = [level[order].contiguous() for level in levels]
+        tuples = list(zip(*[level.tolist() for level in levels]))
+        want = any(later <= earlier for earlier, later in zip(tuples, tuples[1:]))
+        for grain in (65536, 1):
+            got = lex([level.clone() for level in levels], count, grain)
+            assert got is want, (trial, count, grain)
+
+
+@pytest.mark.parametrize("repeat_first", [True, False])
+@pytest.mark.parametrize("first", [255, 256, 257, 511, 512, 513, 1024, 1027])
+def test_the_first_defect_is_the_one_reported_wherever_it_sits_in_a_block(
+    first, repeat_first
+):
+    """The screen only says "go and look"; the check behind it reports, and what it
+    reports is the first defect by position, with the text it always had, whether that
+    defect is the last position of a block, the first of the next, or in the partial
+    block at the end.  A second defect of the other kind follows it."""
+
+    import scorch_ops
+
+    count, width = 1030, 5
+    base = ascending_levels(2, count, torch.int32, seed=3)
+    second = min(first + 300, count - 1)
+    levels = with_defect(base, first, descent=not repeat_first)
+    for level in levels:
+        level[second] = level[second - 1]
+    if repeat_first:
+        levels[-1][second] -= 1
+    rows, cols = levels
+    shape = (int(rows.max()) + 1, 8)
+    values = torch.ones(count, dtype=torch.float32)
+    dense = torch.ones(shape[1] * width, dtype=torch.float32)
+    if repeat_first:
+        coordinate = f"({int(rows[first])}, {int(cols[first])})"
+        text = (
+            rf"COO coordinate \({int(rows[first])}, {int(cols[first])}\) is stored at "
+            rf"positions {first - 1} and {first}; call coalesce\(\)"
+        )
+    else:
+        coordinate = None
+        text = rf"order decreases at position {first}\b"
+
+    with pytest.raises(RuntimeError, match=text):
+        scorch_ops.spmm_coo_float(
+            [shape[0], width],
+            list(shape),
+            [[rows.clone()], [cols.clone()]],
+            values,
+            [shape[1], width],
+            [[], []],
+            dense,
+        )
+    with pytest.raises(TensorIndexError) as raised:
+        STensor.from_components(shape, "oo", [[rows.clone()], [cols.clone()]], values)
+    if repeat_first:
+        assert isinstance(raised.value, RepeatedCoordinateError)
+        assert raised.value.position == first
+        assert coordinate in str(raised.value)
+    else:
+        assert not isinstance(raised.value, RepeatedCoordinateError)
+        assert "lexicographically ordered" in str(raised.value)
+
+
 @pytest.mark.parametrize("seed", range(16))
 def test_coo_validation_agrees_with_the_oracle_over_fuzzed_input(seed):
     """The differential comparison, on COO specifically, ordered and not."""
@@ -828,8 +990,25 @@ def test_coo_validation_agrees_with_the_oracle_over_fuzzed_input(seed):
     srows, scols = rows[order], cols[order]
     values = torch.rand(nnz, generator=generator)
     layout = layout_for("oo", (extent, extent))
+    # Sorted, repeats left in: refused at the first repeat, where there is one.
     check_same(layout, ((srows,), (scols,)), values, f"coo sorted {seed}")
     check_same(layout, ((rows,), (cols,)), values, f"coo as-generated {seed}")
+    # Sorted and distinct: well formed, and the comparison must reach "ok".
+    distinct = sorted(set(zip(srows.tolist(), scols.tolist())))
+    drows = torch.tensor([r for r, _ in distinct], dtype=torch.int32)
+    dcols = torch.tensor([c for _, c in distinct], dtype=torch.int32)
+    dvalues = torch.rand(len(distinct), generator=generator)
+    assert check_same(
+        layout, ((drows,), (dcols,)), dvalues, f"coo distinct {seed}"
+    ) == ("ok", "")
+    # One repeat at every position of the distinct tuples, alone: the tuple at `spot`
+    # becomes its predecessor's, and everything after it still ascends past both.
+    for spot in range(1, len(distinct)):
+        repeat_rows, repeat_cols = drows.clone(), dcols.clone()
+        repeat_rows[spot], repeat_cols[spot] = drows[spot - 1], dcols[spot - 1]
+        verdict = check_same(layout, ((repeat_rows,), (repeat_cols,)), dvalues,
+                             f"coo repeat {seed} at {spot}")
+        assert verdict[0] == "RepeatedCoordinateError", verdict
     # A real descent at every position, in each level in turn. Level 1 is the case
     # that matters most: it needs the level above it to tie, so a screen that stopped
     # after the first level would miss it.
@@ -858,10 +1037,10 @@ def test_the_coo_screen_is_actually_being_consulted(monkeypatch):
 
     nnz, extent = 64, 16
     generator = torch.Generator().manual_seed(5)
-    rows = torch.randint(0, extent, (nnz,), generator=generator, dtype=torch.int32)
-    cols = torch.randint(0, extent, (nnz,), generator=generator, dtype=torch.int32)
-    order = sorted(range(nnz), key=lambda i: (int(rows[i]), int(cols[i])))
-    rows, cols = rows[order], cols[order]
+    # Distinct cells in row-major order: a repeat is now a defect the screen flags.
+    cells, _ = torch.sort(torch.randperm(extent * extent, generator=generator)[:nnz])
+    rows = (cells // extent).to(torch.int32)
+    cols = (cells % extent).to(torch.int32)
     values = torch.rand(nnz, generator=generator)
     monkeypatch.setattr(torch.Tensor, "tolist", counting)
     _validate_index_storage(

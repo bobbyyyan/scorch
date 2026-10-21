@@ -25,6 +25,7 @@ from scorch.compiler.cin import (
     Workspace,
     WorkspaceAccess,
     _is_index_stmt_instance,
+    coordinate_result_driver,
 )
 from .cin_analysis import (
     _compile_options_at_cin_boundary,
@@ -1569,6 +1570,55 @@ class Scheduler:
         )
 
     @staticmethod
+    def loop_order_cost(
+        cin: CIN,
+        loop_order: Sequence[IndexId],
+        *,
+        transposed: Optional[CIN] = None,
+        compile_options: Optional[CompileOptions] = None,
+    ) -> float:
+        """The cost model's objective for visiting ``cin`` in ``loop_order``.
+
+        ``alpha * computation + beta * workspace + gamma * transposition``, the
+        quantity :meth:`cost_to_push` compares between two orders.  The
+        computation and workspace terms are those of ``cin``; the
+        transposition term counts the tensors of ``transposed`` (``cin`` when
+        omitted) stored against ``loop_order``.  A plan that converts operands
+        runs its kernel on the converted program and pays for converting the
+        original program's operands, so it passes the converted program as
+        ``cin`` and the original as ``transposed``.  Neither program is
+        modified.
+        """
+
+        _, costs = _scheduler_costs_at_boundary(None, compile_options)
+
+        def in_order(program: CIN) -> Tuple[CIN, List[IndexVar]]:
+            working = copy.deepcopy(program)
+            variables: Dict[IndexId, IndexVar] = {}
+            stmt = working
+            while isinstance(stmt, ForAll):
+                variables[stmt.index_var.index_id] = stmt.index_var
+                stmt = stmt.stmt
+            return working, [variables[index_id] for index_id in loop_order]
+
+        main, main_order = in_order(cin)
+        source, source_order = in_order(cin if transposed is None else transposed)
+        computation = Scheduler._compute_comp_cost(
+            cin=main, loop_order=main_order, costs=costs
+        )
+        workspace = Scheduler._compute_workspace_cost(
+            cin=main, loop_order=main_order, costs=costs
+        )
+        transposition = Scheduler._compute_transposition_cost(
+            cin=source, loop_order=source_order, costs=costs
+        )
+        return (
+            costs.alpha * computation
+            + costs.beta * workspace
+            + costs.gamma * transposition
+        )
+
+    @staticmethod
     def cost_to_push(
         cin: CIN,
         loop_order: List[IndexVar],
@@ -2233,7 +2283,7 @@ class Scheduler:
             size=k_tile_size
         )
 
-        accum_c = Workspace(name="accum_c", dim=1, dense=True)
+        accum_c = Workspace(name="accum_c", dim=1, dtype=C.dtype, dense=True)
 
         cin_stmt = ForAll(
             i,
@@ -2658,23 +2708,29 @@ class Scheduler:
                     a for a in _result_accesses if not isinstance(a.tensor, Workspace)
                 ]
                 if _non_ws:
-                    _result_ivs = set(iv.name for iv in _non_ws[0].get_index_vars())
                     _all_coo = all(
                         lt == LevelType.COORDINATE
                         for lt in _non_ws[0].get_tensor().get_level_types()
                     )
-                    # Check if an input tensor mirrors the output sparsity
+                    # Check if an input tensor mirrors the output sparsity.
+                    # Sharing the result's index variables is not enough: the
+                    # loops over them must walk that input's stored entries and
+                    # nothing else (``coordinate_result_driver``).  With a
+                    # dense ``x[a]`` and a sparse ``B[a,b]``, ``x`` has the
+                    # indices of ``C[a]`` but the loop over ``a`` walks ``B``;
+                    # left unordered, that program stored ``a`` once per stored
+                    # entry of ``B``.  It takes the workspace path like every
+                    # other reduction into a sparse result.
                     if _all_coo:
-                        _rhs_accesses = [
-                            a
-                            for a in cin.tensor_accesses
-                            if a not in _result_accesses and not a.is_workspace()
-                        ]
-                        for _rhs in _rhs_accesses:
-                            _rhs_ivs = set(iv.name for iv in _rhs.get_index_vars())
-                            if _rhs_ivs == _result_ivs:
-                                _needs_forced_reorder = False
-                                break
+                        _assignment: object = cin
+                        while isinstance(_assignment, ForAll):
+                            _assignment = _assignment.stmt
+                        if (
+                            isinstance(_assignment, TensorAssign)
+                            and coordinate_result_driver(_non_ws[0], _assignment.rhs)
+                            is not None
+                        ):
+                            _needs_forced_reorder = False
 
             if _needs_forced_reorder:
                 cin_ivar_getter = CINIndexVariablesGetter()
@@ -3258,6 +3314,9 @@ class Scheduler:
         schedule: Schedule,
         costs: Optional[_CostModelConstants] = None,
         compile_options: Optional[CompileOptions] = None,
+        *,
+        composed_order_candidate: bool = False,
+        dense_results_any_order: bool = False,
     ) -> ScheduledCIN:
         """Apply an explicit tuner schedule to a CIN loop nest.
 
@@ -3492,6 +3551,8 @@ class Scheduler:
                 tag=schedule.tag,
                 assembly=schedule.assembly,
                 accumulator=schedule.accumulator,
+                composed_order_candidate=composed_order_candidate,
+                dense_results_any_order=dense_results_any_order,
             )
             return ScheduledCIN(scheduled_cin, plan)
 
@@ -3595,13 +3656,35 @@ class Scheduler:
         costs: Optional[_CostModelConstants] = None,
         compile_options: Optional[CompileOptions] = None,
         compilation_context: Optional[CompilationContext] = None,
+        *,
+        composed_order_candidate: bool = False,
+        dense_results_any_order: bool = False,
     ) -> ScheduledCIN:
         """Pair detached semantic CIN with a verified stable-ID schedule.
 
         The legacy validator still performs private tree surgery. Its mutable
         result is discarded here and replayed only inside the lowering adapter.
+
+        ``composed_order_candidate`` is for a caller whose lowering accepts a
+        reduction innermost into a sparse result and requires every tensor in
+        storage order -- the typed LoopIR pipeline.  It lets an automatic plan
+        (an empty ``Schedule``) take the order composed before the forced reorder
+        when that order keeps every tensor in storage order and the forced one
+        does not; see :meth:`_originate_auto_plan`.  Legacy lowering cannot lower
+        those orders, so every other caller leaves it off and its plans are
+        unchanged.
+
+        ``dense_results_any_order`` is for a caller whose lowering writes an
+        all-dense result by its coordinates (the LoopIR pipeline): an automatic
+        plan may then visit such a result's levels out of storage order.  Legacy
+        lowering's dense-workspace consumers write at the workspace level as if
+        it were the result's last, so every other caller leaves it off.
         """
 
+        if type(composed_order_candidate) is not bool:
+            raise TypeError("composed_order_candidate must be an exact bool")
+        if type(dense_results_any_order) is not bool:
+            raise TypeError("dense_results_any_order must be an exact bool")
         _validate_schedule_structure(schedule)
         options, costs = _scheduler_costs_at_boundary(costs, compile_options)
         if compile_options is None and options.requested_schedule is None:
@@ -3635,6 +3718,8 @@ class Scheduler:
                         schedule,
                         costs=costs,
                         compile_options=options,
+                        composed_order_candidate=composed_order_candidate,
+                        dense_results_any_order=dense_results_any_order,
                     )
                 except (InvalidSchedule, UnsupportedFeature, VerificationError):
                     raise
@@ -3868,6 +3953,7 @@ class Scheduler:
         require_complete_plan: bool,
         assembly: Optional[str] = None,
         accumulator: Optional[str] = None,
+        dense_results_any_order: bool = False,
     ) -> Tuple[CIN, LoopPlan]:
         """Apply one automatic order and verify the plan that records it.
 
@@ -3906,6 +3992,7 @@ class Scheduler:
                 provenance="auto",
                 tag=tag,
             ),
+            dense_results_any_order=dense_results_any_order,
         )
         return scheduled_cin, plan
 
@@ -3921,6 +4008,8 @@ class Scheduler:
         require_complete_plan: bool = False,
         assembly: Optional[str] = None,
         accumulator: Optional[str] = None,
+        composed_order_candidate: bool = False,
+        dense_results_any_order: bool = False,
     ) -> Tuple[CIN, LoopPlan]:
         """Originate one verified automatic plan at a plan-producing boundary.
 
@@ -3945,6 +4034,32 @@ class Scheduler:
         * It runs only after a refusal, so a program that produces generated
           code today cannot reach it; and if the pre-forced order is refused
           too, the original refusal is the one reported.
+
+        ``composed_order_candidate`` adds the pre-forced order as a second
+        candidate for a lowering that can use it (the typed LoopIR pipeline).
+        The plan's legality rules check the parent-before-child order only of
+        tensors with a compressed level, while that lowering requires every
+        tensor's storage order, so a forced order that reads an all-dense
+        operand against its storage order verifies here and is refused there
+        (``unsupported_loop_order``) -- SDDMM into CSR or DCSR is one such
+        program.  The verified forced plan is kept unless all of these hold:
+        the forced reorder changed the order, the forced order visits some
+        tensor's levels out of storage order, the pre-forced order visits every
+        tensor's levels in storage order, and the plan re-originated from the
+        pre-forced order verifies.  Then that plan is returned instead.  The
+        forced order stays the first candidate and is returned whenever any
+        condition fails, so this adds an order beside it and never removes one.
+
+        The cost model can also compose an order that reads a dense operand
+        against its storage order on its own, without the forced reorder; which
+        order it composes then depends on the order of the caller's loop nest.
+        When neither the forced nor the pre-forced order visits every tensor in
+        storage order, the flag adds a third candidate: the pre-forced order
+        re-sorted, as little as possible, so that it does
+        (:meth:`_storage_order_sort`).  It is taken when it exists and its plan
+        verifies.  LoopIR lowering refuses every order that breaks a tensor's
+        storage order, so this candidate can only replace an order that
+        pipeline would refuse.  Off, the origin is exactly as described above.
         """
 
         policy = options.scheduler if scheduler_policy is None else scheduler_policy
@@ -3952,8 +4067,28 @@ class Scheduler:
         logical_order = Scheduler.select_loop_order(
             working, costs=costs, pre_forced_order=pre_forced
         )
+        reordered = [index_var.index_id for index_var in pre_forced] != [
+            index_var.index_id for index_var in logical_order
+        ]
+
+        def reoriginate(in_storage_order: bool) -> Optional[Tuple[CIN, LoopPlan]]:
+            return Scheduler._from_pre_forced_order(
+                plan_source,
+                options,
+                costs,
+                policy,
+                tag=tag,
+                require_complete_plan=require_complete_plan,
+                assembly=assembly,
+                accumulator=accumulator,
+                in_storage_order=in_storage_order,
+                dense_results_any_order=dense_results_any_order,
+            )
+
+        forced: Optional[Tuple[CIN, LoopPlan]] = None
+        refusal: Optional[InvalidSchedule] = None
         try:
-            return Scheduler._verified_auto_plan(
+            forced = Scheduler._verified_auto_plan(
                 working,
                 plan_source,
                 logical_order,
@@ -3963,31 +4098,145 @@ class Scheduler:
                 require_complete_plan=require_complete_plan,
                 assembly=assembly,
                 accumulator=accumulator,
+                dense_results_any_order=dense_results_any_order,
             )
-        except InvalidSchedule as refusal:
-            if not Scheduler._refused_for_order_legality(refusal) or [
-                index_var.index_id for index_var in pre_forced
-            ] == [index_var.index_id for index_var in logical_order]:
+        except InvalidSchedule as error:
+            # Only a refusal for an order rule can be answered by another order.
+            if not Scheduler._refused_for_order_legality(error) or (
+                not reordered and not composed_order_candidate
+            ):
                 raise
-            repaired = copy.deepcopy(plan_source)
-            repaired_order: List[IndexVar] = []
-            Scheduler.select_loop_order(
-                repaired, costs=costs, pre_forced_order=repaired_order
+            refusal = error
+        if composed_order_candidate:
+            if forced is not None and Scheduler._visits_every_tensor_in_storage_order(
+                plan_source, logical_order
+            ):
+                return forced
+            composed_in_storage_order = Scheduler._visits_every_tensor_in_storage_order(
+                plan_source, pre_forced
             )
-            try:
-                return Scheduler._verified_auto_plan(
-                    repaired,
-                    plan_source,
-                    repaired_order,
-                    options,
-                    policy,
-                    tag=tag,
-                    require_complete_plan=require_complete_plan,
-                    assembly=assembly,
-                    accumulator=accumulator,
-                )
-            except (InvalidSchedule, UnsupportedFeature, VerificationError):
-                raise refusal
+            if reordered and composed_in_storage_order:
+                composed = reoriginate(False)
+                if composed is not None:
+                    return composed
+            if not composed_in_storage_order:
+                sorted_plan = reoriginate(True)
+                if sorted_plan is not None:
+                    return sorted_plan
+        if forced is not None:
+            return forced
+        assert refusal is not None
+        if not reordered:
+            raise refusal
+        repaired = reoriginate(False)
+        if repaired is None:
+            raise refusal
+        return repaired
+
+    @staticmethod
+    def _from_pre_forced_order(
+        plan_source: CIN,
+        options: CompileOptions,
+        costs: _CostModelConstants,
+        policy: SchedulerPolicy,
+        *,
+        tag: str,
+        require_complete_plan: bool,
+        assembly: Optional[str],
+        accumulator: Optional[str],
+        in_storage_order: bool = False,
+        dense_results_any_order: bool = False,
+    ) -> Optional[Tuple[CIN, LoopPlan]]:
+        """The verified plan of the pre-forced order on a fresh copy, or None.
+
+        With ``in_storage_order`` the order is first re-sorted by
+        :meth:`_storage_order_sort`; None also when no such order exists.
+        """
+
+        repaired = copy.deepcopy(plan_source)
+        repaired_order: List[IndexVar] = []
+        Scheduler.select_loop_order(
+            repaired, costs=costs, pre_forced_order=repaired_order
+        )
+        if in_storage_order:
+            resorted = Scheduler._storage_order_sort(repaired, repaired_order)
+            if resorted is None:
+                return None
+            repaired_order = resorted
+        try:
+            return Scheduler._verified_auto_plan(
+                repaired,
+                plan_source,
+                repaired_order,
+                options,
+                policy,
+                tag=tag,
+                require_complete_plan=require_complete_plan,
+                assembly=assembly,
+                accumulator=accumulator,
+                dense_results_any_order=dense_results_any_order,
+            )
+        except (InvalidSchedule, UnsupportedFeature, VerificationError):
+            return None
+
+    @staticmethod
+    def _storage_order_sort(
+        cin: CIN, order: Sequence[IndexVar]
+    ) -> Optional[List[IndexVar]]:
+        """``order`` re-sorted so that it binds every tensor's levels in storage order.
+
+        A stable topological sort: each tensor's storage order (its access's
+        index variables permuted by its mode order) requires each level's
+        variable before the next level's, and among the variables whose
+        predecessors are all placed, the one earliest in ``order`` goes next.
+        So an order that already satisfies every tensor comes back unchanged,
+        and otherwise each variable moves only as far as a storage order forces
+        it.  None when the tensors' storage orders contradict one another.
+        """
+
+        before: Dict[Any, Set[Any]] = {index_var.index_id: set() for index_var in order}
+        for access in cin.tensor_accesses:
+            levels = [
+                index_var.index_id
+                for index_var in access.get_sorted_index_vars()
+                if index_var.index_id in before
+            ]
+            for parent, child in zip(levels, levels[1:]):
+                before[child].add(parent)
+        placed: Set[Any] = set()
+        remaining = list(order)
+        resorted: List[IndexVar] = []
+        while remaining:
+            ready = next((v for v in remaining if before[v.index_id] <= placed), None)
+            if ready is None:
+                return None
+            remaining.remove(ready)
+            resorted.append(ready)
+            placed.add(ready.index_id)
+        return resorted
+
+    @staticmethod
+    def _visits_every_tensor_in_storage_order(
+        cin: CIN, order: Sequence[IndexVar]
+    ) -> bool:
+        """Whether ``order`` binds each tensor's level coordinates outermost first.
+
+        A tensor's storage order is its access's index variables permuted by its
+        mode order.  An order that binds a deeper level's variable above a
+        shallower one's reads that tensor against its storage order.  Variables
+        the order does not bind are ignored.
+        """
+
+        position = {index_var.index_id: n for n, index_var in enumerate(order)}
+        for access in cin.tensor_accesses:
+            visited = [
+                position[index_var.index_id]
+                for index_var in access.get_sorted_index_vars()
+                if index_var.index_id in position
+            ]
+            if visited != sorted(visited):
+                return False
+        return True
 
     @staticmethod
     def _apply_auto_order_owned(

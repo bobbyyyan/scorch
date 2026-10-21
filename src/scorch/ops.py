@@ -1,9 +1,22 @@
 import os
+import re
 import sys
 import time
 from contextlib import contextmanager
 from dataclasses import dataclass, replace
-from typing import Any, Dict, Iterator, List, Optional, Sequence, Tuple, Union, cast
+from typing import (
+    Any,
+    Callable,
+    Dict,
+    Iterator,
+    List,
+    Mapping,
+    Optional,
+    Sequence,
+    Tuple,
+    Union,
+    cast,
+)
 
 import scorch_ops as _scorch_ops
 import torch
@@ -41,9 +54,20 @@ from .compiler.compilation_context import (
     CompilerStageToken,
     CompilationContext,
 )
-from .exceptions import CompileSpecError, TensorTypeError, TensorValidationError
+from .exceptions import (
+    CompileSpecError,
+    EinsumRepeatedIndexError,
+    TensorTypeError,
+    raise_if_native_repeat,
+)
 from .format import TensorFormat, LevelFormat, LevelType
-from .layout import TensorLayout, TensorSpec
+from .format import conversion_format, stores_only_its_entries
+from .layout import (
+    TensorLayout,
+    TensorSpec,
+    common_value_dtype,
+    require_same_value_dtype,
+)
 from .plan import ENABLED_CELL as _PLAN_ENABLED
 from .plan import GENERATION as _PLAN_GENERATION
 from .plan import PLANS_ATTR as _PLANS_ATTR
@@ -366,6 +390,35 @@ _EXPR_LABELS_CACHE: Dict[str, Tuple[List[List[str]], List[str]]] = {}
 _EXPR_LABELS_CACHE_MAX = 512
 
 
+def _refuse_repeated_index(input_groups: Sequence[str], result_expression: str) -> None:
+    """Raise ``EinsumRepeatedIndexError`` if one term of an expression repeats a letter.
+
+    An operand term that repeats a letter (``"ii->i"``, ``"iij->ij"``) asks for that
+    operand's diagonal.  No kernel computes one: the loop-order sort and the operand
+    relayout both take a term's letters to be distinct, so the expression is refused
+    here, before either sees it.  A result term that repeats a letter has no meaning.
+    """
+    for operand, group in enumerate(input_groups):
+        if len(set(group)) != len(group):
+            index = next(label for label in group if group.count(label) > 1)
+            raise EinsumRepeatedIndexError(
+                f"einsum operand {operand} repeats index {index!r} in its term "
+                f"{group!r}; the diagonal of an operand is not computed",
+                operand,
+                index,
+            )
+    if len(set(result_expression)) != len(result_expression):
+        index = next(
+            label for label in result_expression if result_expression.count(label) > 1
+        )
+        raise EinsumRepeatedIndexError(
+            f"einsum result labels must be unique; {result_expression!r} repeats "
+            f"index {index!r}",
+            None,
+            index,
+        )
+
+
 def _validated_labels(
     expression: str,
     input_groups: Sequence[str],
@@ -390,8 +443,7 @@ def _validated_labels(
         label.isascii() and label.isalpha() for label in result_expression
     ):
         raise CompileSpecError("einsum result labels must be non-empty ASCII letters")
-    if len(set(result_expression)) != len(result_expression):
-        raise CompileSpecError("einsum result labels must be unique")
+    _refuse_repeated_index(input_groups, result_expression)
     input_labels = set("".join(input_groups))
     unknown_result_labels = [
         label for label in result_expression if label not in input_labels
@@ -435,6 +487,155 @@ def _logical_index_sizes(
                 )
             index_to_size[index_str] = size
     return index_to_size
+
+
+def _storage_letters(tensor_format: TensorFormat) -> str:
+    """One letter per storage level: ``"d"`` dense, ``"s"`` any level that stores
+    only the coordinates put in it (compressed, coordinate or singleton)."""
+
+    return "".join(
+        "d" if level_type is LevelType.DENSE else "s"
+        for level_type in tensor_format.get_level_types()
+    )
+
+
+@dataclass(frozen=True)
+class _OperandRelayout:
+    """How einsum relays one operand; see :func:`_einsum_operand_relayout`.
+
+    ``mode_orders`` are the storage orders the operand is moved to, in turn
+    (empty: it stays as it is stored).  ``format_letters`` are its letters after
+    the last move, or ``None`` to keep its own format.  ``keep_every_stored_entry``
+    copies every stored entry whatever its value; otherwise a move keeps only the
+    entries whose value is nonzero, as the relayout always has.
+    """
+
+    mode_orders: Tuple[Tuple[int, ...], ...]
+    format_letters: Optional[str]
+    keep_every_stored_entry: bool
+
+    def move_kwargs(self) -> Dict[str, Any]:
+        """The keyword arguments :func:`_with_compiler_mode_order` takes for a move."""
+
+        if self.format_letters is None and not self.keep_every_stored_entry:
+            return {}
+        return {
+            "format_letters": self.format_letters,
+            "keep_every_stored_entry": self.keep_every_stored_entry,
+        }
+
+
+def _einsum_operand_relayout(
+    operand: int,
+    operand_indices: Sequence[Sequence[str]],
+    operand_letters: Sequence[str],
+    input_orders: Sequence[Sequence[int]],
+    aligned_orders: Sequence[Sequence[int]],
+    result_indices: Sequence[str],
+    result_letters: str,
+    result_order: Sequence[int],
+    extents: Mapping[str, int],
+) -> _OperandRelayout:
+    """Decide how einsum moves operand ``operand`` to the storage order its kernel reads.
+
+    Metadata only.  For every operand: its index letters (``operand_indices``,
+    logical order), its storage letters (``operand_letters``, one per storage
+    level, from :func:`_storage_letters`) and its storage order on entry
+    (``input_orders``, storage level -> logical mode).  For this operand, the
+    orders einsum's alignment moves it to, in turn (``aligned_orders``: the
+    topological order, then the selected loop order's).  For the result: its index
+    letters, storage letters and storage order.  ``extents`` maps each index
+    letter to its extent.
+
+    What a move stores.  For a tensor stored with letters ``L`` under an order,
+    let ``A`` be the modes at or above its deepest compressed level and ``D`` the
+    modes below it (all on dense levels).  It stores exactly the projection of
+    its entries onto ``A`` times every cell of ``D``: a dense level stores every
+    cell under each stored parent.  A move keeps ``L`` by storage position.  So
+    after moves to orders ``o1, o2, ...`` the operand stores cells that differ
+    from a cell it stored only in the modes
+    ``F = (D(o1) | D(o2) | ...) - D(input order)``.  A dense level of extent 1
+    has one cell, so a mode of extent 1 adds no cell.
+
+    When an added cell changes the result.  A mode ``m`` is exposed when its value
+    can decide a stored result coordinate: ``m`` is a result mode at or above the
+    result's deepest compressed level (result storage order), or another operand
+    holds ``m`` at or above its own deepest compressed level (its input order; it
+    may store only some values of ``m``).  If no mode of ``F`` with extent >= 2 is
+    exposed, any combination of entries that reaches a result coordinate through
+    an added cell reaches the same coordinate through the stored cell it differs
+    from, so the result's stored coordinates are unchanged; ``F`` of two operands
+    are disjoint whenever neither is converted (a mode in both would be exposed to
+    each by the other), so the substitution is consistent.  If one is exposed, an
+    input exists whose result stores a coordinate the entries do not imply.  When
+    some index has extent 0 no operand holding it stores an entry and the
+    iteration space is empty, so nothing is added either.
+
+    The decision.
+      - The operand does not move: nothing to decide.
+      - The result has no compressed level (it stores every cell), or the operand
+        has none (it stores every cell, so a zero value is a cell like any
+        other): the moves einsum always made, letters kept, nonzero values
+        copied.  Kernel text is unchanged.
+      - Otherwise every stored entry is copied, whatever its value: copying only
+        nonzero values drops entries the operand stores explicitly as zero, and
+        the result then misses the coordinates they imply.
+      - Converted, when an exposed mode of ``F`` has extent >= 2 and no index has
+        extent 0: one move from the input order to the last aligned order, with
+        letters :func:`scorch.format.conversion_format` (every level compressed),
+        which stores exactly the operand's entries; the main kernel is compiled
+        for those letters.  The operand moves once because a move that keeps
+        ``L`` adds cells a later conversion would keep.  If the last aligned order
+        is the input order, it does not move at all.
+      - Otherwise the moves einsum always made, letters kept.
+    """
+
+    letters = operand_letters[operand]
+    input_order = tuple(input_orders[operand])
+    moves: List[Tuple[int, ...]] = []
+    current = input_order
+    for aligned_order in aligned_orders:
+        order = tuple(aligned_order)
+        if order != current:
+            moves.append(order)
+            current = order
+    if not moves:
+        return _OperandRelayout((), None, False)
+    if "s" not in result_letters or "s" not in letters:
+        return _OperandRelayout(tuple(moves), None, False)
+    if stores_only_its_entries(letters) or any(
+        extent == 0 for extent in extents.values()
+    ):
+        return _OperandRelayout(tuple(moves), None, True)
+
+    def above_and_below(
+        indices: Sequence[str], level_letters: str, order: Sequence[int]
+    ) -> Tuple[set, set]:
+        deepest = max(
+            (level for level, letter in enumerate(level_letters) if letter != "d"),
+            default=-1,
+        )
+        modes = [indices[mode] for mode in order]
+        return set(modes[: deepest + 1]), set(modes[deepest + 1 :])
+
+    indices = operand_indices[operand]
+    input_below = above_and_below(indices, letters, input_order)[1]
+    added = (
+        set().union(*(above_and_below(indices, letters, order)[1] for order in moves))
+        - input_below
+    )
+    exposed = above_and_below(result_indices, result_letters, result_order)[0]
+    for other, other_indices in enumerate(operand_indices):
+        if other != operand:
+            exposed |= above_and_below(
+                other_indices, operand_letters[other], input_orders[other]
+            )[0]
+    if any(extents[mode] >= 2 for mode in added & exposed):
+        final_order = moves[-1]
+        if final_order == input_order:
+            return _OperandRelayout((), None, False)
+        return _OperandRelayout((final_order,), conversion_format(letters), True)
+    return _OperandRelayout(tuple(moves), None, True)
 
 
 def _bind_frontend_operand_mode_orders(
@@ -531,20 +732,132 @@ def _with_compiler_mode_order(
     mode_order: Sequence[int],
     compile_options: CompileOptions,
     compilation_context: Optional[CompilationContext] = None,
+    *,
+    format_letters: Optional[str] = None,
+    keep_every_stored_entry: bool = False,
 ) -> Union[STensor, TensorSpec]:
-    """Relayout a runtime tensor or functionally update a compile-only spec."""
+    """Relayout a runtime tensor or functionally update a compile-only spec.
+
+    ``format_letters`` and ``keep_every_stored_entry`` come from
+    :func:`_einsum_operand_relayout`; the defaults are the relayout as it always
+    was (letters kept by storage position, nonzero values copied).
+    """
+    target_format = None if format_letters is None else parse_format(format_letters)
     if isinstance(tensor, TensorSpec):
-        return tensor.with_mode_order(mode_order)
+        return tensor.with_mode_order(mode_order, tensor_format=target_format)
     result = tensor.copy()
     conversion_options, conversion_context = _conversion_compile_inputs(
         compile_options, compilation_context
     )
-    result.change_mode_order(
-        list(mode_order),
-        _compile_options=conversion_options,
-        _compilation_context=conversion_context,
-    )
+    if target_format is None and not keep_every_stored_entry:
+        result.change_mode_order(
+            list(mode_order),
+            _compile_options=conversion_options,
+            _compilation_context=conversion_context,
+        )
+    else:
+        result.change_mode_order(
+            list(mode_order),
+            _compile_options=conversion_options,
+            _compilation_context=conversion_context,
+            _target_format=target_format,
+            _keep_every_stored_entry=keep_every_stored_entry,
+        )
     return result
+
+
+def _first_einsum_operand_moves(
+    tensors: Sequence[Union[STensor, TensorSpec]],
+    operand_letters: Sequence[str],
+    compiler_mode_orders: Sequence[Sequence[int]],
+    compile_options: CompileOptions,
+    compilation_context: Optional[CompilationContext],
+) -> Tuple[Union[STensor, TensorSpec], ...]:
+    """The first of einsum's two alignment moves, for the operands that make it now.
+
+    An operand with no compressed level moves to the topological order before the
+    loop order is selected, as it always has; that is what
+    :func:`_einsum_operand_relayout` answers for it whatever the orders.  An operand
+    with a compressed level stays as it is: how it moves depends on the selected
+    order, and selection reads only metadata (:func:`_finish_einsum_operand_moves`).
+    """
+
+    return tuple(
+        (
+            tensor
+            if "s" in operand_letters[tensor_index]
+            else _with_compiler_mode_order(
+                tensor,
+                compiler_mode_orders[tensor_index],
+                compile_options,
+                compilation_context,
+            )
+        )
+        for tensor_index, tensor in enumerate(tensors)
+    )
+
+
+def _finish_einsum_operand_moves(
+    tensors: Sequence[Union[STensor, TensorSpec]],
+    tensor_vars: Sequence[TensorVar],
+    input_index_strs: Sequence[Sequence[str]],
+    operand_letters: Sequence[str],
+    input_orders: Sequence[Sequence[int]],
+    compiler_mode_orders: Sequence[Sequence[int]],
+    desired_mode_orders: Sequence[Sequence[int]],
+    result_index_strs: Sequence[str],
+    result_letters: str,
+    result_mode_order: Sequence[int],
+    extents: Mapping[str, int],
+    compile_options: CompileOptions,
+    compilation_context: Optional[CompilationContext],
+) -> Tuple[Tuple[Union[STensor, TensorSpec], ...], List[_OperandRelayout]]:
+    """Decide every operand's relayout and make the moves that remain.
+
+    An operand with a compressed level makes the moves
+    :func:`_einsum_operand_relayout` decides; when it is converted, its TensorVar
+    takes the converted format, so the kernel is compiled for the letters the operand
+    is stored with.  An operand with no compressed level makes the second legacy move,
+    to the selected order.  Returns the operands and the decisions, which the
+    dispatch cache keeps for the calls it serves.
+    """
+
+    operand_relayouts = [
+        _einsum_operand_relayout(
+            tensor_index,
+            input_index_strs,
+            operand_letters,
+            input_orders,
+            (compiler_mode_orders[tensor_index], desired_mode_order),
+            result_index_strs,
+            result_letters,
+            result_mode_order,
+            extents,
+        )
+        for tensor_index, desired_mode_order in enumerate(desired_mode_orders)
+    ]
+    moved = list(tensors)
+    for tensor_index, desired_mode_order in enumerate(desired_mode_orders):
+        relayout = operand_relayouts[tensor_index]
+        if "s" in operand_letters[tensor_index]:
+            for mode_order in relayout.mode_orders:
+                moved[tensor_index] = _with_compiler_mode_order(
+                    moved[tensor_index],
+                    mode_order,
+                    compile_options,
+                    compilation_context,
+                    **relayout.move_kwargs(),
+                )
+            if relayout.format_letters is not None:
+                tensor_vars[tensor_index].format = moved[tensor_index].format
+        elif list(moved[tensor_index].mode_order) != list(desired_mode_order):
+            moved[tensor_index] = _with_compiler_mode_order(
+                moved[tensor_index],
+                desired_mode_order,
+                compile_options,
+                compilation_context,
+            )
+    return tuple(moved), operand_relayouts
 
 
 # The drop-in CSR@dense SpMM symbols: one kernel (spmm_csr_v2_core) instantiated at
@@ -669,7 +982,16 @@ def spmv(
             output_format = parse_format(output_format)
 
         result_shape = (a.shape[0],)
-        y = TensorVar("y", shape=result_shape, fmt=output_format, dtype=a.dtype)
+        # One value dtype, as torch requires of a product (it raises RuntimeError
+        # and does not promote); a mixed pair raises before anything is built.
+        y = TensorVar(
+            "y",
+            shape=result_shape,
+            fmt=output_format,
+            dtype=require_same_value_dtype(
+                a.dtype, b.dtype, operation="matrix-vector product"
+            ),
+        )
         A = TensorVar("A", shape=a.shape, fmt=a.format, dtype=a.dtype)
         x = TensorVar("x", shape=b.shape, fmt=b.format, dtype=b.dtype)
 
@@ -679,6 +1001,7 @@ def spmv(
         workspace = Workspace(
             name="wksp",
             dim=0,
+            dtype=y.dtype,
         )
 
         cin_stmt: IndexStmt = ForAll(
@@ -743,7 +1066,11 @@ def spmv(
         args.append(tensor.values)  # type: ignore
 
     start_time = time.time()
-    result_cpp = module.evaluate(*args)
+    try:
+        result_cpp = module.evaluate(*args)
+    except RuntimeError as error:
+        raise_if_native_repeat(error)
+        raise
     end_time = time.time()
     eval_time = end_time - start_time
     if "time_dict" in kwargs:
@@ -978,6 +1305,17 @@ def _run_torch_operand_plan(a: torch.Tensor, b: torch.Tensor, key: Any) -> Any:
     )
 
 
+def _require_one_product_dtype(a: object, b: object) -> None:
+    """Raise ``OperandDtypeMismatchError`` when ``matmul``'s operands differ in dtype.
+
+    A separate function so ``matmul`` stays within the project's complexity bound.
+    """
+
+    a_dtype, b_dtype = getattr(a, "dtype", None), getattr(b, "dtype", None)
+    if a_dtype != b_dtype and a_dtype is not None and b_dtype is not None:
+        require_same_value_dtype(a_dtype, b_dtype, operation="matmul")
+
+
 def matmul(
     a: Union[torch.Tensor, STensor],
     b: Union[torch.Tensor, STensor],
@@ -1132,6 +1470,12 @@ def matmul(
         return proxy.tracer.create_proxy(
             "call_function", matmul, (a, b), kwargs
         )  # type: ignore[return-value]
+
+    # A product's operands hold one value dtype: torch raises RuntimeError for a mixed
+    # pair and does not promote, so this raises the same, before anything below looks
+    # up or builds a kernel (autograd.py, plans, prebuilt kernels, spmv, einsum).  Two
+    # dense torch tensors were handed to torch above, which raises it itself.
+    _require_one_product_dtype(a, b)
 
     plan_via = None
     # autograd.py next (autograd.serve): a product a gradient is wanted through is recorded
@@ -2011,30 +2355,210 @@ def _regblock_free_size_expr(row_loop: llir.ForLoop) -> Optional[llir.Expr]:
     return _walk(getattr(row_loop, "body", None) or [])
 
 
+# The statements that introduce a name: the only kind `_stitch_regblock_dual_path`
+# moves from the baseline function's scope into the else branch ahead of the loop.
+_CARRIED_DECLARATION_TYPES = (
+    llir.VarInit,
+    llir.VarDecl,
+    llir.DirectInit,
+    llir.FixedStackArrayDecl,
+)
+_LAYOUT_ONLY_TYPES = (llir.BlankLine, llir.Comment)
+_CPP_IDENTIFIER = re.compile(r"[A-Za-z_]\w*")
+
+
+def _is_compile_time_constant(stmt: llir.Stmt) -> bool:
+    """Whether `stmt` declares a `constexpr int`, the form of a tile width."""
+
+    return type(stmt) is llir.VarInit and stmt.var.type is llir.DataType.CONSTEXPR_INT
+
+
+def _carried_declaration_name(stmt: llir.Stmt) -> Optional[str]:
+    """The name a carried statement declares, or None when it is not a declaration."""
+
+    if type(stmt) not in _CARRIED_DECLARATION_TYPES:
+        return None
+    if type(stmt) is llir.FixedStackArrayDecl:
+        name = stmt.name
+    else:
+        name = cast(llir.VarInit, stmt).var.name
+    return name if type(name) is str and name.isidentifier() else None
+
+
+def _baseline_statements_for_else_branch(
+    rb_body: List[llir.Stmt],
+    idx_rb: int,
+    base_body: List[llir.Stmt],
+    idx_base: int,
+    compile_options: Optional[CompileOptions] = None,
+) -> Optional[Tuple[List[llir.Stmt], List[llir.Stmt]]]:
+    """The baseline function's own function-scope statements, to go around its loop.
+
+    The stitched kernel keeps the register-block function's statements and takes
+    the loop from the baseline function, so anything else the baseline function
+    declares at function scope for that loop has to be carried with it.  A
+    baseline nest whose outermost loop is the tile loop over a reduced index has
+    no loop a parallel region can own, so its dense workspace is declared
+    serially ahead of the loop (`CINLowerer._place_unplaced_workspace_clusters`).
+    `einsum('ab,bc->ac', A dd, B ds, format='dd')` is such a nest: the stitch
+    took the loop alone, the else branch used `wksp` with no declaration, and the
+    kernel did not build at any extent.
+
+    Returns `(before, after)`, the statements to emit inside the else branch
+    ahead of and behind the baseline loop, where only that loop sees them.
+    Returns None when the two-branch kernel cannot be formed with every name the
+    baseline loop reads declared as the baseline function declares it:
+
+    - each baseline statement is either emitted identically by the
+      register-block function on the same side of its loop and in the same order
+      (the stitched kernel then already has it at function scope), or carried;
+    - a compile-time constant both functions declare under one name is the
+      exception: it is not carried, and the else branch reads the register-block
+      function's value, as it always has.  The two nests name their tile widths
+      alike (`kTile_k`, 8 for the register-block nest and 32 for the baseline
+      one), so every stitched kernel whose baseline nest is tiled runs its else
+      branch 8 wide.  Carrying the baseline's own width would change that for
+      kernels that build today -- a schedule change, to be judged by a runtime
+      measurement and not folded into this repair;
+    - the carried statements are the ones next to the loop: carrying a statement
+      past one that stays would reorder the two;
+    - a statement carried ahead of the loop is a declaration, and no statement
+      that stays mentions the name it declares;
+    - a statement carried behind the loop mentions a carried name: it closes
+      what a carried declaration opened.
+
+    "Identical" is by emitted C++.  The same code generator renders the stitched
+    kernel, so two statements with one rendering are one statement in it: the
+    comparison renders under the compilation's own `compile_options`, like every
+    other stage of it.  Comments and blank lines are not compared.
+    """
+
+    lowerer = LLIRLowerer(compile_options=compile_options)
+    rb_constants = {
+        cast(llir.VarInit, statement).var.name
+        for statement in rb_body[:idx_rb]
+        if _is_compile_time_constant(statement)
+    }
+
+    def stays_out(statement: llir.Stmt) -> bool:
+        """Not compared: layout, or a constant the first function names too."""
+
+        return type(statement) in _LAYOUT_ONLY_TYPES or (
+            _is_compile_time_constant(statement)
+            and cast(llir.VarInit, statement).var.name in rb_constants
+        )
+
+    def rendered(statements: List[llir.Stmt]) -> List[Tuple[int, str]]:
+        return [
+            (position, lowerer.lower_llir(statement).strip())
+            for position, statement in enumerate(statements)
+            if not stays_out(statement)
+        ]
+
+    def without_counterpart(
+        base_side: List[llir.Stmt], rb_side: List[llir.Stmt]
+    ) -> List[int]:
+        rb_texts = [text for _, text in rendered(rb_side)]
+        cursor, missing = 0, []
+        for position, text in rendered(base_side):
+            try:
+                cursor = rb_texts.index(text, cursor) + 1
+            except ValueError:
+                missing.append(position)
+        return missing
+
+    base_before = list(base_body[:idx_base])
+    base_after = list(base_body[idx_base + 1 :])
+    missing_before = without_counterpart(base_before, list(rb_body[:idx_rb]))
+    missing_after = without_counterpart(base_after, list(rb_body[idx_rb + 1 :]))
+
+    before: List[llir.Stmt] = []
+    if missing_before:
+        start = missing_before[0]
+        next_to_loop = [p for p, _ in rendered(base_before) if p >= start]
+        if next_to_loop != missing_before:
+            return None
+        before = base_before[start:]
+    after: List[llir.Stmt] = []
+    if missing_after:
+        stop = missing_after[-1] + 1
+        next_to_loop = [p for p, _ in rendered(base_after) if p < stop]
+        if next_to_loop != missing_after:
+            return None
+        after = base_after[:stop]
+
+    carried_names = set()
+    for statement in before:
+        if stays_out(statement):
+            # A shared constant between the carried declarations and the loop
+            # would be redeclared by the carry; the stitch is not formed.
+            if type(statement) not in _LAYOUT_ONLY_TYPES:
+                return None
+            continue
+        name = _carried_declaration_name(statement)
+        if name is None:
+            return None
+        carried_names.add(name)
+
+    def mentions_carried_name(statement: llir.Stmt) -> bool:
+        text = lowerer.lower_llir(statement)
+        return not carried_names.isdisjoint(_CPP_IDENTIFIER.findall(text))
+
+    staying = base_before[: len(base_before) - len(before)] + base_after[len(after) :]
+    for statement in staying:
+        if type(statement) in _LAYOUT_ONLY_TYPES:
+            continue
+        if mentions_carried_name(statement):
+            return None
+    for statement in after:
+        if type(statement) in _LAYOUT_ONLY_TYPES:
+            continue
+        if not mentions_carried_name(statement):
+            return None
+    return before, after
+
+
 def _stitch_regblock_dual_path(
-    fn_rb: llir.Function, fn_base: llir.Function, cutoff_n: int
+    fn_rb: llir.Function,
+    fn_base: llir.Function,
+    cutoff_n: int,
+    compile_options: Optional[CompileOptions] = None,
 ) -> Optional[llir.Function]:
     """Splice the register-block and baseline compute loops under one runtime branch.
 
-    Keeps `fn_rb`'s prologue (a strict superset of the baseline's — it only adds the
-    `kTile` decl) and epilogue, replacing its single top-level compute loop with
-    `if (free_size <= cutoff_n) { <regblock loop> } else { <baseline loop> }`.
-    Returns None (decline) if either function's compute region is ambiguous or the
-    free-dim size expression can't be found.
+    Keeps `fn_rb`'s prologue and epilogue, replacing its single top-level compute
+    loop with `if (free_size <= cutoff_n) { <regblock loop> } else { <baseline
+    loop> }`.  The else branch also holds the function-scope statements only the
+    baseline function has around its loop -- a serially placed dense workspace --
+    so that loop reads every name as its own function declared it
+    (`_baseline_statements_for_else_branch`).
+
+    Returns None (decline) if either function's compute region is ambiguous, the
+    free-dim size expression can't be found, or the baseline function has a
+    function-scope statement the stitched kernel would neither already have nor
+    be able to carry.  The caller then emits the baseline nest alone.
     """
     idx_rb, loop_rb = _find_top_compute_loop(fn_rb.body)
-    _, loop_base = _find_top_compute_loop(fn_base.body)
-    if loop_rb is None or loop_base is None or idx_rb is None:
+    idx_base, loop_base = _find_top_compute_loop(fn_base.body)
+    if loop_rb is None or loop_base is None or idx_rb is None or idx_base is None:
         return None
     free_expr = _regblock_free_size_expr(loop_rb)
     if free_expr is None:
         return None
+    carried = _baseline_statements_for_else_branch(
+        fn_rb.body, idx_rb, fn_base.body, idx_base, compile_options
+    )
+    if carried is None:
+        return None
+    before, after = carried
     cond = llir.BinOp(
         op="<=",
         left=free_expr,
         right=llir.Literal(value=cutoff_n, data_type=llir.DataType.INT64),
     )
-    branch = llir.IfThenElse(cond=cond, then_body=[loop_rb], else_body=[loop_base])
+    branch = llir.IfThenElse(
+        cond=cond, then_body=[loop_rb], else_body=[*before, loop_base, *after]
+    )
     new_body = list(fn_rb.body)
     new_body[idx_rb] = branch
     fn_rb.body = new_body
@@ -2105,6 +2629,7 @@ def _build_regblock_dual_path(
             fn_rb,
             fn_base,
             compile_options.scheduler.regblock_max_n,
+            compile_options,
         )
     except Exception:
         if stitch_token is not None and compilation_context is not None:
@@ -2184,6 +2709,21 @@ def _without_mixed_coordinate_levels(
         )
         for level_format in output_level_formats
     ]
+
+
+def _evaluate_native(kernel: Callable[..., Any], *args: Any) -> Any:
+    """Call a native kernel; a repeated COO coordinate its index check refuses is raised
+    as ``RepeatedCoordinateError`` (``raise_if_native_repeat``), anything else unchanged.
+
+    A separate function so that ``_einsum_owned``, whose three native calls need the
+    mapping, does not grow past its complexity (the project bound is 43, .flake8).
+    """
+
+    try:
+        return kernel(*args)
+    except RuntimeError as error:
+        raise_if_native_repeat(error)
+        raise
 
 
 def _einsum_owned(
@@ -2394,7 +2934,8 @@ def _einsum_owned(
             compilation_context.cancel_stage(frontend_token)
             S, A, B = tensors
             result_shape = S.shape
-            result_cpp = _sddmm_fn(
+            result_cpp = _evaluate_native(
+                _sddmm_fn,
                 result_shape,
                 S.shape,
                 S._native_mode_indices(),
@@ -2442,8 +2983,12 @@ def _einsum_owned(
             _input_mos = _cached[4]
             _input_idx_strs = _cached[5]
             _result_idx_strs = _cached[6]
+            _move_kwargs = _cached[7]
 
-            # Set correct mode orders on input tensors
+            # Set correct mode orders on input tensors.  One move each, to the order
+            # the kernel reads, as _einsum_operand_relayout decided for this entry:
+            # its letters, and whether every stored entry is copied.  The key holds
+            # each operand's layout, so the decision is this call's.
             cached_tensors = list(tensors)
             _relayouted = False
             for _index, (_t, _mo) in enumerate(zip(cached_tensors, _input_mos)):
@@ -2453,6 +2998,7 @@ def _einsum_owned(
                         _mo,
                         compile_options,
                         compilation_context,
+                        **_move_kwargs[_index],
                     )
                     _relayouted = True
             tensors = tuple(cached_tensors)
@@ -2484,7 +3030,7 @@ def _einsum_owned(
                 _args.append(_t.values)
 
             _t0 = time.time()
-            _result_cpp = _module.evaluate(*_args)
+            _result_cpp = _evaluate_native(_module.evaluate, *_args)
             _eval_time = time.time() - _t0
 
             _result = _wrap_generated_result(
@@ -2605,8 +3151,8 @@ def _einsum_owned(
                 output_tensor_dtype = tensor.dtype
             else:
                 if output_tensor_dtype != tensor.dtype:
-                    raise TensorValidationError(
-                        "all einsum operands must have the same value dtype"
+                    require_same_value_dtype(
+                        output_tensor_dtype, tensor.dtype, operation="einsum"
                     )
 
     # Get output format from kwargs
@@ -2745,15 +3291,17 @@ def _einsum_owned(
     # the predicted compiler-visible metadata so that it can finish before a
     # runtime relayout starts; the physical relayout still happens here, once
     # for the topological order and again below if the selected loop order
-    # differs.
-    tensors = tuple(
-        _with_compiler_mode_order(
-            tensor,
-            compiler_mode_orders[tensor_index],
-            compile_options,
-            compilation_context,
-        )
-        for tensor_index, tensor in enumerate(tensors)
+    # differs.  An operand with a compressed level waits for both until the
+    # selected order is known (_einsum_operand_relayout decides how it moves).
+    operands = cast(Sequence[Union[STensor, TensorSpec]], tensors)
+    input_orders = [tuple(operand.mode_order) for operand in operands]
+    operand_letters = [_storage_letters(operand.format) for operand in operands]
+    tensors = _first_einsum_operand_moves(
+        operands,
+        operand_letters,
+        compiler_mode_orders,
+        compile_options,
+        compilation_context,
     )
 
     # Align input tensor mode orders with the selected loop order to keep
@@ -2768,17 +3316,21 @@ def _einsum_owned(
         compile_options,
         compilation_context,
     )
-
-    tensors = list(tensors)
-    for tensor_index, desired_mode_order in enumerate(desired_mode_orders):
-        if list(tensors[tensor_index].mode_order) != desired_mode_order:
-            tensors[tensor_index] = _with_compiler_mode_order(
-                tensors[tensor_index],
-                desired_mode_order,
-                compile_options,
-                compilation_context,
-            )
-    tensors = tuple(tensors)
+    tensors, operand_relayouts = _finish_einsum_operand_moves(
+        tensors,
+        tensor_vars,
+        input_index_strs,
+        operand_letters,
+        input_orders,
+        compiler_mode_orders,
+        desired_mode_orders,
+        result_index_strs,
+        _storage_letters(output_format),
+        result_mode_order,
+        result_index_sizes,
+        compile_options,
+        compilation_context,
+    )
 
     # Extract PostOps for fused kernel compilation
     _post_ops = kwargs.get("_post_ops", None)
@@ -2900,6 +3452,7 @@ def _einsum_owned(
             [list(t.mode_order) for t in tensors],
             input_index_strs,
             result_index_strs,
+            [relayout.move_kwargs() for relayout in operand_relayouts],
         )
 
     if compile_only:
@@ -2926,7 +3479,7 @@ def _einsum_owned(
             args.append(extra_t)  # type: ignore
 
     start_time = time.time()
-    result_cpp = module.evaluate(*args)
+    result_cpp = _evaluate_native(module.evaluate, *args)
     end_time = time.time()
     eval_time = end_time - start_time
     # print("Time taken for evaluate:", eval_time)
@@ -3488,10 +4041,10 @@ def lower_and_exec_cin(
     Returns
     -------
     STensor
-        Output tensor. Dense result rank and mode order are derived from the
-        compiler-owned result declaration. Sparse-result wrapping retains its
-        historical compatibility behavior until the sparse-result migration
-        owns its assembled indices.
+        Output tensor, in the format and mode order of the compiler-owned
+        result declaration, sparse or dense.  Its value dtype is the operands'
+        promoted dtype (``layout.common_value_dtype``, PyTorch's rule): the
+        dtype of the statement's result ``TensorVar`` is ignored and replaced.
     """
     compile_options = _compile_options_from_kwargs(kwargs)
     _reject_unsupported_requested_schedule(compile_options, "lower_and_exec_cin")
@@ -3541,7 +4094,16 @@ def lower_and_exec_cin(
             tensor_var.dtype = snapshot.dtype
             tensor_var.mode_order = list(snapshot.mode_order)
 
-        output_dtype = runtime_args[0].dtype if runtime_args else torch.float32
+        # The operands' promoted type (PyTorch's rule), as ``A + B`` declares
+        # it: the first operand's type stored an int64 plus a float64 as int64.
+        output_dtype = (
+            common_value_dtype(
+                *(snapshot.dtype for snapshot in runtime_args),
+                operation="lower_and_exec_cin",
+            )
+            if runtime_args
+            else torch.float32
+        )
         for tensor_var in cin_stmt.get_result_tensor_vars():
             if not isinstance(tensor_var, Workspace):
                 tensor_var.shape = tuple(result_shape)
@@ -3581,26 +4143,31 @@ def lower_and_exec_cin(
         module_args.append(snapshot.values)
 
     start_time = time.time()
-    result_cpp = module.evaluate(*module_args)
+    try:
+        result_cpp = module.evaluate(*module_args)
+    except RuntimeError as error:
+        raise_if_native_repeat(error)
+        raise
     end_time = time.time()
     eval_time = end_time - start_time
     if "time_dict" in kwargs:
         kwargs["time_dict"]["eval_time"] = eval_time
 
-    result_tensor_var = lowerer.final_result_tensor_var
-    dense_result = (
-        result_tensor_var
-        if result_tensor_var is not None
-        and result_tensor_var.format is not None
-        and result_tensor_var.format.is_dense()
-        else None
-    )
+    # The result is wrapped in the format and mode order its declaration gives,
+    # sparse or dense, as ``einsum`` and ``STensor.__add__`` wrap theirs.  A sparse
+    # result used to be wrapped as a two-level dense tensor whatever it was, which
+    # no sparse kernel's level arrays satisfy (``TensorIndexError``).
+    declared_result = lowerer.final_result_tensor_var
+    if declared_result is not None and declared_result.format is None:
+        declared_result = None
     result_format = (
-        dense_result.get_format() if dense_result is not None else parse_format("dd")
+        declared_result.get_format()
+        if declared_result is not None
+        else parse_format("dd")
     )
     result_mode_order = (
-        tuple(dense_result.mode_order)
-        if dense_result is not None and dense_result.mode_order is not None
+        tuple(declared_result.mode_order)
+        if declared_result is not None and declared_result.mode_order is not None
         else None
     )
     result = _wrap_generated_result(

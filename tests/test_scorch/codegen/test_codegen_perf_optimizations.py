@@ -50,7 +50,7 @@ def test_non_tiled_dense_workspace_is_zero_initialized_and_raii_owned():
     c = TensorVar("C", fmt="dd")
     a = TensorVar("A", fmt="dd")
     b = TensorVar("B", fmt="dd")
-    wksp = Workspace("wksp", dim=1, dense=True)
+    wksp = Workspace("wksp", dim=1, dtype=c.dtype, dense=True)
 
     cin_stmt = ForAll(
         i,

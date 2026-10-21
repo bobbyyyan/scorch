@@ -33,6 +33,7 @@ from .nodes import (
     DimensionId,
     Expr,
     FloatConst,
+    IntegerConst,
     IndexValue,
     Load,
     LoopProgram,
@@ -137,7 +138,7 @@ def _seed_expr_ids(expr: Expr, ids: _CanonicalIds) -> None:
     if type(expr) is IndexValue:
         ids.index(expr.index)
         return
-    if type(expr) is FloatConst:
+    if type(expr) is FloatConst or type(expr) is IntegerConst:
         return
     if type(expr) is RootPosition:
         return
@@ -157,6 +158,10 @@ def _seed_expr_ids(expr: Expr, ids: _CanonicalIds) -> None:
     if type(expr) is PositionLoad:
         ids.symbol(expr.tensor)
         _seed_expr_ids(expr.position, ids)
+        if expr.guard is not None:
+            ids.cursor(expr.guard)
+        if expr.default is not None:
+            _seed_expr_ids(expr.default, ids)
         return
     if type(expr) is Load:
         ids.symbol(expr.tensor)
@@ -325,6 +330,8 @@ def _serialize_expr(expr: Expr, ids: _CanonicalIds) -> Dict[str, object]:
         return {"kind": "index", "index": ids.index(expr.index)}
     if type(expr) is FloatConst:
         return {"kind": "float_const", "value": expr.value}
+    if type(expr) is IntegerConst:
+        return {"kind": "integer_const", "value": expr.value}
     if type(expr) is RootPosition:
         return {"kind": "root_position"}
     if type(expr) is DensePosition:
@@ -346,11 +353,18 @@ def _serialize_expr(expr: Expr, ids: _CanonicalIds) -> Dict[str, object]:
             ),
         }
     if type(expr) is PositionLoad:
-        return {
+        serialized = {
             "kind": "position_load",
             "tensor": ids.symbol(expr.tensor),
             "position": _serialize_expr(expr.position, ids),
         }
+        # An unguarded load keeps its serialization, so every program without
+        # a guard keeps its identity.
+        if expr.guard is not None:
+            serialized["guard"] = ids.cursor(expr.guard)
+        if expr.default is not None:
+            serialized["default"] = _serialize_expr(expr.default, ids)
+        return serialized
     if type(expr) is Load:
         return {
             "kind": "load",
@@ -642,7 +656,7 @@ def canonical_program_dump(program: LoopProgram) -> str:
 def _render_expr(expr: Expr, ids: _CanonicalIds, names: Dict[int, str]) -> str:
     if type(expr) is IndexValue:
         return f"x{ids.index(expr.index)}"
-    if type(expr) is FloatConst:
+    if type(expr) is FloatConst or type(expr) is IntegerConst:
         return repr(expr.value)
     if type(expr) is RootPosition:
         return "root"
@@ -662,9 +676,15 @@ def _render_expr(expr: Expr, ids: _CanonicalIds, names: Dict[int, str]) -> str:
             f"default {_render_expr(expr.default, ids, names)})"
         )
     if type(expr) is PositionLoad:
-        return (
+        rendered = (
             f"position_load t{ids.symbol(expr.tensor)}"
             f"[{_render_expr(expr.position, ids, names)}]"
+        )
+        if expr.guard is None or expr.default is None:
+            return rendered
+        return (
+            f"{rendered} if aligned(c{ids.cursor(expr.guard)}) "
+            f"else {_render_expr(expr.default, ids, names)}"
         )
     if type(expr) is Load:
         rendered = ", ".join(_render_expr(index, ids, names) for index in expr.indices)

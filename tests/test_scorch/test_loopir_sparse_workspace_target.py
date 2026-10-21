@@ -2088,8 +2088,22 @@ def test_mixed_leaf_source_is_route_stable_and_erases_to_base():
 
 
 @pytest.mark.parametrize("regblock_enabled", [False, True])
-def test_mixed_leaf_adjacent_seams_stay_fail_closed(regblock_enabled):
-    from scorch.compiler.loopir.lower_cin import LoopIRLoweringError
+def test_mixed_leaf_neighbours_compile_and_match_pytorch(regblock_enabled):
+    """The cells around the mixed dense-leaf family, all lowered now.
+
+    Two of them exited with structured codes until 2026-10-12: a reduction
+    into a compressed-parent/dense-leaf result (``ddd`` summed into ``sd``,
+    ``unsupported_sparse_output_reduction``) now drains a sorted workspace
+    into the dense leaf; a product of two mixed dense-leaf operands into a
+    dense result (``unsupported_sparse_hierarchy``) now binds both operands'
+    row positions from the row intersection, so the dense leaf below it is a
+    position load.  Each is judged on the dense-below-compressed table's
+    inputs.
+    """
+
+    from tests.test_scorch.test_loopir_dense_below_compressed_target import (
+        assert_statement_matches_pytorch,
+    )
 
     i, j, k = IndexVar("i"), IndexVar("j"), IndexVar("k")
     reduction = ForAll(
@@ -2106,19 +2120,8 @@ def test_mixed_leaf_adjacent_seams_stay_fail_closed(regblock_enabled):
             ),
         ),
     )
-    with pytest.raises(LoopIRLoweringError) as error:
-        compile_cin_via_loopir(
-            reduction,
-            (6, 5),
-            (((6, 4, 5), torch.float32),),
-            compile_options=auto_options(regblock_enabled),
-        )
-    assert error.value.defect.code == "unsupported_sparse_output_reduction"
+    assert_statement_matches_pytorch(reduction, regblock_enabled)
 
-    # The single mixed dense-leaf OPERAND now lowers through declared
-    # position loads (test_loopir_mixed_operand_target.py); the adjacent
-    # merged-mixed neighbor keeps this census's fail-closed seam because
-    # no merged loop binds the descent position.
     i2, j2 = IndexVar("i"), IndexVar("j")
     merged_mixed = ForAll(
         i2,
@@ -2134,14 +2137,7 @@ def test_mixed_leaf_adjacent_seams_stay_fail_closed(regblock_enabled):
             ),
         ),
     )
-    with pytest.raises(LoopIRLoweringError) as error:
-        compile_cin_via_loopir(
-            merged_mixed,
-            (4, 5),
-            (((4, 5), torch.float32), ((4, 5), torch.float32)),
-            compile_options=auto_options(regblock_enabled),
-        )
-    assert error.value.defect.code == "unsupported_sparse_hierarchy"
+    assert_statement_matches_pytorch(merged_mixed, regblock_enabled)
 
     i3, j3 = IndexVar("i"), IndexVar("j")
     sparse_domain = ForAll(
@@ -2154,25 +2150,30 @@ def test_mixed_leaf_adjacent_seams_stay_fail_closed(regblock_enabled):
             ),
         ),
     )
-    with pytest.raises(LoopIRLoweringError) as error:
-        compile_cin_via_loopir(
-            sparse_domain,
-            (4, 5),
-            (((4, 5), torch.float32),),
-            compile_options=auto_options(regblock_enabled),
-        )
-    assert error.value.defect.code == "unsupported_sparse_output_domain"
+    # A stored stream driving a dense leaf below a compressed parent is
+    # lowered since 2026-10-11: the leaf block is written, then its parent
+    # coordinate is committed.  test_loopir_dense_below_compressed_target.py
+    # runs it against PyTorch ("ss ij->ij as sd").
+    kernel = compile_cin_via_loopir(
+        sparse_domain,
+        (4, 5),
+        (((4, 5), torch.float32),),
+        compile_options=auto_options(regblock_enabled),
+    )
+    assert "C0_crd.push_back(i)" in kernel.cpp_source
 
 
-def test_mixed_leaf_legacy_comparand_is_failure_evidence_only():
-    """The defective legacy source is retained evidence, never an oracle.
+def test_mixed_leaf_shipped_kernel_records_the_compressed_coordinate():
+    """Both compilers store the row a dense leaf block belongs to.
 
-    The legacy pipeline still generates a kernel for this family whose
-    assembly is inconsistent: every dense-leaf value is appended, but the
-    compressed parent's coordinates are never assembled, so the returned
-    storage would carry values with no owning rows.  This locks the
-    defect's shape as evidence and the intentional absence of any byte
-    or execution parity gate for the B2 family.
+    The shipped pipeline used to generate a kernel for this family whose
+    assembly was inconsistent: every dense-leaf value was appended, but the
+    compressed parent's coordinates were never assembled, so the returned
+    storage carried values with no owning rows.  It now commits the
+    coordinate once its block is written
+    (``test_dense_below_compressed_result.py`` executes it).  The two
+    sources are not required to match: the shipped one fills the block
+    lazily, the typed one appends every cell of a dense-driven block.
     """
 
     legacy_cpp = legacy_generated_cpp(
@@ -2181,9 +2182,11 @@ def test_mixed_leaf_legacy_comparand_is_failure_evidence_only():
         (((4, 5), torch.float32),),
         compile_options=auto_options(False),
     )
-    assert "C_values.emplace_back" in legacy_cpp
-    assert "C0_crd.push_back" not in legacy_cpp
-    assert "C0_crd.emplace_back" not in legacy_cpp
+    assert legacy_cpp.count("C0_crd.push_back(i);") == 1
+    assert "// Commit the compressed coordinate above a written dense block" in (
+        legacy_cpp
+    )
+    assert "C_values.emplace_back" not in legacy_cpp
 
     loopir_kernel = compile_cin_via_loopir(
         build_mixed_leaf_cin(),
@@ -2192,7 +2195,6 @@ def test_mixed_leaf_legacy_comparand_is_failure_evidence_only():
         compile_options=auto_options(False),
     )
     assert "C0_crd.push_back(i);" in loopir_kernel.cpp_source
-    assert loopir_kernel.cpp_source != legacy_cpp
 
 
 def build_mixed_leaf_program(forge=None):

@@ -992,14 +992,20 @@ def _seam_cells():
             merged,
             (4, 5),
             (((4, 5), torch.float32), ((4, 5), torch.float32)),
-            "unsupported_sparse_hierarchy",
+            None,  # lowered since 2026-10-12: merges in a dense result's nest
         ),
         (
+            # A dense level (``j``) stored below a level the union iterates
+            # (``i``): the dense level's position is read from a parent entry
+            # an unaligned cursor does not have.  Refused
+            # (``unsupported_union_dense_descent``) until 2026-10-12, when the
+            # read became a guarded ``PositionLoad``: the leaf is loaded only
+            # where that operand's cursor aligned, and is 0 elsewhere.
             "merged_mixed_union",
             union,
             (4, 5),
             (((4, 5), torch.float32), ((4, 5), torch.float32)),
-            "unsupported_sparse_hierarchy",
+            None,
         ),
         # ``hierarchical_compressed_above_dense_leaf`` (an ssd copy into ddd)
         # sat here until 2026-10-11; it is admitted and byte-identical to
@@ -1009,27 +1015,66 @@ def _seam_cells():
             sparse_result,
             (4, 5),
             (((4, 5), torch.float32),),
-            "unsupported_sparse_output_domain",
+            None,  # an ``sd`` copy into ``sd``: lowered since 2026-10-11
         ),
         (
             "permuted_compressed_pair",
             permuted,
             (4, 5),
             (((4, 5), torch.float32),),
-            "unsupported_mode_order",
+            None,  # lowered since 2026-10-12: mode orders as storage-order form
         ),
         (
             "merged_outermost_vectors",
             merged_outermost,
             (4,),
             (((4,), torch.float32), ((4,), torch.float32)),
-            "unsupported_program_shape",
+            None,  # lowered since 2026-10-12: an intersection as the only loop
         ),
     ]
 
 
+_REFUSED_CELLS = [cell for cell in _seam_cells() if cell[4] is not None]
+_LOWERED_CELLS = [cell for cell in _seam_cells() if cell[4] is None]
+
+
 @pytest.mark.parametrize("regblock_enabled", [False, True])
-@pytest.mark.parametrize("cell", _seam_cells(), ids=[cell[0] for cell in _seam_cells()])
+@pytest.mark.parametrize(
+    "cell", _LOWERED_CELLS, ids=[cell[0] for cell in _LOWERED_CELLS]
+)
+def test_neighbours_lowered_since_2026_10_11_match_pytorch(regblock_enabled, cell):
+    """Neighbours that used to be refused here and are lowered now.
+
+    The ``sd`` copy into ``sd`` was refused until the ordered assembly learned
+    to commit a compressed coordinate after the dense block below it is
+    written (``test_loopir_dense_below_compressed_target.py``, 2026-10-11).
+    The intersection of two ``sd`` operands into ``dd`` and the intersection
+    of two sparse vectors into a dense vector were refused until the dense
+    result's nest accepted a merged loop at any depth (2026-10-12).
+    """
+
+    # Imported here: those modules import this one's ``auto_options`` chain.
+    from tests.test_scorch import test_loopir_dense_union as sums
+    from tests.test_scorch.test_loopir_dense_below_compressed_target import (
+        assert_statement_matches_pytorch,
+    )
+
+    if cell[0] == "merged_mixed_union":
+        # A sum.  The checker below reads a statement back into an einsum, so
+        # it takes products only; this statement is the dense-union table's
+        # ``sd + sd`` into ``dd``, and that table's check executes it.
+        sum_cell = ("ij,ij->ij", ("sd", "sd"), "dd")
+        assert sum_cell in sums.CELLS
+        assert str(sums._statement(*sum_cell)) == str(cell[1])
+        sums.test_dense_result_matches_dense_semantics(sum_cell, regblock_enabled)
+        return
+    assert_statement_matches_pytorch(cell[1], regblock_enabled)
+
+
+@pytest.mark.parametrize("regblock_enabled", [False, True])
+@pytest.mark.parametrize(
+    "cell", _REFUSED_CELLS, ids=[cell[0] for cell in _REFUSED_CELLS]
+)
 def test_adjacent_seams_stay_fail_closed(regblock_enabled, cell):
     _, cin, result_shape, bindings, expected = cell
     with pytest.raises((LoopIRLoweringError, LoopIRTargetError)) as error:

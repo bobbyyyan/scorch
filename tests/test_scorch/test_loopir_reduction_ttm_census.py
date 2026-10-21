@@ -1,53 +1,50 @@
 """Phase-7 cluster 2: the multi-compressed reduction / TTM frontier census.
 
 Cluster 2 -- sparse reductions and TTM over multi-compressed receivers -- is
-now **partly migrated**.  This module pins the representative matrix in both
-automatic arms so the split between what the ordered-key sparse-workspace
-vertical reaches and what it still does not is a locked fact rather than a
-re-derived one.  It remains a deliberately finite frontier, not a claim to
-enumerate every rank/layout combination: a level-general audit finds adjacent
-``dss``/``sds`` reductions and mixed ``ds``/``sd`` factor variants that this
-list does not name, and a migration must derive those itself.
+migrated for every cell of the representative matrix below.  This module pins
+that matrix in both automatic arms so that which family or plan decision
+carries each cell is a locked fact rather than a re-derived one.  It remains a
+deliberately finite frontier, not a claim to enumerate every rank/layout
+combination: a level-general audit finds adjacent ``dss``/``sds`` reductions
+and mixed ``ds``/``sd`` factor variants that this list does not name, and a
+migration must derive those itself.
 
-The cells split three ways.
+The cells split three ways; none of them is refused any more.
 
-**Migrated (9 cells).**  Their automatic plan order is legal and the
+**Migrated (11 cells).**  Their automatic plan order is legal and the
 ordered-key workspace target lowers them end to end, in both arms.  They span
 rank-1, rank-2 and rank-3 keys, root-anchored and prefix-anchored regions,
 single-cursor and merged producers, and dense and compressed second factors.
 Their storage/oracle/PyTorch differentials live in
 ``test_loopir_ordered_key_workspace_target.py``; what is locked HERE is only
 that they compile arm-invariantly, so a regression that un-migrates one is
-caught by the census as well as by its own suite.
+caught by the census as well as by its own suite.  Two of them,
+``TTM dds x {dd,ss} -> dds``, used to stop at
+``unsupported_schedule_auto_family``: the automatic origin emitted an affine
+tile over their non-dense receiver beside the sparse workspace, and it no
+longer does (``AUTO_TILE_BLOCKED`` is empty and says why).
 
-**Auto-tile blocked (2 cells).**  ``TTM dds x {dd,ss} -> dds`` is legal and
-its target shape is supported, but the automatic origin also emits an affine
-tile for it: ``Scheduler._select_index_vars_to_tile`` tiles every dense index
-variable that does not appear in every access, and ``j`` qualifies for a
-``dds`` receiver against a ``kl`` second factor.  A plan carrying BOTH a
-sparse workspace and a tile has no replay contract -- the only implemented
-workspace+tile composition is the dense reduce-out fusion -- so it stops at
-``unsupported_schedule_auto_family``.  This is a schedule-composition
-blocker, not a target or representation one.
+**Formerly reorder-blocked (5 cells).**  ``Scheduler.select_loop_order`` ends
+with a forced reorder (``scheduler.py``, "ensure at least one free variable
+appears after the last reduction variable"): when no free variable follows the
+last reduction it moves the last free variable to the very end of the loop
+order, with no legality check.  For ``sss ijk->{i,j,ij}``, ``ss ij->i`` and
+``ds ij->i`` that permutation violates the sparse operand's own parent
+dominance, and the plan used to be rejected at ``loop_plan_legality``'s
+``sparse_parent_dominance``.  The automatic plan origin now repairs such an
+order, and ``FORMER_REORDER_BLOCKED`` records the family each cell reaches.
 
-**Auto-origin reorder-blocked (5 cells).**  ``Scheduler.select_loop_order``
-ends with a forced reorder (``scheduler.py``, "ensure at least one free
-variable appears after the last reduction variable"): when no free variable
-follows the last reduction it moves the last free variable to the very end of
-the loop order, with no legality check.  For these cells that permutation
-violates the sparse operand's own parent dominance -- ``sss ijk->ij`` declared
-``i,j,k`` becomes ``i,k,j`` while ``A``'s storage order is ``i,j,k`` -- so the
-LoopIR route rejects the plan at ``loop_plan_legality``'s
-``sparse_parent_dominance`` before any LoopIR admission decision is reached.
-
-The explicit-order controls below sharpen what a LoopIR-only automatic-plan
-repair would and would not buy.  A legal declared order does carry these cells
-past LoopPlan -- so the block really is origin-specific -- but the program it
-produces has an EMPTY workspace key: every result coordinate is bound above
-the outermost reduction, leaving nothing to drain.  That ``K == 0`` shape is a
-scalar-accumulator reduction, which no migrated family owns.  Repairing the
-origin alone therefore moves the failure from LoopPlan to a later LoopIR seam
-without migrating anything; the two must be decided together.
+**Permuted result (4 cells).**  ``ss ij->ji``, ``ds ij->ji``, ``sss ijk->ikj``
+and ``sss ijk->ki`` store the result in an order the operand is not stored in,
+so no loop order follows both tensors: the plan stopped at
+``sparse_parent_dominance``, and the order the composition started from was
+refused by ``result_storage_order`` too.  The plan now converts the operand to
+the result's order (``LoopPlan.conversions``,
+``test_loopir_operand_conversions.py``), and the main kernel reads the
+converted operand in storage order.  The shipped compiler's plan origin has no
+conversion and still stops at ``sparse_parent_dominance``.  Both facts are
+locked below; the four run against dense PyTorch in
+``test_loopir_ordered_key_workspace_target.py``, as the migrated cells do.
 """
 
 import pytest
@@ -63,7 +60,10 @@ from scorch.compiler.cin import (
 )
 from scorch.compiler.compile_options import CompileOptions
 from scorch.compiler.loop_plan_legality import InvalidSchedule
-from scorch.compiler.loopir.pipeline import compile_cin_via_loopir
+from scorch.compiler.loopir.pipeline import (
+    compile_cin_via_loopir,
+    legacy_generated_cpp,
+)
 from scorch.compiler.scheduler import Schedule
 from tests.test_scorch.test_loopir_sparse_workspace_target import auto_options
 
@@ -127,22 +127,24 @@ def _ttm_cell(name, a_fmt, b_fmt, c_fmt):
     )
 
 
-# The plan order these cells receive violates the operand's parent dominance,
-# so they never reach a LoopIR admission decision.  ``InvalidSchedule`` carries
-# no ``defect.code``; the stage and reason are checked from its message.
-#
-# The occupants are the PERMUTED-result cells.  The automatic plan origin now
-# repairs a forced order the storage-order rules refuse -- but only when the
-# order the composition started from is itself legal, and for a permuted result
-# it is not: ``result_storage_order`` refuses both.  The cells this list used to
-# name (``sss ijk->{i,j,ij}``, ``ss ij->i``, ``ds ij->i``) moved when the
-# bound-prefix family landed; ``FORMER_REORDER_BLOCKED`` below records where each
-# went, and ``test_loopir_bound_prefix_target`` owns the family.
-REORDER_BLOCKED = [
-    _reduction_cell("ss ij->ji", "ss", "ss", "ij", "ji"),
-    _reduction_cell("ds ij->ji", "ds", "ds", "ij", "ji"),
-    _reduction_cell("sss ijk->ikj", "sss", "sss", "ijk", "ikj"),
-    _reduction_cell("sss ijk->ki", "sss", "ds", "ijk", "ki"),
+# No cell of this matrix stops at the plan's legality check any more.  The list
+# is kept, empty, because the census counts it.  It first named
+# ``sss ijk->{i,j,ij}``, ``ss ij->i`` and ``ds ij->i``, which moved when the
+# bound-prefix family landed (``FORMER_REORDER_BLOCKED`` below records where
+# each went, and ``test_loopir_bound_prefix_target`` owns the family), and then
+# the four cells of ``PERMUTED_RESULT``, which moved when the plan could
+# convert an operand.
+REORDER_BLOCKED: list = []
+
+# The result is stored in an order the operand is not stored in.  Each entry is
+# the cell as ``_reduction_cell`` takes it (name, operand format, result format,
+# operand indices, result indices) and the conversion the plan records for it:
+# the mode order the operand is converted to and the layout it is converted into.
+PERMUTED_RESULT = [
+    (("ss ij->ji", "ss", "ss", "ij", "ji"), ((1, 0), "ss")),
+    (("ds ij->ji", "ds", "ds", "ij", "ji"), ((1, 0), "ds")),
+    (("sss ijk->ikj", "sss", "sss", "ijk", "ikj"), ((0, 2, 1), "sss")),
+    (("sss ijk->ki", "sss", "ds", "ijk", "ki"), ((2, 1, 0), "sss")),
 ]
 
 # Where the five cells this census used to lock as reorder-blocked now go, by
@@ -198,27 +200,53 @@ MIGRATED = [
 AUTO_TILE_BLOCKED: list = []
 
 
+_PERMUTED_RESULT_IDS = [spec[0] for spec, _ in PERMUTED_RESULT]
+
+
 @pytest.mark.parametrize("arm", [False, True])
 @pytest.mark.parametrize(
-    "cell", REORDER_BLOCKED, ids=[cell[0] for cell in REORDER_BLOCKED]
+    ("spec", "conversion"), PERMUTED_RESULT, ids=_PERMUTED_RESULT_IDS
 )
-def test_reorder_blocked_cells_stop_at_parent_dominance(cell, arm):
-    """The shared automatic origin's forced reorder makes the plan illegal.
+def test_permuted_result_cells_convert_the_operand(spec, conversion, arm):
+    """The plan converts the operand to the result's order and the cell compiles.
 
-    These stop before LoopIR gets a say on this origin, and the plan origin's
-    order repair cannot answer for them: their result is permuted, so the order
-    the composition started from is refused by ``result_storage_order`` too and
-    there is no legal order to fall back to.
+    These four stopped at ``sparse_parent_dominance`` before LoopIR got a say:
+    the result is permuted, so the order the composition started from was
+    refused by ``result_storage_order`` too and there was no legal order to
+    fall back to.  One conversion of the operand makes the result's order legal.
     """
 
-    name, cin, result_shape, bindings = cell
+    name, cin, result_shape, bindings = _reduction_cell(*spec)
+    kernel = compile_cin_via_loopir(
+        cin, result_shape, bindings, compile_options=auto_options(arm)
+    )
+    assert [(c.mode_order, c.format) for c in kernel.conversions] == [conversion], name
+    assert len(kernel.conversion_sources) == 1, name
+    # ``sss ijk->ki`` also reduces ``j`` between the result's two coordinates:
+    # the ordered-key workspace region drains its key sorted.  The other three
+    # are copies and reduce nothing.
+    assert ("wksp.sort();" in kernel.cpp_source) == (name == "sss ijk->ki"), name
+
+
+@pytest.mark.parametrize("arm", [False, True])
+@pytest.mark.parametrize(
+    ("spec", "conversion"), PERMUTED_RESULT, ids=_PERMUTED_RESULT_IDS
+)
+def test_the_shipped_plan_origin_still_refuses_a_permuted_result(spec, conversion, arm):
+    """The shipped compiler has no conversion: its plan stays illegal.
+
+    So these four have no shipped text to compare the new compiler's with.
+    ``InvalidSchedule`` carries no ``defect.code``; the stage and reason are
+    read from its structured diagnostic.
+    """
+
+    name, cin, result_shape, bindings = _reduction_cell(*spec)
     with pytest.raises(InvalidSchedule) as error:
-        compile_cin_via_loopir(
+        legacy_generated_cpp(
             cin, result_shape, bindings, compile_options=auto_options(arm)
         )
-    message = str(error.value)
-    assert "stage=LoopPlan" in message, name
-    assert "sparse_parent_dominance" in message, name
+    assert [d.code for d in error.value.diagnostics] == ["sparse_parent_dominance"]
+    assert error.value.diagnostics[0].stage == "loop_plan", name
 
 
 @pytest.mark.parametrize(
@@ -349,14 +377,17 @@ def test_dense_receivers_keep_their_automatic_tile(arm):
 def test_census_covers_the_declared_representative_matrix():
     """Pin the finite review matrix without claiming layout exhaustiveness."""
 
-    assert len(REORDER_BLOCKED) == 4
+    assert len(REORDER_BLOCKED) == 0
+    assert len(PERMUTED_RESULT) == 4
     assert len(FORMER_REORDER_BLOCKED) == 5
     # 9 -> 11 and 2 -> 0: the two ``TTM dds`` cells moved lists rather than
-    # leaving the matrix, so the 20-name total below is unchanged.
+    # leaving the matrix, and so did the four permuted-result cells, so the
+    # 20-name total below is unchanged.
     assert len(MIGRATED) == 11
     assert len(AUTO_TILE_BLOCKED) == 0
     names = (
         [cell[0] for cell in REORDER_BLOCKED]
+        + _PERMUTED_RESULT_IDS
         + [cell[0][0] for cell in FORMER_REORDER_BLOCKED]
         + [cell[0] for cell in MIGRATED]
         + [cell[0] for cell in AUTO_TILE_BLOCKED]

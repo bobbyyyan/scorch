@@ -20,11 +20,13 @@ from typing import (
     List,
     Optional,
     Sequence,
+    Set,
     Tuple,
 )
 
 import torch
 from .compiler.llir import DataType
+from .exceptions import EinsumLoopOrderError
 from .format import parse_format  # noqa: F401 - compatibility re-export
 
 if TYPE_CHECKING:
@@ -661,6 +663,10 @@ def load_to_kernel_cache(
     kernel_cache[kernel_name] = module
 
 
+def _letters_in_order_of_first_appearance(substrings):
+    return list(dict.fromkeys("".join(substrings)))
+
+
 def topo_sort_characters(substrings, tensors):
     # Create a directed graph
     graph = defaultdict(list)
@@ -674,15 +680,18 @@ def topo_sort_characters(substrings, tensors):
             if char not in in_degree:
                 in_degree[char] = 0
 
-    # Add edges to the graph
+    # Add edges to the graph.  A letter beside itself ("ii") orders nothing, and an edge
+    # from a letter to itself would be a cycle that no inversion can remove.
     for substring in substrings:
         for i in range(len(substring) - 1):
+            if substring[i] == substring[i + 1]:
+                continue
             if substring[i + 1] not in graph[substring[i]]:
                 graph[substring[i]].append(substring[i + 1])
                 in_degree[substring[i + 1]] += 1
 
-    def topo_sort():
-        zero_in_degree_nodes = [node for node in nodes if in_degree[node] == 0]
+    def topo_sort(letters):
+        zero_in_degree_nodes = [node for node in letters if in_degree[node] == 0]
         zero_in_degree_nodes = deque(zero_in_degree_nodes)
 
         result_ = []
@@ -700,22 +709,54 @@ def topo_sort_characters(substrings, tensors):
         return result_
 
     # Run topological sort
-    result = topo_sort()
+    result = topo_sort(nodes)
 
     if len(result) < len(nodes):
-        resolve_cycles(nodes, graph, in_degree, substrings, tensors)
-        # Re-run topo_sort with new graph, in_degree
-        result = topo_sort()
+        if resolve_cycles(nodes, graph, in_degree, substrings, tensors):
+            # Re-run topo_sort with new graph, in_degree
+            result = topo_sort(nodes)
+        else:
+            # The second rule resolved the graph (see resolve_cycles).  Like that rule,
+            # this sort takes the letters in order of first appearance, not in the order
+            # of the set, so the loop order does not follow the hash seed.
+            result = topo_sort(_letters_in_order_of_first_appearance(substrings))
 
         if len(result) < len(nodes):
-            raise ValueError("resolve_cycles did not resolve cycles!")
+            raise EinsumLoopOrderError(
+                "einsum loop order: indices "
+                + ", ".join(sorted(nodes - set(result)))
+                + " are still on a cycle after cycle resolution"
+            )
 
     return result
 
 
 def resolve_cycles(nodes, graph, in_degree, substrings, tensors):
+    """Remove or invert edges of ``graph``, in place, until it has no cycle.
+
+    Each pass takes one cycle and gives up its cheapest edge: the edge is removed, and
+    its reverse is put in unless the graph already has it.  That rule does not finish on
+    every graph.  An edge it put in belongs to no operand, so a later cycle through one
+    has an edge with no cost to compare (``max()`` of an empty list).  And nothing
+    bounds its passes: an edge it removed can come back as the reverse of another, so
+    the graphs it visits need not all differ, and on a graph with an edge from a letter
+    to itself they do not.
+
+    So the rule runs first exactly as it always has, which keeps every loop order it has
+    ever selected, and ``True`` is returned.  Only if it meets a cycle through an edge
+    of no operand, or arrives at a state it has already had (its passes would then
+    repeat for ever), is the graph restored and resolved again by a second rule, and
+    ``False`` returned.  The second rule differs in two ways.  An edge the loop put in,
+    or one no operand has, is an order no operand asked for, so one found on a cycle is
+    dropped, and is never inverted: each pass then either takes an operand edge out for
+    good or drops an edge of that kind, so the rule ends within twice as many passes as
+    there are operand edges (plus the edges of no operand it was given), with no cycle
+    left.  And it looks for cycles from the letters in order of first appearance, not in
+    the order of the set, so what it leaves does not follow the hash seed.
+    """
+
     # Finds a cycle in the graph (if any) and then returns cycle's edges
-    def find_cycle():
+    def find_cycle(letters):
         visited = set()
         stack = []
         in_stack = set()
@@ -744,7 +785,7 @@ def resolve_cycles(nodes, graph, in_degree, substrings, tensors):
             in_stack.remove(curr_node)
             return []
 
-        for node in nodes:
+        for node in letters:
             if node not in visited:
                 cycle_edges_ = dfs(node)
                 if cycle_edges_:
@@ -772,7 +813,7 @@ def resolve_cycles(nodes, graph, in_degree, substrings, tensors):
         min_cost_tensor_indices = edges_to_tensor_indices[min_cost_edge]
         return min_cost_edge, min_cost_tensor_indices
 
-    inverted_edges = defaultdict(list)
+    inverted_edges: Dict[int, List[Tuple[str, str]]] = defaultdict(list)
     edges_to_tensor_indices = defaultdict(list)
 
     # Build dictionary from edges (tuples) in graph to indices of tensors they appear in
@@ -798,22 +839,74 @@ def resolve_cycles(nodes, graph, in_degree, substrings, tensors):
 
     tensor_index_to_size[len(tensors)] = result_size
 
-    # Loop while there are cycles, resolving them by inverting edges and storing them in inverted_edges
-    while True:
-        cycle_edges = find_cycle()
-        if not cycle_edges:
-            break
-        edge_to_invert, tensor_indices = invert_cheapest_edge(cycle_edges)
-        graph[edge_to_invert[0]].remove(edge_to_invert[1])
-        in_degree[edge_to_invert[1]] -= 1
+    node_order = sorted(nodes)
 
-        # If the cycle is just two edges, we will remove one edge, not invert it
-        if edge_to_invert[0] not in graph[edge_to_invert[1]]:
-            graph[edge_to_invert[1]].append(edge_to_invert[0])
-            in_degree[edge_to_invert[0]] += 1
+    # Loop while there are cycles, resolving them by inverting edges and storing them in
+    # inverted_edges.  Returns False, under the shipped rule only, when that rule cannot
+    # finish on this graph.
+    def break_cycles(shipped_rule, letters):
+        inverted_edges.clear()
+        added_edges: Set[Tuple[str, str]] = set()
+        seen_states: Set[Tuple[Any, ...]] = set()
+        while True:
+            cycle_edges = find_cycle(letters)
+            if not cycle_edges:
+                return True
+            if shipped_rule:
+                # The next pass is a function of the adjacency lists and of which
+                # operands already have an inverted edge, so a state seen before means
+                # the passes repeat for ever.
+                state = (
+                    tuple(tuple(graph[node]) for node in node_order),
+                    frozenset(inverted_edges),
+                )
+                if state in seen_states or not all(
+                    edge in edges_to_tensor_indices for edge in cycle_edges
+                ):
+                    return False
+                seen_states.add(state)
+            else:
+                unasked = next(
+                    (
+                        edge
+                        for edge in cycle_edges
+                        if edge in added_edges or edge not in edges_to_tensor_indices
+                    ),
+                    None,
+                )
+                if unasked is not None:
+                    graph[unasked[0]].remove(unasked[1])
+                    in_degree[unasked[1]] -= 1
+                    continue
+            edge_to_invert, tensor_indices = invert_cheapest_edge(cycle_edges)
+            graph[edge_to_invert[0]].remove(edge_to_invert[1])
+            in_degree[edge_to_invert[1]] -= 1
 
-        for tensor_index in tensor_indices:
-            inverted_edges[tensor_index].append(edge_to_invert)
+            # If the cycle is just two edges, we will remove one edge, not invert it
+            if edge_to_invert[0] not in graph[edge_to_invert[1]]:
+                graph[edge_to_invert[1]].append(edge_to_invert[0])
+                in_degree[edge_to_invert[0]] += 1
+                added_edges.add((edge_to_invert[1], edge_to_invert[0]))
+
+            for tensor_index in tensor_indices:
+                inverted_edges[tensor_index].append(edge_to_invert)
+
+    graph_at_entry = {node: list(successors) for node, successors in graph.items()}
+    if break_cycles(True, nodes):
+        return True
+    graph.clear()
+    graph.update(graph_at_entry)
+    break_cycles(False, _letters_in_order_of_first_appearance(substrings))
+    # The counts the caller passed in no longer include the edges out of the letters its
+    # first sort placed, and the sort after the shipped rule takes those edges out a
+    # second time.  The sort after this rule is to be exact, so every edge of the
+    # resolved graph is counted afresh.
+    in_degree.clear()
+    in_degree.update({node: 0 for node in nodes})
+    for successors in graph.values():
+        for successor in successors:
+            in_degree[successor] += 1
+    return False
 
 
 PYTORCH_DTYPE_TO_C_PYTORCH_DTYPE_NAME: Dict[torch.dtype, str] = {

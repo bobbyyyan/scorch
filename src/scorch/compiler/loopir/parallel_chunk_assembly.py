@@ -581,13 +581,10 @@ def build_parallel_chunk_assembly(
         raise TypeError("an exact ParallelChunkAssemblyContext is required")
     if type(statements) is not list:
         raise TypeError("the serial statement list must be a list")
-    outer_index = _sole_outer_loop(statements)
-    if outer_index is None:
+    gate = _gated_outer_loop(statements)
+    if gate is None:
         return None
-    outer = cast(llir.ForLoop, statements[outer_index])
-    policy = _policy_expressions(outer)
-    if policy is None:
-        return None
+    outer, policy = gate
     return [
         _body_lambda(outer, context),
         llir.VarInit(
@@ -615,6 +612,33 @@ def build_parallel_chunk_assembly(
             else_body=list(statements),
         ),
     ]
+
+
+def parallel_chunk_gate_derivable(statements: Sequence[llir.Stmt]) -> bool:
+    """Whether :func:`build_parallel_chunk_assembly` can gate this serial body.
+
+    The same derivation the builder runs, so the two answers cannot differ: one
+    top-level loop, counting by one up to a named bound, whose body's first
+    sparse position array is indexed by that bound (the estimate of the stored
+    entries the thread count is computed from).
+    """
+
+    return _gated_outer_loop(statements) is not None
+
+
+def _gated_outer_loop(
+    statements: Sequence[llir.Stmt],
+) -> Optional[Tuple[llir.ForLoop, _PolicyExpressions]]:
+    """The one top-level loop and its gate's arguments, or ``None``."""
+
+    outer_index = _sole_outer_loop(statements)
+    if outer_index is None:
+        return None
+    outer = cast(llir.ForLoop, statements[outer_index])
+    policy = _policy_expressions(outer)
+    if policy is None:
+        return None
+    return outer, policy
 
 
 def _sole_outer_loop(statements: Sequence[llir.Stmt]) -> Optional[int]:

@@ -786,7 +786,10 @@ def _stensor_operand(s: STensor) -> Optional[Tuple[_Operand, torch.Tensor]]:
         (coordinates,) = indices[1]
         sources = (row_of, coordinates)
         if _native.abi_screen_lex_levels([row_of, coordinates], row_of.numel()):
-            return None  # not row-major order, so not a CSR order of the values
+            # Not strictly row-major -- a descent, or a coordinate stored twice, which
+            # the kernel's index check on the fallback path refuses -- so not a CSR
+            # order of the values.
+            return None
 
         def build() -> _Structure:
             positions = torch._convert_indices_from_coo_to_csr(

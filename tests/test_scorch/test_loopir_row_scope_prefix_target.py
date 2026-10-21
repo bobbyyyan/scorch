@@ -64,13 +64,8 @@ from scorch.compiler.cin import (
 )
 from scorch.compiler.cin_analysis import normalize_cin
 from scorch.compiler.compile_options import CompileOptions
-from scorch.compiler.loop_plan_legality import InvalidSchedule
 from scorch.compiler.loopir.levels import LevelTensorStorage
-from scorch.compiler.loopir.lower_cin import LoopIRLoweringError
-from scorch.compiler.loopir.lower_llir import (
-    LoopIRTargetError,
-    _bound_prefix_assembly_chain,
-)
+from scorch.compiler.loopir.lower_llir import _bound_prefix_assembly_chain
 from scorch.compiler.loopir.oracle import run_program
 from scorch.compiler.loopir.pipeline import (
     compile_cin_via_loopir,
@@ -241,14 +236,20 @@ def test_a_stored_loop_may_drive_a_dense_result_prefix_level(cell, arm):
     assert compiled(cell, arm).cpp_source
 
 
-def test_a_merged_prefix_domain_stays_refused_at_cin():
-    """A united prefix coordinate has no single cursor to advance the catch-up.
+def test_a_merged_prefix_domain_is_lowered():
+    """A united prefix coordinate below a DENSE result level.
 
-    ``C[i, j] += A[i, j, k] + B[i, j, k]`` unites ``i``, whose result level is
-    DENSE.  Admitting it would need merged-prefix assembly, which neither
-    target chain has, so CIN refuses rather than approximating.
+    ``C[i, j, k] += A[i, j, k] + B[i, j, k]`` into ``dss`` unites ``i``, whose
+    result level is DENSE.  It was refused until 2026-10-12, when a union
+    over a dense result level became a dense union whose loop catches the
+    result's segments up at every coordinate.  The dense-union table executes
+    the same sum (``sss + sss`` into ``dss``) against dense PyTorch, on both
+    register-blocking settings.
     """
 
+    from tests.test_scorch.test_loopir_dense_union import SPARSE_CELLS
+
+    assert ("ijk,ijk->ijk", ("sss", "sss"), "dss") in SPARSE_CELLS
     ivars = {name: IndexVar(name) for name in "ijk"}
     a = TensorVar("A", fmt="sss", dtype=torch.float32)[
         ivars["i"], ivars["j"], ivars["k"]
@@ -263,16 +264,16 @@ def test_a_merged_prefix_domain_stays_refused_at_cin():
     for name in reversed("ijk"):
         stmt = ForAll(ivars[name], stmt)
 
-    with pytest.raises((LoopIRLoweringError, LoopIRTargetError, InvalidSchedule)):
-        compile_cin_via_loopir(
-            stmt,
-            (EXTENT["i"], EXTENT["j"], EXTENT["k"]),
-            (
-                ((EXTENT["i"], EXTENT["j"], EXTENT["k"]), torch.float32),
-                ((EXTENT["i"], EXTENT["j"], EXTENT["k"]), torch.float32),
-            ),
-            compile_options=auto_options(False),
-        )
+    kernel = compile_cin_via_loopir(
+        stmt,
+        (EXTENT["i"], EXTENT["j"], EXTENT["k"]),
+        (
+            ((EXTENT["i"], EXTENT["j"], EXTENT["k"]), torch.float32),
+            ((EXTENT["i"], EXTENT["j"], EXTENT["k"]), torch.float32),
+        ),
+        compile_options=auto_options(False),
+    )
+    assert kernel.cpp_source and "union" in kernel.program_text
 
 
 @pytest.mark.parametrize(

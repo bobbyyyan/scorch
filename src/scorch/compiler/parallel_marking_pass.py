@@ -40,8 +40,10 @@ from .iterator import (
     match_mode_position_begin,
 )
 from .llir_traversal import (
+    LLIRPath,
     LLIRRewriter,
     LLIRTraversalContext,
+    LLIRWalker,
 )
 
 _PARALLEL_POOL_SCALAR_TYPES = frozenset(
@@ -183,6 +185,10 @@ _PARALLEL_POLICY_VALUE_CONTEXT = LLIRTraversalContext(
 _PARALLEL_CLUSTER_PLACEMENT_CONTEXT = LLIRTraversalContext(
     stage="CIN lowering",
     pass_name="place_parallel_workspace_cluster",
+)
+_PARALLEL_CARRIED_SCALAR_CONTEXT = LLIRTraversalContext(
+    stage="CIN lowering",
+    pass_name="parallel_loop_carried_scalars",
 )
 
 
@@ -492,6 +498,91 @@ def is_openmp_compatible_for_loop(for_loop: llir.ForLoop) -> bool:
     if not isinstance(for_loop.cond.left, llir.Var):
         return False
     return for_loop.cond.left.name == loop_var.name
+
+
+class _ScalarWrites(LLIRWalker):
+    """The names a statement list declares, the scalars it assigns and the objects
+    it calls a member of."""
+
+    def __init__(self, context: LLIRTraversalContext) -> None:
+        super().__init__(context)
+        self.declared: List[str] = []
+        self.assigned: List[str] = []
+        self.receivers: List[str] = []
+
+    def enter_node(self, node: llir.Node, path: LLIRPath) -> None:
+        kind = type(node)
+        if kind in (llir.VarInit, llir.VarDecl, llir.DirectInit, llir.ForLoopAuto):
+            self.declared.append(cast(llir.VarInit, node).var.name)
+        elif kind is llir.Increment:
+            self.assigned.append(cast(llir.Increment, node).var.name)
+        elif kind is llir.Assign and type(cast(llir.Assign, node).var) is llir.Var:
+            self.assigned.append(cast(llir.Var, cast(llir.Assign, node).var).name)
+        elif kind is llir.FunctionCallStmt:
+            # ``wksp.insert(...)``: a member call spelled in the call's name.
+            receiver, dot, _ = cast(llir.FunctionCallStmt, node).name.partition(".")
+            if dot:
+                self.receivers.append(receiver)
+        elif kind is llir.MemberCallStmt:
+            base = cast(llir.MemberCallStmt, node).base
+            if type(base) is llir.Var:
+                self.receivers.append(cast(llir.Var, base).name)
+
+
+def scalars_carried_between_iterations(
+    for_loop: llir.ForLoop,
+    worker_private: Sequence[llir.Stmt] = (),
+) -> Tuple[str, ...]:
+    """Scalars the loop body assigns and neither it nor ``worker_private`` declares.
+
+    Such a scalar is declared outside the loop, so each iteration reads the value
+    the one before it left -- and under ``omp parallel for`` every worker reads and
+    writes the one shared variable.  The loop over a dense extent that a sum of a
+    dense and a compressed operand emits is the case: the compressed operand's
+    position is declared before the loop and advanced at the end of each
+    iteration (``pC0 += (int)(i_C == i);``), so iteration ``i`` is only right
+    after iterations ``0 .. i - 1`` have run, in order.
+
+    ``worker_private`` holds statements placed inside the parallel region ahead of
+    the loop (a workspace cluster's allocations); what they declare is one per
+    worker.  Names are returned in first-assignment order.
+    """
+
+    body = _ScalarWrites(_PARALLEL_CARRIED_SCALAR_CONTEXT)
+    body.walk(list(for_loop.body))
+    private = _ScalarWrites(_PARALLEL_CARRIED_SCALAR_CONTEXT)
+    private.walk(list(worker_private))
+    local = set(body.declared) | set(private.declared)
+    if isinstance(for_loop.init, (llir.VarInit, llir.VarDecl)):
+        local.add(for_loop.init.var.name)
+    return tuple(dict.fromkeys(name for name in body.assigned if name not in local))
+
+
+def objects_shared_between_workers(
+    for_loop: llir.ForLoop,
+    worker_private: Sequence[llir.Stmt] = (),
+) -> Tuple[str, ...]:
+    """Objects the loop body calls a member of and neither it nor ``worker_private``
+    declares.
+
+    A member-call statement is there for its effect on the object -- a workspace's
+    ``insert``, a vector's ``push_back`` -- and an object declared outside the loop
+    is one object for every worker under ``omp parallel for``.  The relayout of an
+    all-dense operand of rank three or more is the case: one coordinate workspace
+    is declared before the loop over the operand and every iteration inserts into
+    it (``wksp.insert({i, k, j}, B_val[pB2]);``), so two workers grew one vector
+    and one hash map at once and the kernel crashed or lost entries as soon as
+    the outer extent gave it two workers.
+
+    Names are returned in first-call order.
+    """
+
+    body = _ScalarWrites(_PARALLEL_CARRIED_SCALAR_CONTEXT)
+    body.walk(list(for_loop.body))
+    private = _ScalarWrites(_PARALLEL_CARRIED_SCALAR_CONTEXT)
+    private.walk(list(worker_private))
+    local = set(body.declared) | set(private.declared)
+    return tuple(dict.fromkeys(name for name in body.receivers if name not in local))
 
 
 def has_sparse_inner_loop(stmts: Sequence[llir.Stmt]) -> bool:
@@ -844,7 +935,7 @@ def attach_serial_workspace_pools(
 def mark_first_for_loop_parallel(
     stmts: Sequence[llir.Stmt],
     cluster: ParallelWorkspaceCluster,
-) -> None:
+) -> bool:
     """Configure the first OpenMP-compatible loop and place the cluster.
 
     The plain path marks ``omp parallel for`` and moves the cluster's
@@ -865,6 +956,16 @@ def mark_first_for_loop_parallel(
         if isinstance(llir_stmt, llir.ForLoop) and is_openmp_compatible_for_loop(
             llir_stmt
         ):
+            if scalars_carried_between_iterations(
+                llir_stmt, cluster.alloc
+            ) or objects_shared_between_workers(llir_stmt, cluster.alloc):
+                # Its iterations must run in order (or one at a time on an
+                # object they share), so it stays serial.  No
+                # later loop is marked in its place: that would be a schedule
+                # this statement list has never had, with the cluster's
+                # per-worker allocations placed on a loop they were not built
+                # for.  The caller places an unmarked list's cluster serially.
+                return False
             llir_stmt.omp_parallel_for = True
             has_sparse = has_sparse_inner_loop(llir_stmt.body)
             # Hoist per-thread workspace alloc/free outside the for loop
@@ -930,4 +1031,63 @@ def mark_first_for_loop_parallel(
                 cluster.pool_specs,
                 thread_policy_factory,
             )
-            return
+            return True
+    return False
+
+
+def serial_workspace_cluster_placement(
+    cluster: ParallelWorkspaceCluster,
+) -> Tuple[List[llir.Stmt], List[llir.Stmt]]:
+    """Place a workspace cluster that no parallel loop placed: one worker.
+
+    A Where's dense workspaces are allocated by whichever loop the parallel
+    marking selects, inside that loop's region and sized for its team.  A
+    kernel that runs serially -- a sparse result, or a loop the marking finds
+    no OpenMP-compatible loop for -- selects none, and its workspaces were
+    then never declared at all.  This is their serial placement: one owner
+    per workspace sized for one worker, and each worker borrow taking slice
+    zero rather than ``omp_get_thread_num()``'s, which outside a region of
+    this kernel's own is not this kernel's to index by.
+
+    Returns the statements to place before the loop the workspaces are used
+    in and the statements to place after it.
+    """
+
+    _validate_cluster_fields(cluster)
+    owners = {f"{spec.name}_pool_owner" for spec in cluster.pool_specs}
+    before: List[llir.Stmt] = []
+    for spec in cluster.pool_specs:
+        before.append(
+            llir.VarInit(
+                var=llir.Var(name=f"{spec.name}_pool_owner", type=llir.DataType.AUTO),
+                value=llir.FunctionCall(
+                    "scorch_make_aligned_buffer",
+                    [
+                        llir.Cast(
+                            expr=llir.Var(name=spec.extent, type=llir.DataType.INT64),
+                            data_type=llir.DataType.SIZE_T,
+                        )
+                    ],
+                    template_args=(spec.scalar_type,),
+                ),
+            )
+        )
+    for statement in _detach_cluster_statements(cluster.alloc):
+        if (
+            type(statement) is llir.VarInit
+            and type(statement.value) is llir.Add
+            and type(statement.value.left) is llir.MemberCall
+            and type(statement.value.left.base) is llir.Var
+            and statement.value.left.base.name in owners
+        ):
+            # The same declaration with its slice offset dropped: every other
+            # field, the result-storage marker included, travels with it.
+            statement = llir.VarInit(
+                var=statement.var,
+                value=statement.value.left,
+                op=statement.op,
+                cast=statement.cast,
+                result_storage=statement.result_storage,
+            )
+        before.append(statement)
+    return before, _detach_cluster_statements(cluster.free)

@@ -236,16 +236,35 @@ _DENSE_DUAL_CONSTITUENTS = {
     ),
     "ttm_dense": ("ddd", "ijk", (("ddd", "ijl"), ("dd", "lk")), "ijlk"),
     "three_operand_ds": ("dd", "ik", (("ds", "ij"), ("dd", "jk"), ("dd", "ik")), "ijk"),
+    # Four families this file used to pin as refused by the new compiler: a
+    # COO operand (``unsupported_format``) and three trailing-compressed
+    # operands (``unsupported_schedule_auto_family``).  Both arms of each now
+    # compile and stitch into the production kernel.
+    "spmm_coo": ("dd", "ik", (("oo", "ij"), ("dd", "jk")), "ijk"),
+    "ttm_sparse_operand": ("ddd", "ijk", (("dds", "ijl"), ("dd", "lk")), "ijlk"),
+    "batched_sparse_operand": (
+        "ddd",
+        "lik",
+        (("dds", "lij"), ("ddd", "ljk")),
+        "lijk",
+    ),
+    "batched_transposed_sparse_operand": (
+        "ddd",
+        "lik",
+        (("dds", "lij"), ("ddd", "lkj", (0, 2, 1))),
+        "lijk",
+    ),
 }
 
 
 @pytest.mark.parametrize("family", sorted(_DENSE_DUAL_CONSTITUENTS))
 def test_dense_dual_constituents_compose_from_actual_loopir_arms(family):
-    """Representative identity-layout dual kernels reconstruct from LoopIR arms.
+    """Representative dual kernels reconstruct from LoopIR arms.
 
     The reduce-out migration closed the dense-matmul constituent of the
-    production dual domain.  Cover rank-2, batched, rank-3, and three-/four-
-    operand qualifying families: stitching the two actual LoopIR-produced
+    production dual domain.  Cover rank-2, batched, rank-3, three-/four-
+    operand, COO-operand and trailing-compressed-operand qualifying
+    families: stitching the two actual LoopIR-produced
     arm lowerings must reproduce the production ``_build_regblock_dual_path``
     kernel byte-for-byte.  Comparing the same legacy helpers to themselves
     is not evidence; both arms here come from ``compile_cin_via_loopir``.
@@ -297,62 +316,10 @@ def test_dense_dual_constituents_compose_from_actual_loopir_arms(family):
     assert _lower_to_cpp(reconstructed) == production_cpp
 
 
-@pytest.mark.parametrize(
-    ("family", "spec", "expected"),
-    [
-        (
-            "spmm_coo",
-            ("dd", "ik", (("oo", "ij"), ("dd", "jk")), "ijk"),
-            "unsupported_format",
-        ),
-        (
-            "dense_at_csr",
-            ("dd", "ik", (("dd", "ij"), ("ds", "jk")), "ijk"),
-            "unsupported_schedule_auto_family",
-        ),
-        (
-            "ttm_sparse_operand",
-            ("ddd", "ijk", (("dds", "ijl"), ("dd", "lk")), "ijlk"),
-            "unsupported_schedule_auto_family",
-        ),
-        (
-            "batched_sparse_operand",
-            ("ddd", "lik", (("dds", "lij"), ("ddd", "ljk")), "lijk"),
-            "unsupported_schedule_auto_family",
-        ),
-        (
-            "batched_transposed_sparse_operand",
-            ("ddd", "lik", (("dds", "lij"), ("ddd", "lkj", (0, 2, 1))), "lijk"),
-            "unsupported_schedule_auto_family",
-        ),
-    ],
-)
-def test_dual_domain_census_locks_open_boundaries(family, spec, expected):
-    """Qualifying dual families outside the migrated arms fail closed.
+def _census_arms(spec, options):
+    """The two LoopIR arm lowerings of one census family: plain, then blocked."""
 
-    This representative production census locks the known format-family
-    boundaries.  Hierarchical-compressed ``ss`` operands left this list when
-    the generic target began descending a compressed level under a compressed
-    level; their arm is locked as legacy-identical in
-    ``test_dual_path_hierarchical_ss_arm_lowers_the_legacy_kernel``.  COO
-    operands fail level lowering
-    (``unsupported_format``); trailing-compressed operands derive
-    sparse-workspace-adjacent automatic plans that the family gate keeps on
-    the legacy path (``unsupported_schedule_auto_family``).  Production
-    release behavior is unchanged for every one of these: dispatch still
-    builds the dual kernel from the legacy helpers, and the strangler path
-    is not live.
-    """
-
-    options = CompileOptions.from_environment(environ={})
-    assert (
-        ops._build_regblock_dual_path(
-            _build_census_cin(*spec),
-            None,
-            compile_options=options,
-        )
-        is not None
-    )
+    arms = []
     for enabled in (False, True):
         arm_options = replace(
             options.with_regblock_enabled(enabled),
@@ -368,14 +335,62 @@ def test_dual_domain_census_locks_open_boundaries(family, spec, expected):
             )
             for operand_spec in spec[2]
         )
-        with pytest.raises(Exception) as error:
+        arms.append(
             compile_cin_via_loopir(
                 _build_census_cin(*spec),
                 tuple(_CENSUS_DIMS[x] for x in spec[1]),
                 bindings,
                 compile_options=arm_options,
             )
-        assert getattr(error.value, "defect").code == expected
+        )
+    return arms
+
+
+def test_dense_times_csr_arms_compile_and_keep_no_workspace():
+    """Dense times CSR into a dense result: both arms compile, without the workspace.
+
+    The automatic plan of ``C[i,k] += A[i,j] * B[j,k]`` over ``dd`` and ``ds``
+    tiles the reduction loop ``j`` and cannot tile the workspace axis ``k``,
+    which walks ``B``'s compressed level.  The new compiler lowers that plan
+    with plain affine tiles and accumulates into the result directly.  The
+    production dual kernel is stitched from the shipped compiler's arms, which
+    keep a full-row workspace (allocated once, zeroed per row, copied out after
+    the reduction), so the kernel stitched from the two LoopIR arms is not the
+    production kernel: the loops are the same and the workspace is gone.
+
+    Emitting the shipped form as well is open work.  If the stitched kernel
+    ever equals the production one, this family belongs in
+    ``_DENSE_DUAL_CONSTITUENTS`` and this test is stale.
+    """
+
+    spec = ("dd", "ik", (("dd", "ij"), ("ds", "jk")), "ijk")
+    options = CompileOptions.from_environment(environ={})
+    built = ops._build_regblock_dual_path(
+        _build_census_cin(*spec, bind_shapes=True),
+        None,
+        compile_options=options,
+    )
+    assert built is not None
+    production_cpp = _lower_to_cpp(built[0])
+    base_arm, regblock_arm = _census_arms(spec, options)
+    assert base_arm.schedule.plan.auto_policy.regblock_enabled is False
+    assert regblock_arm.schedule.plan.auto_policy.regblock_enabled is True
+    for arm in (base_arm, regblock_arm):
+        plan = arm.schedule.plan
+        assert plan.workspace is not None and plan.workspace.dense
+        tiled = [tile.loop for tile in plan.tiles]
+        assert plan.workspace.reduction_loop in tiled
+        assert plan.workspace.axis_loops[0] not in tiled
+        assert "wksp" not in arm.cpp_source
+        assert "C_values[pC1] += A_val[pA1] * B_val[pB1];" in arm.cpp_source
+    assert "wksp[k] += A_val[pA1] * B_val[pB1];" in production_cpp
+    reconstructed = ops._stitch_regblock_dual_path(
+        copy.deepcopy(regblock_arm.llir_function),
+        copy.deepcopy(base_arm.llir_function),
+        options.scheduler.regblock_max_n,
+    )
+    assert reconstructed is not None
+    assert _lower_to_cpp(reconstructed) != production_cpp
 
 
 def test_transposed_dual_constituent_matches_production_alignment():

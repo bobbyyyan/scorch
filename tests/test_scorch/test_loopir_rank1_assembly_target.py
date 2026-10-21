@@ -18,9 +18,13 @@ the gate is byte parity with ``legacy_generated_cpp`` in both arms plus the
 LoopIR oracle and the PyTorch dense reference — the B1/B3 discipline.
 
 Every excluded neighbour keeps its exact prior code: ``s-s`` stays at
-``unsupported_sparse_subtraction`` (legacy cannot compile SUB at all),
-``s+d`` at ``unsupported_union_with_dense``, and 3-ary chains at
-``unsupported_program_shape``.  The rank-1 dense output ``s->d`` keeps its
+``unsupported_sparse_subtraction`` (legacy cannot compile SUB at all), and
+3-ary sums at ``unsupported_program_shape``.  ``s+d`` and ``d+s`` are lowered
+since 2026-10-12 (a dense union into a compressed result); their kernels
+differ from the shipped compiler's, so they run in
+``test_loopir_dense_union.py`` against float64 dense semantics on both
+compilers instead of under this file's byte-parity gate.  The rank-1 dense
+output ``s->d`` keeps its
 existing admitted route.
 """
 
@@ -70,6 +74,21 @@ def bindings_for(operand_fmts, dtype):
 
 
 def fixtures(kind, dtype, seed=41):
+    """Three operand vectors of one kind; two-operand cells use the first two.
+
+    The third is drawn after the first two, so adding it left the pairs the
+    two-operand cells see unchanged.
+    """
+
+    pair = _fixture_pair(kind, dtype, seed)
+    if kind == "explicit_zero":
+        third = torch.tensor([2.0, 3.0, 0.0, 1.0, 0.0, 7.0, 0.5, 0.0, 6.0])
+    else:
+        third = (torch.rand(N) < 0.6) * torch.randn(N)
+    return (*pair, third.to(dtype))
+
+
+def _fixture_pair(kind, dtype, seed):
     torch.manual_seed(seed)
     if kind == "disjoint":
         mask = torch.arange(N) % 2 == 0
@@ -118,6 +137,9 @@ ADMITTED = [
     ("s*s intersect", ("s", "s"), "mul"),
     ("s*d mixed", ("s", "d"), "mul"),
     ("d*s commuted", ("d", "s"), "mul"),
+    # Refused (``unsupported_program_shape``) until 2026-10-12, when the
+    # assembly targets accepted an intersection of three or more cursors.
+    ("3-ary s*s*s", ("s", "s", "s"), "mul"),
 ]
 
 _KIND = {"d": LevelKind.DENSE, "s": LevelKind.COMPRESSED}
@@ -408,11 +430,57 @@ def test_repeated_compiled_execution_is_byte_stable():
 
 NEIGHBOURS = [
     ("s-s SUB", ("s", "s"), "sub", "unsupported_sparse_subtraction"),
-    ("s+d union-with-dense", ("s", "d"), "add", "unsupported_union_with_dense"),
-    ("d+s union-with-dense", ("d", "s"), "add", "unsupported_union_with_dense"),
-    ("3-ary s*s*s", ("s", "s", "s"), "mul", "unsupported_program_shape"),
-    ("3-ary s+s+s", ("s", "s", "s"), "add", "unsupported_program_shape"),
 ]
+
+
+# Refused (``unsupported_program_shape``) until 2026-10-12, when a UNION merge
+# gained one case per aligned subset of three or more cursors.  Its kernel is
+# not the legacy comparand's text, so it is judged by execution, not by the
+# byte-parity gate above.
+@pytest.mark.parametrize("regblock_enabled", [False, True], ids=["base", "regblock"])
+@pytest.mark.parametrize(
+    "kind",
+    [
+        "random",
+        "disjoint",
+        "empty_a",
+        "empty_b",
+        "cancel",
+        "identical",
+        "explicit_zero",
+    ],
+)
+@pytest.mark.parametrize("dtype", [torch.float32, torch.float64], ids=["f32", "f64"])
+def test_three_operand_union_matches_the_dense_reference(kind, dtype, regblock_enabled):
+    operand_fmts = ("s", "s", "s")
+    dense_operands = fixtures(kind, dtype)
+    out = execute_cin_via_loopir(
+        build_rank1_cin("s", operand_fmts, "add", dtype),
+        (N,),
+        *operands_for(operand_fmts, dense_operands),
+        compile_options=auto_options(regblock_enabled, jit=True),
+    )
+    result = out[0] if isinstance(out, tuple) else out
+    expected = dense_reference(operand_fmts, dense_operands, "add")
+    tolerance = 1e-12 if dtype is torch.float64 else 1e-5
+    assert torch.allclose(
+        # ``to_torch()`` replaces the result's storage with dense storage; the
+        # level arrays are read below.
+        result.to_torch(in_place=False).to(torch.float64),
+        expected.to(torch.float64),
+        atol=tolerance,
+        rtol=tolerance,
+    )
+    # Stored coordinates: every coordinate some operand stores, in order.
+    positions, coordinates = storage_pieces(result)
+    stored = sorted(
+        {
+            int(c)
+            for tensor in operands_for(operand_fmts, dense_operands)
+            for c in tensor.storage.index.mode_indices[0][1].tolist()
+        }
+    )
+    assert coordinates == stored and positions == [0, len(stored)]
 
 
 @pytest.mark.parametrize("regblock_enabled", [False, True], ids=["base", "regblock"])

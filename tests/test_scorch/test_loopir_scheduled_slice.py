@@ -62,6 +62,7 @@ from scorch.compiler.loopir.pipeline import (
 from scorch.compiler.loopir.schedule_passes import SchedulePassError
 from scorch.compiler.scheduler import Schedule, Scheduler, TileSpec
 from scorch.stensor import STensor
+from tests.test_scorch.test_loopir_storage_order_form import stored_in_order
 
 F32 = torch.float32
 F64 = torch.float64
@@ -709,6 +710,15 @@ def csr_stensor(tensor, name):
     return STensor.from_torch(tensor, name).to_sparse("ds")
 
 
+def csc_stensor(tensor, name):
+    """``tensor`` stored by columns: ``ds`` levels in mode order ``(1, 0)``.
+
+    Built level by level, so constructing it compiles no kernel.
+    """
+
+    return stored_in_order(tensor, tensor != 0, "ds", name, (1, 0))
+
+
 def assert_scheduled_shadow(
     cin,
     schedule,
@@ -913,11 +923,19 @@ def test_randomized_scheduled_execution_matches_torch():
 
 
 def test_scheduled_relayout_prerequisite_uses_schedule_free_options(monkeypatch):
+    """The relayout of an operand is compiled without the request's schedule.
+
+    The operand is CSC under a CIN that declares CSR: a tensor with a
+    compressed level stored in another order than the CIN declares is relaid
+    out before the scheduled operation compiles.  (An all-dense operand no
+    longer is; see the expected failure below.)
+    """
+
     torch.manual_seed(2617)
-    a = torch.randn(2, 3, 4)
-    b = torch.randn(2, 3, 4)
-    a_st = STensor.from_torch(a, "A", mode_order=[1, 0, 2]).to_dense()
-    b_st = STensor.from_torch(b, "B", mode_order=[1, 0, 2]).to_dense()
+    a = torch.randn(4, 5, dtype=F64) * (torch.rand(4, 5) < 0.5)
+    b = torch.randn(5, 6, dtype=F64)
+    a_st = csc_stensor(a, "A")
+    assert tuple(a_st.mode_order) == (1, 0)
     observed = []
     original = STensor.change_mode_order
 
@@ -934,14 +952,14 @@ def test_scheduled_relayout_prerequisite_uses_schedule_free_options(monkeypatch)
     options = scheduled_options(Schedule(loop_order=("i", "j", "k")))
     context = CompilationContext(options)
     result, _ = execute_cin_via_loopir(
-        build_dense_add_3d(),
-        (2, 3, 4),
+        build_spmm(F64),
+        (4, 6),
         a_st,
-        b_st,
+        dense_stensor(b, "B"),
         compile_options=options,
         _compilation_context=context,
     )
-    assert torch.equal(result.to_torch(), a + b)
+    assert torch.allclose(result.to_torch(), a @ b, atol=1e-12, rtol=1e-12)
     assert CompilerStageId.FRONTEND_VALIDATED_OPERATION_CONSTRUCTION in tuple(
         record.stage_id for record in context.stage_run_records
     )
@@ -952,16 +970,14 @@ def test_scheduled_relayout_prerequisite_uses_schedule_free_options(monkeypatch)
 
 
 def test_scheduled_relayout_failure_retires_the_parent_compilation(monkeypatch):
-    a = STensor.from_torch(
-        torch.randn(2, 3, 4),
-        "A",
-        mode_order=[1, 0, 2],
-    ).to_dense()
-    b = STensor.from_torch(
-        torch.randn(2, 3, 4),
-        "B",
-        mode_order=[1, 0, 2],
-    ).to_dense()
+    """A relayout that fails leaves the scheduled compilation failed, not open.
+
+    The same CSC operand as above, so that the entry does relay out.
+    """
+
+    torch.manual_seed(2617)
+    a = csc_stensor(torch.randn(4, 5) * (torch.rand(4, 5) < 0.5), "A")
+    b = dense_stensor(torch.randn(5, 6), "B")
     options = scheduled_options(Schedule(loop_order=("i", "j", "k")))
     context = CompilationContext(options)
     injected = RuntimeError("injected scheduled relayout failure")
@@ -972,8 +988,8 @@ def test_scheduled_relayout_failure_retires_the_parent_compilation(monkeypatch):
     monkeypatch.setattr(STensor, "change_mode_order", fail_relayout)
     with pytest.raises(RuntimeError) as error:
         execute_cin_via_loopir(
-            build_dense_add_3d(),
-            (2, 3, 4),
+            build_spmm(),
+            (4, 6),
             a,
             b,
             compile_options=options,
@@ -989,6 +1005,256 @@ def test_scheduled_relayout_failure_retires_the_parent_compilation(monkeypatch):
             compile_options=options,
         )
     assert terminal.value.diagnostic.code == "failed_compilation"
+
+
+def _dense_operands_stored_in(order, shape=(2, 3, 4), dtype=F32):
+    """Two random rank-3 tensors, and each as a dense operand stored in ``order``."""
+
+    torch.manual_seed(2617)
+    a = torch.randn(shape, dtype=dtype)
+    b = torch.randn(shape, dtype=dtype)
+    return (
+        a,
+        b,
+        STensor.from_torch(a, "A", mode_order=list(order)).to_dense(),
+        STensor.from_torch(b, "B", mode_order=list(order)).to_dense(),
+    )
+
+
+def _scheduled_alignment(cin, loop_order, operands):
+    """What the scheduled entry plans to relay out, without compiling anything.
+
+    The normalized CIN, the operands' snapshots, and the mode order each
+    operand is copied into (``None``: passed as the caller stored it).
+    """
+
+    from scorch.compiler.loopir.pipeline import (
+        _apply_requested_schedule,
+        _plan_mode_orders_to_planned_order,
+    )
+    from scorch.ops import _snapshot_runtime_tensors
+
+    options = scheduled_options(Schedule(loop_order=loop_order))
+    normalized, plan = _apply_requested_schedule(
+        cin, options, CompilationContext(options)
+    )
+    snapshots = _snapshot_runtime_tensors(operands)
+    operand_orders, result_order = _plan_mode_orders_to_planned_order(
+        normalized,
+        snapshots,
+        plan,
+        dense_by_coordinate=True,
+        converted_by_plan=True,
+    )
+    assert result_order is None
+    return normalized, snapshots, operand_orders
+
+
+@pytest.mark.parametrize(
+    "stored, copied_into",
+    [
+        ((0, 1, 2), None),
+        ((1, 0, 2), (0, 1, 2)),
+        ((2, 0, 1), (0, 1, 2)),
+        ((2, 1, 0), (0, 1, 2)),
+    ],
+)
+def test_scheduled_entry_copies_a_dense_operand_only_into_its_declared_order(
+    stored, copied_into
+):
+    """A dense operand is copied when, and only when, it is not stored as declared.
+
+    The kernel reads an all-dense operand by coordinate in the mode order the
+    CIN declares, here the identity.  An operand stored that way is passed as
+    it is; one stored in any other order is copied into the declared order.
+    No compiler is needed: this is the entry's plan, before any relayout.
+    """
+
+    _, _, a_st, b_st = _dense_operands_stored_in(stored)
+    _, _, operand_orders = _scheduled_alignment(
+        build_dense_add_3d(), ("i", "j", "k"), (a_st, b_st)
+    )
+    assert operand_orders == (copied_into, copied_into)
+
+
+@pytest.mark.parametrize("stored, copied_into", [((1, 0), None), ((0, 1), (1, 0))])
+def test_scheduled_entry_copies_a_dense_operand_into_a_declared_order_that_is_not_the_identity(
+    stored, copied_into
+):
+    """The declared order decides, not the identity and not the planned order.
+
+    ``build_transposed_spmm`` declares its dense operand in mode order
+    ``(1, 0)``.  Stored that way it is not copied; stored in the identity
+    order it is copied into ``(1, 0)``.  The CSR operand is aligned to the
+    planned order as before, and is already in it.
+    """
+
+    torch.manual_seed(2617)
+    sparse = torch.randn(4, 5)
+    a_st = stored_in_order(sparse, sparse.abs() > 0.5, "ds", "A", (0, 1))
+    b_st = STensor.from_torch(
+        torch.randn(6, 5), "B", mode_order=list(stored)
+    ).to_dense()
+    _, _, operand_orders = _scheduled_alignment(
+        build_transposed_spmm(), ("i", "j", "k"), (a_st, b_st)
+    )
+    assert operand_orders == ((0, 1), copied_into)
+
+
+def test_scheduled_entry_refuses_a_dense_operand_left_in_an_undeclared_order():
+    """The check on the operands the entry is about to pass to the kernel.
+
+    Two orders of equal extents pass every extent check and read the wrong
+    cells, so the entry does not rely on its own relayout having run: after
+    the alignment, an all-dense operand that is still not stored in its
+    declared order is an error.  The alignment is skipped here to reach the
+    check; operands stored as declared pass it.
+    """
+
+    from scorch.compiler.loopir.pipeline import (
+        _require_dense_operands_in_declared_order,
+    )
+    from scorch.exceptions import CompileSpecError
+
+    for shape in ((3, 3, 3), (2, 3, 4)):
+        _, _, a_st, b_st = _dense_operands_stored_in((1, 0, 2), shape)
+        normalized, snapshots, _ = _scheduled_alignment(
+            build_dense_add_3d(), ("i", "j", "k"), (a_st, b_st)
+        )
+        with pytest.raises(CompileSpecError) as refused:
+            _require_dense_operands_in_declared_order(normalized, snapshots)
+        assert "'A' declares mode order (0, 1, 2)" in str(refused.value)
+        assert "stored in mode order (1, 0, 2)" in str(refused.value)
+
+        _, _, a_st, b_st = _dense_operands_stored_in((0, 1, 2), shape)
+        normalized, snapshots, _ = _scheduled_alignment(
+            build_dense_add_3d(), ("i", "j", "k"), (a_st, b_st)
+        )
+        _require_dense_operands_in_declared_order(normalized, snapshots)
+
+
+def _record_relayouts(monkeypatch):
+    """Record the mode order of every relayout ``STensor.change_mode_order`` runs."""
+
+    relaid = []
+    original = STensor.change_mode_order
+
+    def record(self, mode_order, **kwargs):
+        relaid.append(tuple(mode_order))
+        return original(self, mode_order, **kwargs)
+
+    monkeypatch.setattr(STensor, "change_mode_order", record)
+    return relaid
+
+
+def _refuse_relayouts(monkeypatch):
+    """Make any relayout through ``STensor.change_mode_order`` an error."""
+
+    def refuse(self, mode_order, **_kwargs):
+        raise AssertionError(
+            f"an operand stored in mode order {tuple(self.mode_order)} was "
+            f"relaid out to {tuple(mode_order)}"
+        )
+
+    monkeypatch.setattr(STensor, "change_mode_order", refuse)
+
+
+@pytest.mark.parametrize("dtype", [F32, F64], ids=["float32", "float64"])
+@pytest.mark.parametrize("shape", [(3, 3, 3), (2, 3, 4)])
+def test_scheduled_entry_runs_dense_operands_stored_in_another_mode_order(
+    shape, dtype, monkeypatch
+):
+    """Dense operands stored ``(1, 0, 2)`` under a CIN that declares the identity.
+
+    The shipped compiler and this entry without a schedule both compute it.
+    With a schedule the entry passed such an operand as stored and the kernel
+    read it in the declared order: wrong values where the extents are equal
+    (``(3, 3, 3)``, largest error about 3.4) and ``index_extent_mismatch``
+    where they are not (``(2, 3, 4)``).  Each operand is now copied into the
+    declared order first, and the caller's operands are left as they were.
+    """
+
+    a, b, a_st, b_st = _dense_operands_stored_in((1, 0, 2), shape, dtype)
+    relaid = _record_relayouts(monkeypatch)
+    result, _ = execute_cin_via_loopir(
+        build_dense_add_3d(),
+        shape,
+        a_st,
+        b_st,
+        compile_options=scheduled_options(Schedule(loop_order=("i", "j", "k"))),
+    )
+    assert relaid == [(0, 1, 2), (0, 1, 2)]
+    assert tuple(a_st.mode_order) == (1, 0, 2)
+    assert tuple(b_st.mode_order) == (1, 0, 2)
+    computed = result.to_torch()
+    assert computed.dtype == dtype
+    tolerance = 1e-12 if dtype == F64 else 1e-6
+    assert torch.allclose(
+        computed.double(), a.double() + b.double(), atol=tolerance, rtol=tolerance
+    )
+
+
+@pytest.mark.parametrize("dtype", [F32, F64], ids=["float32", "float64"])
+@pytest.mark.parametrize("shape", [(3, 3, 3), (2, 3, 4)])
+def test_scheduled_entry_copies_no_dense_operand_stored_as_declared(
+    shape, dtype, monkeypatch
+):
+    """Operands stored in the declared order reach the kernel without a copy."""
+
+    a, b, a_st, b_st = _dense_operands_stored_in((0, 1, 2), shape, dtype)
+    with monkeypatch.context() as patch:
+        _refuse_relayouts(patch)
+        result, _ = execute_cin_via_loopir(
+            build_dense_add_3d(),
+            shape,
+            a_st,
+            b_st,
+            compile_options=scheduled_options(Schedule(loop_order=("i", "j", "k"))),
+        )
+    tolerance = 1e-12 if dtype == F64 else 1e-6
+    assert torch.allclose(
+        result.to_torch().double(),
+        a.double() + b.double(),
+        atol=tolerance,
+        rtol=tolerance,
+    )
+
+
+@pytest.mark.parametrize("stored", [(1, 0), (0, 1)])
+def test_scheduled_entry_runs_a_dense_operand_declared_in_another_mode_order(
+    stored, monkeypatch
+):
+    """``build_transposed_spmm``: the dense operand is declared in ``(1, 0)``.
+
+    Stored as declared it is not copied.  Stored in the identity order it is
+    copied into ``(1, 0)``, the declared order, and the product is the same.
+    """
+
+    torch.manual_seed(2617)
+    sparse = torch.randn(4, 5, dtype=F64)
+    sparse[sparse.abs() < 0.5] = 0.0
+    dense_logical = torch.randn(6, 5, dtype=F64)
+    a_st = csr_stensor(sparse, "A")
+    b_st = STensor.from_torch(dense_logical, "B", mode_order=list(stored)).to_dense()
+    options = scheduled_options(Schedule(loop_order=("i", "j", "k")))
+    with monkeypatch.context() as patch:
+        if stored == (1, 0):
+            _refuse_relayouts(patch)
+            relaid = []
+        else:
+            relaid = _record_relayouts(patch)
+        result, _ = execute_cin_via_loopir(
+            build_transposed_spmm(F64),
+            (4, 6),
+            a_st,
+            b_st,
+            compile_options=options,
+        )
+    assert relaid == ([] if stored == (1, 0) else [(1, 0)])
+    assert tuple(b_st.mode_order) == stored
+    assert torch.allclose(
+        result.to_torch(), sparse @ dense_logical.T, atol=1e-12, rtol=1e-12
+    )
 
 
 @pytest.mark.parametrize("shape", [(3, 3), (3, 4)])

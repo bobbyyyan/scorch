@@ -33671,3 +33671,1466 @@ tree root and expected commit), their receipts, and the pinned worktree at
    rather than rebuilt.
 5. Items 3–7 of the previous slice's list still stand: the two completion mirrors,
    rule 4's obstacles B and E, the two-configuration chunk-merge grid, and mkt1.
+
+
+## Sums into sparse results, guarded dense reads below a union, and the merge tree (2026-10-12; scorch-merge)
+
+Work done on the merge tree (`/Users/bobby/scorch-nc`, base 7ac70f2, uncommitted;
+snapshots with digests in `~/.cache/scorch-codex/merge-snapshots/`).
+
+**1. What the new compiler lowers that it refused before.** Elementwise sums
+`A + B` whose result has a compressed level, for every result layout the shipped
+compiler computes:
+
+* all-compressed results (`ss`, `sss`, `ssss`), including a dense operand
+  (`ss + dd`, `sss + ddd`), through the united assembly
+  (`_MultiCompressedAssemblyLowering`), which now splits by alignment at every
+  depth;
+* CSR and other dense-prefix results (`ds`, `dss`, `dds`): a union or dense
+  union may drive a dense prefix level above a united compressed suffix; the
+  cells it skips are caught up by coordinate as below a stored stream;
+* results with dense blocks below a compressed level (`sd`, `ssd`, `sdd`,
+  `sds`): a one-sided case drains its operand into the block the compressed
+  coordinate opened, resolving the block cell's position
+  (`_one_sided_result_resolves`), and a dense level whose child is compressed
+  catches that child up and closes it per cell inside the drain as the merged
+  cases do (`_one_sided_level_statements`); the block commits as for any other
+  driver;
+* a dense loop (every operand dense at that level) anywhere in a united chain:
+  above every union both operands are present at each cell, below one a
+  one-sided drain visits every cell for the operand present
+  (`_one_sided_dense_statements` now takes a `DenseFor` as well as a
+  DENSE_UNION);
+* sums of three or more operands: a UNION merge emits one case per aligned
+  subset (larger first) and one tail loop per lattice point below the full one
+  (`merge_loop_over` in `_lower_merged`; two cursors emit exactly what they did
+  before), and the united assembly takes N operands (a case with several but
+  not all operands present descends through the merges as they are, the absent
+  operands' child streams being empty segments);
+* a dense level stored below a level a union iterates (`sd + ds`, `dss + ssd`,
+  `dsd`, `ssd` operands), for dense and sparse results alike — item 2;
+* products of three or more operands whose innermost loop intersects all of
+  them (`ij,ij,ij->ij` into `ds` or `ss`, `dss` at rank 3): the generic target
+  required exactly two cursors in an innermost merge and now admits whatever
+  `_supported_merge` admits. Two-cursor merges are unchanged;
+* sums whose coordinate (COO) operands are vectors (`o + o`, `o + s`, `o + d`,
+  three operands, into `s`, `o` or `d`): a COO tensor's last level stores each
+  coordinate of its segment once, so a union walks it as a compressed level.
+  lower_cin, the verifier and the generic target's coordinate-nest check now
+  refuse a union only over a coordinate level that has a level below it;
+* sums with a term over fewer indices into a CSR-like result whose term is
+  dense (`ds + x[i] -> ds`, `ds + x[j] -> ds`, `dds + y[i,k] -> dds`): the
+  DENSE_UNION over the column took its bound from `C1_size`, which a
+  compressed result level does not declare, so the C++ did not compile; it
+  now takes it from a dense result level only, else from the cursor tensor's
+  shape;
+* sums of three CSR operands (`ds + ds + ds -> ds`, and `dds` at rank 3)
+  through the generic target, which admits every merge `_supported_merge`
+  admits.
+
+On the 44 sum cells of the frontier census the new compiler now compiles every
+cell the shipped compiler computes (27), and refuses the same 17 the shipped
+compiler refuses since ken's 0022 (sums reduced into a compressed result).
+
+**2. Guarded `PositionLoad`.** A dense leaf below a compressed level a union
+iterates has an address only where that union's cursor aligned. `PositionLoad`
+gains optional `guard` (the cursor of the tensor's deepest compressed level, every
+level below it dense, iterated by a UNION or DENSE_UNION merge) and `default`
+(value-typed, evaluated where the guard is not aligned), set together. Verifier:
+`malformed_guard`, `dead_default` (a guard on an address that is bound wherever it
+runs, or outside a union), `position_load_mismatch` (guard on another tensor or not
+the deepest compressed level); the dense spine may hang from the guard's
+union-bound position only inside the guarded load. Oracle: the default where the
+guard is unaligned. Printer: an unguarded load serializes exactly as before, so no
+existing program's identity changes. Target: inside an alignment case the read is
+a plain load or drops out; elsewhere it is `x_T == x ? load : 0` (an integer zero,
+so a float32 sum stays float32). A dense result's DENSE_UNION above the innermost
+loop now splits by alignment when one of its cursors guards a read, so the select
+disappears from the inner loop. A united cursor's own value beside a guarded read
+outside a case fails closed (`unsupported_union_dense_descent`).
+
+**3. Shipped defects found tonight** (all fixed or refused by ken's 0010–0024):
+workspace copy-out by memcpy inside an outer reduction; `std::min(int, int64_t)`
+in the atomic chunk loop; a union tail loop restarting at the parent's first
+position (entries added twice); a parallel loop over a shared union cursor (max
+error 0.99999 at 200000×16); sparse results under an outer reduction
+(segfault; now refused); `lower_and_exec_cin` wrapping results as `dd`. And
+from ken's 0025–0029: a three-operand sum whose kernel used an undeclared loop
+counter (0025); coordinate (`ooo`) results storing a level more than once
+(0026); `A + B` and `matmul(A, x)` storing the result in the left operand's
+dtype, so int64 + float64 truncated every sum (0028, now `torch.promote_types`;
+for `matmul` this was wider than torch, which raises; since ken's 0036 a
+mixed-dtype product raises, item 12);
+a sum with a term over fewer indices, `C[i,j] = A[i,j] + x[j]`, whose kernel
+dropped `x` (the body became `C = A`) in every layout (0029, now refused with
+`unsupported_sum_addend_without_loop_variable`). And on the frozen tree `nc_0525`: an integer einsum into an all-coordinate result whose last result loop has a reduction directly under it (SDDMM into `oo`, `ab,ac,bc,c->ab` into `oo`) accumulated in a `float _accum`, exact only below 2**24 (off by up to 38 near 1e8 in `test_coordinate_driver_merged_reduction.py`); patch B had typed that accumulator for float64 only. B2 (`B2-integer-element-type.patch`, its test hunk rebased over ken's `test_all_coordinate_row_sum_is_refused`) declares it with the result's element type; ken checked 192 kernels: the 24 integer `[oo]` kernels change and every float32 and float64 kernel is byte-identical. All 51 programs `high_rank_expected.json` listed as shipped defects now compute on both blocking settings (workspace-dtype 0001, ken's any-rank coordinate workspace, dennis's relayout fix), so its `defects.shipped` is empty. `change_mode_order` kept format letters by position, so a relaid-out operand's compressed level could become dense and a reduction into a compressed result stored coordinates the operands do not imply (`ijklmn->i` from `sddssd`, 29 programs in all); dennis's eefc9c04 permutes the letters with the modes, and the 22 entries of `RELAYOUT_STRUCTURE_DEFECTS` in `test_dense_operand_out_of_storage_order.py` it fixed are removed by ken's nc-0002. Its runtime is not yet measured on the two-host grid.
+
+**4. Kernels that differ from the shipped compiler's** and so need the two-host
+runtime grid before they can replace a shipped kernel: every new sparse-result sum
+except `s + s`, `ss + ss -> ss|sd`, `sss + sss -> sss`, `ssss + ssss -> ssss`
+(byte-identical); the dense-result sums; MTTKRP into dense; the tiled reductions
+listed in `test_loopir_tiled_dense_reductions.py`; the 150 reduction-tiled
+automatic plans of mlsys's 0014 (shipped text minus the full-row workspace);
+`ss,ds,ds -> ds` among the three-operand products (a dense position resolved
+before the assembly instead of after, and the closing pos loop bounded by
+`B0_size` instead of the equal `C0_size`). The shipped schedule stays the
+dispatched one for each until then. The harness for that grid: item 13.
+
+**5. Serial where the shipped kernel is parallel** (mlsys census 81201): 73
+programs, every product or reduction into a dense-then-compressed result. The
+automatic plans carry no explicit parallel loop, so the row-parallel sparse
+workspace target is never chosen. (Re-counted at 64 rows in item 20 and closed
+for most programs by items 24 and 25.)
+
+**6. Tests.** `test_loopir_dense_union.py` gains the sparse-result table (65 cells,
+2-D to 4-D, both compilers, both arms, four inputs including empty child segments
+and three extents with zeros), each judged against float64 dense values and the
+stored structure the operands imply. Stale refusal pins converted to executed
+tests in `test_loopir_rank1_assembly_target.py`,
+`test_loopir_union_assembly_target.py`, `test_loopir_dense_leaf_cooperand_target.py`,
+`test_loopir_llir_lowering.py`, `test_loopir_bound_prefix_target.py`.
+The table also holds 11 sums with a term over fewer indices
+(`INVARIANT_TERM_CELLS`): the new compiler computes the four dense-result forms
+and refuses the seven sparse-result forms, and the shipped compiler refuses all
+eleven. `test_loopir_merged_drivers.py` gains the three-operand products.
+`test_loop_invariant_factor_hoist_validity.py`'s pinned nest now includes the
+`C_nonempty` flag: the result stores `i` only when some entry under row `i`
+contributes.
+
+Stale refusal pins restated on the merge tree: `test_loopir_cin_lowering.py`
+(three sums now lower), `test_loopir_llir_lowering.py` (the three-cursor
+union), `test_loopir_multi_dense_prefix_target.py` (`sd`/`sdd` sums,
+`dsd + dsd -> dds`, and `sds + sds -> sds`, which now refuses for the dense
+level's address), `test_loopir_pipeline_execution.py` (a rank-6 dense
+reduce-out that both compilers now compute; the shipped C++ no longer reads
+`pA2` before declaring it), `test_loopir_coordinate_levels.py` (the verifier
+refuses a union only over a COO level that repeats).
+
+**7. Open after this section.** (`sds + sds -> sds` was here; fixed, item 9.) Sums with a term over fewer indices into a
+sparse result: both compilers refuse; the lowering is a loop over the whole
+extent of the missing index for a term dense along it. The new compiler's
+scheduled entry read a dense operand stored in another mode order as if stored
+in the declared one (wrong values when the extents agree; mlsys 81232; shipped
+and the unscheduled entry are correct): mlsys's 0016 relayouts it into the
+declared order. An operand the plan converts and that is stored in another
+order is refused (`CompileSpecError`) where the shipped compiler relayouts.
+(Sums with a COO operand of rank 2 or more were here; both compilers now
+compute the 24 cells of `COORDINATE_SUM_CELLS` in `test_loopir_dense_union.py`,
+`oo + oo` to `ooo + dss` into compressed, dense and COO results: a union walks
+a COO level run by run, an aligned cursor stepping over its run and an
+unaligned one's run empty.)
+
+**8. Integer element types in the new compiler** (after `nc_0740`). The new
+compiler refused every int64, int32, int8 and uint8 program with
+`unsupported_dtype` (1,056 of 1,056 on mlsys's integer pass); the shipped
+compiler builds all six element types of `utils.PYTORCH_DTYPE_TO_C_DATATYPE`.
+`ScalarType` gains `INT64`, `INT32`, `INT8`, `UINT8` (and `is_floating`); a
+value-typed `IntegerConst` is the integer counterpart of `FloatConst`, and the
+verifier holds every value constant to its program's kind and range
+(`mixed_dtype` otherwise), so a float program's printed and serialized form is
+unchanged. `lower_cin` maps the four torch dtypes and builds the union default
+with `LoopIRBuilder.additive_identity`; `lower_llir` routes every scalar-type
+choice through one table (`_scalar_llir_type`, zeros spelled as B2 spells
+them) and every value pointer through `_value_pointer_type`, which spells
+int32 `int32_t*` as the shared result ABI does (`llir.DataType.ptr_type`
+spelled it `int*`, and the parallel sparse-workspace completion check saw two
+types for one array). `plan_identity._DTYPE_TOKENS` gains the four tokens
+(mlsys reviewed; the request schema is unchanged because no integer request
+had bytes before), tied to the lowering's table by a test. The oracle refuses
+an integer program (`LoopIROracleError`): its arithmetic is Python float.
+(Mixed element types in one program: item 10.)
+`test_loopir_integer_programs.py`: 19 cells (products, SDDMM, MTTKRP,
+batched, reductions, sums; dense, CSR and COO operands and results, a
+converted operand), int64 and int32 everywhere and int8/uint8 on four, both
+compilers, both arms, judged exactly against int64 `torch.einsum` with values
+past 2**24 and stored structure checked.
+
+
+**9. A compressed level below a dense level below a union** (`sds + sds -> sds`,
+`sss + sds -> sss`, and the 4-D `sdds`, `sdsd`, `ssds`, `sdss` sums). The new
+compiler refused them (`unsupported_union_dense_descent`); the shipped compiler
+computes all 16 sums tried, both arms. A cursor's parent may now hang from a
+union-bound position through dense levels: its segment is empty where the
+union's cursor did not align, exactly as with no dense level between. No IR
+field is added. `lower_cin.position_expr` admits such a parent
+(`absence_handled`); the verifier types a dense position over a maybe-absent
+parent as maybe-absent and accepts it as a cursor parent (`cursor_parent_tensor`
+beside `guarded_load_tensor`); the oracle's `_segment` walks dense parents to
+the union position; `lower_llir._union_parent_alignment` does the same, so
+`_segment_bound` selects the empty segment. The united assembly already
+emits one alignment case per subset of operands, so in practice each case walks
+only the operands that stored `i`. The programs that compiled before are
+unchanged: no verified program had such a parent. Tests: 16 cells in
+`test_loopir_dense_union.py` (`UNION_DENSE_DESCENT_CELLS`, both compilers,
+both arms, four extents with zeros); `test_loopir_multi_dense_prefix_target.py`
+executes three of them and requires the compiled arrays to equal the oracle's.
+
+**10. Mixed element types** (int64 + float64, int32 + int64, uint8 + int32, ...).
+Both compilers' generic entries bound the result to the FIRST operand's dtype
+(`ops.lower_and_exec_cin`, `pipeline`'s runtime binder), so a mixed sum through
+them was truncated to the left operand's type, the defect ken fixed for
+`STensor + STensor` (which builds its own program). Both now bind the
+operands' promoted dtype (`layout.common_value_dtype`, PyTorch's rule);
+single-dtype programs are unchanged. The result's declared `TensorVar` dtype is
+ignored and replaced, as before: CIN has no undeclared state for it
+(mlsys agreed; "caller-requested result dtype" is a separate API question).
+int8 with uint8 raises `UnsupportedDtypePromotionError`
+(`unsupported_dtype_promotion`) in every entry. The new compiler's binder
+applies that refusal only when every operand's dtype is one Scorch stores; an
+operand of another dtype (int16, bool, float16, complex64) is still refused by
+the lowering, which names it (`unsupported_dtype`), as before. In LoopIR every value
+expression now has a type: a read its tensor's or workspace's, a binary
+operation `nodes.promoted_scalar_type` of its operands, a constant the type of
+what it stands for (a default its read's, elsewhere the result's); a stored,
+combined or inserted value must have exactly its target's type
+(`mixed_dtype`), and `lower_cin` refuses a statement whose result type is not
+its right-hand side's. Union defaults are typed by their own tensor (same text
+as before in a single-dtype program). `test_loopir_mixed_dtype_sums.py`: 16
+cells (rank 1 to 3, compressed, dense, COO and `sds` operands, a reduction, two
+three-operand sums) under up to eight type pairs, both compilers, both arms,
+and the shipped `A + B` where it builds the cell; values exact against
+torch's own `a + b` except float three-term sums and reductions; int64 values
+past 2**40 kept exactly in float64; a float32 x float64 reduction whose float64
+factors float32 cannot hold; the verifier's own refusals.
+
+**11. Known failures not caused by the merge.** `test_format_ownership_boundary.py`
+fails 5 tests identically on 7ac70f2 and on every merge tree: they expect a
+storage to copy the caller's index arrays, and the shipped storage shares them.
+`test_compiler_ir_benchmark.py::test_benchmark_rejects_an_import_from_a_different_worktree`
+needs a `.git` directory, which frozen copies do not have.
+
+**12. Products of operands with different element types raise** (ken's 0036;
+Bobby 07:36, "You should raise."). PyTorch raises `RuntimeError` for a
+mixed-dtype `matmul`, `mv`, `mm`, `@` and `einsum`; `ops.spmv`, `ops.matmul`
+and `ops.einsum` now raise `exceptions.OperandDtypeMismatchError` (a
+`TensorValidationError` and a `RuntimeError`, code `operand_dtype_mismatch`,
+from `layout.require_same_value_dtype`) before any kernel is looked up or built.
+Sums still promote (`layout.common_value_dtype`, item 10). In `ops.matmul` the
+check lives in `_require_one_product_dtype`, so `matmul` stays within the
+project's flake8 complexity bound (the inline check made it 44). Tests:
+`test_result_value_dtype_of_mixed_operands.py`.
+
+**13. The runtime grid for kernels whose C++ changed** (`bench/kernel_grid/`,
+README there). `run_host.sh <old tree> <new tree> <pairs.json> <out dir>`:
+`capture.py` runs each pair (program, dtype) on each cell (three sizes by the
+largest tensor's element count, 4e3, 2.6e5 and 4e6, times fills 0.05 and 0.55)
+through the public `scorch.einsum` on both trees and through
+`execute_cin_via_loopir` on the new tree, judges each result against float64
+`torch.einsum`, and saves the main kernel's `.so` and its exact arguments.
+`time_cells.py` then calls those kernels in one process without importing
+either tree (only one tree's `scorch_ops`, which registers the C++ `Tensor`
+result type; `run_host.sh` requires both trees to define it identically), each
+arm beside a copy of itself (A/A) and a positive control that calls the first
+arm twice, in seeded random order, 21 rounds, three processes run one after
+another. `analyze.py` reports per cell the median paired ratio, a two-level
+bootstrap interval, the A/A floor, and NEUTRAL-OR-BETTER / REGRESSION /
+UNRESOLVED, and lists every cell not timed with each kernel's capture outcome.
+The pair list (306 pairs: 146 whose shipped C++ changed with a correct old
+kernel, 159 the new compiler builds with nonempty C++, 1 both) is
+`~/.cache/scorch-codex/merge-grid/pairs.json`. The smoke run found that
+7ac70f2's shipped kernels for `MM ss x dd -> ds` and `SDDMM ss x dd x dd -> ds`
+are wrong when the DCSR (`ss`) operand has an empty row: the assembly sizes
+and indexes the result's row positions by the operand's stored rows
+(`pA0_end`, `pA0`) instead of the row extent and coordinate (`C0_size`,
+`A0_crd[pA0]`, as the merge tree emits), and the call raises in argument
+validation ("B compressed level 1 positions length must equal parent count +
+1"). The merge tree computes both exactly (4x4 probe and the S cells). With no
+correct old kernel these pairs need no timing (Bobby 07:47); `analyze.py`
+reports such a pair as "old incorrect" and still prints its timed cells.
+
+**14. An operand absent in a union case has no dense positions** (found
+2026-10-12 by the full suite on snapshot nc_0856). In a union case, tail loop
+or one-operand drain the emission knows which cursors aligned. Until this fix
+`_input_resolves_at` still emitted the dense position of every operand at
+every dense loop, so a one-operand drain computed, for the operand it does not
+iterate, a position from a position variable that case never declares:
+`sdsd + sdsd` into `ssss` or `sdsd`, and `ssds + ssds` into `ssds`, emitted
+`int pB3 = pB2 * B3_size + l;` with no `pB2` in scope, and did not compile
+(6 failing tests, both register-blocking settings). The rule now
+(`_TargetLowering._operand_absent_here`): a dense level is resolved only when
+the cursor of the nearest stored level above it is not known to be unaligned.
+Only the nearest stored level decides, because a cursor further up that did
+not align leaves the cursors below it iterating the empty segment
+(`_segment_bound`), and the positions under those are still declared and read.
+The same rule picks the loop bound (`_input_bound_var`: the first operand
+present, so a drain of `B` counts to `B3_size`), and a one-operand dense drain
+resolves after the result's catch-up (`_one_sided_level_statements`), as
+`_lower_dense` and the shipped lattice do. Effect on emitted text, 185 sum
+cells times two settings: 20 rows that differed from the shipped text are now
+equal to it (comments and blank lines aside), among them the three programs
+above, `sd + sd` into `ss` and `sd`, `sdd + sdd`, `sds + sds` into `sds` and
+`sss`, `sdds + sdds`, `sdss + sdss`; 48 rows changed and still differ (the
+absent operand's position arithmetic is gone); none went from equal to
+different. On the two program lists: 3 frontier programs changed text
+(`union2 sd+ds ij->i|ij|j`), no front-door program did.
+
+**15. A dense union's dense operand may be absent** (found the same day by
+reading the kernel the fix above changed; no test input reached it).
+`_MultiCompressedAssemblyLowering._merged_case_stmts` treated every operand
+dense at a DENSE_UNION level as present at every coordinate. For
+`sds + sss + dss` into `sss`, inside the case of the union over `i` in which
+`A` (`sds`) has no entry and `B` has one, the dense union over `j` drained
+`A2_pos[pA0 * A1_size + j]` in its dense-only case: the entries of whatever
+`i` the cursor of `A` stood at, or one segment past the end. Wrong values
+(error 1.38 at scale 1.38); the shipped compiler is correct. Now an operand
+dense at the level takes part only when the entry its dense level hangs from
+is present (`_operand_absent_here` again), and a case in which no operand is
+present emits nothing.
+
+**16. Test inputs: every subset of the operands, and several workers.** Both
+defects above needed "one operand stores an outer coordinate, another does
+not". Random fill almost never empties a whole slice of one operand, and the
+`gap` and `hollow` inputs empty the same slices in every operand.
+`test_loopir_dense_union.py` now also runs every cell, both compilers, on
+subset inputs (`_subset_keep`): coordinate `c` of every mode is stored by the
+operands whose bit is set in `(c + shift) mod 2**n`, shifts 0, 3 and 5, so at
+every level each subset of up to three operands, the empty one included, is
+the set storing some coordinate. A fifth extent with 70 first-mode coordinates
+makes a parallel outer loop run on several workers (18 new-compiler sum
+kernels carry an OpenMP pragma and had never run above 4 rows). mlsys's
+front-door and all-programs harnesses filled each operand independently and
+had the same gap; they take the same rule as three extra fills.
+
+**17. A kernel that reads a variable outside its declaring block is refused**
+(`compiler/loopir/llir_scope.py`, called at the end of
+`_lower_loopir_to_llir_owned`; code `variable_read_out_of_scope`). The check
+walks the completed LLIR function block by block: a function body, a loop
+(its init is visible in the header and body), each branch of an `if`, a
+lambda's body. Only names some node of the function declares are checked.
+With the fix of item 14 switched off it refuses exactly the three sums; on
+the fixed lowering it fires on none of 4,060 frontier rows, 4,262 front-door
+rows and 356 sum-cell rows, and both lists emit the same text with and
+without it. A text-level version of the same check
+(`_positions_read_out_of_scope` in `test_loopir_dense_union.py`, and the
+scan sealed in `~/.cache/scorch-codex/scope-scan-nc0856/`, 6,291 files,
+SHA256SUMS 9a8989d9...) reads the emitted C++ of both compilers: 0 flagged
+kernels on the public route of either compiler; 13 programs of the raw
+frontier route through `legacy_generated_cpp` (`ddd ijk->...` into a result
+with a compressed level) read `pA1` before declaring it, which is the known
+invalid C++ of that route.
+
+**18. An operand stored in another mode order than its program declares is
+converted from the order it is stored in** (`pipeline._run_conversions`).
+The refusal ("a converted operand must be stored in the mode order its program
+declares") is gone: the conversion kernel is rebuilt for the stored order
+(`conversion_source(..., source_mode_order=stored)`), the main kernel is
+unchanged, and the execution returns the kernel with the conversion sources
+that ran. Test: `test_a_converted_operand_stored_in_another_order_is_
+converted_as_stored` in `test_loopir_operand_conversions.py`.
+
+**19. Tests that were wrong or out of date on nc_0856** (39 failures in the
+first 7 of 20 parts; besides the 6 of item 14): the verifier's
+`mixed_dtype` path and the `malformed_guard` code in the production table (2
+and 1); `format.py` named the new compiler's package in a comment, which the
+neutrality suite searches for (1); `merged_mixed_union` went through a
+product-only checker (2); `test_three_operand_union_matches_the_dense_
+reference` read level arrays after `to_torch()`, which replaces the storage
+with dense storage (28); two refusal tests for programs that are lowered now
+(`sss + sss` into `dss`; the stack form with register blocking off) (2).
+
+**20. Open: sparse assembly that the shipped compiler runs in parallel and the
+new one runs serially.** Of the 73 programs in
+`~/.cache/scorch-codex/text-identity-census/names.shipped_parallel_new_serial.txt`
+(71 distinct), re-checked at 64 result rows with nothing compiled: 13 are
+parallel by default (the census ran 5-row shapes, below the 32-row
+threshold); for 33 the default is serial at any extent while a requested
+`two_pass_parallel` emits the shipped kernel's text exactly; 8 more are
+parallel under `two_pass_parallel` with the shipped text not captured; 13 are
+hosted by `_MultiCompressedAssemblyLowering` and 2 by
+`_RowScopeSparseWorkspaceLowering`, which emit serial assembly only; 2 are
+COO results (`unsupported_schedule_assembly`). For 8 programs a requested
+`single_pass_chunk_parallel` returns the serial kernel unchanged
+(`build_parallel_chunk_assembly` returns None when the gate's work estimate
+cannot be derived): that must become `unsupported_assembly_strategy`.
+Agreed with mlsys (2026-10-12): the assembly strategy becomes a LoopPlan
+field the scheduler picks (rows < 32 serial; chunked single pass when legal
+and its gate derivable; else `two_pass_parallel` when legal; else serial),
+the target family reports legality and derivability, and the lowering emits
+what the plan requests. (Built in item 24, with the two-pass strategy tried
+before the chunked single pass.)
+
+**21. The execution entry binds declared-order shapes, and refuses an
+unconverted operand stored in another order** (`loopir/pipeline.py`; mlsys's
+review `~/.cache/scorch-codex/merge-candidate-diffs/REVIEW-pipeline.nc0856-to-guard1216.md`,
+findings F1 and F2). Item 18 left one defect: `execute_cin_via_loopir` bound
+each operand's stored shape, so a converted operand stored in another mode order
+compiled a kernel for the wrong extents (`index_extent_mismatch`; 22 failures of
+item 18's own test in the first two parts of the suite on `cand1140`).
+`_declared_order_shape` permutes the stored shape into the declared level order.
+That permutation is only right for an operand some conversion kernel reads, so
+`_require_converted_or_stored_as_declared` runs after the compile and before any
+build: an operand with stored order != declared order that the plan does not
+convert raises `LoopIRLoweringError`, code `unconverted_operand_order`. The three
+`assert letters is not None` are gone: `_conversion_letters` refuses with
+`unsupported_operand_conversion`, and a missing bound shape takes the same code.
+Tests: `test_an_operand_stored_in_an_undeclared_order_must_be_one_the_plan_
+converts`, `test_a_conversion_of_a_level_kind_the_copy_does_not_read_is_refused`.
+Open (mlsys, `plan_identity.py`): `loopir_request_dump` wraps every
+non-`VerificationError` in a generic `VerificationError`, so a plan-verifier
+refusal reaches the caller with its code only on `__cause__`.
+
+**22. Refusal tests that were out of date** (5 more failures on `cand1140`, all
+present on `nc_0856`, whose suite run stopped before reaching them).
+`test_adjacent_seams_stay_fail_closed` listed `ss + ss + ss -> ss` and
+`sds + sds -> sds` as refused; both are lowered (items 1 and 9). The rows are
+replaced by `test_unions_lowered_since_2026_10_12_execute`: the raw programs,
+both register-blocking settings, two extents, subset inputs at shifts 0, 3 and 5,
+judged against the dense sum and level array by level array against the
+reference interpreter. `test_reduce_out_form_shape_is_exact` expected
+`apply_schedule_plan` to refuse a reduce-out plan with one of its two tiles
+dropped. The pass applies both now (the axis tile alone is the stack form, the
+reduction tile alone the reduction-tiled form). Neither plan reaches the pass
+through the compile entry for that program: `verify_loop_plan` refuses an
+automatic plan whose tiles are not the ones its policy derives
+(`auto_tile_decision`), and for a dense product the policy derives both. The
+test asserts all three facts. `test_loopir_tiled_dense_reductions.py` gains
+compiled runs with every tiled extent past twice the tile width (68-75; 16
+programs, both settings, 4 input kinds), each asserting the plan keeps the shape
+it has at the one-tile extents.
+
+**23. The runtime grid harness after three sample runs** (`bench/kernel_grid/`,
+sealed with the pair list in `~/.cache/scorch-codex/merge-grid/`, SHA256SUMS
+5d3e283a...). Six defects, all in the harness: only the last kernel call of a
+route was timed (a route that converts an operand or the result makes two or
+three); pairs with no timed cell were dropped from the report; the dense
+reference of a three-factor program at extent 2000 took 53 GB (the reference is
+now contracted pairwise and refused above 2^27 cells); operand names did not
+follow einsum's `A, B, C`, so three-operand programs raised; the empty-row
+inputs emptied all three slices of an extent-3 operand; the cross-arm check read
+a `torch.Tensor`'s `storage` method. `run_step.sh` runs one step (capture on one
+tree, one timing process, the analysis), for a host where each step is a job.
+Sizing for the 306 pairs: capture 1,676 + 3,276 records, about 2.2 GB peak per
+capture process; timing about 3.5 h on a quiet M5 for 3 processes of 21 rounds.
+On a loaded M5 the positive control (first arm called twice) fired in 64 of 92
+cells, so a loaded host measures nothing; the deciding runs are a quiet M5 and
+mkt1, on the final tree. Not a measurement, one warm call per route on a loaded
+M5: for reductions into a sparse result at 2000 x 2000 the shipped public route
+makes 2-3 kernel calls and takes 40-1,050 ms where the new compiler's single
+kernel takes 0.03-13 ms.
+
+**24. Sparse-assembly strategy: one automatic rule, applied by its own stage**
+(landed in `nc_1537`; reviewed by mlsys as
+`assembly.nc1303-to-tpf1359.diff`, sha256 d6b2dc98...).
+The automatic scheduler records no strategy; its plans are shared with the
+shipped compiler and the request identity is computed from them. The rule is
+one function, `automatic_assembly(emittable, first extent)` in
+`loopir/assembly_rule.py`: from 32 first-level coordinates
+(`2 * ROWS_PER_THREAD`, the extent below which `scorch_nthreads` cannot return
+two) the first emittable of `two_pass_parallel`, `single_pass_chunk_parallel`;
+otherwise the first emittable of `single_pass_serial`, `two_pass_serial`;
+otherwise the first emittable in vocabulary order (the two-phase family's
+`two_pass_parallel`). The target reports what is emittable
+(`lower_llir.assembly_choices`: host family, emittable strategies, the result's
+first-level extent, whether the result has a level that is not dense).
+
+Two-pass comes before the chunked single pass on purpose. It is the shipped
+compiler's strategy, so wherever it can be emitted the kernel has the shipped
+schedule; the chunked form's only two-host runtime measurement (review section
+59.9, TTM) has it faster than the two-pass on 8 of 16 redwood configurations and
+slower than the SERIAL kernel on two, and no condition separates the cases. By
+the 2026-10-11 rule a variant is added beside the old schedule with its own
+trigger condition; the chunked form has none yet. It is recorded automatically
+only where it is the one parallel strategy a program has (1 of the 2,242 wide
+programs) and is reachable by request (`Schedule(assembly=...)`) wherever legal.
+**Open measurement:** the four-strategy runtime grid on two hosts (TTM and the
+240 wide programs that can be emitted both ways) is what gives the chunked form
+a trigger condition; until then it must not become the automatic choice.
+
+Where the rule is applied. The pipeline runs
+`CompilerStageId.LOOPIR_ASSEMBLY_SELECTION` (between schedule application and
+target lowering) whenever the program about to be lowered records no strategy
+and its result has a level that is not dense (`lower_llir.assembles_sparse_result`).
+For an automatic plan the stage completes the plan
+(`assembly_selection.complete_automatic_plan`); the completed plan is verified
+(`verify_loop_plan`, conversions included) before `apply_schedule_plan` runs on
+it, so `schedule.plan.assembly` and `program_dump` show the strategy. For an
+explicit plan that names none and for an unscheduled program the plan is left as
+written and target lowering receives a copy of the program with the strategy
+recorded (`choose_unrequested_assembly`); `program_dump` keeps `"assembly":null`.
+On every route the kernel carries the record
+(`LoopIRCompiledKernel.assembly_decision`: host, emittable, extent, strategy,
+with a canonical `dump()`). For an all-dense result the stage does not run and
+no stage record is published. The target entry applies the same function to a
+program handed to it directly with no strategy
+(`lower_llir.with_recorded_assembly`), so a harness that lowers a scheduled
+program itself gets the same kernel. No target family holds a default: both
+`default_assembly()` overrides are deleted (the ordered-key family's read the
+extent and never chose a two-pass strategy), and what a lowering assumes of a
+program without a strategy is `_TargetLowering.unrecorded_assembly()`, reached
+only for an all-dense result and by the lowering `assembly_choices` builds to ask
+what is emittable. A test fails if a family defines either method.
+Today the non-automatic routes always record `single_pass_serial`: a sparse
+result reaches the two workspace families only through the automatic schedule
+(unscheduled it is refused, with an explicit loop order it is lowered by the
+ordered-append family, which emits the serial strategy only).
+
+A requested chunked strategy whose gate has no work estimate is refused
+(`unsupported_assembly_strategy`) where it used to return the serial kernel.
+`ROWS_PER_THREAD` is one Python constant that a test compares with
+`SCORCH_ROWS_PER_THREAD` in `csrc/scorch_policy.h`.
+Because every sparse-result program now carries a recorded strategy when it is
+lowered, `erase_schedule` treats the strategy (and the accumulator structure) as
+schedule state: a program with no splits that carries either is rebuilt without
+it, where it used to be returned unchanged, so the erased program still equals
+the unscheduled base (six `erases_to_base` tests depend on it).
+Evidence (snapshot `tpf1359`, nothing compiled unless said): the frontier scan
+(2,279 records) and the front-door census (2 x 1,125 records, both
+register-blocking settings) are byte-identical to the snapshot before the change,
+and so are all 2,242 programs below at 5 rows: no kernel text changes below 32
+coordinates. Executions on sapling by mlsys on the earlier chunked-first
+snapshot, 1,300 of 1,300 correct on both sides of the threshold with empty rows
+and slices (`~/.cache/scorch-codex/assembly-c3-serial1222/`); mlsys reruns the
+240 programs whose automatic kernel the reordering changed.
+Over the 2,242 programs whose OpenMP pragmas differ between the compilers
+(`~/.cache/scorch-codex/assembly-choices-proposal/wide-2242-flip/`, per-program
+lists in `lists/`), at 64 rows with register blocking on: 450 have an all-dense
+result and record no strategy; of the 1,792 others, 721 record
+`two_pass_parallel` and emit the shipped text exactly, 222 record
+`two_pass_parallel` with other text, 1 records `single_pass_chunk_parallel`
+(`dss,dd ijk,jl->ilk [dss]`), and **848 record `single_pass_serial`: 792 hosted
+by `_MultiCompressedAssemblyLowering` (results `ds` 696, `dss` 96), 50 by
+`_CoordinateResultAssemblyLowering`, 3 by `_RowScopeSparseWorkspaceLowering`
+(`ss x ss` matmul into `ds`), 3 by `_OrderedKeySparseWorkspaceLowering`
+(`oo x X` into `ds`)**. The shipped kernel has a parallel region for 804 of the
+848 (all but 44 coordinate-result programs, whose shipped text differs only by a
+`simd` pragma). Those 804 are a runtime regression against the shipped compiler
+on large inputs until their families emit a parallel strategy; the 223 parallel
+programs with other text owe the timing grid (84 of the 222 two-pass ones differ
+from shipped in the thread-count gate: the new kernel passes a work estimate
+where the shipped one passes `-1`). With the chunked form tried first the same
+counts were 574 / 129 / 241 chunked / 848; the 241 are now 147 shipped text, 93
+two-pass with other text and the 1 still chunked.
+The same scheduled program handed to the target entry with its strategy removed
+lowers to the automatic kernel for 1,792 of 1,792 at both extents (702 differed
+at 64 rows while the families held defaults); the unscheduled route is identical
+before and after for 2,242 of 2,242 (905 refused `unsupported_program_shape`,
+887 `single_pass_serial`, 450 dense).
+Of the 792, the existing chunked single-pass builder derives its thread-count
+gate unchanged for 155 (`ds` 134, `dss` 21). The other 637 have no gate it can
+derive: in 509 the outer loop runs over the stored entries of an operand's
+compressed first level (`for pA0 in A0_pos[0] .. A0_pos[1]`) and is followed by
+the loop that closes the positions of the rows after the last stored one; in 127
+the outer loop is dense but the first position array in its body belongs to an
+inner loop (`dd,ds ij,kj->ik`), so no total-entries expression is indexed by the
+outer bound; 1 is the sorted-workspace form. The shipped compiler runs all 637
+as two parallel passes whose thread count is capped by rows alone
+(`scorch_nthreads(-1, A0_size)` and `scorch_nthreads(-1, pA0_end)`). **Next
+slice:** by the rule above the family first gains `two_pass_parallel` (the
+shipped strategy; the shared two-phase pass with result rows numbered by
+coordinate through `OuterCellDomain`, as review section 66 did for the
+ordered-key family); the chunked single pass follows as a requestable strategy
+and needs the rows-only gate and, for the stored-outer-level form, chunk bounds
+in positions and a position shift indexed by coordinate.
+For a cutover: a dispatch cache keyed on less than the full shape must include
+the completed plan's `assembly` field, because one program records different
+strategies on the two sides of 32 coordinates.
+
+**25. ken's 0037 and 0039, and one registry entry** (in `nc_1537`).
+0037 (`0037-coo-repeated-coordinates.patch`, sha256 2258ac11...): a COO tensor
+that stores one coordinate twice is refused with a coded error
+(`RepeatedCoordinateError`, code `coo_repeated_coordinate`; native check
+`AbiCheckLexStrict`), a torch COO input is summed on import, and
+`STensor.coalesce()` exists (Bobby, 2026-10-12 08:18). It touches
+`loopir/pipeline.py` only to map the native refusal at the three
+`module.evaluate` calls. 0039 (`0039-einsum-loop-order-sort.patch`, sha256
+2e7338d3...): the einsum loop-order sort (`exceptions.py`, `ops.py`,
+`utils.py`); emission over 9,061 einsum programs is identical before and after
+it. ken's patch notes are in
+`~/.cache/scorch-codex/high-rank-sweep-fixes/`.
+`test_result_storage_marker_mechanisms.py` did not list
+`single_iteration_loop_pass._IdentifierSearch.enter_node` (ken's 0018), which
+reads `vars(node)`; it is registered as a reader that sees the result-storage
+marker and reads nothing from it.
+
+**26. Suite results and what is open after this section.**
+The suite on `cand1140` (the 11:40 candidate, M5, 20 fresh-process parts):
+17,259 passed, 34 failed, 237 skipped, 1 xfailed. 27 of the failures are items
+21 and 22 (fixed in `nc_1303`), 1 is the registry entry of item 25, and 6 are
+item 11's. The suite on `nc_1537` starts after this section is written; its
+result is recorded as `nc_1537.suite.txt` in
+`~/.cache/scorch-codex/merge-snapshots/`, beside the tree's diff. The expected
+result is the 6 failures of item 11 and no other.
+Open, in the order they are planned:
+1. Two-pass assembly for the ordered-append family: built and tested in
+   `/Users/bobby/scorch-append`, not in `nc_1537`. It makes 791 of the
+   792 serial programs of item 24 record `two_pass_parallel` from 32 rows. To
+   land after an execution check of all 791 (harness
+   `exec_programs.py`; mlsys runs an independent one), with its own suite run.
+2. ken's 0038 (the int32 position bound; the two-pass text narrows
+   `_offset` to `int` unguarded) and mlsys's `plan_identity.py` change (item
+   21's open point).
+3. The two-host runtime grid (item 13, item 23) on the final tree: every
+   program whose C++ differs from the shipped compiler's, among them the 223
+   parallel programs with other text of item 24.
+4. Still serial where the shipped kernel is parallel after step 1: one
+   ordered-append program whose workspace region owns the whole nest
+   (`sd,dd ij,ik->kj [ds]`), 6 coordinate results, 3 row-scope programs
+   (`ss x ss` into `ds`), 3 ordered-key programs (`oo x X` into `ds`).
+5. The chunked single pass has no trigger condition; a four-strategy grid on
+   two hosts is what would give it one.
+6. Dispatch: nothing in release dispatch calls the new compiler. Eight release
+   call sites build kernels through the shipped lowering (`ops.spmv`,
+   `ops._build_regblock_dual_path`, `ops._einsum_owned`,
+   `ops.lower_and_exec_cin`, `STensor.__add__`, `to_dense`, `to_sparse`,
+   `change_mode_order`). Proposed to Bobby on 2026-10-12: einsum behind an
+   environment variable with a counted fallback first, the default after the
+   runtime grid, the other seven sites after that.
+
+**27. Read-only value types (beat-mkl's db8ac65), applied late; `nc_1625` replaces
+`nc_1537` as the 2026-10-12 tree.**
+`b3_readonly_values_db8ac65.patch` (sha256 741f86a7..., one commit on 154320f, sent to
+scorch-merge on 2026-10-11 20:07) makes `LevelFormat`, `TensorFormat`, `TensorLayout` and
+`TensorMetadata` read-only through a C base (`csrc/sealed_values.cpp`, compiled into
+`scorch_ops`), so tensors can share one format object again, and it computes a format's
+derived fields (level types, density, string) at construction. It was never applied to
+the merge tree, and `nc_1537` was frozen without it. That was an omission, not a decision.
+
+How it was found: beat-mkl's early timing check of `nc_0856` against 864745d on mkt1 read
+the first `matmul` call on a new `STensor.from_csr` operand about 10% slower in the
+20-500 us band (float32 1.101 [1.089, 1.114], float64 1.111 [1.099, 1.123]); warm and cold
+calls and torch CSR operands were neutral. Cause: without the patch every new STensor
+carries a fresh format object, and the first call derives its string and density
+(`TensorFormat.__str__`, `LevelFormat.__str__` per level, `is_dense`). It is a fixed cost
+per first call, not a pass over the index arrays; 9d58a4a is not involved. M5 under
+load, lower decile of 2,000 fresh operands (64 rows, 256 entries, 4 columns), three
+process repeats: 864745d 18.1-18.5 us, `nc_1537` 24.3-25.6 us, with the patch
+18.8-19.5 us. Third call on the same operand (served by a plan), lower quartile:
+1.54-1.58, 1.62-1.71, 1.54-1.58 us.
+
+Applied on `nc_1537` with one reject, the `from .format import ...` line in `stensor.py`
+(today's work had reflowed the neighbouring import); `owned_format` was added to it by
+hand. The applied form is
+`~/.cache/scorch-codex/merge-candidate-diffs/read-only-values.nc_1537-to-b3.diff`
+(sha256 a491bc06...). Lint equals the base. The five `test_format_ownership_boundary.py`
+failures of item 11 are this patch's tests and pass with it, so the suite's expected
+failures on `nc_1625` are 1 (`test_compiler_ir_benchmark.py`), not 6; item 26's
+sentence about `nc_1537` is superseded by this one, and the suite result is recorded as
+`nc_1625.suite.txt` in `~/.cache/scorch-codex/merge-snapshots/`.
+
+Left over against 864745d: about +0.7 us per `matmul` call that no plan serves (M5, same
+measurement). By the call lists of a profile, not yet by a timing A/B, it is
+`_matmul_compile_policy` with `_requested_schedule` on entry and the mixed-dtype check of
+ken's 0036 (`_require_one_product_dtype`). beat-mkl's speed check on `nc_1625`
+measures it on a quiet machine; trimming either step needs that measurement first.
+
+Also retracted the same afternoon, so nobody chases it: "`matmul` of two CSR STensors
+returns a dense result on the merge tree". The harness read the result's format after
+`to_torch()`, whose default `in_place=True` densifies the STensor itself, on every tree.
+
+**28. Two-pass assembly for results the new compiler appends in loop order**
+(item 26's open point 1; lands in `nc_0402` with `plan_identity.py`'s change for item 21
+and the import fix for the two test-order failures of `test_kernels.py`).
+`_MultiCompressedAssemblyLowering` lowers a `ds` or `dss` result whose entries
+are each one scalar reduction appended in loop order, with no workspace. The
+shipped compiler reaches the same programs through an operand relayout and a
+workspace schedule and assembles them in two parallel passes; the new compiler's
+plan needs neither the conversion kernel nor the workspace, and until this
+change it had no parallel assembly for them (item 24: 792 of the 2,242 programs
+whose pragmas differ, serial where the shipped kernel is parallel).
+
+The family now emits `two_pass_serial` and `two_pass_parallel` through the shared
+two-phase pass (`compressed_where_openmp_pass`), the same pass and the same
+`OuterCellDomain` numbering review section 66 gave the ordered-key family
+(`_outer_cell_domain` moved to `_TargetLowering`; one definition for both).
+Changes:
+- `CompressedWhereOpenMPContext.workspace_name` is `Optional[str]`. `None` says
+  the nest declares no workspace: no declaration is looked for, hoisted, pooled
+  or renamed, and `workspace_ctype` is only the result's value type. A request
+  for the chained accumulation structure is refused there
+  (`unsupported_accumulator_structure`). Every existing caller names a workspace
+  and emits what it emitted.
+- `_TargetLowering._two_phase_spec` takes `workspace_decl=None` for such a nest.
+- `_MultiCompressedAssemblyLowering.two_pass_assembly_legal()`: result level
+  zero dense with every level below compressed, not a coordinate result, no
+  dense block below a compressed level; outermost loop a dense loop or a loop
+  over one COMPRESSED operand level (a root merge is a `while` loop the pass
+  does not select; a coordinate level can store a coordinate twice); a workspace
+  region at the leaf must sit below every result level but the last. A request
+  outside that is refused `unsupported_assembly_strategy`.
+  `_CoordinateResultAssemblyLowering` states serial only.
+- Under the automatic rule (item 24) these programs record `two_pass_parallel`
+  from 32 first-level coordinates, on every route: an unscheduled program and an
+  explicit loop order now reach a parallel strategy too, because the family they
+  land in has one.
+
+Emitted text: the count loop and the fill loop are the serial nest with its
+appends counted, then stored at the prefix-sum offsets; the catch-up loops and
+the running position index are gone (the prefix sum gives a row the outer loop
+never visits its equal positions). For a stored outer loop the count array is
+sized by the result's first extent and indexed by `A0_crd[pA0]`. The thread
+count is the shared pass's own derivation, so 636 of these programs open on
+`scorch_nthreads(-1, rows)` exactly as their shipped kernels do.
+
+Evidence, nothing compiled (`wide_recheck_text.py`, 2,242 programs, both
+register-blocking settings): at 5 rows every text is unchanged; at 64 rows 791
+of the 792 record `two_pass_parallel` (695 `ds`, 96 `dss`), the other 1,450
+programs are unchanged, and 0 are refused. The one left serial is
+`sd,dd ij,ik->kj [ds]`, whose workspace region owns the whole nest. Remaining
+serial where the shipped kernel is parallel after this: that program, 6
+coordinate results, 3 row-scope (`ss x ss` into `ds`), 3 ordered-key
+(`oo x X` into `ds`).
+Tests: `test_loopir_ordered_append_two_pass.py` (9 programs: dense and stored
+outer loops, `ds` and `dss`, with and without a workspace region; each two-pass
+kernel stores the index arrays of the serial single pass exactly and the values
+of a dense float64 reference to 1e-12, at 70 rows with empty leading, interior
+and trailing slices; refusals), two pass-level tests in
+`test_compressed_where_openmp_pass.py`, and the strategy table in
+`test_sparse_assembly_strategy.py`.
+Execution so far (mlsys-submission, front-door executor v6c, `execute_frontdoor_v6c.py`
+sha256 29608fb6...; the 792 keys of `tp792_all.json`, extents i=37, j=41, k=35, l=34,
+m=33, six fills including empty slices, the result's level arrays compared exactly):
+on `tpb_1543` (sapling 81819, 81820) 765 of 792 programs executed, 54,762 calls
+correct, 4 stopped at the per-call deadline, 0 wrong; on `nc_1537` (81821, 81822) 739
+executed, 52,743 correct, 58 at the deadline, 0 wrong. All four jobs ended at their time
+limit; records under `/scratch/bobby/allprog/fdexec_v6c_tp792_*` on sapling.
+**Owed before these 791 ship in dispatch:** the programs not yet executed and the
+deadline records, on the landed tree (mlsys-submission queues it after the landing),
+and the two-host runtime grid against the shipped kernels (they join the 223 parallel
+programs with other
+text). The chunked single pass for this family stays unbuilt; by the 2026-10-11
+rule it would be a requestable variant with its own trigger condition.
+
+**29. Kernel runtime, new compiler against shipped: first table, and why most refusals of
+the shipped loop order are one missing step (10-12, 17:11 to 17:56).**
+
+Bobby (desk, 15:46): find where the new compiler is slower, and say for each case whether
+it is a bug, a capability gap, or a scheduling issue.
+
+Measurement. Tree `tpb_1629` (= `nc_1625` + the two-pass ordered-append diff, source
+digest 55ab41ea...). 128 programs, up to 4 from each of 48 classes of the 2,242 programs
+whose emitted text differs (`classes2242.tsv`; pair file `pairs_sample128_v2.json`,
+sha256 2544578d...), float64, sizes S and M (4e3 and 2.6e5 entries in the largest dense
+operand), fills 0.05 and 0.55, M5 only, one timing process per cell. Variant `shipped` is
+the public `scorch.einsum`; `new` is `execute_cin_via_loopir` on the program einsum hands
+its scheduler, under `Schedule()`. Evidence:
+`~/.cache/scorch-codex/new-vs-shipped-runtime-2026-10-12/` (`m5c/` is the run that counts;
+`m5b/` is superseded, below).
+
+Result (`m5c/summary_SM.txt`, `summary.json`): 508 of 512 cells timed. Whole route
+(every kernel call and every operand move): 410 neutral-or-better, 77 slower, 21
+unresolved; 43 programs have a slower cell, 27 at M. Program kernels alone: 332 / 148 /
+28. The 4 untimed cells are a shipped defect: `ijk,jl,kl->il` with a dense rank-3 operand
+and two COO operands, result `ds`, every extent 15, emits `int pA2 = pA1 * A2_size + j`
+with `pA1` undeclared; present at 7ac70f2; sent to ken. Fixed in the shipped compiler by
+senior-engineer-a's fix4 (item 32).
+
+Two harness defects found and fixed on the way, both worth knowing before the next run.
+- The shipped route moves a 2-D `d,d`, `d,s` or `o,o` operand in PyTorch, with no kernel,
+  on a fresh deep copy at every einsum call (`STensor.change_mode_order`'s no-kernel path;
+  `ops._with_compiler_mode_order`). A harness that times kernel calls leaves that out of
+  the shipped route: 118 of 508 cells. `harness2/torch_moves.py` replays the move with
+  PyTorch alone (the timing process imports no Scorch tree) and `capture.py` asserts the
+  replay equals what the method stored. Diff `harness_torch_moves.diff`, sha256
+  5943cf43...; merged by mlsys-submission into the mkt1 copy. The first run (`m5b/`)
+  lacks it and read 372 / 106 / 30.
+- On macOS one timing process cannot load every kernel: each loaded image with
+  thread-local variables takes one of 512 slots and the process aborts in dyld
+  (`_tlv_bootstrap_error`) near the 490th kernel, with an empty log. Time in parts
+  (`tools/time_parts.sh`; `time_cells.py <part> <parts>`).
+
+Where it is slower (whole route, M size unless said):
+- `sd,dd ij,ik->kj [ds]` 150x: the automatic plan is a serial whole-result coordinate
+  list.
+- COO results the shipped kernel fills in one parallel loop (6 programs in the 2,242):
+  3.5x to 17x. `_CoordinateResultAssemblyLowering.supported_assemblies` is the serial
+  single pass only; `two_pass_parallel` and an explicit parallel loop are refused. The
+  serial-against-serial COO programs (44) are 1.1x to 1.5x slower: same loops, but the
+  new kernel writes `C_nonempty` inside the reduction loop, carries no `omp simd`, and
+  appends entry by entry where the shipped one sizes the result from the operand's count.
+- `_RowScopeSparseWorkspaceLowering` (3 programs): 5.6x to 7.7x, serial single pass only
+  (`unsupported_assembly_host` for both parallel strategies).
+- `dss,dd ijk,jl->ilk [dss]` 7.8x, `ds,dd,sd ij,jk,kl->il [ds]` 4.2x at fill 0.05,
+  `ds,ds ij,kj->ik [ds]` and `ds,oo ij,kj->ik [ds]` 2.1x to 3.5x (7.5x at 2000 x 2000,
+  fill 0.002): the automatic plan takes another loop order than the shipped call.
+- Dense results the automatic plan parallelizes with no work estimate
+  (`scorch_nthreads(-1, rows)`): 1.2x to 1.9x at S, up to 2.3x at M.
+
+The shipped loop order as an explicit `Schedule`. mlsys-submission's census (source only,
+`tpb_1629`): of 1,940 programs whose text differs, 272 accepted; 1,405 refused with
+`unsupported_program_shape` "reducing into sparse result storage requires the verified
+sparse-workspace schedule"; 172 "require a dense, sparse, tile-origin, or panel-origin
+outermost loop"; 59 a bare `InvalidSchedule` "violates result storage order" on all-dense
+results (no defect code: a zero-unclassified violation); 32 `sparse_parent_dominance`.
+
+Why the 1,405 are refused (traced on `ds,ds ij,kj->ik [ds]`, order `ijk`;
+`tools/trace_plan.py`): the conversion candidate is accepted, `lower_cin` classifies
+`CSR_DENSE_ROW`, and the refusal comes from `choose_unrequested_assembly` ->
+`assembly_choices` -> `_select_lowering` -> `_validate_loop_kinds` on a program that is
+still a bare `StoreReduce`. An explicit plan has `workspace=None`: `LoopPlan.workspace` is
+recorded only by `Scheduler._verified_auto_plan`, and the public `Schedule` has no field
+for it. Experiment, not a patch (`tools/complete_explicit_order.py`): for a `Schedule`
+that names only a loop order, originate the plan with `_verified_auto_plan` from that
+order. With it the shipped order is accepted and emits the shipped loop structure for
+`dss,dd ijk,jl->ilk [dss]` (1.96 ms against shipped 2.00, automatic 15.3),
+`ds,dd,sd ij,jk,kl->il [ds]` (2.39 / 2.64 / 10.5), `sd,dd ij,ik->kj [ds]` (22.0 / 25.1 /
+1,499) and `ds,ds ij,kj->ik [ds]` (3.56 / 2.36 / 9.07, one compiled conversion); times are
+one loaded-machine probe each. Still refused: a COO operand that must be converted, and
+the merged outermost loop. So the lowering has the families; the gap is at the Schedule
+boundary (mlsys-submission's code), and after it the question is the automatic order,
+which for these programs is not the shipped call's order and is slower.
+
+Not covered: size L, float32, the second host (mkt1 job 17831019, 377 programs, both
+dtypes, three sizes), more than one timing process per cell.
+
+**30. Same loop order, new slower than shipped: the transpose kernel, the workspace class, and
+a defect in the timing harness's A/A control (2026-10-12 evening).**
+
+*Bobby's request (desk, 18:11): "for programs like ds,ds ij,kj->ik [ds] where the same order
+has new compiler slower than shipped compiler, need to investigate and fix".*
+
+Cause for the program named. Under the shipped loop order (with the workspace step of item
+29) the new compiler's program kernel and the shipped kernel have the same `evaluate()` body:
+145 lines each, one differing line, the mode order passed to `validate_jit_tensor` for B
+(a transposed view on the shipped route, a transposed copy on the new one). The time
+difference is the transpose of B that runs first. The shipped route makes it in PyTorch
+(`STensor.change_mode_order`: argsort + bincount on a copy). The new route compiles a
+conversion kernel (`operand_conversion.conversion_program`: a sparse workspace region,
+sorted drain) whose accumulator is `coo_workspace<T, N>` of `csrc/header.h`. That class
+builds a `std::vector` key per insert at the call site, keeps a `std::unordered_map` node
+per entry, comparison-sorts an index vector, and builds another `std::vector` per entry in
+the drain.
+
+How wide. Tools `same_body_census.py`, `workspace_use.py`, `program_traits.py` under
+`~/.cache/scorch-codex/new-vs-shipped-runtime-2026-10-12/tools/` (source text only). Of the
+128 sampled programs, 17 put such a compiled conversion on the new route under the shipped
+order (64 of 444 cells); the shipped route moves the operand in PyTorch in 16 of those cells
+and compiles a conversion through the same class in the rest. The same class is the
+accumulator of the automatic plan in `sd,dd ij,ik->kj [ds]` and `dss,dd ijk,jl->ilk [dss]`
+(item 29's 150x and 7.8x rows). Under the shipped order the program kernel's text equals
+shipped's in 38 of 444 cells; in 156 of the others the shipped kernel has an OpenMP
+parallel region and the new kernel has none (100 of them at the small size), in 52 the
+shipped kernel has `#pragma omp simd` and the new one does not.
+
+Two fixes, both needed.
+(a) The sort-free conversion (mlsys-submission's draft, tree `/Users/bobby/scorch-convcount`):
+    the conversion program becomes the in-order nest over the operand with an `AppendEntry`
+    at the permuted coordinates under `TWO_PASS_SERIAL`; count per result parent, prefix
+    sum, fill with a per-parent cursor (Gustavson 1978; Chou, Kjolstad, Amarasinghe, PLDI
+    2020). A new target-lowering class beside the existing ones; today's region form stays
+    for the layouts it refuses.
+(b) A rewrite of `coo_workspace<T, N>` with the same interface and call-site text
+    (`class_swap/new_class.inc`): flattened key + value per entry; in-order inserts append;
+    otherwise an open-addressing table whose home slot keeps key order, or direct
+    addressing once the entries reach one eighth of the cells; radix sort. It serves the
+    region fallback, accumulating regions and the shipped compiler's own conversions.
+    Differential test against the shipped class: 23,015 scripted runs, equal entries, order,
+    value bytes and exception text, under ASan and UBSan.
+
+Harness defect found on the way (recorded in memory `same_name_extension_is_same_module`).
+With torch 2.13 (pybind11 3.0.4) a second extension file with the module name of one
+already imported returns the first module. `time_cells.load(path, copy_dir)` copied
+`kernel_<id>.so` and imported it under the same name, so every "#aa" arm timed the
+original against itself and "the copy returns the primary's result" could not fail;
+mlsys-submission confirmed the same on Linux (torch 2.14.1). On the M5 the copy is now
+written with a same-length module name over every occurrence in the file and re-signed
+(`harness5/kernel_copy.py`); ELF needs another route (the symbol hash table). Every A/A
+floor before 2026-10-12 21:00 is a same-function repeat.
+
+*Bobby's follow-ups (desk, 19:48 and 20:00): "make sure whenever we do any transpose of any
+dimension we use the most optimized/fastest way -- i.e. compiler changes should be fully
+general"; "if it's an optimization that can be generalized to help other transposes we
+should take full advantage of it".*
+
+Coverage of fix (a) as first drafted. On the tree with the review fixes
+(`/Users/bobby/scorch-runs/convcount_fix`, mlsys-submission's digest 00b465fc) the
+relabelled copy takes 24 of the 88 conversion calls of the 17 sampled programs; the other
+64 (operands with two or more compressed levels, or a dense level below a compressed one)
+still take the region form.  The shipped `STensor.change_mode_order` is no better off: its
+PyTorch path covers 2-D `dd`/`ds`/`oo` only, and every other move compiles a `Where`
+kernel through the same `coo_workspace<T, N>`.
+
+The general rule agreed with mlsys-submission (who writes the lowering; draft promised
+for 2026-10-13 08:00).  Source levels in order (s1..sk), converted levels (r1..rk):
+the common leading prefix is never sorted; the longest trailing run of the converted
+order that keeps the source's relative order needs no pass, because every pass is
+stable; the levels between are one key, sorted by a stable least-significant-digit radix
+sort (count, prefix sum, scatter per digit).  (i,j)->(j,i) is one pass, the textbook
+transpose; a move of dense levels only is none.  The draft emits the global form (passes
+over all records, then one stable pass on the prefix run index); a per-segment form and a
+parallel form join as candidates beside it, chosen by measurement.  Digit width and
+record layout are named values of the emission, to be measured.  Interface for the
+measurement: `conversion_source(..., forms=("relabelled", "region"))`.
+
+The transposes-only grid (mine).  `~/.cache/scorch-codex/transpose-grid/tools/`:
+`transpose_cells.py` (399 conversions: every dense/compressed source layout of ranks 2-4
+with a compressed level, every mode order; 4,788 cells over 3 sizes, 3 shape families,
+2 fills, 3 element types; tier 1 = 195 cells), `capture_transposes.py` (the shipped move
+as einsum's relayout makes it, the region form, the relabelled form; each result read
+from its level arrays with PyTorch only and compared exactly), `time_transposes.py`
+(each candidate alone, a separately loaded copy as A/A, a twin with the rewritten
+class), `summarize_transposes.py`.  Ship condition told to Bobby: the new routine is the
+fastest candidate, or inside A/A noise of it, in every cell on two hosts; a cell where it
+is not is a finding.
+
+Fix (b) since the first paragraph: gcc 13.4 on Linux passes the differential test (with
+the sanitizers and with the kernels' flags) and the four test files that pin the class;
+`tests/test_scorch/test_coo_workspace_accumulation.py` (126 tests, passes on the shipped
+class and on the rewritten one; catches six seeded defects of the rewritten class) is
+ready to land with it.  Iteration before `sort()` was never defined in the shipped class
+(its iterator reads the index vector only `sort()` fills).
+
+
+**31. The 512-cell table with the rewritten workspace class and a counting-sort transpose;
+the cells still slower, by cause; beat-mkl's merge speed check, part A, and the fix for
+STensor construction (2026-10-12 night).**
+
+Measurement. The 128 programs of item 29, float64, sizes S and M, fills 0.05 and 0.55,
+M5, quiet from 20:38:06 to 20:52:56 (`tools/window_2110.sh`; outputs `m5e_t/` and
+`m5e_h/` under `~/.cache/scorch-codex/new-vs-shipped-runtime-2026-10-12/`). The harness
+is `harness5`, whose A/A copy is a renamed and re-signed kernel file (item 30). Local
+processes of other sessions inside the window are listed in `m5e_t/window.notes.txt`
+(one sub-second `python3` inside part 5 of the main pass; no part was rerun). One host,
+one timing process per cell: it orders the routes, it is not a ship verdict.
+
+Whole route against the shipped route (`m5e_t/summary3.txt`), 512 cells:
+- automatic plan: 407 neutral-or-better, 72 slower, 29 unresolved, 4 refused;
+- the shipped loop order as an explicit plan (with the workspace step of item 29's
+  experiment): 366 neutral-or-better, 51 slower, 27 unresolved, 68 refused;
+- the better of the two per cell: 424 / 56 / 28.
+The worst automatic pick is `sd,dd ij,ik->kj [ds]`, 146x; under the shipped order it is
+0.99.
+
+The 51 slower cells under the shipped loop order, by what differs in the kernel text
+(`m5e_t/cause_table.txt`):
+- 24: the shipped kernel has an OpenMP parallel region and the new kernel is serial
+  (worst `ds,dd,sd ij,jk,kl->il [ds]`, 54x): 8 coordinate results, 10 `ds` results
+  reduced through a sparse workspace, 2 `dd` results, and the 4 cells of one program the
+  variant ran in another loop order (each read below).
+- 15: the shipped kernel has `#pragma omp simd` and the new one has not (worst 1.54x).
+- 6: a compiled conversion through `coo_workspace<T, N>` on the new route (worst 2.12x).
+  With the counting-sort conversion and the rewritten class they read 0.45 to 0.89 of
+  shipped.
+- 6: the same constructs, other text (worst `dd,dd,sd ij,ik,jk->k [d]`, 4.8x). Read on
+  10-12 night, three programs, kernel sources under `m5e/ext_tpb_1629/`; in each the
+  variant timed was given the shipped loop order and nothing else of the shipped schedule:
+  - `dd,dd,sd ij,ik,jk->k [d]` (4 cells; 4.8 at M, 1.2 at S; shipped
+    `kernel_304c76df343b`, new `kernel_ef7d4a77ba1d`): the same nest (OpenMP loop over
+    tiles of `k`, tiles of `i`, a stack workspace per tile). The shipped kernel's tile
+    width is 8 and the new one's is 32 (`scheduler.auto_tile_width`; the shipped kernel
+    is the two-branch form stitched by `ops._stitch_regblock_dual_path`, which declares
+    one width, `regblock_tile_width` = 8, for both branches). The shipped route also
+    transposes `A` first (a PyTorch move) and reads it along the inner loop; the new
+    kernel reads `A` as stored.
+  - `ds,dd ij,kj->ik [ds]` (1 cell, 1.17; `kernel_e15ff3b00165`, `kernel_7f44b5b0139f`)
+    and `oo,dd ij,jk->ki [dd]` (1 cell, 1.07; `kernel_6efad22083fc`,
+    `kernel_5764a93c6f30`): the bodies differ in three lines, how `B` is read. The
+    shipped route transposes `B` first; the new kernel reads it as stored, with a stride
+    of one row in the inner loop. The automatic plan reads 0.27 and 0.22 of shipped on
+    these two cells.
+  So the six are schedule fields the variant did not carry (operand layout, tile width),
+  not a lowering defect. Not measured yet: the same cells with those two fields named in
+  the plan.
+
+Two more readings of the same night (kernel sources and a text scan, nothing run):
+- Coordinate (COO) results: 8 of the 24 cells of the first row and all 15 of the second. Where every result entry belongs to one stored position of the
+  operand that drives the loop, the shipped compiler allocates the result arrays with
+  that operand's entry count (`_known_nnz`), writes each entry at the driver's position,
+  runs the driver loop as an OpenMP loop, and marks the dense reduction loop inside it
+  `#pragma omp simd` (`iter_lattice._mark_simd_on_reduction_loops`). The new compiler's
+  coordinate-result assembly appends to `std::vector`s, and only when the reduction loop
+  ran at least once (`C_nonempty`), so its loop stays serial and its arrays grow; nothing
+  in `loopir/` sets `ForLoop.simd`. Seen in `oo,dd ij,ik->ij [oo]` (8.8x; shipped
+  `kernel_ec434e54b2fb`, new `kernel_16681fa6f088`) and `dds,ddd ijk,ijl->ijk [ooo]`
+  (1.5x; `kernel_70a117bea7a3`, `kernel_10f2b45b8882`). The two conventions store the
+  same values except when the reduction is empty, where the shipped kernel stores a
+  zero; by Bobby's rule (10-12) the faster convention is kept.
+- `ds` results reduced through a sparse workspace: 10 cells of the first row (8
+  programs, among them `ss,ss ij,jk->ki [ds]`, 7.6x, and `sss ijk->ik [ds]`). The shipped
+  kernel is the two-pass parallel assembly with one `linked_list_workspace_1d` per thread
+  (indexed by the coordinate, sized by the result's extent); the new kernel, in the
+  shipped order and in its own automatic plan, is the serial single pass into
+  `coo_workspace_1d` (appended, sorted, merged). Item 28's two-pass form does not reach
+  this lowering.
+- `dd` results: 2 cells (1.03 and 1.07); the new kernel opens with a tile loop over `j`
+  outside the loop the shipped kernel runs in parallel.
+- The variant's loop order. `harness5/capture.py` records the first
+  `Scheduler.select_loop_order` result of the shipped einsum, and the shipped compiler can
+  change the order after it. A scan of the loop nests of all 508 shipped kernels
+  (`order_scan_2245/`) reads every loop in 236 cells: in 214 the requested order is the
+  shipped kernel's, in 22 (6 programs) it is not. One of them is the worst row-one cell,
+  `ds,dd,sd ij,jk,kl->il [ds]` (54x): requested k,i,j,l; the shipped kernel runs i (in
+  parallel), k, j, l. So its 4 cells time another loop order, not a missing parallel
+  loop, and the first row is 20 cells. Reported to mlsys-submission, who owns the
+  harness, on 10-12 at 22:41.
+
+What a comparison under "the shipped schedule" may claim. Bobby, desk 22:49: "when
+comparing shipped vs. new compiler, you need to make sure they are using the same schedule
+(loop order, tiling, parallelization, tile sizes, etc.) -- if we don't have scheduling
+language maybe it's time we design and implement carefully". So every result above under
+the shipped loop order shares the loop order only, and a cell counts only when both
+kernels follow one schedule. The design for review, posted 22:58
+(`~/.cache/scorch-codex/new-vs-shipped-runtime-2026-10-12/schedule_design_2258.html`):
+ten decisions the shipped compiler makes for a generated kernel; `Schedule` and `LoopPlan`
+already carry loop order, tiles, the requested parallel loop, one relayout, the assembly
+strategy and the accumulator; to add are operand moves before the kernel (any operand,
+dense included), two schedules in one kernel picked by an extent at run time (the
+register-blocking branch), the thread rule of the parallel loop, and a per-loop vector
+mark; the shipped compiler reports the schedule it compiled. mlsys-submission builds the
+check (read that schedule, request it field by field, refuse a cell whose two kernels
+differ in any field; positive control: the 22 cells above). The shipped register-blocking
+kernel runs both branches 8 wide, the large branch reading the small one's tile width
+(`ops._baseline_statements_for_else_branch` documents it), so the `dd,dd,sd` reading
+above compares 8 with the new kernel's 32.
+
+`ds,ds ij,kj->ik [ds]`, the program Bobby named, M, fill 0.55, milliseconds, transpose +
+program kernel: shipped 9.98 = 5.83 (PyTorch) + 4.15; new as landed 20.90 = 16.80 + 4.11;
+new with the rewritten class 6.31 = 2.21 + 4.11; new with the counting-sort conversion
+4.54 = 0.247 + 4.29. Totals in the other three cells (M/0.05, S/0.55, S/0.05), same four
+routes: 1.538 / 2.217 / 0.992 / 0.693; 0.173 / 0.223 / 0.097 / 0.084; 0.059 / 0.021 /
+0.012 / 0.009.
+
+The rewritten `coo_workspace<T, N>` (`class_swap/new_class.inc`, sha256 4326e1ea...; not
+in this tree): of 322 timed kernel calls that use the class, all are neutral-or-better
+(12 at 10x or more, 151 at 5x to 10x, 117 at 2x to 5x, 42 at 1.1x to 2x; median
+after/before 0.173 at M and 0.238 at S), and 0 of 1,176 timed calls returned another
+result. Linux object code (sapling job 82004, gcc 13.4, the kernels' flags): 334 of 400
+kernel directories compared before the time limit; the 289 kernels that do not use the
+class are identical with either header, the 45 that use it differ. Owed before it lands:
+its Linux suite (sapling 82012, 82013) and the second host's timing.
+
+Transposes. The general sort-based conversion is mlsys-submission's (`convcount7a.patch`,
+sha256 23dc1dd5...; `lower_llir._RelabelledCopyAssemblyLowering`): a counting sort into
+one compressed level, a stable least-significant-digit radix sort of records into two or
+more, an in-order copy when only the layout changes, the sparse-workspace copy for the
+layouts the target refuses (coordinate levels, a dense level below a compressed one).
+Reviewed by reading on 10-12; the serial forms are accepted. My grid
+(`~/.cache/scorch-codex/transpose-grid/`), each result compared exactly with a PyTorch
+reference: sapling 82008 on the first draft, 195 tier-1 cells, shipped move and new
+default all correct; 82055 on `convcount5`, 195 cells x 3 forms = 585 kernels, 0 wrong
+(parallel counting sort 20, in-order copy 23, radix 152). Nothing in it is timed on two
+hosts yet.
+
+beat-mkl's merge speed check, part A (mkt1 job 17830969; `nc_1625` against 864745d and a
+same-binary copy of it; 20,628 timed cells): no wrong result. Three findings.
+(1) The first `matmul` on a new STensor operand, 20 to 500 us band: 1.033 (float32) and
+1.044 (float64), +3 to +4 us; the first call on a torch CSR operand is unchanged.
+(2) The attention workload, 1,024 tokens, `scorch.matmul(A, V, format="dd")` with the
+operand built every step: 1.16 in both passes (same-binary 0.99 and 1.00), +1.9 ms on a
+12 ms step. Two causes by beat-mkl's own reading: more Python work per `from_csr` (246
+calls against 171), and minor page faults seen on mkt1 only, 1,711 per step against 276
+to 343 (mkt1 job fast-sc8m finds which part of the step makes them).
+(3) The as-735 graphs at 32 float64 columns: 8% to 22% slower, 2 to 3 us on 20 us calls.
+`spmm.h`, `scorch_policy.h`, `plan.h` and `tiling.py` are byte-identical in the two trees.
+
+Cause of (1) and of the Python part of (2); the page faults of (2) are not explained by
+it: a construction inside Scorch (`from_csr`, `from_coo`,
+`from_torch`, `from_components`, `_wrap_generated_result`, `to_sparse`,
+`change_mode_order`, addition) built a `TensorIndex` only to hand it to the constructor.
+`SparseStorage` cannot tell that object from one a caller kept, so it audited the
+object's stored state and every index array a second time, and copied a second time the
+arrays of an index that did not adopt them; each audit also made a base-class view of
+every array (`torch.Tensor.as_subclass`), exact `torch.Tensor` or not. Python calls per
+construction, and the fastest of three rounds on a shared sapling node (job 82091; the
+times order the trees and are not a timing claim):
+
+    route                864745d         nc_1625         with the fix
+    from_csr             169   71 us     245  124 us     127   65 us
+    from_torch, CSR      170   75 us     255  128 us     137   71 us
+    from_torch, COO      184   91 us     270  150 us     152   87 us
+    from_components      170   79 us     248  144 us     128   65 us
+    sparse result wrap   182   63 us     220  101 us     131   49 us
+    dense result wrap     66   16 us     113   37 us      51   15 us
+    from_torch, dense     13  8.5 us      13  8.6 us      13  8.3 us
+
+The fix (`~/.cache/scorch-codex/construction-single-audit/`, patch `0001-construct-with-one-index-audit.v2.patch`, sha256 b1a4e90e..., which replaces the first cut `0001-construct-with-one-index-audit.patch`):
+`storage._index_components` holds the checks of `TensorIndex.__init__` and returns the
+four values an index holds (format, audited arrays, mode order, index dtype);
+`STensor._from_parts` calls it once and hands that result to the storage
+(`SparseStorage(..., _audited_index=...)`, private like `_trusted_index`). The storage
+keeps the arrays without a second audit, requires an exact `TensorLayout`, and holds the
+layout to the audited format, mode order and index dtype with the three errors the
+`index=` branch raises, also when `_trusted_index` is set. An exact `torch.Tensor` is
+audited without the extra view, its method reads going through the type. The public
+`STensor(index=...)` and `SparseStorage(index=...)` paths keep the full audit. A
+non-adopting internal site copies its index arrays once where it copied twice.
+Reviewed by mlsys-submission (10-12 night); its four points are in this cut. Measured on
+the final bytes (sapling job 82141): the call counts of the table's last column,
+unchanged. Tests: `test_single_index_audit.py` (162: the same tensor, sharing and errors
+as the public constructor for 12 valid and 37 malformed component sets, one audit per
+factory and per kernel result, the exact-tensor reads including a `detach` or `clone`
+set on the instance, the layout checks, the public audit unmoved; 4 of them skip where
+torch does not hand `Tensor.as_subclass` to `__torch_function__`, which is every torch
+tried so far, so the "is malformed" branch around that call stays unreached). Sapling job 82141 on `land_e`: black and flake8 clean on the four files, mypy reports the same 135 messages as `land_d` and no new one, the new test file 158 passed and 4 skipped, the eleven neighbouring test files 809 passed and 71 skipped (receipt `cfix2_82141/cfix2.82141.out`; ledger SHA256SUMS 3e77ceb7...).
+
+The page faults of (2): sapling job 82132 recorded every allocation of 64 KB or more
+during the step (an `LD_PRELOAD` recorder, `tools/alloctrace.c`). The shipped line, the
+merged tree and the merged tree with the fix make the same 49 allocations and 49
+releases per step, in the same order and of the same requested sizes (40 of 519,416
+bytes in the benchmark's softmax, 8 product results of 131,072, one `torch.stack` of
+1,048,576), all from the main heap on one thread; no step leaves an object to the cycle
+collector; minor faults per step read 91, 93 and 90. So the merged tree adds no buffer
+and moves no release. What differs on mkt1 is then where glibc places those blocks,
+which the small allocations around them decide. beat-mkl's mkt1 job 17834640 (attention,
+S=1024, 8 heads, 24 pinned threads; 36 runs, all exit 0; log
+`/matx/u/bobbyy/fast/results/sc8m/fast-sc8m.17834640.log`) puts every fault in the
+softmax's own torch temporaries and none in `from_csr` or the product, in every build.
+Under glibc's default thresholds each process lands either near 0 faults per step or at
+1,585 to 3,357, in every build (high in 1 of 6 shipped-line processes, 4 of 6 merged, 4 of
+6 with the fix; that difference is not established). With the thresholds pinned
+(`M_MMAP_THRESHOLD` 32 MiB, `M_TRIM_THRESHOLD` 4 GiB) every build reads 0 to 32 faults
+per step, and per call `from_csr` reads 463-471 us shipped, 674-699 merged (+27 us) and
+407-421 with the fix (7 us faster than shipped); the product's result wrap 512-526,
+535-559 (+3 us) and 515-535 (equal to shipped). Steps: 12.69 and 12.69 ms shipped, 12.88
+and 12.68 merged, 11.65 and 11.75 with the fix. The earlier 1.16 step ratio on mkt1 was
+mostly which fault state a process fell into (about 1.4 ms) plus `from_csr` (about
+0.2 ms), and the fix removes both of the merged tree's costs on this path.
+
+Finding (3) is withdrawn as a merged-tree slowdown. beat-mkl's mkt1 job 17833865 (32
+processes, all exit 0; `/matx/u/bobbyy/fast/results/sc8n/levels.csv`): G_374 as stored
+(7,716 rows), k=32, float64, best time per process 20.2-26.4 us merged and 20.2-25.0 us
+shipped over 16 processes each (8 under glibc's defaults, 8 pinned); medians 22.15 and
+22.6 us; defaults alone 22.7 against 21.95, pinned 21.35 against 22.8. No call faults,
+the result always sits on the heap at one reused address per process, and time does not
+follow that address modulo 2 MiB or 4 KiB. Size controls in both builds: 7,000 rows
+(1.79 MB result) read 19-21 us and 8,400 rows (2.15 MB) 24.5-26 us; only the 7,716-row
+matrix (1.98 MB) shows the per-process 20-against-23 us levels, from a cause not yet
+identified. The earlier pass flagged the merged tree because the five related graphs sit
+next to each other in the screen and one process times all five; with 2 processes per
+build, one slow process flagged the family twice, so those cells were not independent.
+beat-mkl records that as a finding about the check itself.
+
+Also for the record: ken's 0037 (item 25) on mkt1 (job 17831991) reads 35 of 36 cells
+neutral or better and one slower, `jit_spmv_strict` with the validation memo off at
+65,536 entries, 1.21 [1.20, 1.26], better at the three other sizes and neutral on the
+M5. Every arm of every round is its own process: the 12 old-tree processes read 1,461 to
+1,472 us in that cell and the 6 new-tree processes 1,756 to 1,845 us. On the default path
+(validation memo on) 32 cells, none slower. 0037 is a correctness fix and stays; the cell
+is an open finding, and ken's control job on mkt1 repeats it with the OpenMP wait policy
+unset, passive and active and reads call time against the idle time before the call.
+
+
+**32. Shipped compiler: a dense operand's position waits for its parent's (senior-engineer-a's
+fix4, lands in `nc_0402`).**
+`scorch.einsum('ijk,jl,kl->il', A, B, C, format='ds')` with `A` dense rank 3 and `B`, `C`
+COO (or `C` compressed) emitted C++ that did not compile at extent 15: `'pA1' was not
+declared` at `int pA2 = pA1 * A2_size + j;` (item 29's 4 untimed cells). A dense level's
+position declaration reads its parent's position; `LatticePoint.get_candidate_coordinate_stmts`
+released it once its own and its parent's index variables were bound, while the parent's
+declaration was still waiting for the grandparent's index variable. That loop order is
+legal (the scheduler puts no storage-order constraint on an all-dense operand), so the fix
+is in the lowering: `iter_lattice._declarable_now(pending, bound)` holds a declaration while
+a position it reads is pending and cannot be declared at this loop. A declaration is held
+only where the old code read an undeclared name, so every kernel that compiled before is
+emitted byte for byte as before.
+
+Patch `fix4.patch` (sha256 f4d431ab..., base `nc_1625`; result `iter_lattice.py` 9b75ef26...,
+new `tests/test_scorch/test_dense_operand_position_waits_for_parent.py` e0ec2de6..., 432
+lines). Evidence (sapling, senior-engineer-a; nothing timed because no kernel that compiled
+before changed):
+- Emitted text, old against fixed, 9,061 programs at 3 extent settings: text differs in
+  exactly the 37 programs that have the defect (20 at extent 15, 21 at 63); the fixed tree
+  has it in none; selections, lowered nests and operand moves identical in all 27,183
+  records; the 5,657 main kernels of the front-door census identical. Hand-built nests over
+  every stored order and loop order: the old code fails 12 of 36 (rank 3), 336 of 576 (rank
+  4), 94 of 120 (rank 5); the fix none.
+- Executed on the fix against float64 `torch.einsum`, every level array compared: the two
+  reported programs 96 of 96 cells; all 37 programs 959 of 959 cells in 193 kernels
+  (float64 at extents 15, 33, 63; float32 and int64 at each program's defect extent);
+  largest relative error float64 4.84e-15, float32 2.62e-6, int64 exact.
+- Tests: the new file 53 of 53 on the fix, 51 failing on the old tree. Lint: no finding the
+  fix alone has; McCabe of `get_candidate_coordinate_stmts` 23 -> 22.
+- On the landing tree: applies cleanly to `land_t`; sapling job 82184 on `land_u` (`land_t` + fix4, with `land_s`'s extension): black and flake8 clean, no mypy message `land_s` lacks; fix4's file 53 of 53; `test_kernels.py`, `test_kernels_mode_order.py`, `test_einsum_loop_order_sort.py` and `test_einsum_repeated_index.py` 158 tests passed and 0 failed before the stage's 30-minute limit stopped the last few on a loaded node (load 24-35). The landed tree's full suite covers them.
+Ledger: `~/.cache/scorch-codex/dense-position-declaration/` on the M5 (copy on sapling: `/scratch/bobby/a_ddd/ledger`), 629 files, 89 MB, sha256 of `SHA256SUMS` f3e1368313bf12a67f8111b9619027a116c39940ce150e9a931e29bcfbd160cc. It holds the patch (`patches/0001-dense-position-waits-for-parent.nc_1625.patch`, the same bytes as `fix4.patch`), every job's output, and the tools. Sapling job 82034 compared the new compiler's emitted text on base and on the fix over the 1,138 frontier programs (float32 and float64, register blocking off and on): identical, so the fix changes nothing the new compiler emits.
+
+Recorded as a separate finding, not in this patch: `einsum` selects a loop order and moves
+operands to it, then `auto_schedule` selects again, and the two can differ (loops not
+following the just-moved storage order in 148, 153 and 136 of the 9,061 programs at the
+three extent settings).
+- On `land_v` (`land_u` without 0038, item 34): fix4's files are unchanged, since the 0038 reversal touches neither
+  `iter_lattice.py` nor fix4's test file; the whole suite on `land_v` (82203 -> 82205) includes fix4's tests.
+
+**33. Test-only add-on to the operand-conversion patch (mlsys-submission's convcount7c add-on).**
+`test_result_storage_marker_mechanisms.py::test_every_statement_rebuild_threads_the_marker_or_is_classified`
+locks the list of places that build a result-marked LLIR statement by copying a field off another
+node; convcount7a/7b added three in `lower_llir.py` without listing them, so the landing tree failed it
+(1 failed, 375 passed over the marker file, `test_llir_string_budget.py`, `test_result_write_pass.py` and
+`test_loopir_verifier.py`). The add-on lists them: `_RelabelledCopyAssemblyLowering._restricted` rebuilds
+the outermost loop's iterator declaration with one chunk's lower bound (not a result write, the same case
+as `parallel_chunk_assembly._body_lambda`); `_radix_passes` and `_parallel_radix_passes` copy a histogram
+vector's name into an `assign` call, which the scanner mistakes for a statement rebuild. Patch
+`convcount7c_addon.patch` (sha256 55df5794..., one test file, 28 added lines, `src` unchanged); applied to
+`land_u` with no rejects, the file then equals convcount7c's (df6d10bc...). The same four files on the
+patched copy: 376 passed, 0 failed (sapling, `/scratch/bobby/allprog/convcount/addon_land.land_u.002037`).
+Missed because the conversion patch's own check ran only `test_loopir*.py`; job 82176 compares the 25
+other test files that read compiler source on base and on the patch (14 of 25 done, no difference, at 00:22).
+On `land_v` (`land_u` without 0038, item 34), the same four files: 376 passed, 0 failed (mlsys-submission,
+`/scratch/bobby/allprog/convcount/check_land.lu_no38.005744/out.txt`, run on ken's byte-equal copy `lu_no38`).
+A third test-only add-on, convcount7d (mlsys-submission, 01:44; `convcount7d_addon.patch`, sha256
+1be019671c3b229e532098f92e19b8c76e5ae846f8c78a6db1828323613d3837, one file, +29 -5), is applied to `land_v`.
+`test_loopir_single_cursor_assembly_target.py::test_permuted_mode_order_stays_fail_closed` builds a program by hand.
+The program walks a column-major A and appends each entry to a row-major compressed C, with no assembly strategy
+recorded, and the test pinned `LoopIRTargetError` `unsupported_mode_order`. With the conversion patch the verifier
+refuses it first, with `LoopIRVerificationError` `unordered_append`: an append out of its result's storage order
+needs a recorded two-pass assembly. With `TWO_PASS_SERIAL` or `TWO_PASS_PARALLEL` recorded, the verifier admits
+the program and the target still refuses `unsupported_mode_order`. The test now covers all three cases. It is
+still fail closed with a structured code. No program of the frontier (0 of 4,552) or census (0 of 18,122)
+populations reaches it. The file now equals convcount7d's (b24abbf7...), and `src` is unchanged. Local and sapling
+`land_v` are byte-equal on 292 files (list digest 8a51f28962ea2312).
+
+**convcount7d (relabelled copy for operand conversions; patch 3adc755f…, 10 files = convcount7a
+23dc1dd5… + three test-only add-ons: f92e6c65…, which registers `unordered_append` in
+`test_loopir_verifier.PRODUCTION_SUBSET_DEFECT_CODES`; 55df5794…, which registers the three
+new statement constructions of `_RelabelledCopyAssemblyLowering` in
+`test_result_storage_marker_mechanisms._MECHANISMS`; and 1be01967…, which re-pins
+`test_loopir_single_cursor_assembly_target.test_permuted_mode_order_stays_fail_closed` (its
+hand-built program, a column-major operand appended to a row-major result with no strategy, is now
+refused by the verifier with `unordered_append` before the target's `unsupported_mode_order`; with
+a two-pass strategy recorded the target's refusal is unchanged); src digest 573a064c… in all
+four).**  The new
+compiler's operand conversion (`operand_conversion.conversion_source`) gets a second form beside
+the sparse-workspace copy (`conversion_program`, one hash insertion per entry and a comparison
+sort).  `relabelled_copy_program` walks the operand in its storage order and appends each stored
+entry at its permuted coordinates under a recorded two-pass assembly; the target
+(`lower_llir._RelabelledCopyAssemblyLowering` and its count, chunk-count, chunk-fill and record
+passes) lowers it into one compressed level as a counting sort (count per segment, prefix sum,
+place), and into two or more as an LSD radix sort of the same counting passes followed by one
+sweep that builds every level.  Two constants: `RELABELLED_COPY_DIGIT_BITS_MAX = 11` (radix digit
+width, digits of `bit_width(entries)` bits) and `RELABELLED_COPY_ENTRIES_PER_THREAD = 1 << 15`
+(the parallel form's grain: one thread per 32,768 entries, decided when the kernel runs; one
+thread runs the one-thread kernel).  Two refusal codes: the target's
+`unsupported_relabelled_assembly` (a layout it cannot assemble; `conversion_source` then falls back
+to the sparse-workspace copy under a fresh compilation context), and the verifier's
+`unordered_append` (`verifier._check_append_order`: an append out of its result's storage order is
+admitted only under a two-pass record, as a relabelled copy of one input, into a result with no
+dense level below a sparse one).  `oracle.py` assembles such outputs in coordinate order at
+program exit; `nodes.py` documents the exception.
+**One refusal moved:** a hand-built program that appends out of its result's storage order with no
+strategy recorded used to reach the target and get `LoopIRTargetError`; it now gets
+`LoopIRVerificationError` `unordered_append` from the verifier.  No program of the frontier
+(4,552 verdicts) or of the 9,061-program einsum census (18,122 verdicts) reaches it; the gate tools
+that classify by exception type (frontier_ext2.py, census_dual.py) would call it UNCLASSIFIED if
+one did.
+**Defaults after landing:** every conversion that changes level order takes the one-thread
+relabelled copy (`forms=("relabelled", "region")`); a conversion that keeps the level order is
+lowered by the ordinary route as one in-order walk, no sort; the parallel form
+(`"relabelled_parallel"`) and the sparse-workspace copy alone (`("region",)`) are on request only.
+**Evidence:**
+- Emission: byte-identical to convcount7 on 1,191 cases x 3 forms (82106, so convcount7's compiled
+  results carry over).  mypy 2.2.0: 141 errors = base, 0 new (82106).  black 26.5.1 / flake8 7.3.0
+  clean on the patch's files and on each add-on's file (82123, check7b.230815, check7c.001613,
+  check7d.014324).
+- Compiled tests, step 1 (82079): test_loopir_relabelled_conversion.py,
+  test_loopir_operand_conversions.py and test_einsum_operand_relayout.py, 1,625 passed, 0 failed.
+- Compiled tests, step 2 (82081, 82082, resume 82162; tree convcount7, which has none of the
+  add-ons): the other 49 LoopIR test files, 7,985 tests, complete at 02:40:47: 7,843 passed, 66
+  skipped, 76 failed, every test recorded once.  The 76 failures are 74 in
+  test_loopir_spike_execution.py (exact float comparisons of the spike interpreter; the same 74
+  ids fail on base tpb1629, 74 failed / 431 passed on both trees side by side) and the 2 tests
+  re-pinned by the first and third add-ons.
+- Test files outside `test_loopir*.py`, base tpb1629 against the patched tree per test:
+  14 of the 25 files that read compiler source or name the LoopIR package, 864 tests on both
+  trees, 0 differ (82176, stopped by me at 36% of its long files); the six quick files of those
+  25, 261 passed and 1 skipped on both trees, 0 differ; the four files that reach the package only
+  through `tests/test_scorch/sum_cin_support.py`, 325 of 325 passed on both trees, 0 differ
+  (82193, 82194).  This comparison found the marker-registry failure fixed by the second add-on.
+- The six long files of those 25 on the patched tree only (82222; a test that passes there cannot
+  be a regression): complete at 02:51:55.  All 732 tests of these six files are recorded as
+  passed on the patched tree (131 by 82176, 601 by 82199 and 82222); not passed: 0.
+- Landing tree: on a full copy of land_v's bytes with the three add-ons, the four test files that
+  lock lists of compiler source pass 376 of 376 and the re-pinned test passes its three cases.
+- Ask 1 (82131, nothing compiled): 0 of 4,552 frontier verdicts (1,138 programs x 2 value types x
+  2 arms) and 0 of 18,122 verdicts of 9,061 einsum programs through both compilers changed against
+  base tpb1629.
+- Front-door census on convcount7a (82137, nothing compiled; its comparison with the base is due
+  12:00 on Oct 13).
+**Owed:** the two-host timing of the forms (conversion-forms grid, pre-registered rule in
+sapling `allprog/convgrid/harness2/README.md`: every arm against the one-thread relabelled copy,
+including the sparse-workspace copy, on mkt1 and the M5): mkt1 job 17834710, staged for
+convcount8b (= convcount7a + the chunk-local sort, whose one-thread kernels are byte-identical),
+starts Oct 14 at the earliest; the M5 half is not yet scheduled.  The switch of the
+default from the sparse-workspace copy to the relabelled copy changes emitted kernels, and so far
+is timed only on sapling smoke runs (not a timing host; there the sparse-workspace copy read
+6-10x slower); under the 2026-10-11 rule its release needs that grid.
+
+**ken's 0042: the merged-coordinate name** (on `nc_1625`).
+0042 (`0042-merged-coordinate-name.patch`, sha256 f679bc98..., 4 files): a kernel that
+merges sparse operands on an index declares each operand's coordinate as
+`<index>_<tensor>`. With an upper-case index letter that is how the C library spells its
+constants: `einsum('M,M,M,M,M->M', ...)` on five sparse vectors declared `int M_E` (e in
+math.h) and did not build (job 81957). The name now comes from
+`merged_coordinate_name(index, tensor)`: unchanged when the index name holds a
+lower-case letter, `<index>_<tensor>_coord` otherwise, so no kernel emitted today changes
+text. Files: `compiler/merged_coordinate.py` (new, no imports), `compiler/iterator.py` (2
+sites), `compiler/loopir/lower_llir.py` (4 sites, 2 of which reserve the name),
+`tests/test_scorch/test_merged_coordinate_name.py`. Equal object code stands in for a
+timing (mlsys-submission, 10-12 20:38): the renamed kernels compile to the same object
+code on sapling (81996), on mkt1 (17834427: 12 programs, 9 of them with renamed sources;
+every object and every loaded shared object is equal, 0 lines of disassembly differ, and
+both trees' results equal torch.einsum) and on the M5 under Apple clang 21.0.0 (10-13,
+03:23:41 to 03:25:09: the same 12 programs, every compiled object equal, 0 lines of
+disassembly with relocations differ). On the M5 the linked shared objects are not equal,
+and the cause is the comparison's two build directories, not the patch: the 3 programs
+whose sources are byte-equal show it too. Each object holds the absolute path of its
+main.cpp as a string, the run built into `ext_before` and `ext_after`, whose names differ
+in length by one character, so every string the linker places after that path sits one
+byte earlier; read on one byte-equal pair, the 731 differing lines are all `add`
+instructions whose immediate differs by exactly 1, and nothing else differs. Backing:
+tests 115/115 (82100), the same file under Apple clang and Apple's headers on the M5
+(10-13, 03:26:25 to 03:28:14: 115 passed in 108.39 s), emission of 9,061 programs through both
+compilers (81992: the shipped compiler emits all 9,061 with the same text before and
+after; the new compiler emits 9,037 on both sides and refuses the same 24, 9,500 sources
+with the same text; the shipped-route census of 4,256 records shows no difference; the
+2,276 frontier records, 4,056 source digests, are identical), lint (81997: no new
+finding). Owed: the 26-operand patch, which then follows without its skipped names.
+
+**34. Patch 0038 (int32 position bound) is held out of this landing (scorch-merge, 2026-10-13 01:01).**
+On mkt1, ken's 0038 timing (job 17833943) shows 13 of 65 judged cells slower, by 1.011x to 1.067x. Every
+slower cell is a generated-kernel row; every prebuilt-kernel cell is neutral. The project rule ships a change
+only when its runtime is neutral or better on both hosts, so 0038 does not land tonight. mlsys-submission,
+who owns ken's stack, withdrew it at 00:52 (desk thread t-patch-0038).
+
+ken's fit splits the slowdown into two parts:
+- a constant of +30 to +37 us per call, from the longer preamble (+4.2%, 15,010 bytes) that is read and
+  hashed on every call;
+- a part that grows with the result, probably page faults from the same per-call text buffers rather than the
+  patch's own checks.
+Neither explanation has been tested.
+
+0038 returns when two things have happened, in this order: the per-call CompileOptions snapshot fix lands
+(item 35), and a three-arm mkt1 run (nc_1625, nc_1625 + snapshot fix, nc_1625 + snapshot fix + 0038) shows it
+neutral.
+
+What stays as on nc_1625 without 0038: a generated kernel refuses any operand or result whose logical element
+count passes 2**31 - 1, however few entries it stores. For example, a 64,000 x 64,000 CSR matrix with 4,000
+entries is refused. The refusal comes from `validate_jit_tensor` and `validate_jit_result_shape` in
+`src/scorch/csrc/native_abi.h` and is a plain RuntimeError with no defect code. A `ds` operand of shape
+(1, 2**31 - 1) still fails at 40.5 GiB without a code. Wrapped positions in a returned result were read from the
+code and never run. ken's job 82209 ran seven public operations on a 64,000 x 64,000 operand, once with 4,000
+stored entries and once with 1,023,865 (about 8 a row), on the tree without 0038 (land_v's bytes) and on the tree
+with it:
+- `scorch.matmul(CSR, dense)`, the prebuilt route, computes on both trees, equal to torch at 1e-12.
+- Six operations refuse on the tree without 0038, each with an uncoded RuntimeError ("element count 4096000000
+  exceeds the current native int32 allocation bound"):
+  - `einsum("ij,j->i", format="d")` and `einsum("ij,jk->ik", format="dd")`, on the operand;
+  - `A + B`, `einsum("ij,ij->ij", format="ds")`, the sampled product `einsum("ij,ik,jk->ij", format="ds")` and
+    `.to_sparse("oo")`, on the result shape.
+- With 0038, all six compute. The dense results equal torch at 1e-12; the sparse results have torch's entry
+  counts. This probe compares sparse results by entry count only; 0038's own tests (job 81964) compare every
+  entry.
+- Each refusal is raised by the generated kernel's first statements, after the kernel is built (87-93 s on first
+  use), with no growth in memory. Nothing returned a wrong value and nothing crashed.
+The refusal also breaks the fail-closed rule, because it carries no defect code. After tonight, ken will propose a
+separate small patch that gives this refusal a code in Python, where native errors are already mapped to codes, by
+matching the existing messages. It changes no header and no kernel text.
+
+This is not a capability tonight's landing removes, since nc_1625 already refuses these inputs. It is a capability
+the refactor line lacks compared with main, and that matters before the line merges into main. Main (b3b5d4b) has
+no `native_abi.h` (its C++ is in a top-level `csrc/`), and `git grep` over main's `src` and `csrc` finds no
+element-count bound and no int32 refusal message. Whether main computes these inputs correctly has not been run.
+Open condition for the merge into main: either 0038, or an equivalent fix, lands once shown neutral, or main's
+behaviour on these inputs is measured.
+
+A second open condition for main, found by ken from kernel text and the landing tree's code (nothing executed;
+relayed by mlsys-submission, 02:51). A kernel that reduces through a sparse workspace counts the drained entries
+in 64 bits and reads the count back as `int pT0_end = T0_crd_tensor.size(0)`. Past 2**31 - 1 workspace entries
+that bound wraps, and the kernel returns a short result that passes every check: a wrong result, not a refusal.
+- On land_v it cannot be reached. `validate_jit_result_shape`, emitted first in every generated kernel
+  (`cin_lowerer.py:4344`), refuses a result above 2**31 - 1 logical cells. A multi-coordinate workspace takes its
+  extents from the result shape (`_sparse_workspace_extents`, `cin_lowerer.py:1497`), and `coo_workspace::insert`
+  throws on a key outside them. So the entries are at most the result's cells, at most 2**31 - 1. In census 82166,
+  1,730 of 3,968 captured kernels have a sparse workspace, and none has more key coordinates than its result has
+  levels. Two cases were not enumerated: a key that names one result variable twice, and a result extent of 0
+  outside the key.
+- It is open on main, which has no cell-count refusal, and on any tree with 0038, which lifts the cell-count bound
+  for sparse results. There 0038's per-append compare is the only bound on those arrays.
+- Condition attached to 0038's return: a checked narrowing of the drained count, emitted in every workspace kernel
+  with a structured refusal, lands with 0038 or before it. ken writes the proposal, with the kernel line, after ken's
+  list of every 64-bit length narrowed to `int` in emitted kernels.
+
+How it was taken out. The landing tree `land_v` is `land_u` plus ken's reverse patch
+(`revert-0038-on-land_u.patch`, sha256 59e140ac8c9022d6ef7d905ff74d1e41ca2f249f421e31bb7102e02c6ff706d1;
+17 files, +140 -1,537).
+- 15 files reversed whole. Five hunks were merged by hand because later landing patches had moved their
+  context.
+- 13 of the 17 files now equal nc_1625's bytes. For each of these 13, `land_u`'s copy equalled nc_1625 + 0038
+  exactly (one black line-join in 0038's own `ops.py` code aside), so no other landing patch loses an edit.
+- `loopir/lower_llir.py`, `stensor.py` and `test_compressed_where_openmp_pass.py` keep the other patches'
+  changes. `test_index_position_bound.py` is removed.
+- `src/scorch/csrc` and the generated-kernel preamble (353,948 bytes) equal nc_1625's.
+- The local and sapling copies are byte-equal on 292 src and tests files.
+
+Checks on `land_v`:
+- the four inventory test files: 376 of 376 passed (mlsys-submission);
+- ken's 82201 and 82218, the files that pin kernel or preamble text plus 0037's test file:
+  `test_compressed_where_openmp_pass.py` 128 passed; 0037's `test_coo_repeated_coordinates.py` 103 passed; the
+  timing harness's generated-kernel cells (jit_spmv, sum_ds, prod_ds, prod_oo, two sizes) 8 of 8 correct, values at
+  1e-12 and sparse results compared by stored structure (ken, 82218, on the byte-equal copy `lu_no38`);
+- found on `land_u` and fixed by the removal: two tests of `test_compile_options.py` failed there (`assert 2510 ==
+  2505`, the length of a generated kernel text), because 0038's result-check statement is 5 characters longer and
+  those pins were not re-pinned with it (ken, 82197). They join 0038's re-pin list; the `land_v` suite runs them;
+- the whole suite on sapling and the M5 suite after composing: item 36.
+
+**35. Finding: every `scorch.einsum` call builds and digests a full compile-options snapshot (ken, 2026-10-13;
+the fix lands after `nc_0402`).**
+On this line, `ops._compile_options_from_kwargs` -> `CompileOptions.from_environment()` runs on every call
+before any cache lookup. It reads the resource headers from disk and assembles the kernel preamble (about 0.36 MB),
+searches torch's library directory for the OpenMP runtime, and resolves the compiler. Then
+`CompileOptions.cache_key` takes the SHA-256 of the preamble. The same happens in `spmv`, `lower_and_exec_cin` and
+`STensor.__add__`, `to_dense` of a tensor that is not dense, `to_sparse` and `change_mode_order`. It does not
+happen in `scorch.matmul`'s dense-dense, plan and prebuilt SpMM/SpMV routes (sapling 82196: 0
+`from_environment` calls over 20 `matmul(CSR, dense)` calls in every tree, 186/184/184 us).
+Cost (sapling, one thread; warm `einsum("ij,j->i", COO, dense, format="d")`, 200 calls, median): 8,192 rows
+248 us on the SpMM line (864745d), 5,251 us on `land_u` (the earlier landing candidate, which still carried 0038); 1,024 rows 107 and 5,233 us. Under cProfile 3.7 ms is the
+snapshot and 1.5 ms the digest. On mkt1 the generated cells of 17831991 took 1.3-2.1 ms a call at every size from
+8,192 to 1,048,576 entries, so the cost does not depend on the operand. It also explains 0037's REGRESSION cell
+(an allocator effect on these per-call strings, ken 82183/82168) and is ken's likely cause of part of 0038's slowdown (item 34; 0038 is held out of this landing).
+Fix (ken, `/scratch/bobby/ken/lu_snap`; tests 82197): the build snapshot is kept per process, keyed by exactly what
+it reads (the eight environment values `from_environment` passes, the working directory, platform, the Python
+executable, torch's version and file, and path, size, mtime and inode of each resource header). Each caller
+gets its own copy. The preamble digest is cached by its text, and a failed resolution is not kept. Measured
+(82196): 5,251 -> 438 us at 8,192 rows, 5,233 -> 326 us at 1,024 rows; `from_environment` 2,730 -> 81 us,
+`cache_key` 1,571 -> 7 us. Build fields and cache keys are byte-identical under three environments, and the
+kernels are the same. One behaviour changes: a compiler wrapper that appears in a directory already on `PATH` is
+not seen until `clear_build_snapshot_cache()` or a new process; the build then refuses with
+`compiler_wrapper_name`, and a test pins this. Seeing it would cost 29 us a call on sapling (13 directories).
+Still over the SpMM line after the fix: about 200 us a call, 81 us of it `from_environment` itself. Next (ken):
+memoize the whole parse on its raw inputs, profile the other ~120 us, and measure on the M5 too.
+Patch for its own item after this landing: `0043-build-snapshot-cache.patch` (ken; sapling `/scratch/bobby/ken/e43/`,
+sha256 5a66b923b72ae071c53204aba9cb1cf1c5ff58306a1188be1bc760a8c462c322; 3 files, +768 -1). It was cut against `land_u`
+and gives the same bytes on `land_v`.
+- Timing (82198; three passes, median us of 200 calls), 8,192 rows: SpMM line 197.6-219.2, `land_u` 5,001-6,330, with
+  the patch 388-413. At 1,024 rows: 110, 5,229 and 282.
+- Tests: the new test file passes 31 of 31. Six neighbouring files: 229 passed, 2 failed, and the same 2 fail without
+  the patch (the two 0038 pins in item 34).
+- Lint: no new finding (82200, 82237).
+- Not yet run: the full suite with the patch, and the mkt1 and M5 timing.
+
+**36. The landing's test runs (scorch-merge; lands in `nc_0402` = nc_1625 + land_v).**
+- The whole suite on sapling, land_v's bytes, resumable chain 82203 (the files the landing touches) -> 82204
+  -> 82205: [result].
+- The M5 suite on the frozen copy `nc_0402`, 13 workers in chunks of 900 tests: [result].
+- Correctness pass on land_v's bytes (mlsys-submission, 03:16; tree /scratch/bobby/csrx3/landv, src digest
+  c1bdb2eff9c92116, equal to land_v's). New compiler, the 7 lists in float32 and float64: 11,240 records, 16 of
+  16 parts finished, harness errors 0. Both automatic arms: 10,660 records executed and 10,660 correct, 0
+  unclassified. The second call went through the dispatch cache in all 10,660. Stored coordinates were compared
+  exactly in 8,800 first calls per arm. Not executed, the same 580 as on nc_1625: 540 refused while building an
+  operand in the requested layout (`to_sparse` on mixed coordinate hierarchies 480, singleton levels 60), and 40
+  not expressible through einsum. Not correct and not a structured refusal: none. Jobs 82246 (cancelled at 02:57
+  after 1,485 records) and its resume 82277 (03:02:54 to 03:14:38) in one run directory; table
+  `/scratch/bobby/allprog/fdexec_v6b_landv_new/table.txt`. Of the kernels, 2,330 were reused from the nc_1625
+  and nc_1537 runs through an index that checks each kernel's content, and 220 were compiled here.
+- Same pass, shipped compiler, the 7 lists in float32 and float64 (82279, 03:14:38 to about 03:22): 11,240
+  records, 16 of 16 parts, harness errors 0. Both automatic arms: 10,660 executed and 10,660 correct, 0
+  unclassified. The second call went through the dispatch cache in all 10,660, and stored coordinates were
+  compared exactly in 8,800 first calls per arm. Not executed: the same 580 as the new compiler's run. Kernels:
+  2,541 reused, 16 compiled. Table `/scratch/bobby/allprog/fdexec_v6b_landv_shipped/table.txt` (f187b2e6…).
+- Same pass, new compiler, the 48 SDDMM layouts (82282): 480 records, 4 of 4 parts, harness errors 0. Both
+  arms: 480 executed, 480 correct, 0 unclassified, stored coordinates compared exactly in all 480. Table
+  `fdexec_v6b_sddmm_landv_new/table.txt` (4943d6f5…).
+- Same pass, shipped compiler, the 7 lists in int64 and int32 (82281, 03:24:48 to 03:31:38): 11,240 records,
+  16 of 16 parts, harness errors 0. Both arms: 10,493 executed and 10,493 correct, 0 unclassified; stored
+  coordinates compared exactly in 8,643 first calls per arm. Not executed: 167 not judged because the float64
+  reference does not fit in int32, 540 operand-layout refusals, 40 not expressible through einsum. Kernels:
+  2,542 reused, 16 compiled. Table `fdexec_v6b_int_landv_shipped/table.txt` (25c40a64…).
+- Same pass, shipped compiler, the 48 SDDMM layouts (82280): 480 of 480 correct per arm; the table
+  (36fde1ef…) is byte-identical to nc_1625's.
+- Same pass, new compiler, the corpus as written (82283, 03:31:40 to 03:57:20): 4,568 records; 4,104 executions
+  compared with the reference, 4,104 correct; not correct on either route 0; programs that crashed the process
+  0. Per fill and value type (0.55 and 1.0, float32 and float64): arm 0 has 1,014 correct and 124 refused; arm 1
+  has 12 correct, 1,002 with the same source as arm 0, and 124 refused. Each of the 124 refusals carries a
+  structured code (unsupported_mixed_coordinate_hierarchy, auto_reduction_operator, unsupported_update_op,
+  unsupported_union_with_dense, unsupported_sparse_output_domain). 165 programs have a converted operand (660
+  executions). These equal the nc_1625 run's counts. Kernels: 2,072 reused, 310 compiled. Output
+  `/scratch/bobby/allprog/allprog_v9.82283.out`.
+- Still running or queued: int64 and int32 through the new compiler (82284), the high-rank population through
+  both compilers (82304), and the 792 two-pass programs through the new compiler (82295 onward): [result].

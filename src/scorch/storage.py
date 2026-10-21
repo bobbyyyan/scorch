@@ -18,11 +18,14 @@ from typing import Any, List, Optional, Tuple
 import torch
 
 from .exceptions import (
+    COALESCE_ADVICE,
+    RepeatedCoordinateError,
     TensorDeviceError,
     TensorIndexError,
     TensorLayoutError,
     TensorStorageError,
     TensorTypeError,
+    format_coordinate,
 )
 from .format import (
     FormatInput,
@@ -39,6 +42,9 @@ from .layout import (
 )
 
 IndexModes = Tuple[Tuple[torch.Tensor, ...], ...]
+# What ``_index_components`` returns: a format, the index arrays audited against it, the
+# physical-to-logical mode order and the index dtype.
+AuditedIndex = Tuple[TensorFormat, IndexModes, Tuple[int, ...], torch.dtype]
 
 # Resolved once. The extension is built from this same tree, but an editable install
 # whose extension has not been rebuilt will not have the entry point, and validation
@@ -163,24 +169,34 @@ def _normalize_mode_indices(
         normalized_arrays = []
         for slot, index in enumerate(arrays):
             index_type = type(index)
-            try:
-                mro = type.__getattribute__(index_type, "__mro__")
-            except Exception as error:
-                raise TensorTypeError(
-                    f"mode_indices[{mode}][{slot}] must be a torch.Tensor"
-                ) from error
-            if not any(base is torch.Tensor for base in mro):
-                raise TensorTypeError(
-                    f"mode_indices[{mode}][{slot}] must be a torch.Tensor"
-                )
-            try:
-                base = torch.Tensor.as_subclass(index, torch.Tensor)
-            except Exception as error:
-                raise TensorIndexError(
-                    f"mode_indices[{mode}][{slot}] is malformed"
-                ) from error
-            if type(base) is not torch.Tensor:
-                raise TensorIndexError(f"mode_indices[{mode}][{slot}] is malformed")
+            if index_type is torch.Tensor:
+                # An exact torch.Tensor has no subclass whose overrides a read could
+                # reach, so it needs no base-class view of itself: making one is a new
+                # tensor object per array per audit. The reads below that are methods
+                # go through the type, so an attribute set on the instance cannot
+                # answer for them, and the properties are data descriptors, which an
+                # instance cannot shadow. What is retained is the detached tensor made
+                # at the end of this loop body, never the caller's object.
+                base = index
+            else:
+                try:
+                    mro = type.__getattribute__(index_type, "__mro__")
+                except Exception as error:
+                    raise TensorTypeError(
+                        f"mode_indices[{mode}][{slot}] must be a torch.Tensor"
+                    ) from error
+                if not any(base is torch.Tensor for base in mro):
+                    raise TensorTypeError(
+                        f"mode_indices[{mode}][{slot}] must be a torch.Tensor"
+                    )
+                try:
+                    base = torch.Tensor.as_subclass(index, torch.Tensor)
+                except Exception as error:
+                    raise TensorIndexError(
+                        f"mode_indices[{mode}][{slot}] is malformed"
+                    ) from error
+                if type(base) is not torch.Tensor:
+                    raise TensorIndexError(f"mode_indices[{mode}][{slot}] is malformed")
             if base.layout != torch.strided:
                 raise TensorIndexError(
                     f"mode_indices[{mode}][{slot}] must use strided storage"
@@ -194,11 +210,11 @@ def _normalize_mode_indices(
                     f"mode_indices[{mode}][{slot}] must use int32 or int64, "
                     f"got {base.dtype}"
                 )
-            if base.dim() != 1:
+            if torch.Tensor.dim(base) != 1:
                 raise TensorIndexError(
                     f"mode_indices[{mode}][{slot}] must be one-dimensional"
                 )
-            if not base.is_contiguous():
+            if not torch.Tensor.is_contiguous(base):
                 raise TensorIndexError(
                     f"mode_indices[{mode}][{slot}] must be contiguous"
                 )
@@ -251,6 +267,86 @@ class TensorLevelIndex:
     __repr__ = __str__
 
 
+def _index_components(
+    tensor_format: FormatInput,
+    mode_indices: Sequence[Sequence[torch.Tensor]],
+    mode_order: Optional[Sequence[int]],
+    index_dtype: Optional[torch.dtype],
+    copy: bool,
+) -> AuditedIndex:
+    """Check a format with its index arrays; return the four values an index holds.
+
+    These are the checks ``TensorIndex.__init__`` makes, in its order and with its
+    messages, as a function: the format, the audited arrays (copied, or the caller's
+    own when ``copy`` is false), the physical-to-logical order and the index dtype.
+
+    It is a function so that code inside Scorch that is about to build a storage
+    (``STensor._from_parts``, ``stensor._wrap_generated_result``) can make these checks
+    once and hand the arrays over. Going through a ``TensorIndex`` instead audits
+    twice: ``SparseStorage`` cannot know that an index object it is handed was made a
+    moment ago by its own caller, so it audits the object's stored state and every
+    array again, and it copies the arrays of an index that did not adopt them a second
+    time. That audit is right for an index a user kept; for one that never left the
+    constructing expression it found nothing, at 75 Python calls of the 249 in a
+    ``STensor.from_csr``.
+    """
+    if tensor_format is None:
+        raise TensorIndexError(
+            "tensor_format is required; use TensorFormat() for a scalar"
+        )
+    # Direct index construction retains the format through
+    # ``format.owned_format``: an exact format is kept as it is (it cannot
+    # change once built), a subclass is normalized, and a format that was
+    # never constructed fails closed. ``TensorIndex._from_layout`` needs neither: a
+    # ``TensorLayout`` already owns the format it hands over.
+    tensor_format = owned_format(parse_format(tensor_format))
+    normalized = _normalize_mode_indices(mode_indices, tensor_format, copy)
+    if mode_order is None:
+        order = tuple(range(tensor_format.get_order()))
+    else:
+        if isinstance(mode_order, (str, bytes)) or not isinstance(mode_order, Sequence):
+            raise TensorTypeError("mode_order must be a sequence of integers")
+        supplied_order = tuple(mode_order)
+        if any(
+            type(mode) is bool or not issubclass(type(mode), int)
+            for mode in supplied_order
+        ):
+            raise TensorTypeError("mode_order entries must be integers")
+        order = tuple(int.__int__(mode) for mode in supplied_order)
+    if len(order) != tensor_format.get_order() or sorted(order) != list(
+        range(tensor_format.get_order())
+    ):
+        raise TensorIndexError(
+            f"mode_order must be a permutation of range({tensor_format.get_order()})"
+        )
+
+    observed_dtypes = {index.dtype for arrays in normalized for index in arrays}
+    if len(observed_dtypes) > 1:
+        raise TensorIndexError(
+            "all sparse index arrays must use one common index dtype"
+        )
+    observed = next(iter(observed_dtypes), None)
+    declared = (
+        torch.int32
+        if index_dtype is None and observed is None
+        else (observed if index_dtype is None else index_dtype)
+    )
+    if type(declared) is not torch.dtype:
+        raise TensorIndexError(
+            "index_dtype must be torch.int32 or torch.int64, got "
+            f"{type(declared).__name__}"
+        )
+    if declared not in _INDEX_DTYPES:
+        raise TensorIndexError(
+            f"index_dtype must be torch.int32 or torch.int64, got {declared}"
+        )
+    if observed is not None and observed != declared:
+        raise TensorIndexError(
+            f"declared index dtype {declared} does not match arrays of dtype {observed}"
+        )
+    return tensor_format, normalized, order, declared
+
+
 @dataclass(frozen=True, init=False, eq=False)
 class TensorIndex:
     """Immutable compatibility descriptor for format and sparse index arrays.
@@ -258,11 +354,19 @@ class TensorIndex:
     Shape-dependent checks are completed when the descriptor is combined with a
     :class:`TensorLayout` in :class:`SparseStorage`. Caller containers and index
     tensors are copied, so later caller mutation cannot invalidate the descriptor;
-    they are never silently cast or replaced in the caller. The exception is the
-    conversion of a torch sparse tensor (``STensor.from_torch`` / ``from_csr`` /
-    ``from_coo``), which shares that tensor's arrays the way torch itself does (see
-    ``_adopt``).
+    they are never silently cast or replaced in the caller. The exception is an index
+    built to adopt its arrays (see ``_adopt``), the way the conversion of a torch
+    sparse tensor (``STensor.from_torch`` / ``from_csr`` / ``from_coo``) shares that
+    tensor's arrays as torch itself does.
+
+    Whether the arrays were adopted is recorded (``_adopted``, a slot, so the instance
+    ``__dict__`` keeps exactly the four declared fields that every ownership audit checks)
+    and set only by that constructor argument. A ``SparseStorage`` built from an index
+    shares the arrays of an adopted one, because sharing is the point of adopting them, and
+    copies those of any other, so that two storages built from one index never share arrays.
     """
+
+    __slots__ = ("_adopted", "__dict__", "__weakref__")
 
     _format: TensorFormat
     _mode_indices: IndexModes
@@ -281,7 +385,9 @@ class TensorIndex:
         """Describe a format and its index arrays, copying the arrays.
 
         ``_adopt`` is internal and takes the arrays as they are instead of copying
-        them. Every validation below still runs. It is for two situations:
+        them. Every validation below still runs. Scorch's own constructions make the
+        same choice without an index object, as ``_index_components(..., copy=False)``
+        (``STensor._from_parts(..., adopt=True)``). It is for two situations:
 
         * Arrays a kernel just allocated for its own result, which nothing else
           references (`_wrap_generated_result`).
@@ -304,66 +410,14 @@ class TensorIndex:
         write through a raw pointer or a numpy view bumps no version counter. Nothing
         in Scorch writes into an index array it was given.
         """
-        if tensor_format is None:
-            raise TensorIndexError(
-                "tensor_format is required; use TensorFormat() for a scalar"
-            )
-        # Direct index construction retains the format, so it detaches the
-        # caller's value on the way in (``format.owned_format``).  Canonical
-        # subclasses are normalized; malformed values fail closed.
-        # ``_from_layout`` needs no rebuild: a ``TensorLayout`` already owns
-        # the format it hands over.
-        tensor_format = owned_format(parse_format(tensor_format))
-        normalized = _normalize_mode_indices(mode_indices, tensor_format, not _adopt)
-        if mode_order is None:
-            order = tuple(range(tensor_format.get_order()))
-        else:
-            if isinstance(mode_order, (str, bytes)) or not isinstance(
-                mode_order, Sequence
-            ):
-                raise TensorTypeError("mode_order must be a sequence of integers")
-            supplied_order = tuple(mode_order)
-            if any(
-                type(mode) is bool or not issubclass(type(mode), int)
-                for mode in supplied_order
-            ):
-                raise TensorTypeError("mode_order entries must be integers")
-            order = tuple(int.__int__(mode) for mode in supplied_order)
-        if len(order) != tensor_format.get_order() or sorted(order) != list(
-            range(tensor_format.get_order())
-        ):
-            raise TensorIndexError(
-                f"mode_order must be a permutation of range({tensor_format.get_order()})"
-            )
-
-        observed_dtypes = {index.dtype for arrays in normalized for index in arrays}
-        if len(observed_dtypes) > 1:
-            raise TensorIndexError(
-                "all sparse index arrays must use one common index dtype"
-            )
-        observed = next(iter(observed_dtypes), None)
-        declared = (
-            torch.int32
-            if index_dtype is None and observed is None
-            else (observed if index_dtype is None else index_dtype)
+        tensor_format, normalized, order, declared = _index_components(
+            tensor_format, mode_indices, mode_order, index_dtype, not _adopt
         )
-        if type(declared) is not torch.dtype:
-            raise TensorIndexError(
-                "index_dtype must be torch.int32 or torch.int64, got "
-                f"{type(declared).__name__}"
-            )
-        if declared not in _INDEX_DTYPES:
-            raise TensorIndexError(
-                f"index_dtype must be torch.int32 or torch.int64, got {declared}"
-            )
-        if observed is not None and observed != declared:
-            raise TensorIndexError(
-                f"declared index dtype {declared} does not match arrays of dtype {observed}"
-            )
         object.__setattr__(self, "_format", tensor_format)
         object.__setattr__(self, "_mode_indices", normalized)
         object.__setattr__(self, "_mode_order", order)
         object.__setattr__(self, "_index_dtype", declared)
+        object.__setattr__(self, "_adopted", _adopt is True)
 
     @classmethod
     def _from_layout(
@@ -473,6 +527,21 @@ class TensorIndex:
         return [self.get_size(mode) for mode in range(self.get_order())]
 
 
+_ADOPTED_SLOT = TensorIndex.__dict__["_adopted"]
+
+
+def _index_adopted(index: TensorIndex) -> bool:
+    """Whether ``index`` was built to adopt its arrays. Read through the slot descriptor so
+    a subclass cannot answer for it; an index that never recorded it (``_from_layout``, a
+    view of a storage's own arrays) did not adopt them. Anything that is not a TensorIndex
+    (the descriptor raises TypeError) did not either, and is left to
+    ``_owned_tensor_index_components``, which rejects it with a TensorTypeError."""
+    try:
+        return _ADOPTED_SLOT.__get__(index, TensorIndex) is True
+    except (AttributeError, TypeError):
+        return False
+
+
 def _owned_tensor_index_components(
     index: object,
     *,
@@ -548,7 +617,8 @@ def _screen_bounds(coordinate: torch.Tensor, extent: int) -> bool:
 
 
 def _screen_lex_levels(levels: Sequence[torch.Tensor], count: int) -> bool:
-    """``False`` means the COO coordinates ascend lexicographically across levels.
+    """``False`` means the COO coordinates ascend strictly lexicographically across
+    levels: no tuple is smaller than, or equal to, the one before it.
 
     Same one-directional contract as the other screens. When this clears a tensor,
     the Python loop below it -- which materializes every index array with ``tolist``
@@ -561,6 +631,30 @@ def _screen_lex_levels(levels: Sequence[torch.Tensor], count: int) -> bool:
         return bool(screen(list(levels), int(count), _WRAP_GRAIN))
     except Exception:
         return True
+
+
+def _first_coo_order_defect(
+    levels: Sequence[torch.Tensor], count: int
+) -> Optional[Tuple[int, bool]]:
+    """The first position whose coordinate tuple is not strictly greater than the one
+    before it, with True when it is equal (one coordinate stored twice) and False when it
+    is smaller; None when the tuples strictly ascend.
+
+    The Python loop below is the most expensive thing in this file: it materializes every
+    level's index array with `tolist` and then builds and compares two tuples per NONZERO
+    -- 0.40 us each, so 159 ms over a 400,000-nonzero COO tensor. The native screen makes
+    the same comparison in one thread-split pass and clears the tensor without allocating
+    anything. Only when it declines does any of that happen, and then it reports.
+    """
+    if _screen_lex_levels(levels, count) is False:
+        return None
+    coordinate_values = [level.tolist() for level in levels]
+    for position in range(1, count):
+        previous = tuple(values[position - 1] for values in coordinate_values)
+        current = tuple(values[position] for values in coordinate_values)
+        if current <= previous:
+            return position, current == previous
+    return None
 
 
 def _screen_compressed_level(
@@ -640,6 +734,7 @@ def _validate_index_storage(
     values: torch.Tensor,
     *,
     allow_unordered: bool = False,
+    repair_coo: bool = False,
 ) -> bool:
     """Raise unless the index arrays describe well-formed storage for ``values``.
 
@@ -649,6 +744,11 @@ def _validate_index_storage(
     compressed and nothing else is wrong. The caller replaces the storage with its
     canonical form (``_canonical_storage``). Every other defect still raises, and so
     does an unordered level in any other format. Returns False for well-formed storage.
+
+    A COO tensor whose coordinates repeat or descend is never repaired on construction:
+    a repeat raises ``RepeatedCoordinateError``. ``repair_coo`` is for
+    ``STensor.coalesce()`` alone, the call that sums repeats on request: such COO
+    coordinates are then reported by returning True instead.
     """
     nnz = values.numel()
     level_types = layout.format.level_types
@@ -689,29 +789,23 @@ def _validate_index_storage(
                 coordinate, layout.physical_shape[mode], f"COO mode {mode}"
             )
             coordinates_per_mode.append(coordinate)
-        # The Python loop below is the most expensive thing in this file: it
-        # materializes every mode's index array with `tolist` and then builds and
-        # compares two tuples per NONZERO -- 0.40 us each, so 159 ms to wrap a
-        # 400,000-nonzero COO tensor. The native screen makes the same comparison in
-        # one thread-split pass, and clears the tensor without allocating anything.
-        # Only when it declines does any of that happen, and then it reports.
-        if _screen_lex_levels(coordinates_per_mode, nnz) is False:
+        defect = _first_coo_order_defect(coordinates_per_mode, nnz)
+        if defect is None:
             return False
-        coordinate_values = [c.tolist() for c in coordinates_per_mode]
-        for position in range(1, nnz):
-            previous = tuple(
-                coordinate_values[mode][position - 1]
-                for mode in range(len(coordinate_values))
-            )
-            current = tuple(
-                coordinate_values[mode][position]
-                for mode in range(len(coordinate_values))
-            )
-            if current < previous:
-                raise TensorIndexError(
-                    "COO coordinates must be lexicographically ordered"
-                )
-        return False
+        if repair_coo:
+            return True
+        position, repeated = defect
+        if not repeated:
+            raise TensorIndexError("COO coordinates must be lexicographically ordered")
+        # A COO tensor is never repaired, unlike an unordered compressed level: Scorch
+        # refuses a stored repeat and the caller sums it (RepeatedCoordinateError).
+        repeat = tuple(int(c[position].item()) for c in coordinates_per_mode)
+        raise RepeatedCoordinateError(
+            f"COO coordinate {format_coordinate(repeat)} is stored at positions "
+            f"{position - 1} and {position}; {COALESCE_ADVICE}",
+            position,
+            repeat,
+        )
 
     unordered = False
     parent_positions = 1
@@ -798,18 +892,60 @@ def _validate_index_storage(
     return unordered
 
 
+def _sorted_distinct(
+    key: torch.Tensor,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, int]:
+    """Sort entries on their row-major linear index ``key`` and number the distinct keys.
+
+    Returns the distinct keys in ascending order, the sorting permutation, each sorted
+    entry's distinct number, and the number of distinct keys. Stable, so entries at one
+    coordinate keep their order and are summed in it. ``key`` is not empty.
+    """
+    key, order = torch.sort(key, stable=True)
+    starts = torch.ones(key.numel(), dtype=torch.bool)
+    if key.numel() > 1:
+        starts[1:] = key[1:] != key[:-1]
+    entry = torch.cumsum(starts.to(torch.int64), 0) - 1
+    return key[starts], order, entry, int(entry[-1].item()) + 1
+
+
+def _canonical_coo_index(
+    mode_indices: IndexModes,
+    extents: Sequence[int],
+    index_dtype: torch.dtype,
+    count: int,
+) -> Tuple[IndexModes, int, Optional[torch.Tensor]]:
+    """``_canonical_index`` for a COO layout, whose every level stores one coordinate per
+    entry, so that an entry's full coordinate is read straight from the levels."""
+    if count == 0:
+        return tuple((torch.zeros(0, dtype=index_dtype),) for _ in extents), 0, None
+    key = torch.zeros(count, dtype=torch.int64)
+    for arrays, extent in zip(mode_indices, extents):
+        key = key * extent + arrays[0].to(torch.int64)
+    key, order, entry, unique_count = _sorted_distinct(key)
+    rebuilt: List[Tuple[torch.Tensor, ...]] = [()] * len(extents)
+    for level in reversed(range(len(extents))):
+        rebuilt[level] = ((key % extents[level]).to(index_dtype).contiguous(),)
+        key = torch.div(key, extents[level], rounding_mode="floor")
+    destination = torch.empty(count, dtype=torch.int64)
+    destination[order] = entry
+    return tuple(rebuilt), unique_count, destination
+
+
 def _canonical_index(
     layout: TensorLayout, mode_indices: IndexModes, value_count: int
 ) -> Tuple[IndexModes, int, Optional[torch.Tensor]]:
-    """The canonical form of an index whose levels are all dense or compressed.
+    """The canonical form of an index whose levels are all dense or compressed, or all
+    coordinate (COO).
 
     Every parent's coordinates sorted and each coordinate stored once: for an index with a
     compressed level whose coordinates are out of order or repeated inside a parent, which
     torch accepts in a CSR tensor and sums in every operation on it, but which Scorch's
     kernels cannot read, since co-iterating two sparse operands assumes distinct,
-    increasing coordinates. Every stored entry's full coordinate is recovered, the entries
-    are sorted lexicographically, and the levels are rebuilt in the same format from the
-    distinct coordinates.
+    increasing coordinates; and for COO levels that store a coordinate twice or out of
+    order, which Scorch refuses and ``STensor.coalesce()`` repairs. Every stored entry's
+    full coordinate is recovered, the entries are sorted lexicographically, and the levels
+    are rebuilt in the same format from the distinct coordinates.
 
     Returns the rebuilt index arrays, the number of values they store, and the map from
     each of the given index's value positions to its position in the rebuilt one
@@ -828,6 +964,8 @@ def _canonical_index(
     def arange(n: int) -> torch.Tensor:
         return torch.arange(n, dtype=torch.int64)
 
+    if level_types and all(level == LevelType.COORDINATE for level in level_types):
+        return _canonical_coo_index(mode_indices, extents, index_dtype, count)
     if count == 0:
         # Nothing is stored below some level, so there is nothing to sort or sum: the
         # canonical form of an empty tensor stores no coordinates at all. (Any extent of
@@ -875,18 +1013,11 @@ def _canonical_index(
             position = parents[position]
 
     # Sort on the row-major linear index. It cannot overflow: a layout's element count
-    # is checked to fit in a signed int64 (layout._normalize_shape). Stable, so entries
-    # at one coordinate keep their order and are summed in it.
+    # is checked to fit in a signed int64 (layout._normalize_shape).
     key = torch.zeros(count, dtype=torch.int64)
     for level, extent in enumerate(extents):
         key = key * extent + coordinate_at[level]
-    key, order = torch.sort(key, stable=True)
-    starts = torch.ones(count, dtype=torch.bool)
-    if count > 1:
-        starts[1:] = key[1:] != key[:-1]
-    entry = torch.cumsum(starts.to(torch.int64), 0) - 1
-    unique_count = int(entry[-1].item()) + 1
-    key = key[starts]
+    key, order, entry, unique_count = _sorted_distinct(key)
 
     # Rebuild the levels from the sorted, distinct coordinates.
     unique_at: List[torch.Tensor] = [arange(0)] * len(level_types)
@@ -928,6 +1059,30 @@ def _canonical_index(
     destination = torch.empty(count, dtype=torch.int64)
     destination[order] = position[entry]
     return tuple(rebuilt), parent_count, destination
+
+
+def repeated_coordinate_in(
+    indices: torch.Tensor, what: str, remedy: str
+) -> RepeatedCoordinateError:
+    """The error for COO coordinates ``indices`` (``[rank, nnz]``) that store a tuple more
+    than once: it names the smallest repeated tuple and the first two positions storing it.
+    Only built once a repeat is known to exist."""
+    if indices.shape[0] == 0:  # rank 0: every entry is the one coordinate ()
+        coordinate: Tuple[int, ...] = ()
+        positions = [0, 1]
+    else:
+        distinct, inverse, counts = torch.unique(
+            indices, dim=1, return_inverse=True, return_counts=True
+        )
+        repeated = int(torch.nonzero(counts > 1)[0].item())
+        positions = torch.nonzero(inverse == repeated).flatten()[:2].tolist()
+        coordinate = tuple(int(part) for part in distinct[:, repeated].tolist())
+    return RepeatedCoordinateError(
+        f"{what} store coordinate {format_coordinate(coordinate)} at positions "
+        f"{positions[0]} and {positions[1]}; {COALESCE_ADVICE} ({remedy})",
+        int(positions[1]),
+        coordinate,
+    )
 
 
 def _canonical_storage(
@@ -1016,69 +1171,107 @@ class SparseStorage:
         *,
         _trusted_index: bool = False,
         index: Optional[TensorIndex] = None,
+        _audited_index: Optional[AuditedIndex] = None,
     ) -> None:
-        # A caller's layout is copied, so a later object.__setattr__ on the caller's
-        # object cannot rewrite this storage. A trusted construction (a kernel result,
-        # assembled by scorch around a layout scorch built) keeps the object it is
-        # handed: the all-dense result cache (stensor._RESULT_PARTS_CACHE) holds one
-        # layout for many results, and STensor._set_state requires the metadata and the
-        # storage to name the same layout object.
-        if not _trusted_index:
+        # ``_audited_index`` is internal, like ``_trusted_index``: the four values that
+        # ``_index_components`` returned to the caller's own frame a moment ago. The
+        # arrays are retained as they are, with no second audit, and the layout is held
+        # to the format, mode order and index dtype they were audited against, exactly
+        # as it is held to an index object's further down. It is how a construction
+        # inside Scorch audits its index arrays once (see ``_index_components``); a
+        # caller that holds an index object passes ``index=`` and gets the full audit.
+        #
+        # A caller's layout passes through owned_layout: an exact TensorLayout, which
+        # cannot change once built, is kept as it is, and a subclass is rebuilt as an
+        # exact one. A trusted construction (a kernel result, assembled by scorch around
+        # a layout scorch built) keeps the object it is handed without that step, since
+        # STensor._set_state requires the metadata and the storage to name the same
+        # layout object. So does one that brings ``_audited_index``, and there the
+        # layout has to be an exact TensorLayout already: a subclass is refused, not
+        # rebuilt, because the caller's metadata names the object it handed over.
+        if _audited_index is not None:
+            if type(layout) is not TensorLayout:
+                raise TensorTypeError("layout must be a TensorLayout")
+        elif not _trusted_index:
             layout = owned_layout(layout)
         value_type = type(value)
-        try:
-            value_mro = type.__getattribute__(value_type, "__mro__")
-        except Exception as error:
-            raise TensorTypeError(
-                "SparseStorage value must be a torch.Tensor"
-            ) from error
-        if not any(base is torch.Tensor for base in value_mro):
-            raise TensorTypeError("SparseStorage value must be a torch.Tensor")
-        try:
-            base_value = torch.Tensor.as_subclass(value, torch.Tensor)
-        except Exception as error:
-            raise TensorStorageError("values tensor is malformed") from error
-        if type(base_value) is not torch.Tensor:
-            raise TensorStorageError("values tensor is malformed")
+        if value_type is torch.Tensor:
+            # As for an index array in ``_normalize_mode_indices``: an exact tensor needs
+            # no base-class view, the method reads below go through the type, and what
+            # is retained is the detached tensor made further down.
+            base_value = value
+        else:
+            try:
+                value_mro = type.__getattribute__(value_type, "__mro__")
+            except Exception as error:
+                raise TensorTypeError(
+                    "SparseStorage value must be a torch.Tensor"
+                ) from error
+            if not any(base is torch.Tensor for base in value_mro):
+                raise TensorTypeError("SparseStorage value must be a torch.Tensor")
+            try:
+                base_value = torch.Tensor.as_subclass(value, torch.Tensor)
+            except Exception as error:
+                raise TensorStorageError("values tensor is malformed") from error
+            if type(base_value) is not torch.Tensor:
+                raise TensorStorageError("values tensor is malformed")
         if base_value.layout != torch.strided:
             raise TensorStorageError("values must use strided storage")
         if base_value.device.type != "cpu":
             raise TensorDeviceError(
                 f"Scorch values must be on CPU, got {base_value.device}"
             )
-        if base_value.dim() != 1:
+        if torch.Tensor.dim(base_value) != 1:
             raise TensorStorageError("values must be a flat one-dimensional tensor")
-        if not base_value.is_contiguous():
+        if not torch.Tensor.is_contiguous(base_value):
             raise TensorStorageError("values must be contiguous")
-        if base_value.is_neg() or base_value.is_conj():
+        if torch.Tensor.is_neg(base_value) or torch.Tensor.is_conj(base_value):
             raise TensorStorageError(
                 "values must resolve lazy negative and conjugate view bits"
             )
         validate_runtime_contract(layout.format, base_value.dtype)
-        if (mode_indices is None) == (index is None):
+        if (
+            (mode_indices is not None)
+            + (index is not None)
+            + (_audited_index is not None)
+        ) != 1:
             raise TensorStorageError(
                 "provide exactly one of mode_indices or a TensorIndex"
             )
-        if index is not None:
-            # The index's arrays are shared, not copied again: a TensorIndex already owns
-            # them (it copies at construction) or adopted them on purpose (`_adopt`, a
-            # torch tensor's arrays or a kernel result's). They are re-audited -- type,
-            # dtype, layout, rank, contiguity -- without a copy.
+        if _audited_index is not None:
+            index_format, normalized, index_order, index_dtype = _audited_index
+        elif index is not None:
+            # Arrays the index adopted on purpose (`_adopt`: a torch tensor's arrays, which
+            # the STensor shares as torch does, or a kernel result's) and a kernel result's
+            # trusted index are shared and re-audited -- type, dtype, layout, rank,
+            # contiguity -- without a copy. Any other index's arrays are copied, so two
+            # storages built from one index, or a storage and the index it came from, never
+            # share arrays: a write through one cannot reach the other.
+            share = _trusted_index or _index_adopted(index)
             (
                 index_format,
                 held,
                 index_order,
                 index_dtype,
-            ) = _owned_tensor_index_components(index, own_arrays=False)
-            normalized = _normalize_mode_indices(held, index_format, copy=False)
-            if index_format != layout.format:
+            ) = _owned_tensor_index_components(index, own_arrays=not share)
+            normalized = (
+                _normalize_mode_indices(held, index_format, copy=False)
+                if share
+                else held
+            )
+        else:
+            normalized = _normalize_mode_indices(mode_indices, layout.format)  # type: ignore[arg-type]
+        if mode_indices is None:
+            # What an index object declares, or what the arrays were audited against,
+            # has to be what the layout says. The identity test comes first because a
+            # construction inside Scorch builds its layout from the format its arrays
+            # were audited against, which is then the same object or an equal one.
+            if index_format is not layout.format and index_format != layout.format:
                 raise TensorIndexError("index format does not match storage layout")
             if index_order != layout.permutation:
                 raise TensorIndexError("index mode_order does not match storage layout")
             if index_dtype != layout.index_dtype:
                 raise TensorIndexError("index dtype does not match storage layout")
-        else:
-            normalized = _normalize_mode_indices(mode_indices, layout.format)  # type: ignore[arg-type]
         # Keep tensor metadata independent from the caller while retaining normal
         # tensor payload aliasing semantics for element updates.
         owned_value = torch.Tensor.detach(base_value)

@@ -356,7 +356,9 @@ def test_stensor_requires_complete_runtime_state_and_validates_storage_metadata(
     assert tensor.storage is not storage
     assert tensor.storage.value.data_ptr() == storage.value.data_ptr()
     assert tensor.metadata.layout is tensor.storage.layout
-    assert tensor.storage.layout is not storage.layout
+    # A layout is a value that cannot change once built, so the tensor's storage may
+    # hold the caller's storage's layout itself.
+    assert tensor.storage.layout == storage.layout
     assert tensor.shape == (2, 3)
     assert tensor.logical_shape == (2, 3)
     assert tensor.dtype == torch.float32

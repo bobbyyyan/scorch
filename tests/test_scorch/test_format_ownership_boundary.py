@@ -1,25 +1,22 @@
-"""The construction-side format-ownership boundary, and what it deliberately leaves open.
+"""The format-ownership boundary: what an object that retains a format or layout holds.
 
-``TensorFormat`` and ``LevelFormat`` are frozen value objects, but
-``object.__setattr__`` still rewrites their stored state.  Until now every
-object that *retained* a caller's format kept the caller's exact instance, so a
-caller who held on to one could rewrite a tensor's declared layout after
-construction -- and, worse, could rewrite a format shared with a process-global
-kernel-resolution memo, silently changing the behaviour of later, unrelated
-calls.
+``LevelFormat``, ``TensorFormat``, ``TensorLayout`` and ``TensorMetadata`` cannot change
+once built: their fields are read-only, ``object.__setattr__`` on any of them raises, and
+the constructor validates everything they hold (format.py, "Read-only stored state";
+``test_value_types_read_only.py`` holds that guarantee itself). Before that, these were
+frozen only by convention, a caller who kept a format could rewrite a tensor's declared
+layout through it, and every retaining object copied what it was given.
 
-The boundary is installed on the way **in**, at the two construction sites that
-retain a format (``TensorLayout.__post_init__`` and ``TensorIndex.__init__``),
-not on every read.  Read-side rebuilding was measured as a double-digit
-regression on the live dispatch path and would still not close the write side,
-so it is deliberately not done.
+So the boundary now has two halves. An exact value is retained as it is and may be shared
+by any number of tensors, layouts, indexes and caches: the tests below that used to show a
+forged caller value could not reach a retained copy now show the forge itself fails. A
+subclass, or a level with an ``int``-subclass bit width, is still normalized to an exact
+value on the way in (``TensorLayout.__init__``, ``TensorIndex.__init__``), so no retained
+value carries caller-defined behaviour; those tests are unchanged.
 
-What remains open is recorded here as an explicit characterization lock, not
-hidden: a caller can still forge the object *it* holds, and forging a
-returned tensor's own retained value objects still corrupts that tensor's
-metadata.  Closing that needs structurally unforgeable value types, which is a
-separate change to four core types (equality, hashing, pickling, and the
-dataclass surface) and is not attempted here.
+What stays open is narrower and is per object: the containers (``TensorIndex``,
+``SparseStorage``, ``STensor``) are not value types, so ``object.__setattr__`` on one can
+still replace the *reference* it holds. That changes only the container written to.
 """
 
 from abc import ABCMeta
@@ -65,66 +62,83 @@ def csr(name="A", size=3):
 # -- the boundary holds ------------------------------------------------------
 
 
-def test_layout_does_not_retain_the_caller_format():
+_OO = (LevelFormat("o"), LevelFormat("o"))
+
+
+def test_layout_holds_an_exact_caller_format_that_cannot_change():
     caller = TensorFormat("ds")
     layout = TensorLayout.from_logical_shape((4, 5), caller)
-    assert layout.format is not caller
-    assert layout.format == caller
+    assert layout.format is caller
+    with pytest.raises(AttributeError):
+        object.__setattr__(caller, "_level_formats", _OO)
+    assert layout.format == TensorFormat("ds")
 
 
-def test_layout_does_not_retain_the_caller_level_formats():
+def test_layout_holds_the_caller_level_formats_that_cannot_change():
     caller = TensorFormat([LevelFormat("d"), LevelFormat("s", bit_width=32)])
     layout = TensorLayout.from_logical_shape((4, 5), caller)
     for retained, given in zip(
         layout.format.get_level_formats(), caller.get_level_formats()
     ):
-        assert retained is not given
-        assert retained == given
+        assert retained is given
+        with pytest.raises(AttributeError):
+            object.__setattr__(given, "_mode", LevelType.COORDINATE)
+    assert str(layout.format) == "d,s"
 
 
-def test_index_does_not_retain_the_caller_format():
+def test_index_holds_an_exact_caller_format_that_cannot_change():
     caller = TensorFormat("ds")
     index = TensorIndex(
         tensor_format=caller,
         mode_indices=[[], [torch.tensor([0, 1]), torch.tensor([0])]],
     )
-    assert index.format is not caller
+    assert index.format is caller
+    with pytest.raises(AttributeError):
+        object.__setattr__(caller, "_level_formats", _OO)
+    assert index.format == TensorFormat("ds")
 
 
-def test_forging_the_caller_format_cannot_change_the_layout():
+def test_forging_the_caller_format_fails_and_the_layout_is_unchanged():
     caller = TensorFormat("ds")
     layout = TensorLayout.from_logical_shape((4, 5), caller)
-    object.__setattr__(caller, "_level_formats", (LevelFormat("o"), LevelFormat("o")))
+    with pytest.raises(AttributeError):
+        object.__setattr__(caller, "_level_formats", _OO)
+    with pytest.raises(AttributeError):
+        object.__delattr__(caller, "_level_formats")
     assert list(layout.format.get_level_types()) == [
         LevelType.DENSE,
         LevelType.COMPRESSED,
     ]
 
 
-def test_forging_a_caller_level_format_cannot_change_the_layout():
+def test_forging_a_caller_level_format_fails_and_the_layout_is_unchanged():
     level = LevelFormat("s")
     caller = TensorFormat([LevelFormat("d"), level])
     layout = TensorLayout.from_logical_shape((4, 5), caller)
-    object.__setattr__(level, "_mode", LevelType.COORDINATE)
+    with pytest.raises(AttributeError):
+        object.__setattr__(level, "_mode", LevelType.COORDINATE)
     assert layout.format.get_level_types()[1] is LevelType.COMPRESSED
 
 
-def test_two_tensors_built_from_one_caller_format_do_not_share_it():
+def test_two_tensors_built_from_one_caller_format_share_it_safely():
     caller = TensorFormat("ds")
     first = TensorLayout.from_logical_shape((4, 5), caller)
     second = TensorLayout.from_logical_shape((6, 7), caller)
-    assert first.format is not second.format
+    assert first.format is second.format is caller
+    with pytest.raises(AttributeError):
+        object.__setattr__(first.format, "_level_formats", _OO)
+    assert str(second.format) == "d,s"
 
 
-def test_storages_do_not_retain_or_cross_share_a_caller_layout():
+def test_storages_share_a_caller_layout_that_cannot_change():
     caller = TensorLayout.from_logical_shape((2, 2), "dd")
     first = SparseStorage(caller, torch.arange(4.0), mode_indices=((), ()))
     second = SparseStorage(caller, torch.arange(4.0, 8.0), mode_indices=((), ()))
 
-    assert first.layout is not caller
-    assert second.layout is not caller
-    assert first.layout is not second.layout
-    object.__setattr__(caller, "permutation", (1, 0))
+    assert first.layout is caller
+    assert second.layout is caller
+    with pytest.raises(AttributeError):
+        object.__setattr__(caller, "permutation", (1, 0))
     first.validate()
     second.validate()
     assert first.layout.permutation == (0, 1)
@@ -142,10 +156,11 @@ def test_tensors_do_not_cross_share_an_explicit_caller_storage_graph():
     assert first.storage is not second.storage
     assert first.storage.value.data_ptr() == caller.value.data_ptr()
     assert second.storage.value.data_ptr() == caller.value.data_ptr()
-    assert first.layout is not second.layout
-    assert first.format is not second.format
+    # The layout and format are values, shared because nothing can change them.
+    assert first.layout is second.layout
 
-    object.__setattr__(first.format, "_level_formats", (LevelFormat("o"),))
+    with pytest.raises(AttributeError):
+        object.__setattr__(first.format, "_level_formats", (LevelFormat("o"),))
     assert second.format == TensorFormat("dd")
     second.storage.validate()
 
@@ -180,18 +195,17 @@ def test_value_tensor_subclass_properties_cannot_interpose_on_storage():
     storage.validate()
 
 
-def test_metadata_does_not_retain_a_caller_layout_graph():
+def test_metadata_holds_a_caller_layout_graph_that_cannot_change():
     caller = TensorLayout.from_logical_shape((2, 3), "dd")
     metadata = TensorMetadata("A", torch.float32, torch.device("cpu"), caller)
 
-    assert metadata.layout is not caller
-    assert metadata.layout.format is not caller.format
-    object.__setattr__(caller, "permutation", (1, 0))
-    object.__setattr__(
-        caller.format,
-        "_level_formats",
-        (LevelFormat("o"), LevelFormat("o")),
-    )
+    assert metadata.layout is caller
+    with pytest.raises(AttributeError):
+        object.__setattr__(caller, "permutation", (1, 0))
+    with pytest.raises(AttributeError):
+        object.__setattr__(caller.format, "_level_formats", _OO)
+    with pytest.raises(AttributeError):
+        object.__setattr__(metadata, "layout", None)
     assert metadata.layout.permutation == (0, 1)
     assert metadata.layout.format == TensorFormat("dd")
     metadata.serialize()
@@ -522,17 +536,18 @@ def test_sparse_storage_rejects_malformed_tensor_index_state(malformation):
 def test_forging_a_result_format_does_not_poison_later_unrelated_calls():
     """The worst verified consequence of the seam is closed.
 
-    The prebuilt matmul resolution memo is process-global; before the boundary
-    it handed its own cached ``TensorFormat`` object straight through to the
-    result tensor, so one ``object.__setattr__`` on a returned result rewrote
-    the memo and changed every later ``matmul(..., format='ds')`` in the
-    process.
+    The prebuilt matmul resolution memo is process-global, and the result tensor
+    holds the format object it cached, as do the layout cache and the result
+    caches. Once, one ``object.__setattr__`` on a returned result rewrote that
+    memo and changed every later ``matmul(..., format='ds')`` in the process. Now
+    the write itself fails.
     """
 
     first = scorch.matmul(csr("A"), csr("B"), format="ds")
-    object.__setattr__(
-        first.format, "_level_formats", (LevelFormat(LevelType.COORDINATE),)
-    )
+    with pytest.raises(AttributeError):
+        object.__setattr__(
+            first.format, "_level_formats", (LevelFormat(LevelType.COORDINATE),)
+        )
     later = scorch.matmul(csr("C"), csr("D"), format="ds")
     assert list(later.format.get_level_types()) == [
         LevelType.DENSE,
@@ -571,23 +586,27 @@ def test_owned_format_canonicalizes_a_structurally_plain_subclass():
     assert audit_format_state(caller) is not None
 
 
-def test_owned_format_rebuilds_an_exact_format():
+def test_owned_format_keeps_an_exact_format():
     caller = TensorFormat("ds")
-    owned = owned_format(caller)
-    assert owned is not caller
-    assert owned == caller
+    assert owned_format(caller) is caller
 
 
-def test_audit_rejects_forged_stored_state():
+def test_stored_state_cannot_be_forged_and_an_unbuilt_format_is_rejected():
     caller = TensorFormat("ds")
-    object.__setattr__(caller, "_level_formats", [LevelFormat("d")])
-    assert audit_format_state(caller) is None
+    with pytest.raises(AttributeError):
+        object.__setattr__(caller, "_level_formats", [LevelFormat("d")])
+    assert audit_format_state(caller) == list(caller.get_level_formats())
+    # The one format without validated state is one made by __new__ alone.
+    assert audit_format_state(TensorFormat.__new__(TensorFormat)) is None
 
 
-def test_audit_rejects_a_forged_bit_width():
+def test_a_bit_width_cannot_be_forged():
     level = LevelFormat("s")
-    object.__setattr__(level, "_bit_width", -1)
-    assert audit_format_state(TensorFormat([LevelFormat("d"), level])) is None
+    with pytest.raises(AttributeError):
+        object.__setattr__(level, "_bit_width", -1)
+    with pytest.raises(TensorFormatError):
+        LevelFormat("s", bit_width=-1)
+    assert audit_format_state(TensorFormat([LevelFormat("d"), level])) is not None
 
 
 class _Width(enum.IntEnum):
@@ -863,33 +882,43 @@ def test_retaining_boundaries_accept_an_int_subclass_bit_width(owner):
 
 
 @pytest.mark.parametrize("forged", [True, 0, -8])
-def test_audit_still_rejects_bool_and_non_positive_bit_widths(forged):
+def test_bool_and_non_positive_bit_widths_cannot_be_built_or_forged(forged):
     """Canonicalizing int subclasses must not widen the accepted set."""
 
+    with pytest.raises((TensorTypeError, TensorFormatError)):
+        LevelFormat("s", bit_width=forged)
     level = LevelFormat("s")
-    object.__setattr__(level, "_bit_width", forged)
-    assert audit_format_state(TensorFormat([LevelFormat("d"), level])) is None
+    with pytest.raises(AttributeError):
+        object.__setattr__(level, "_bit_width", forged)
+    assert level.bit_width is None
 
 
 @pytest.mark.parametrize("owner", ["layout", "index"])
 @pytest.mark.parametrize(
     "malformation", ["list_levels", "tuple_subclass", "extra_key", "invalid_level"]
 )
-def test_retaining_boundaries_reject_malformed_format_state(owner, malformation):
+def test_malformed_format_state_cannot_be_forged(owner, malformation):
     class TupleSubclass(tuple):
         pass
 
     caller = TensorFormat("ds")
     levels = caller.get_level_formats()
-    if malformation == "list_levels":
-        object.__setattr__(caller, "_level_formats", list(levels))
-    elif malformation == "tuple_subclass":
-        object.__setattr__(caller, "_level_formats", TupleSubclass(levels))
-    elif malformation == "extra_key":
-        object.__setattr__(caller, "_extra", object())
-    else:
-        object.__setattr__(levels[1], "_mode", "s")
+    with pytest.raises(AttributeError):
+        if malformation == "list_levels":
+            object.__setattr__(caller, "_level_formats", list(levels))
+        elif malformation == "tuple_subclass":
+            object.__setattr__(caller, "_level_formats", TupleSubclass(levels))
+        elif malformation == "extra_key":
+            object.__setattr__(caller, "_extra", object())
+        else:
+            object.__setattr__(levels[1], "_mode", "s")
+    if owner == "layout":
+        assert TensorLayout.from_logical_shape((2, 3), caller).format is caller
 
+
+@pytest.mark.parametrize("owner", ["layout", "index"])
+def test_retaining_boundaries_reject_a_format_that_was_never_built(owner):
+    caller = TensorFormat.__new__(TensorFormat)
     with pytest.raises(TensorFormatError, match="malformed stored state"):
         if owner == "layout":
             TensorLayout.from_logical_shape((2, 3), caller)
@@ -918,7 +947,9 @@ def test_canonical_level_subclass_is_accepted_and_detached():
     assert retained is not level
     assert retained.bit_width == 64
 
-    object.__setattr__(level, "_mode", LevelType.COORDINATE)
+    # A subclass instance's inherited fields are read-only too.
+    with pytest.raises(AttributeError):
+        object.__setattr__(level, "_mode", LevelType.COORDINATE)
     assert retained.get_level_type() is LevelType.COMPRESSED
 
 
@@ -988,15 +1019,16 @@ def test_audit_preserves_bit_widths():
     assert levels[1].bit_width is None
 
 
-def test_constructor_valid_large_bit_width_is_owned_without_aliasing():
+def test_constructor_valid_large_bit_width_is_retained_and_cannot_change():
     level = LevelFormat("d", bit_width=1 << 80)
     caller = TensorFormat([level])
     layout = TensorLayout.from_logical_shape((3,), caller)
-    assert layout.format is not caller
-    assert layout.format.get_level_formats()[0] is not level
+    assert layout.format is caller
+    assert layout.format.get_level_formats()[0] is level
     assert layout.format.get_level_formats()[0].bit_width == 1 << 80
 
-    object.__setattr__(level, "_mode", LevelType.COORDINATE)
+    with pytest.raises(AttributeError):
+        object.__setattr__(level, "_mode", LevelType.COORDINATE)
     assert layout.format.get_level_types() == [LevelType.DENSE]
 
 
@@ -1007,70 +1039,59 @@ def test_parse_format_still_passes_through_an_exact_format():
     assert parse_format(caller) is caller
 
 
-# -- the deliberately deferred half, locked explicitly -----------------------
+# -- what used to be the deferred half -------------------------------------------
 
 
-def test_a_returned_tensor_still_exposes_its_own_retained_format():
-    """CHARACTERIZATION LOCK -- this is known-open, not a passing guarantee.
-
-    Reads are not defended: ``tensor.format`` is the tensor's own retained
-    value object, and forging it still desynchronizes that tensor's declared
-    layout from its index arrays.  The damage is now confined to the tensor
-    whose format was forged -- it no longer escapes into a process-global memo
-    or into an unrelated tensor built from the same caller value.
-
-    Closing this needs structurally unforgeable value types (a change to
-    ``LevelFormat``, ``TensorFormat``, ``TensorLayout`` and ``TensorMetadata``
-    covering equality, hashing, pickling and the dataclass surface), which is
-    not attempted here.  Update this test when that lands.
-    """
+def test_a_returned_tensor_s_retained_format_cannot_be_forged():
+    """This was a characterization lock on a known-open seam: ``tensor.format`` is the
+    tensor's own retained value object, and forging it desynchronized that tensor's
+    declared layout from its index arrays. The read-only value types close it: the
+    forge fails, and the tensor still describes its arrays."""
 
     tensor = csr("A")
     retained = tensor.format
     assert retained is tensor.layout.format
-    object.__setattr__(retained, "_level_formats", (LevelFormat("o"), LevelFormat("o")))
+    with pytest.raises(AttributeError):
+        object.__setattr__(retained, "_level_formats", _OO)
+    with pytest.raises(AttributeError):
+        object.__setattr__(tensor.layout, "format", TensorFormat("oo"))
     assert list(tensor.format.get_level_types()) == [
-        LevelType.COORDINATE,
-        LevelType.COORDINATE,
+        LevelType.DENSE,
+        LevelType.COMPRESSED,
     ]
+    tensor.storage.validate()
 
 
-def test_a_copy_detaches_the_complete_metadata_graph():
+def test_a_copy_has_its_own_metadata_and_shares_only_values():
     tensor = csr("A")
     tensor.requires_grad = True
     duplicate = tensor.copy()
     assert duplicate.metadata is not tensor.metadata
-    assert duplicate.layout is not tensor.layout
-    assert duplicate.format is not tensor.format
     assert duplicate.metadata.layout is duplicate.storage.layout
     assert duplicate.metadata == tensor.metadata
     assert duplicate.requires_grad is True
     assert duplicate.name == tensor.name
     assert duplicate.shape == tensor.shape
 
-    object.__setattr__(
-        duplicate.format,
-        "_level_formats",
-        (LevelFormat("o"), LevelFormat("o")),
-    )
+    with pytest.raises(AttributeError):
+        object.__setattr__(duplicate.format, "_level_formats", _OO)
+    duplicate.requires_grad = False
+    assert tensor.requires_grad is True
     assert list(tensor.format.get_level_types()) == [
         LevelType.DENSE,
         LevelType.COMPRESSED,
     ]
 
 
-def test_dense_to_dense_copy_detaches_metadata():
+def test_dense_to_dense_copy_has_its_own_metadata():
     tensor = STensor.from_torch(torch.eye(3), "A")
     duplicate = tensor.to_dense(in_place=False)
     assert duplicate.metadata is not tensor.metadata
-    assert duplicate.layout is not tensor.layout
-    assert duplicate.format is not tensor.format
 
-    object.__setattr__(
-        duplicate.format,
-        "_level_formats",
-        (LevelFormat("o"), LevelFormat("o")),
-    )
+    with pytest.raises(AttributeError):
+        object.__setattr__(duplicate.format, "_level_formats", _OO)
+    duplicate.name = "B"
+    assert tensor.name == "A"
     assert tensor.format.is_dense()
 
 

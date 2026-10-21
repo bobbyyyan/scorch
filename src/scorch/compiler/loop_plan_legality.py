@@ -273,8 +273,16 @@ def _require_relative_order(
             )
 
 
-def _verify_storage_order(facts: LoopPlanLegalityFacts) -> None:
+def _verify_storage_order(
+    facts: LoopPlanLegalityFacts, dense_results_any_order: bool = False
+) -> None:
     for layout in facts.result_accesses:
+        if dense_results_any_order and all(
+            level == LevelType.DENSE for level in layout.level_types
+        ):
+            # The caller's lowering writes an all-dense result by its
+            # coordinates, so the loops may visit its levels in any order.
+            continue
         _require_relative_order(
             facts,
             layout.storage_index_ids,
@@ -1609,12 +1617,27 @@ def _verify_accumulator(facts: LoopPlanLegalityFacts, plan: LoopPlan) -> None:
         )
 
 
-def verify_loop_plan_semantics(analysis: CINAnalysis, plan: LoopPlan) -> None:
-    """Prove one structurally valid plan legal for its analyzed normalized CIN."""
+def verify_loop_plan_semantics(
+    analysis: CINAnalysis,
+    plan: LoopPlan,
+    *,
+    dense_results_any_order: bool = False,
+) -> None:
+    """Prove one structurally valid plan legal for its analyzed normalized CIN.
 
+    ``dense_results_any_order`` is for a caller whose lowering writes an
+    all-dense result by its coordinates, so the result-storage-order rule does
+    not apply to it -- the LoopIR pipeline.  Legacy lowering assembles every
+    result in storage order (its dense-workspace consumers write at the
+    workspace level as if it were the last), so every other caller leaves it
+    off.
+    """
+
+    if type(dense_results_any_order) is not bool:
+        raise TypeError("dense_results_any_order must be an exact bool")
     facts = _build_facts(analysis, plan)
     _verify_schedulable_scope(facts, plan)
-    _verify_storage_order(facts)
+    _verify_storage_order(facts, dense_results_any_order)
     workspace_inserted = _verify_tiling_capabilities(facts, plan)
     _verify_workspace_replay_shape(facts, plan, workspace_inserted)
     state = _apply_affine_placements(facts, plan, workspace_inserted)

@@ -35,6 +35,7 @@ from .nodes import (
     DimensionId,
     Expr,
     FloatConst,
+    IntegerConst,
     IndexValue,
     LevelDecl,
     LevelKind,
@@ -330,6 +331,16 @@ class LoopIRBuilder:
     def float_const(self, value: float) -> FloatConst:
         return FloatConst(self._node_id(), value)
 
+    def integer_const(self, value: int) -> IntegerConst:
+        return IntegerConst(self._node_id(), value)
+
+    def additive_identity(self, dtype: ScalarType) -> Expr:
+        """The zero of ``dtype``: ``0.0`` in a floating-point program, ``0``
+        in an integer one."""
+        if dtype.is_floating:
+            return self.float_const(0.0)
+        return self.integer_const(0)
+
     def root_position(self) -> RootPosition:
         return RootPosition(self._node_id())
 
@@ -385,8 +396,14 @@ class LoopIRBuilder:
     def load(self, tensor: SymbolId, indices: Sequence[Expr]) -> Load:
         return Load(self._node_id(), tensor, tuple(indices))
 
-    def position_load(self, tensor: SymbolId, position: Expr) -> PositionLoad:
-        return PositionLoad(self._node_id(), tensor, position)
+    def position_load(
+        self,
+        tensor: SymbolId,
+        position: Expr,
+        guard: Optional[CursorId] = None,
+        default: Optional[Expr] = None,
+    ) -> PositionLoad:
+        return PositionLoad(self._node_id(), tensor, position, guard, default)
 
     def binary(self, op: BinaryOp, lhs: Expr, rhs: Expr) -> BinaryExpr:
         return BinaryExpr(self._node_id(), op, lhs, rhs)
