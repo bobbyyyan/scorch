@@ -76,11 +76,14 @@ from .compiler.compilation_context import (
 )
 from .exceptions import (
     CompileSpecError,
+    EinsumOperandCountError,
     EinsumRepeatedIndexError,
+    EinsumResultLabelError,
     EinsumScalarResultError,
     IndexExtentMismatchError,
     KeywordArgumentError,
     MatmulOperandRankError,
+    OperandRankMismatchError,
     ScheduleWithoutSparseOperandError,
     ScorchAssertionError,
     ScorchNotImplementedError,
@@ -774,10 +777,9 @@ def _validated_labels(
         label for label in result_expression if label not in input_labels
     ]
     if unknown_result_labels:
-        raise CompileSpecError(
+        raise EinsumResultLabelError(
             "einsum result labels must appear in an input; unknown labels: "
-            + ", ".join(unknown_result_labels),
-            code="einsum_result_label_unknown",
+            + ", ".join(unknown_result_labels)
         )
     input_index_strs = [list(group) for group in input_groups]
     result_index_strs = list(result_expression)
@@ -834,10 +836,9 @@ def _logical_index_sizes(
     for operand, (index_strs, tensor) in enumerate(zip(input_index_strs, tensors)):
         mode_order = tuple(tensor.mode_order)
         if len(index_strs) != len(mode_order):
-            raise CompileSpecError(
+            raise OperandRankMismatchError(
                 f"einsum operand {operand} has {len(index_strs)} indices but "
-                f"tensor rank {len(mode_order)}",
-                code="einsum_operand_rank_mismatch",
+                f"tensor rank {len(mode_order)}"
             )
         shape = tensor.shape
         for logical_axis, index_str in enumerate(index_strs):
@@ -2564,9 +2565,8 @@ def _refuse_matrix_vector_operands(a: object, b: object) -> None:
     b_shape = b._metadata.layout.logical_shape
     for operand, (shape, rank) in enumerate(((a_shape, 2), (b_shape, 1))):
         if len(shape) != rank:
-            raise CompileSpecError(
-                f"spmv operand {operand} has rank {len(shape)}, not {rank}",
-                code="einsum_operand_rank_mismatch",
+            raise OperandRankMismatchError(
+                f"spmv operand {operand} has rank {len(shape)}, not {rank}"
             )
     if a_shape[1] != b_shape[0]:
         raise IndexExtentMismatchError(
@@ -4612,9 +4612,8 @@ def _validated_einsum_request(
     input_expression, result_expression = expression.split("->")
     input_groups = input_expression.split(",")
     if len(input_groups) != len(tensors):
-        raise CompileSpecError(
-            f"einsum expression expects {len(input_groups)} operands, got {len(tensors)}",
-            code="einsum_operand_count_mismatch",
+        raise EinsumOperandCountError(
+            f"einsum expression expects {len(input_groups)} operands, got {len(tensors)}"
         )
     for tensor in tensors:
         if not isinstance(tensor, (STensor, TensorSpec)):
@@ -4649,10 +4648,9 @@ def _validated_einsum_request(
             )
     for operand, (labels, tensor) in enumerate(zip(input_index_strs, tensors)):
         if len(labels) != tensor.dim():
-            raise CompileSpecError(
+            raise OperandRankMismatchError(
                 f"einsum operand {operand} has {len(labels)} labels but tensor "
-                f"rank {tensor.dim()}",
-                code="einsum_operand_rank_mismatch",
+                f"rank {tensor.dim()}"
             )
     output_mode_order = kwargs.get("output_mode_order")
     if output_mode_order is not None:

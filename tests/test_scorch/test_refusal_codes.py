@@ -30,6 +30,9 @@ from scorch.compiler.diagnostics import (
 )
 from scorch.exceptions import (
     CompileSpecError,
+    EinsumOperandCountError,
+    EinsumResultLabelError,
+    OperandRankMismatchError,
     ScorchAssertionError,
     ScorchError,
     ScorchFrozenInstanceError,
@@ -172,13 +175,18 @@ def _matrix(shape=(2, 3)):
         ),
         (
             lambda: scorch.einsum("ij,jk->ik", _matrix()),
-            CompileSpecError,
+            EinsumOperandCountError,
             "einsum_operand_count_mismatch",
         ),
         (
             lambda: scorch.einsum("ij->k", _matrix()),
-            CompileSpecError,
+            EinsumResultLabelError,
             "einsum_result_label_unknown",
+        ),
+        (
+            lambda: scorch.einsum("i,jk->ik", _matrix(), _matrix((3, 4))),
+            OperandRankMismatchError,
+            "einsum_operand_rank_mismatch",
         ),
         (
             lambda: scorch.einsum("ij,jk->ik", _matrix(), _matrix((4, 5))),
@@ -191,7 +199,7 @@ def _matrix(shape=(2, 3)):
             "unsupported_mixed_coordinate_hierarchy",
         ),
     ],
-    ids=["implicit-output", "operand-count", "unknown-label", "extent", "so-layout"],
+    ids=["implicit-output", "operand-count", "unknown-label", "rank", "extent", "so-layout"],
 )
 def test_public_refusals_name_their_cause(call, error_type, code):
     with pytest.raises(error_type) as raised:

@@ -360,6 +360,41 @@ class IndexExtentMismatchError(CompileSpecError, RuntimeError):
     code = "einsum_index_extent_mismatch"
 
 
+# The three classes below follow the rule IndexExtentMismatchError and
+# OperandDtypeMismatchError follow: where PyTorch refuses the same call with a
+# ``RuntimeError``, Scorch's refusal is a ``RuntimeError`` too, as well as the Scorch class
+# it was, so an ``except`` clause written for either catches it.
+class OperandRankMismatchError(CompileSpecError, RuntimeError):
+    """An operand's rank is not the rank its call gives it.
+
+    ``einsum`` refuses an operand whose term has more or fewer labels than the operand has
+    modes, and ``spmv`` a matrix that is not two-dimensional or a vector that is not
+    one-dimensional, before any kernel is built.  PyTorch raises ``RuntimeError`` for the
+    same calls to ``einsum`` and ``mv``.  ``code`` names the defect.
+    """
+
+    code = "einsum_operand_rank_mismatch"
+
+
+class EinsumOperandCountError(CompileSpecError, RuntimeError):
+    """An einsum expression names more or fewer operands than the call passes.
+
+    PyTorch's ``einsum`` raises ``RuntimeError`` for both.  ``code`` names the defect.
+    """
+
+    code = "einsum_operand_count_mismatch"
+
+
+class EinsumResultLabelError(CompileSpecError, RuntimeError):
+    """An einsum result names a label that no operand's term has.
+
+    The result's extent along that label is undefined.  PyTorch's ``einsum`` raises
+    ``RuntimeError`` for it.  ``code`` names the defect.
+    """
+
+    code = "einsum_result_label_unknown"
+
+
 class GeneratedKernelCacheError(ScorchError, RuntimeError):
     """A kept generated kernel is not the kernel its call builds.
 

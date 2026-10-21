@@ -24,6 +24,10 @@ class.  matmul itself checks nothing up front, so a correct call pays for no che
 4. ``spmv``: a vector of the wrong length, a 2-D vector, a 1-D matrix and an operand that
    is not an STensor, each with ``einsum``'s code for the same mistake.
 5. ``einsum``'s own extent refusal raises the same class.
+5a. Every refusal here that PyTorch makes with a ``RuntimeError`` -- an operand of the
+   wrong rank in ``einsum`` or ``spmv`` (torch's ``mv``), an einsum expression naming
+   more or fewer operands than the call passes, a result label no operand has -- is a
+   ``RuntimeError`` here too, as well as a ``CompileSpecError``.
 6. Every prebuilt kernel (SpMV, SpMM, SpGEMM; every value dtype and index width it takes)
    refuses each mismatch -- either operand short or long, the result's extents -- in its
    native check, and ``raise_if_native_coded`` gives that refusal the class and code.
@@ -47,7 +51,10 @@ from scorch.compiler.scheduler import Schedule, schedule_force
 import scorch_ops
 from scorch.exceptions import (
     CompileSpecError,
+    EinsumOperandCountError,
+    EinsumResultLabelError,
     IndexExtentMismatchError,
+    OperandRankMismatchError,
     TensorTypeError,
     defect_code,
     raise_if_native_coded,
@@ -249,9 +256,9 @@ def _spmv_cases():
         ("long vector", lambda: ops.spmv(st, STensor.from_torch(torch.rand(COLS + 1))),
          IndexExtentMismatchError, EXTENT),
         ("2-D vector", lambda: ops.spmv(st, STensor.from_torch(torch.rand(COLS, 1))),
-         CompileSpecError, "einsum_operand_rank_mismatch"),
+         OperandRankMismatchError, "einsum_operand_rank_mismatch"),
         ("1-D matrix", lambda: ops.spmv(STensor.from_torch(v).to_sparse("s"), STensor.from_torch(v)),
-         CompileSpecError, "einsum_operand_rank_mismatch"),
+         OperandRankMismatchError, "einsum_operand_rank_mismatch"),
         ("torch vector", lambda: ops.spmv(st, v), TensorTypeError, "spmv_operand_type_invalid"),
         ("torch matrix", lambda: ops.spmv(dense.to_sparse_csr(), STensor.from_torch(v)),
          TensorTypeError, "spmv_operand_type_invalid"),
@@ -312,6 +319,45 @@ def test_einsums_extent_refusal_is_the_same_class(builds):
         builds,
     )
     assert str(error) == "einsum index 'j' has incompatible dimensions 5 and 4"
+
+
+def _torch_parity_cases():
+    dense = _dense(torch.float32)
+    a = STensor.from_torch(dense).to_sparse("ds")
+    v = torch.rand(COLS)
+    rank = "einsum_operand_rank_mismatch"
+    count = "einsum_operand_count_mismatch"
+    return [
+        ("einsum rank", lambda: scorch.einsum("i,j->i", a, v),
+         lambda: torch.einsum("i,j->i", dense, v), OperandRankMismatchError, rank),
+        ("too few operands", lambda: scorch.einsum("ij,j->i", a),
+         lambda: torch.einsum("ij,j->i", dense), EinsumOperandCountError, count),
+        ("too many operands", lambda: scorch.einsum("ij->ij", a, v),
+         lambda: torch.einsum("ij->ij", dense, v), EinsumOperandCountError, count),
+        ("unknown result label", lambda: scorch.einsum("ij,j->k", a, v),
+         lambda: torch.einsum("ij,j->k", dense, v), EinsumResultLabelError,
+         "einsum_result_label_unknown"),
+        ("spmv 2-D vector", lambda: ops.spmv(a, STensor.from_torch(torch.rand(COLS, 1))),
+         lambda: torch.mv(dense, torch.rand(COLS, 1)), OperandRankMismatchError, rank),
+        ("spmv 1-D matrix",
+         lambda: ops.spmv(STensor.from_torch(v).to_sparse("s"), STensor.from_torch(v)),
+         lambda: torch.mv(v, v), OperandRankMismatchError, rank),
+    ]
+
+
+@pytest.mark.parametrize(
+    "call, torch_call, cls, code",
+    [c[1:] for c in _torch_parity_cases()],
+    ids=[c[0] for c in _torch_parity_cases()],
+)
+def test_refusals_torch_makes_as_runtime_errors_are_runtime_errors(
+    call, torch_call, cls, code, builds
+):
+    error = _assert_refused(call, cls, code, builds)
+    assert isinstance(error, CompileSpecError)
+    assert isinstance(error, RuntimeError)
+    with pytest.raises(RuntimeError):
+        torch_call()
 
 
 # The prebuilt kernels refuse a mismatch in their own native entry checks, with the code in
