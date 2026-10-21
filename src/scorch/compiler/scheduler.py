@@ -1,9 +1,11 @@
 import copy
 import math
+import operator
 from collections import defaultdict, deque
 from contextlib import contextmanager
 from contextvars import ContextVar
 from dataclasses import dataclass, fields as dataclass_fields, replace
+from itertools import repeat
 from typing import (
     Any,
     Callable,
@@ -15,6 +17,7 @@ from typing import (
     Set,
     Tuple,
     TypeVar,
+    cast,
 )
 
 import torch
@@ -73,6 +76,8 @@ from .loop_plan import (
     entity_display_names,
     verify_loop_plan,
 )
+from . import sparse_accumulator as _sparse_accumulator_module
+from . import sparse_assembly as _sparse_assembly_module
 from .sparse_accumulator import (
     SPARSE_ACCUMULATOR_STRUCTURES,
     is_accumulator_structure,
@@ -658,23 +663,184 @@ class Schedule:
         enters it only when set: a schedule that sets none of them keeps the
         key it had before they existed, and so does every options digest that
         carries it.
+
+        Every read validates the schedule's current state, but the full validation
+        (``_canonical_schedule``) and the formatting run once per distinct state.  A
+        read first rebuilds its state's memo key (``_schedule_memo_key``), which makes
+        the reads and refusals the full validation starts with, and returns the
+        string memoized under it.  A state changed through ``object.__setattr__``
+        has another memo key, so its next read validates it in full and refuses it
+        if it is invalid.  A state the memo does not key is validated in full on
+        every read, as before.  Rebuilding two Schedule objects on each read cost
+        a warm ``einsum`` with a schedule about 87,000 instructions per read, twice
+        per call (sapling 85220 and 85225).
         """
 
-        schedule = _validate_schedule_structure(self)
-        keyed = [
-            f"{field.name}={getattr(schedule, field.name)!r}"
-            for field in dataclass_fields(schedule)
-            if field.repr
-            and (
-                field.name not in _SCHEDULE_KEY_WHEN_SET
-                or getattr(schedule, field.name) is not None
-            )
-        ]
-        return f"{type(schedule).__qualname__}({', '.join(keyed)})"
+        context = _schedule_validation_context()
+        memo_key = _schedule_memo_key(self, context)
+        if memo_key is not None:
+            try:
+                known = _SCHEDULE_KEY_MEMO.get(memo_key)
+            except TypeError:  # module state replaced by an unhashable value
+                memo_key = known = None
+            if known is not None:
+                return known
+        canonical = _canonical_schedule(self)
+        key = _format_schedule_key(canonical)
+        if memo_key is not None:
+            # Under the memo key of the state validated and formatted: the canonical
+            # copy, which no caller holds, rather than the key read above, which
+            # another thread could have changed since.
+            stored_key = _schedule_memo_key(canonical, context)
+            if stored_key is not None:
+                if len(_SCHEDULE_KEY_MEMO) >= _SCHEDULE_KEY_MEMO_LIMIT:
+                    _SCHEDULE_KEY_MEMO.clear()
+                _SCHEDULE_KEY_MEMO[stored_key] = key
+        return key
 
 
 #: Schedule fields whose unset value (``None``) leaves the cache key unchanged.
 _SCHEDULE_KEY_WHEN_SET = frozenset({"vector_loops", "entries_of"})
+
+#: The stored fields of each schedule carrier, in declaration order: the names
+#: ``_stored_schedule_fields`` requires, and the order of a state's memo key.
+_SCHEDULE_FIELDS = (
+    "loop_order",
+    "tiles",
+    "relayout",
+    "tag",
+    "parallel_loop",
+    "assembly",
+    "accumulator",
+    "vector_loops",
+    "entries_of",
+)
+_TILE_SPEC_FIELDS = (
+    "index_var",
+    "width",
+    "placement",
+    "parallel",
+    "kind",
+    "accum",
+    "unroll",
+)
+_RELAYOUT_SPEC_FIELDS = ("operand", "pack_var", "strip_width", "scope_var")
+
+#: The cache key of each schedule state validated so far, under the state's memo
+#: key (``_schedule_memo_key``).  Bounded like the parse memo: emptied when full.
+_SCHEDULE_KEY_MEMO: Dict[tuple, str] = {}
+_SCHEDULE_KEY_MEMO_LIMIT = 4096
+
+#: The leaf values a memo key holds: exact immutable built-in types whose equal
+#: values have equal ``repr``, so that equal memo keys format equal cache keys.
+#: Not ``float`` (``0.0 == -0.0``, and their reprs differ).
+_MEMO_LEAF_TYPES = frozenset({str, int, bool, type(None)})
+_EXACT_STR = frozenset({str})
+
+
+class _UnkeyedState(Exception):
+    """A schedule state the memo does not key: its read takes the full validation."""
+
+
+def _schedule_validation_context() -> tuple:
+    """The module state the validation and the key format read besides the schedule.
+
+    The assembly and accumulator name registries (``is_assembly_strategy`` and
+    ``is_accumulator_structure`` read their modules' tuples), the tile width bound
+    and the fields a key leaves out when unset.  It enters every memo key, so a
+    change to any of them is a new state.
+    """
+
+    return (
+        _sparse_assembly_module.SPARSE_ASSEMBLY_STRATEGIES,
+        _sparse_accumulator_module.SPARSE_ACCUMULATOR_STRUCTURES,
+        MAX_AFFINE_TILE_WIDTH,
+        _SCHEDULE_KEY_WHEN_SET,
+    )
+
+
+def _schedule_memo_key(schedule: object, context: tuple) -> Optional[tuple]:
+    """The memo key of ``schedule``'s current state, or None if the memo does not
+    key it."""
+
+    try:
+        return (context, _carrier_memo_key(schedule, Schedule, _SCHEDULE_FIELDS))
+    except _UnkeyedState:
+        return None
+
+
+def _carrier_memo_key(
+    value: object, expected_type: type, fields: Tuple[str, ...]
+) -> tuple:
+    """The typed key of one schedule carrier's stored state.
+
+    Read the way ``_stored_schedule_fields`` reads it, and ``_UnkeyedState`` wherever
+    that function refuses: a value not exactly ``expected_type``, a ``__dict__`` that
+    is not a dict of exactly ``fields`` under exact ``str`` names, or a field whose
+    ``object.__getattribute__`` read is not the stored object.  A TileSpec or
+    RelayoutSpec held by the carrier is keyed by the same rule.  No method of a
+    stored name or value runs: every one is known to be of an exact built-in type
+    before anything hashes or compares it.
+    """
+
+    if type(value) is not expected_type:
+        raise _UnkeyedState
+    try:
+        state = object.__getattribute__(value, "__dict__")
+    except Exception:
+        raise _UnkeyedState from None
+    if (
+        type(state) is not dict
+        or len(state) != len(fields)
+        or not _EXACT_STR.issuperset(map(type, state))
+    ):
+        raise _UnkeyedState
+    try:
+        stored = tuple(map(state.__getitem__, fields))
+        observed = tuple(map(object.__getattribute__, repeat(value), fields))
+    except Exception:
+        raise _UnkeyedState from None
+    if not all(map(operator.is_, observed, stored)):
+        raise _UnkeyedState
+    return _memo_tuple(stored)
+
+
+def _memo_tuple(values: tuple) -> tuple:
+    """A tuple of stored values as it enters a memo key: each value's exact type
+    beside the values, a nested tuple or carrier replaced by its own typed key."""
+
+    types = tuple(map(type, values))
+    if not _MEMO_LEAF_TYPES.issuperset(types):
+        values = tuple(map(_memo_value, values))
+    return (types, values)
+
+
+def _memo_value(value: object) -> object:
+    kind = type(value)
+    if kind in _MEMO_LEAF_TYPES:
+        return value
+    if kind is tuple:
+        return _memo_tuple(cast(tuple, value))
+    if kind is TileSpec:
+        return _carrier_memo_key(value, TileSpec, _TILE_SPEC_FIELDS)
+    if kind is RelayoutSpec:
+        return _carrier_memo_key(value, RelayoutSpec, _RELAYOUT_SPEC_FIELDS)
+    raise _UnkeyedState
+
+
+def _format_schedule_key(schedule: Schedule) -> str:
+    """The cache key of one validated schedule (see ``Schedule.cache_key``)."""
+
+    keyed = [
+        f"{field.name}={getattr(schedule, field.name)!r}"
+        for field in dataclass_fields(schedule)
+        if field.repr
+        and (
+            field.name not in _SCHEDULE_KEY_WHEN_SET
+            or getattr(schedule, field.name) is not None
+        )
+    ]
+    return f"{type(schedule).__qualname__}({', '.join(keyed)})"
 
 
 def _stored_schedule_fields(
@@ -800,22 +966,18 @@ def _unsupported_accumulator(structure: str, reason: str) -> NoReturn:
 def _validate_schedule_structure(schedule: object) -> Schedule:
     """Revalidate a frozen public schedule at every compiler use boundary."""
 
-    state = _stored_schedule_fields(
-        schedule,
-        Schedule,
-        (
-            "loop_order",
-            "tiles",
-            "relayout",
-            "tag",
-            "parallel_loop",
-            "assembly",
-            "accumulator",
-            "vector_loops",
-            "entries_of",
-        ),
-        "Schedule",
-    )
+    _canonical_schedule(schedule)
+    return cast(Schedule, schedule)
+
+
+def _canonical_schedule(schedule: object) -> Schedule:
+    """Validate ``schedule``'s stored state and return its canonical copy.
+
+    The copy is rebuilt from the state read here, compares equal to ``schedule``, and
+    is held by no caller.
+    """
+
+    state = _stored_schedule_fields(schedule, Schedule, _SCHEDULE_FIELDS, "Schedule")
     loop_order = state["loop_order"]
     tiles = state["tiles"]
     relayout = state["relayout"]
@@ -876,18 +1038,7 @@ def _validate_schedule_structure(schedule: object) -> Schedule:
     checked_tiles = []
     for position, tile in enumerate(tiles):
         tile_state = _stored_schedule_fields(
-            tile,
-            TileSpec,
-            (
-                "index_var",
-                "width",
-                "placement",
-                "parallel",
-                "kind",
-                "accum",
-                "unroll",
-            ),
-            f"Schedule.tiles[{position}]",
+            tile, TileSpec, _TILE_SPEC_FIELDS, f"Schedule.tiles[{position}]"
         )
         try:
             checked_tiles.append(TileSpec(**tile_state))
@@ -900,10 +1051,7 @@ def _validate_schedule_structure(schedule: object) -> Schedule:
     checked_relayout = None
     if relayout is not None:
         relayout_state = _stored_schedule_fields(
-            relayout,
-            RelayoutSpec,
-            ("operand", "pack_var", "strip_width", "scope_var"),
-            "Schedule.relayout",
+            relayout, RelayoutSpec, _RELAYOUT_SPEC_FIELDS, "Schedule.relayout"
         )
         try:
             checked_relayout = RelayoutSpec(**relayout_state)
@@ -934,7 +1082,7 @@ def _validate_schedule_structure(schedule: object) -> Schedule:
             "Schedule state is not in canonical owned form",
             code="schedule_state_invalid",
         )
-    return schedule
+    return canonical
 
 
 def _entity_ids_by_name(

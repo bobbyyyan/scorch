@@ -259,6 +259,11 @@ class _DeferredOptions:
     hands back is the same string object on every call.  Two cache keys give the same
     fingerprint only when they are equal (the encoding tags each value's type), so
     the key selects the kernels it selected before.
+
+    ``schedule_key`` is ``requested_schedule``'s cache key, read once here.  The parse
+    memo and the dispatch key (``_einsum_cache_key``) both take this one read, so the
+    two describe one state of the schedule even if it is changed during the call, and
+    the call pays for one read rather than two.
     """
 
     __slots__ = (
@@ -267,6 +272,7 @@ class _DeferredOptions:
         "_environment_key",
         "requested_schedule",
         "reuse_key",
+        "schedule_key",
     )
 
     def __init__(self, kwargs: dict) -> None:
@@ -285,16 +291,16 @@ class _DeferredOptions:
             self._environment_key = key
             if key is not None:
                 forced = _SCHEDULE_FORCE.get()
+                forced_key = forced.cache_key if forced is not None else None
                 known = _compile_options_module._parsed_options_keys.get(
-                    (key, forced.cache_key if forced is not None else None)
+                    (key, forced_key)
                 )
                 if known is not None:
                     self.requested_schedule: Optional[Schedule] = forced
+                    self.schedule_key: Optional[str] = forced_key
                     self.reuse_key: str = known
                     return
-            options = self.options()
-            self.requested_schedule = options.requested_schedule
-            self.reuse_key = options.cache_fingerprint
+            self._take_options()
             return
         if kwargs.get("_compile_options") is None:
             self._environment_key = environment_reuse_key()
@@ -304,15 +310,21 @@ class _DeferredOptions:
             ):
                 requested = _requested_schedule(kwargs)
                 schedule = requested if requested is not None else get_forced_schedule()
-                known = parsed_options_key(
-                    self._environment_key, _schedule_cache_key(schedule)
-                )
+                schedule_key = _schedule_cache_key(schedule)
+                known = parsed_options_key(self._environment_key, schedule_key)
                 if known is not None:
                     self.requested_schedule = schedule
+                    self.schedule_key = schedule_key
                     self.reuse_key = known
                     return
+        self._take_options()
+
+    def _take_options(self) -> None:
+        """Take the schedule and the reuse key from the call's snapshot."""
+
         options = self.options()
         self.requested_schedule = options.requested_schedule
+        self.schedule_key = _schedule_cache_key(self.requested_schedule)
         self.reuse_key = options.cache_fingerprint
 
     def options(self) -> CompileOptions:
@@ -332,11 +344,18 @@ class _DeferredOptions:
         the host changed since the parse ``reuse_key`` came from (a header file, the
         working directory): the kernel then belongs to the new snapshot, and the next
         call, keyed by the new snapshot through ``parsed_options_key``, builds and keeps
-        its own.
+        its own.  And only when the schedule still has the state ``schedule_key`` was
+        read from: one changed during the call (with ``object.__setattr__``) may have
+        been compiled in its new state, and that kernel does not belong under the key
+        of the old one.  A schedule whose new state is invalid is refused here, as at
+        every read.
         """
 
-        return (
+        options_kept = (
             self._options is None or self._options.cache_fingerprint == self.reuse_key
+        )
+        return options_kept and (
+            _schedule_cache_key(self.requested_schedule) == self.schedule_key
         )
 
 
@@ -492,6 +511,10 @@ def _schedule_cache_key(schedule: Optional[Schedule]) -> Optional[str]:
     return schedule.cache_key if schedule is not None else None
 
 
+#: ``_einsum_cache_key``'s default for ``schedule_key``: the caller did not read it.
+_SCHEDULE_KEY_UNREAD = object()
+
+
 def _reject_unsupported_requested_schedule(
     compile_options: CompileOptions,
     boundary: str,
@@ -519,12 +542,15 @@ def _einsum_cache_key(
     compile_options: Optional[CompileOptions] = None,
     *,
     options_key: object = None,
+    schedule_key: object = _SCHEDULE_KEY_UNREAD,
 ) -> tuple:
     """Build the early dispatch key, including every scheduling decision.
 
     The options enter as ``compile_options.cache_fingerprint`` when a snapshot is
     given, else as ``options_key`` (``_DeferredOptions.reuse_key``, the same
-    fingerprint), which names them without making them.
+    fingerprint), which names them without making them.  The schedule enters as
+    ``schedule_key`` when the caller has read it (``_DeferredOptions.schedule_key``,
+    ``schedule``'s key read once per call), else as ``schedule.cache_key`` read here.
     """
 
     def layout_contract(tensor: Any) -> Any:
@@ -567,7 +593,11 @@ def _einsum_cache_key(
         ),
         str(output_format) if output_format is not None else None,
         tuple(output_mode_order) if output_mode_order else None,
-        _schedule_cache_key(schedule),
+        (
+            _schedule_cache_key(schedule)
+            if schedule_key is _SCHEDULE_KEY_UNREAD
+            else schedule_key
+        ),
         (
             compile_options.cache_fingerprint
             if compile_options is not None
@@ -4575,6 +4605,7 @@ def _einsum_owned(
             output_mode_order,
             effective_schedule,
             options_key=options.reuse_key,
+            schedule_key=options.schedule_key,
         )
         _cached = _einsum_dispatch_cache.get(_dispatch_key)
         if _cached is not None:
