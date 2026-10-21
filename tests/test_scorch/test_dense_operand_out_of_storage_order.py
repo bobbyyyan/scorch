@@ -16,12 +16,18 @@ covers only what cannot be lowered -- a COMPRESSED level looped outside a level
 above it -- and carries a code.
 
 The loop order follows Python's string hashing (the scheduler iterates a set
-of index names), so the programs run in a child process with
+of index names), so each program runs in its own child process with
 ``PYTHONHASHSEED=0``, the seed at which they were found.  Each child also
 records whether the program reached the case: a dense operand level looped
 outside a level above it in a dense workspace's producer.  The programs found
 refused are required to reach it, so the test cannot pass by the scheduler
 choosing some other order.
+
+One case per program and result layout (145): each builds one kernel, about
+20 s, so pytest-xdist spreads the builds.  Until 2026-10-17 a case held a
+whole family and result layout, up to 64 builds one after another in one
+child (1380 s with the node to itself), which ran past the child's 3600 s
+timeout when 15 pytest-xdist workers shared the node.
 
 Every result is judged by ``test_dense_below_compressed_result._judge``:
 canonical level arrays, values against a float64 ``torch.einsum``, and stored
@@ -126,11 +132,17 @@ def _cases():
     for expr, programs in FAMILIES.items():
         # Every program into ``sd``; the ones refused before also into the
         # neighbouring sparse layouts.
-        cases.append((expr, "sd", programs))
+        cases.extend((expr, "sd", program) for program in programs)
         refused = sorted(REFUSED_BEFORE[expr])
         for result_fmt in ("ss", "ds"):
-            cases.append((expr, result_fmt, refused))
+            cases.extend((expr, result_fmt, program) for program in refused)
     return cases
+
+
+# A case builds one kernel: about 20 s (64 took 1380 s with the node to
+# itself, 21.6 s each).  600 s is 28 times that, room for a loaded node, and
+# still bounds a hung build.
+_CHILD_TIMEOUT = 600
 
 
 def _child(expr, result_fmt, programs):
@@ -250,11 +262,25 @@ def _child(expr, result_fmt, programs):
     print("ROWS " + json.dumps(rows))
 
 
+def test_the_premise_tables_keep_a_program_that_reaches_the_case():
+    """Some program refused before still reaches the case in every family, and
+    every program listed as now looped in order was refused before."""
+
+    for expr, relaid in NOW_LOOPED_IN_ORDER.items():
+        assert relaid <= REFUSED_BEFORE[expr], (expr, relaid - REFUSED_BEFORE[expr])
+    for expr, refused in REFUSED_BEFORE.items():
+        assert len(refused) > len(NOW_LOOPED_IN_ORDER.get(expr, set())), expr
+        assert refused <= set(FAMILIES[expr]), (expr, refused - set(FAMILIES[expr]))
+
+
 @pytest.mark.parametrize(
-    "expr,result_fmt,programs",
-    [pytest.param(*case, id=f"{case[0]} as {case[1]}") for case in _cases()],
+    "expr,result_fmt,program",
+    [
+        pytest.param(*case, id=f"{case[0]} as {case[1]} with {','.join(case[2])}")
+        for case in _cases()
+    ],
 )
-def test_dense_operands_out_of_storage_order_match_pytorch(expr, result_fmt, programs):
+def test_dense_operands_out_of_storage_order_match_pytorch(expr, result_fmt, program):
     import scorch
 
     root = Path(__file__).resolve().parents[2]
@@ -269,55 +295,32 @@ def test_dense_operands_out_of_storage_order_match_pytorch(expr, result_fmt, pro
             sys.executable,
             "-m",
             "tests.test_scorch.test_dense_operand_out_of_storage_order",
-            json.dumps([expr, result_fmt, [list(p) for p in programs]]),
+            json.dumps([expr, result_fmt, [list(program)]]),
         ],
         cwd=root,
         env=environment,
         capture_output=True,
         text=True,
-        timeout=3600,
+        timeout=_CHILD_TIMEOUT,
     )
     lines = [line for line in completed.stdout.splitlines() if line.startswith("ROWS ")]
     assert completed.returncode == 0 and lines, completed.stderr[-3000:]
     rows = json.loads(lines[-1][len("ROWS ") :])
-    assert len(rows) == len(programs)
-    failures = [
-        f"{','.join(row['operands'])}: " + "; ".join(row["failures"])
-        for row in rows
-        if row["failures"]
-    ]
-    assert not failures, "\n".join(failures)
+    assert [tuple(row["operands"]) for row in rows] == [program]
+    (row,) = rows
+    assert not row["failures"], "; ".join(row["failures"])
     # The programs refused before must reach the case into ``sd``, where they
     # were found, except those the relayout now lays out in the loop's order; a
     # schedule or relayout change that moves any of them fails here.
-    if result_fmt == "sd":
-        relaid = NOW_LOOPED_IN_ORDER.get(expr, set())
-        refused = [
-            row for row in rows if tuple(row["operands"]) in REFUSED_BEFORE[expr]
-        ]
-        missed = [
-            ",".join(row["operands"])
-            for row in refused
-            if tuple(row["operands"]) not in relaid and not row["reached"]
-        ]
-        assert not missed, f"no longer loop a dense operand out of order: {missed}"
-        back = [
-            ",".join(row["operands"])
-            for row in refused
-            if tuple(row["operands"]) in relaid and row["reached"]
-        ]
-        assert not back, (
-            "loop a dense operand out of order again; remove them from "
-            f"NOW_LOOPED_IN_ORDER: {back}"
-        )
-        not_relaid = [
-            ",".join(row["operands"])
-            for row in refused
-            if tuple(row["operands"]) in relaid and not row["relaid"]
-        ]
-        assert not not_relaid, f"listed as relaid but not relaid: {not_relaid}"
-        # Some program refused before still reaches the case.
-        assert len(refused) > len(relaid)
+    if result_fmt == "sd" and program in REFUSED_BEFORE[expr]:
+        if program in NOW_LOOPED_IN_ORDER.get(expr, set()):
+            assert not row["reached"], (
+                "loops a dense operand out of order again; remove it from "
+                "NOW_LOOPED_IN_ORDER"
+            )
+            assert row["relaid"], "listed as relaid but not relaid"
+        else:
+            assert row["reached"], "no longer loops a dense operand out of order"
 
 
 if __name__ == "__main__":
