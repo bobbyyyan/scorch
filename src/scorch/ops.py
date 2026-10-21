@@ -86,7 +86,7 @@ from .exceptions import (
     raise_if_native_coded,
     shape_capacity_error,
 )
-from .format import TensorFormat, LevelFormat, LevelType
+from .format import FormatInput, TensorFormat, LevelFormat, LevelType
 from .format import (
     conversion_format,
     dense_prefix_unaddressable,
@@ -1358,6 +1358,10 @@ def _spmv_owned(
     except Exception:
         # Parsed again in the frontend stage, which raises it as it always did.
         parsed_format = None
+    if parsed_format is not None and parsed_format.get_order() != 1:
+        # The result is a vector; refused before any CIN is built (see
+        # _require_output_format_rank), for a caller of scorch.ops.spmv itself.
+        _require_output_format_rank(parsed_format, 1, "spmv")
     result_shape = (a.shape[0],)
     # What the lowering reads: both layouts and value dtypes and the result format.
     key = (
@@ -1828,6 +1832,29 @@ def _refuse_matrix_vector_operands(a: object, b: object) -> None:
         )
 
 
+def _require_output_format_rank(
+    requested: Optional[FormatInput], result_rank: int, operation: str
+) -> Optional[TensorFormat]:
+    """``requested`` parsed, after checking it has one level per mode of the result.
+
+    A requested output format of another rank is the caller's argument mistake, so it
+    is refused here, at the front door, with the code ``einsum`` gives it, before any
+    CIN exists for the compiler's verifier to reject at a stage boundary.  ``None``
+    (nothing requested) comes back as ``None``.
+    """
+
+    if requested is None:
+        return None
+    parsed = parse_format(requested)
+    if parsed.get_order() != result_rank:
+        raise CompileSpecError(
+            f"{operation} output format rank {parsed.get_order()} "
+            f"does not match result rank {result_rank}",
+            code="einsum_output_format_rank_mismatch",
+        )
+    return parsed
+
+
 def _dense_result_as_tensor(
     result: Union[torch.Tensor, STensor],
 ) -> Union[torch.Tensor, STensor]:
@@ -2225,6 +2252,11 @@ def matmul(
     if a.dim() == 2 and b.dim() == 1:
         if effective_schedule is not None:
             raise ScheduleNotThreadedThroughSpMVError()
+        # A matrix times a vector is a vector: a format of any other rank is refused
+        # here, as einsum refuses it on every other branch, before the prebuilt
+        # resolution or spmv sees it (the CIN verifier caught it at a stage boundary,
+        # with its own code; pp's prebuilt path crashed on it).
+        _require_output_format_rank(requested_output_format, 1, "matmul")
         default_mode_order = [0, 1]
         if (
             not a.format.is_dense()
@@ -3479,15 +3511,10 @@ def _einsum_owned(
     input_index_strs, result_index_strs = _validated_labels(
         expression, input_groups, result_expression
     )
-    requested_output_format = kwargs.get("format")
+    requested_output_format = _require_output_format_rank(
+        kwargs.get("format"), len(result_index_strs), "einsum"
+    )
     if requested_output_format is not None:
-        requested_output_format = parse_format(requested_output_format)
-        if requested_output_format.get_order() != len(result_index_strs):
-            raise CompileSpecError(
-                f"einsum output format rank {requested_output_format.get_order()} "
-                f"does not match result rank {len(result_index_strs)}",
-                code="einsum_output_format_rank_mismatch",
-            )
         if any(
             level_type == LevelType.SINGLETON
             for level_type in requested_output_format.get_level_types()
