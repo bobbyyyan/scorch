@@ -448,7 +448,7 @@ def test_a_forged_dense_result_permutation_is_level_mapped(regblock_enabled):
 
     fixture = forged_permuted_result_matmul()
     expect_target_code(
-        "dimension_extent_mismatch",
+        "einsum_index_extent_mismatch",
         fixture.program,
         {fixture.a: (3, 5), fixture.b: (5, 4)},
         (3, 4),
@@ -547,13 +547,13 @@ def test_dimension_extent_mismatch():
     program = build_matvec()
     a_symbol, x_symbol = program.inputs
     expect_target_code(
-        "dimension_extent_mismatch",
+        "einsum_index_extent_mismatch",
         program,
         {a_symbol: (3, 4), x_symbol: (5,)},
         (3,),
     )
     expect_target_code(
-        "dimension_extent_mismatch",
+        "einsum_index_extent_mismatch",
         program,
         {a_symbol: (3, 4), x_symbol: (4,)},
         (9,),

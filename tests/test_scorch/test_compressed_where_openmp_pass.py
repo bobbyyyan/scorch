@@ -4197,9 +4197,10 @@ def test_production_ds_generated_cpp_locks_typed_offset_family(
     assert len({id(bound) for bound in production_bounds}) == 4
     cpp = LLIRLowerer().lower_llir(function)
 
-    assert len(cpp) == 7165
+    # 7387 with the entry's index-extent check (validate_jit_index_extents), one line.
+    assert len(cpp) == 7387
     assert hashlib.sha256(cpp.encode()).hexdigest() == (
-        "46c841dbf06bc466ce6c4266979abd12783dbb32409fb2fc8b12cea02782f45e"
+        "f317a83500ba4be0f2687cb9408010d3f2ca572a91d9628122bc5e17ac8cffaa"
     )
     assert cpp.count("wksp.insert_unchecked(") == 2
     assert "wksp.insert(" not in cpp
@@ -4337,9 +4338,10 @@ def test_production_dss_generated_cpp_locks_typed_offset_family() -> None:
     assert len({id(bound) for bound in production_bounds}) == 8
     cpp = LLIRLowerer().lower_llir(lowered)
 
-    assert len(cpp) == 8843
+    # 9092 with the entry's index-extent check (validate_jit_index_extents), one line.
+    assert len(cpp) == 9092
     assert hashlib.sha256(cpp.encode()).hexdigest() == (
-        "b9d701fcf97b28ee77c17cb7aac1ca718fb651333c1d1f8f030ec868c5e7d492"
+        "423053e8800e868f9ee0bc0ff094e1d78b3e9e6ddd1a020dbdfcd14be004b2b7"
     )
     assert cpp.count("wksp.insert(") == 2
     assert "wksp.insert_unchecked(" not in cpp
@@ -4399,9 +4401,10 @@ def test_production_ds_float64_locks_typed_value_source() -> None:
         for code in _raw_codes(lowered)
     )
     cpp = LLIRLowerer().lower_llir(lowered)
-    assert len(cpp) == 6325
+    # 6538 with the entry's index-extent check (validate_jit_index_extents), one line.
+    assert len(cpp) == 6538
     assert hashlib.sha256(cpp.encode()).hexdigest() == (
-        "96915e68a0782bb446e29483cd25c568105d5eac36f05efb11b92f81751c85ac"
+        "59d8815b1db8b97f13562890857b8a906c8a701e6fc1a1cb07c100daa03966b5"
     )
 
 

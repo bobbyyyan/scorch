@@ -137,6 +137,7 @@ from ..torch_cpp_abi import (
     TorchCppKernelABI,
     dense_block_check,
     dense_blocks,
+    index_extent_bindings,
     level_total_check,
 )
 from ...utils import dtype_to_c_datatype
@@ -1952,7 +1953,7 @@ class _TargetLowering:
                     extents[dimension] = (shape[level], decl.name, level)
                 elif known[0] != shape[level]:
                     _fail(
-                        "dimension_extent_mismatch",
+                        "einsum_index_extent_mismatch",
                         f"dimension "
                         f"{self.dimension_names[dimension]!r}: "
                         f"{known[1]}[{known[2]}] is {known[0]} but "
@@ -6880,9 +6881,27 @@ class _TargetLowering:
 
     def kernel_abi(self) -> TorchCppKernelABI:
         """The kernel's ABI.  Its result check declares the dense blocks the
-        body bounds (:meth:`_levels_bounded_in_kernel`)."""
+        body bounds (:meth:`_levels_bounded_in_kernel`); its index bindings are
+        the declared dimensions, a mode's dimension being the identity its
+        extent must share (``DimensionDecl``)."""
 
+        index_names, index_bindings = index_extent_bindings(
+            [
+                (
+                    tuple(level.mode for level in self.decls[symbol].levels),
+                    [
+                        [
+                            (dimension, self.dimension_names[dimension])
+                            for dimension in self.decls[symbol].dimensions
+                        ]
+                    ],
+                )
+                for symbol in (self.result_symbol, *self._input_symbols)
+            ]
+        )
         return TorchCppKernelABI(
+            index_names=index_names,
+            index_bindings=index_bindings,
             result_levels_bounded_in_kernel=self._levels_bounded_in_kernel(),
             result_shape=self.shapes[self.result_symbol],
             result_level_types=self._result_level_types(),

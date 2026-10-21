@@ -960,7 +960,9 @@ def test_verifier_rejects_extent_mismatches_and_classifies_implicit_reductions()
 
     with pytest.raises(VerificationError) as extent_error:
         verify_cin(extent_program)
-    assert "index_extent_mismatch" in _assert_structured_diagnostics(extent_error)
+    assert "einsum_index_extent_mismatch" in _assert_structured_diagnostics(
+        extent_error
+    )
 
     implicit_reduction = ForAll(
         i,
@@ -989,7 +991,7 @@ def test_full_verification_is_explicit_at_debug_compiler_boundary() -> None:
 
     normalize_cin(invalid)
     with full_cin_verification():
-        with pytest.raises(VerificationError, match="index_extent_mismatch"):
+        with pytest.raises(VerificationError, match="einsum_index_extent_mismatch"):
             Scheduler.apply_schedule(invalid, Schedule())
 
 

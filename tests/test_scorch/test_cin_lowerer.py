@@ -873,7 +873,7 @@ def test_kernel_abi_arguments_validation_and_function_are_fresh_and_byte_exact()
         'scorch_native::validate_jit_tensor("evaluate", "Mask", Mask_shape, '
         "Mask_mode_indices, Mask_values, torch::kFloat32, {2, 2}, {0, 1}, {5, 3})",
         "scorch_native::validate_jit_extra_tensor(bias_values, torch::kFloat64, "
-        '"evaluate", "bias_values")',
+        '"evaluate", "bias_values", result_shape)',
     )
     assert all(
         type(statement) is llir.FunctionCallStmt for statement in first_validation
@@ -1107,6 +1107,7 @@ def test_kernel_abi_validation_calls_are_structured_frozen_and_byte_exact() -> N
         llir.QualifiedName,
         llir.Literal,
         llir.Literal,
+        llir.Var,
     ]
     extra_values = cast(llir.Var, extra_call.args[0])
     assert (extra_values.name, extra_values.type) == (
@@ -1123,6 +1124,12 @@ def test_kernel_abi_validation_calls_are_structured_frozen_and_byte_exact() -> N
     )
     assert extra_call.args[3] == llir.Literal(
         value="bias_values", data_type=llir.DataType.STRING
+    )
+    # The result's shape, whose cell count the post-op tensor must hold.
+    extra_shape = cast(llir.Var, extra_call.args[4])
+    assert (extra_shape.name, extra_shape.type) == (
+        "result_shape",
+        llir.DataType.STD_VECTOR_INT,
     )
     assert cast(llir.Var, first[4].args[0]).name == "scale_values"
     assert first[4].args[3] == llir.Literal(
@@ -1145,9 +1152,9 @@ def test_kernel_abi_validation_calls_are_structured_frozen_and_byte_exact() -> N
         'scorch_native::validate_jit_tensor("evaluate", "Mask", Mask_shape, '
         "Mask_mode_indices, Mask_values, torch::kFloat32, {2, 2}, {0, 1}, {5, 3});",
         "scorch_native::validate_jit_extra_tensor(bias_values, torch::kFloat64, "
-        '"evaluate", "bias_values");',
+        '"evaluate", "bias_values", result_shape);',
         "scorch_native::validate_jit_extra_tensor(scale_values, torch::kFloat64, "
-        '"evaluate", "scale_values");',
+        '"evaluate", "scale_values", result_shape);',
     ]
     assert LLIRLowerer().lower_llir(first) == "\n".join(expected_lines)
 
@@ -1243,7 +1250,7 @@ def test_kernel_abi_validation_preserves_unicode_identifiers() -> None:
             '"\\316\\224", Δ_shape, Δ_mode_indices, Δ_values, torch::kFloat32, '
             "{0}, {0}, {2});",
             "scorch_native::validate_jit_extra_tensor(β_values, torch::kFloat32, "
-            '"\\303\\251valuate", "\\316\\262_values");',
+            '"\\303\\251valuate", "\\316\\262_values", result_shape);',
         ]
     )
     function_cpp = LLIRLowerer().lower_llir(
@@ -1273,7 +1280,13 @@ def test_kernel_abi_validation_preserves_unicode_identifiers() -> None:
     )
     assert (
         "scorch_native::validate_jit_extra_tensor(β_values, torch::kFloat32, "
-        '"evaluate", "\\316\\262_values");' in cpp
+        '"evaluate", "\\316\\262_values", result_shape);' in cpp
+    )
+    # Neither shape is compiled in, so the entry compares the extents `i` is bound to.
+    assert (
+        'scorch_native::validate_jit_index_extents("evaluate", '
+        '{"result", "\\317\\200"}, {"i"}, {0, 0, 0, 0, 1, 0}, result_shape, π_shape);'
+        in cpp
     )
 
 
@@ -1430,7 +1443,7 @@ def test_post_op_extra_tensor_data_ptr_is_live_typed_and_fresh() -> None:
         'scorch_native::validate_jit_tensor("evaluate", "Input", Input_shape, '
         "Input_mode_indices, Input_values, torch::kFloat32, {0}, {0}, {});",
         "scorch_native::validate_jit_extra_tensor(bias_values, torch::kFloat32, "
-        '"evaluate", "bias_values");',
+        '"evaluate", "bias_values", result_shape);',
     ]
 
     def pointer_initializer(function: llir.Function) -> llir.VarInit:
@@ -7134,7 +7147,9 @@ def test_permuted_dense_level_types_map_through_storage_order() -> None:
     )
     i, j, k = IndexVar("i"), IndexVar("j"), IndexVar("k")
     result = TensorVar("C", fmt="ddd", shape=(2, 3, 4))
-    source = TensorVar("A", fmt="ddd", shape=(2, 3, 4))
+    # A TensorVar's shape is in storage order, as einsum builds it: level p holds
+    # logical axis mode_order[p], so A's levels hold j, k, i with extents 3, 4, 2.
+    source = TensorVar("A", fmt="ddd", shape=(3, 4, 2))
     source.mode_order = [1, 2, 0]
     program = ForAll(
         i,

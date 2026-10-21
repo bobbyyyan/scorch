@@ -1349,8 +1349,9 @@ inline std::string argument_name(const char* op, const char* argument) {
 // 64,001 row offsets and its nonzeros, and no kernel forms rows x columns for it. The bound
 // on a logical element count belongs to the kernels that address a dense array with `int`
 // offsets, and to no others.
-// A refusal under this bound ends with the first code below, and a prebuilt kernel's refusal of
-// operands that give one index two extents with the second. scorch.exceptions.raise_if_native_coded
+// A refusal under this bound ends with the first code below, and a kernel's refusal of operands
+// that give one index two extents (a prebuilt kernel's entry check, or a generated kernel's
+// validate_jit_index_extents) with the second. scorch.exceptions.raise_if_native_coded
 // turns each into its error at every Python call site of a kernel: change both or neither.
 #define SCORCH_INDEX_CAPACITY_CODE " [index_position_exceeds_int32]"
 #define SCORCH_EXTENT_MISMATCH_CODE " [einsum_index_extent_mismatch]"
@@ -2758,6 +2759,88 @@ inline void validate_jit_extra_tensor(const torch::Tensor& tensor,
   TORCH_CHECK(false, op, ": contraction mismatch: A.shape[1]=", a_cols,
               " but B.shape[0]=", b_rows, SCORCH_EXTENT_MISMATCH_CODE);
   std::abort();  // not reached: TORCH_CHECK(false) throws
+}
+
+// A post-op's extra tensor, read at the result's cell (cin_lowerer, _emit_post_ops): it must
+// hold exactly the result's cells, or the read passes its end.  The result is dense (the ABI
+// refuses extra tensors otherwise) and result_shape was checked first, so the product fits.
+// Out of line for the reason given at validate_jit_index_extents below.
+SCORCH_NOINLINE inline void validate_jit_extra_tensor(const torch::Tensor& tensor,
+                                                      torch::ScalarType expected_dtype,
+                                                      const char* op, const char* argument,
+                                                      const std::vector<int64_t>& result_shape) {
+  validate_jit_extra_tensor(tensor, expected_dtype, op, argument);
+  int64_t cells = 1;
+  for (const int64_t extent : result_shape) cells *= extent;
+  TORCH_CHECK(tensor.numel() == cells, argument_name(op, argument), " holds ",
+              tensor.numel(), " values and the result ", cells, " cells",
+              SCORCH_EXTENT_MISMATCH_CODE);
+}
+
+// That every argument dimension bound to one index variable carries the same extent, emitted
+// after the arguments' own checks in every generated evaluate() with an index whose extents
+// are not all compiled in (TorchCppKernelABI.emit_validation).  The checks above hold each
+// argument to its own shape argument only, and a kernel bounds an index's loop by one
+// argument's extent and reads or writes the others by it: a vector one entry short was read
+// past its end, a result one row short written past its end.
+//
+// `shapes` are the result's and the inputs' shape arguments in the ABI's order and
+// `arguments` their names; `bindings` are (index, argument, level) triples, an index's
+// together, `level` a physical level (shape arguments are in physical level order); `indices`
+// names the indices.  Out of line, as validate_jit_result_shape is and for its reason:
+// inlined into evaluate(), an entry check changed the register allocation of loops it never
+// touches.  The call passes braced lists and the shape arguments themselves, by reference
+// (validate_jit_index_extents below), so it constructs no std::vector and the structured IR
+// that emits it takes no address.
+SCORCH_NOINLINE inline void validate_jit_index_extent_table(
+    const char* op, const std::vector<int64_t>* const* shape, size_t shape_count,
+    std::initializer_list<const char*> arguments,
+    std::initializer_list<const char*> indices, std::initializer_list<int> bindings) {
+  TORCH_CHECK(shape_count == arguments.size() && bindings.size() % 3 == 0, op,
+              ": malformed index-extent contract");
+  const char* const* argument = arguments.begin();
+  const char* const* index_name = indices.begin();
+  const int* binding = bindings.begin();
+  int index = -1;
+  int first_argument = 0;
+  int first_level = 0;
+  int64_t extent = 0;
+  for (size_t b = 0; b < bindings.size(); b += 3) {
+    const int this_index = binding[b];
+    const int this_argument = binding[b + 1];
+    const int level = binding[b + 2];
+    TORCH_CHECK(this_index >= 0 && static_cast<size_t>(this_index) < indices.size() &&
+                    this_argument >= 0 &&
+                    static_cast<size_t>(this_argument) < shape_count && level >= 0 &&
+                    static_cast<size_t>(level) < shape[this_argument]->size(),
+                op, ": malformed index-extent contract at binding ", b / 3);
+    const int64_t this_extent = (*shape[this_argument])[level];
+    if (this_index != index) {
+      index = this_index;
+      first_argument = this_argument;
+      first_level = level;
+      extent = this_extent;
+      continue;
+    }
+    TORCH_CHECK(this_extent == extent, op, ": index '", index_name[index], "' has extent ",
+                extent, " in ", argument[first_argument], " (level ", first_level,
+                ") and ", this_extent, " in ", argument[this_argument], " (level ",
+                level, ")", SCORCH_EXTENT_MISMATCH_CODE);
+  }
+}
+
+// The entry's call: the shape arguments last, by reference, gathered into the table above.
+template <typename... Shapes>
+SCORCH_NOINLINE void validate_jit_index_extents(const char* op,
+                                                std::initializer_list<const char*> arguments,
+                                                std::initializer_list<const char*> indices,
+                                                std::initializer_list<int> bindings,
+                                                const Shapes&... shapes) {
+  static_assert(sizeof...(Shapes) > 0 &&
+                    (std::is_same<Shapes, std::vector<int64_t>>::value && ...),
+                "validate_jit_index_extents takes shape arguments, std::vector<int64_t>");
+  const std::vector<int64_t>* const table[] = {&shapes...};
+  validate_jit_index_extent_table(op, table, sizeof...(Shapes), arguments, indices, bindings);
 }
 
 }  // namespace scorch_native

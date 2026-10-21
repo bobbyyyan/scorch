@@ -185,10 +185,12 @@ def test_direct_string_encoded_var_expression_budget_is_explicit() -> None:
         # ``dense_block_check`` (a level's extent and the pending position of
         # the compressed level above a dense block), both plain identifiers.  89:
         # ``level_total_check`` and ``drained_entries_check`` (each a copy of the
-        # int64 count it checks), plain identifiers.
-        "torch_cpp_abi.py": 89,
+        # int64 count it checks), plain identifiers.  91: the entry's index-extent
+        # check (each argument's shape parameter, ``"<argument>_shape"``) and the extra
+        # tensor check's ``result_shape``, plain identifiers.
+        "torch_cpp_abi.py": 91,
     }
-    assert sum(constructor_counts.values()) == 538
+    assert sum(constructor_counts.values()) == 540
     assert unclassified_counts == {
         "cin.py": 9,
         "cin_lowerer.py": 195,
@@ -206,9 +208,10 @@ def test_direct_string_encoded_var_expression_budget_is_explicit() -> None:
         "schedule_lowerer.py": 106,
         "single_iteration_loop_pass.py": 1,
         "sparse_prefetch_pass.py": 1,
-        "torch_cpp_abi.py": 89,
+        # 91: as in constructor_counts above.
+        "torch_cpp_abi.py": 91,
     }
-    assert sum(unclassified_counts.values()) == 528
+    assert sum(unclassified_counts.values()) == 530
     assert known_indirect == {
         ("cin_lowerer.py", "actual_size"): 2,
         ("cin_lowerer.py", "expr.name.replace(old, new)"): 1,
@@ -1290,10 +1293,11 @@ def test_known_nnz_coordinate_torch_allocation_is_structured() -> None:
             len(_llir_constructor_calls(path, constructor))
             for constructor in ("VarInit", "Array", "FunctionCall", "QualifiedName")
         )
-        == 65
+        == 67
     )
     assert len(_llir_constructor_calls(path, "VarInit")) == 29
-    assert len(_llir_constructor_calls(path, "Array")) == 10
+    # 12 with the index-extent check's argument names and index names.
+    assert len(_llir_constructor_calls(path, "Array")) == 12
     # 14 with the coordinate count ``emit_position_tail_close`` reads.
     assert len(_llir_constructor_calls(path, "FunctionCall")) == 14
     assert len(_llir_constructor_calls(path, "QualifiedName")) == 12

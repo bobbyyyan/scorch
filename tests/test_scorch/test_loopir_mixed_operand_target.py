@@ -914,7 +914,7 @@ def test_target_failure_is_a_recorded_stage_loss():
             compile_options=options,
             compilation_context=context,
         )
-    assert error.value.defect.code == "dimension_extent_mismatch"
+    assert error.value.defect.code == "einsum_index_extent_mismatch"
     assert context._failed_stage_id is CompilerStageId.LOOPIR_TO_LLIR_LOWERING
     assert CompilerStageId.LOOPIR_TO_LLIR_LOWERING not in {
         record.stage_id for record in context.stage_run_records

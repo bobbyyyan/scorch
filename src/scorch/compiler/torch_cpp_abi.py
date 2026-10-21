@@ -17,6 +17,7 @@ from .llir_traversal import (
 )
 from ..exceptions import (
     IndexCapacityError,
+    IndexExtentMismatchError,
     ScorchAssertionError,
     ScorchTypeError,
     ScorchValueError,
@@ -652,6 +653,46 @@ class KernelTensorABI:
         )
 
 
+def index_extent_bindings(
+    arguments: Sequence[Tuple[Sequence[int], Sequence[Sequence[Tuple[object, str]]]]],
+) -> Tuple[Tuple[str, ...], Tuple[Tuple[int, int, int], ...]]:
+    """A kernel ABI's ``index_names`` and ``index_bindings``, from its accesses.
+
+    ``arguments`` holds, for the result and then each input in ABI order, its mode order
+    (``mode_order[level]`` is the logical axis stored at ``level``; empty for the identity)
+    and its accesses, each one ``(key, name)`` per logical axis: ``key`` identifies the
+    index variable and ``name`` displays it.  An index bound to fewer than two distinct
+    argument dimensions is left out, since there is nothing to compare; one bound twice
+    in one access (``A(i, i)``) is kept.  An axis the mode order does not hold is skipped,
+    as the CIN analysis skips it; that access is refused elsewhere.
+    """
+
+    dimensions: dict = {}
+    names: dict = {}
+    for argument, (mode_order, accesses) in enumerate(arguments):
+        for access in accesses:
+            for axis, (key, name) in enumerate(access):
+                if mode_order and axis not in mode_order:
+                    continue
+                level = list(mode_order).index(axis) if mode_order else axis
+                if key not in dimensions:
+                    dimensions[key] = []
+                    names[key] = name
+                if (argument, level) not in dimensions[key]:
+                    dimensions[key].append((argument, level))
+    kept = [key for key, bound in dimensions.items() if len(bound) >= 2]
+    index_names = tuple(
+        names[key] if names[key].isidentifier() else f"index{position}"
+        for position, key in enumerate(kept)
+    )
+    bindings = tuple(
+        (position, argument, level)
+        for position, key in enumerate(kept)
+        for argument, level in sorted(dimensions[key])
+    )
+    return index_names, bindings
+
+
 def _int_initializer_list(
     values: Tuple[int, ...],
     element_type: llir.DataType,
@@ -693,10 +734,20 @@ class TorchCppKernelABI:
     #: and the entry checks cannot be emitted until the body's record is known
     #: (:meth:`with_levels_bounded_in_kernel`).
     result_levels_bounded_in_kernel: Optional[Tuple[int, ...]] = ()
+    #: The index variables bound to two or more argument dimensions, and those dimensions:
+    #: ``(index, argument, level)`` triples, ``index`` a position in ``index_names``,
+    #: ``argument`` 0 for the result and ``k`` for the k-th input, ``level`` a physical
+    #: level (shape arguments are in physical level order), an index's triples together and
+    #: the indices in order (:func:`index_extent_bindings`).  The extents of an index's
+    #: dimensions must agree: refused at construction where every one is known
+    #: (:meth:`_refuse_disagreeing_extents`), and at the kernel's entry otherwise.
+    index_names: Tuple[str, ...] = ()
+    index_bindings: Tuple[Tuple[int, int, int], ...] = ()
 
     def __post_init__(self) -> None:
         self._validate()
         self._refuse_unaddressable_shapes()
+        self._refuse_disagreeing_extents()
 
     @property
     def result_rank(self) -> int:
@@ -777,6 +828,103 @@ class TorchCppKernelABI:
                 _refuse_unaddressable_dense_prefix(
                     tensor.name, tensor.shape, tensor.level_types, self.function_name
                 )
+
+    def _argument(self, argument: int) -> Tuple[str, int, Tuple[int, ...]]:
+        """Argument ``argument``'s name, rank and known shape (empty when not known)."""
+
+        if argument == 0:
+            return "result", self.result_rank, self.result_shape
+        tensor = self.input_tensors[argument - 1]
+        return tensor.name, len(tensor.level_types), tensor.shape
+
+    def _validate_index_bindings(self) -> None:
+        if type(self.index_names) is not tuple or any(
+            type(name) is not str or not name.isidentifier()
+            for name in self.index_names
+        ):
+            raise ScorchTypeError(
+                "index names must be an immutable identifier tuple",
+                code="internal_argument_type_invalid",
+            )
+        if type(self.index_bindings) is not tuple or any(
+            type(binding) is not tuple
+            or len(binding) != 3
+            or any(type(part) is not int for part in binding)
+            for binding in self.index_bindings
+        ):
+            raise ScorchTypeError(
+                "index bindings must be an immutable tuple of (index, argument, level) "
+                "int triples",
+                code="internal_argument_type_invalid",
+            )
+        counts = [0] * len(self.index_names)
+        previous = -1
+        for index, argument, level in self.index_bindings:
+            if not 0 <= index < len(self.index_names) or index < previous:
+                raise ScorchValueError(
+                    "index bindings must name their indices in order",
+                    code="kernel_abi_index_binding_invalid",
+                )
+            if not 0 <= argument <= len(self.input_tensors):
+                raise ScorchValueError(
+                    f"index binding names argument {argument} of "
+                    f"{len(self.input_tensors) + 1}",
+                    code="kernel_abi_index_binding_invalid",
+                )
+            if not 0 <= level < self._argument(argument)[1]:
+                raise ScorchValueError(
+                    f"index binding names level {level} of argument {argument}, which "
+                    f"has {self._argument(argument)[1]}",
+                    code="kernel_abi_index_binding_invalid",
+                )
+            counts[index] += 1
+            previous = index
+        if any(count < 2 for count in counts):
+            raise ScorchValueError(
+                "every bound index must be bound to two argument dimensions or more",
+                code="kernel_abi_index_binding_invalid",
+            )
+
+    def _index_groups(self) -> List[List[Tuple[int, int]]]:
+        """Each index's ``(argument, level)`` pairs, in index order."""
+
+        groups: List[List[Tuple[int, int]]] = [[] for _ in self.index_names]
+        for index, argument, level in self.index_bindings:
+            groups[index].append((argument, level))
+        return groups
+
+    def _refuse_disagreeing_extents(self) -> None:
+        """Refuse two known extents of one index that differ, before a kernel is built.
+
+        At construction, as for :meth:`_refuse_unaddressable_shapes`: a kernel compiled for
+        known shapes would be built only for its entry check to refuse every call.
+        """
+
+        for index, group in enumerate(self._index_groups()):
+            first: Optional[Tuple[str, int, int]] = None
+            for argument, level in group:
+                name, _, shape = self._argument(argument)
+                if not shape:
+                    continue
+                if first is None:
+                    first = (name, level, shape[level])
+                elif shape[level] != first[2]:
+                    raise IndexExtentMismatchError(
+                        f"{self.function_name}: index '{self.index_names[index]}' has "
+                        f"extent {first[2]} in {first[0]} (level {first[1]}) and "
+                        f"{shape[level]} in {name} (level {level})"
+                    )
+
+    def _entry_checked_bindings(self) -> Tuple[Tuple[int, int, int], ...]:
+        """The bindings of the indices one of whose extents is not known: the ones the
+        kernel's entry must compare (every known one was compared at construction)."""
+
+        groups = self._index_groups()
+        return tuple(
+            (index, argument, level)
+            for index, argument, level in self.index_bindings
+            if any(not self._argument(other)[2] for other, _ in groups[index])
+        )
 
     def _validate(self) -> None:
         if type(self.function_name) is not str or not self.function_name.isidentifier():
@@ -888,6 +1036,17 @@ class TorchCppKernelABI:
                 "extra tensor dtype must be None without extra tensors",
                 code="internal_argument_type_invalid",
             )
+        if self.extra_tensor_names and any(
+            level_type is not LevelType.DENSE for level_type in self.result_level_types
+        ):
+            # The body reads an extra tensor at the result's cell; with a sparse level that
+            # is a storage position, whose count no caller can know to size the tensor.
+            raise ScorchValueError(
+                "a post-op's extra tensor is read at the result's cell, which a result "
+                "with a sparse level does not have",
+                code="post_op_extra_tensor_sparse_result",
+            )
+        self._validate_index_bindings()
         argument_names = ["result_shape"]
         for tensor in self.input_tensors:
             argument_names.extend(
@@ -1043,10 +1202,70 @@ class TorchCppKernelABI:
                                 value=f"{name}_values",
                                 data_type=llir.DataType.STRING,
                             ),
+                            # Read at the result's cell: it must hold that many values.
+                            llir.Var(
+                                name="result_shape",
+                                type=llir.DataType.STD_VECTOR_INT,
+                            ),
                         ),
                     )
                 )
+        extent_check = self._emit_index_extent_check()
+        if extent_check is not None:
+            validation.append(extent_check)
         return validation
+
+    def _emit_index_extent_check(self) -> Optional[llir.FunctionCallStmt]:
+        """The entry's comparison of the extents its indices are bound to, or ``None``
+        when every such extent was compared at construction.  Last of the entry checks:
+        each shape argument's rank has been checked by then (the call checks it too)."""
+
+        bindings = self._entry_checked_bindings()
+        if not bindings:
+            return None
+        indices = sorted({index for index, _, _ in bindings})
+        renumbered = {index: position for position, index in enumerate(indices)}
+        # Each argument's shape parameter is "<argument>_shape" (emit_arguments).
+        argument_names = ["result"] + [tensor.name for tensor in self.input_tensors]
+        # The shape arguments go last and by reference (the helper is variadic), so the
+        # call takes no address.
+        return llir.FunctionCallStmt(
+            name="scorch_native::validate_jit_index_extents",
+            args=(
+                llir.Literal(value=self.function_name, data_type=llir.DataType.STRING),
+                llir.Array(
+                    values=tuple(
+                        llir.Literal(value=name, data_type=llir.DataType.STRING)
+                        for name in argument_names
+                    ),
+                    data_type=llir.DataType.STRING,
+                ),
+                llir.Array(
+                    values=tuple(
+                        llir.Literal(
+                            value=self.index_names[index],
+                            data_type=llir.DataType.STRING,
+                        )
+                        for index in indices
+                    ),
+                    data_type=llir.DataType.STRING,
+                ),
+                _int_initializer_list(
+                    tuple(
+                        part
+                        for index, argument, level in bindings
+                        for part in (renumbered[index], argument, level)
+                    ),
+                    llir.DataType.INT,
+                ),
+                *(
+                    llir.Var(
+                        name=f"{argument}_shape", type=llir.DataType.STD_VECTOR_INT
+                    )
+                    for argument in argument_names
+                ),
+            ),
+        )
 
     def emit_input_prologue(self) -> List[llir.Stmt]:
         """Build fresh shape/index/value bindings for every input tensor."""

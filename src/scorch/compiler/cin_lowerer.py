@@ -102,6 +102,7 @@ from .torch_cpp_abi import (
     TorchCppKernelABI,
     dense_block_check,
     drained_entries_check,
+    index_extent_bindings,
     tensor_data_ptr,
     tensor_storage_member,
 )
@@ -182,20 +183,58 @@ def _kernel_tensor_abi(tensor_var: TensorVar) -> KernelTensorABI:
     )
 
 
+def _abi_index_bindings(
+    accesses: Sequence[TensorAccess],
+    result_tensor_var: TensorVar,
+    input_tensor_vars: List[TensorVar],
+) -> Tuple[Tuple[str, ...], Tuple[Tuple[int, int, int], ...]]:
+    """The ABI's index bindings from the statement's accesses of its arguments.
+
+    Matched to the arguments by name, which the ABI requires to be unique: the lowering
+    works on a copy of the caller's tree, so a ``TensorVar`` is not the caller's object.
+    An access of anything else (a workspace) binds no argument dimension.
+    """
+
+    argument_names = [result_tensor_var.get_name()] + [
+        tensor_var.get_name() for tensor_var in input_tensor_vars
+    ]
+    per_argument: List[List[List[Tuple[object, str]]]] = [[] for _ in argument_names]
+    for access in accesses:
+        name = access.get_tensor().get_name()
+        if name in argument_names:
+            per_argument[argument_names.index(name)].append(
+                [(index_var.index_id, index_var.name) for index_var in access.indices]
+            )
+    tensor_vars = [result_tensor_var] + list(input_tensor_vars)
+    return index_extent_bindings(
+        [
+            (tuple(tensor_var.get_mode_order() or ()), accesses_of)
+            for tensor_var, accesses_of in zip(tensor_vars, per_argument)
+        ]
+    )
+
+
 def _torch_cpp_kernel_abi(
     result_tensor_var: TensorVar,
     input_tensor_vars: List[TensorVar],
     post_ops: Optional[PostOps],
     result_levels_bounded_in_kernel: Optional[Tuple[int, ...]] = (),
+    accesses: Sequence[TensorAccess] = (),
 ) -> TorchCppKernelABI:
     """Snapshot one complete public kernel ABI without retaining semantic IR.
 
     ``result_levels_bounded_in_kernel`` is ``None`` before the body is built
-    (``TorchCppKernelABI.result_levels_bounded_in_kernel``).
+    (``TorchCppKernelABI.result_levels_bounded_in_kernel``).  ``accesses`` are the
+    statement's accesses, from which the ABI's index bindings come.
     """
 
     extra_tensor_names = tuple(post_ops.extra_tensors) if post_ops is not None else ()
+    index_names, index_bindings = _abi_index_bindings(
+        accesses, result_tensor_var, input_tensor_vars
+    )
     return TorchCppKernelABI(
+        index_names=index_names,
+        index_bindings=index_bindings,
         result_shape=tuple(result_tensor_var.shape or ()),
         result_level_types=tuple(result_tensor_var.get_level_types()),
         input_tensors=tuple(_kernel_tensor_abi(tensor) for tensor in input_tensor_vars),
@@ -4422,6 +4461,7 @@ class CINLowerer:
             rhs_tensor_vars,
             self.post_ops,
             result_levels_bounded_in_kernel=None,
+            accesses=stmt.tensor_accesses,
         )
         # The ABI snapshot is the fail-closed dtype/rank boundary.  Do not
         # index the raw dtype mapping before it has validated every input.

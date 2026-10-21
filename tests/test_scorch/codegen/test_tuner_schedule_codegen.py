@@ -292,9 +292,10 @@ def test_tuner_free_k_stack_workspace_is_structured_owned_and_byte_exact() -> No
     assert first_cpp == second_cpp
     assert first_cpp.count("float wksp[kTile_k] = {};") == 1
     # The result check names the level kinds, {0, 0}, where it named the rank (0038).
-    assert len(first_cpp) == 3065
+    # 3249 with the entry's index-extent check (validate_jit_index_extents), one line.
+    assert len(first_cpp) == 3249
     assert hashlib.sha256(first_cpp.encode()).hexdigest() == (
-        "613d1394aee25f89ff0bb0a71bc181b8f356ad348ae734a4f64c17de808f8c92"
+        "02000ea4326b73bd88e4d330a1b0def72cbae233b877dfb3d5dcd18e173e05be"
     )
 
     assert ownership_state(statement) == original_state

@@ -349,7 +349,10 @@ class IndexExtentMismatchError(CompileSpecError, RuntimeError):
     but two dense layouts, where it gives torch's refusal this class.  PyTorch raises
     ``RuntimeError`` for the same mistake in ``matmul``, ``mv``, ``mm``, ``@`` and
     ``einsum``, and so did the prebuilt kernels' native checks, so this is a
-    ``RuntimeError`` as well as the ``CompileSpecError`` ``einsum`` raised.  ``code``
+    ``RuntimeError`` as well as the ``CompileSpecError`` ``einsum`` raised.
+    The compiler refuses the mismatch between known shapes before it builds a kernel, and
+    a generated kernel whose extents are not all compiled in refuses it at its entry;
+    :func:`raise_if_native_coded` turns that refusal's text into this error.  ``code``
     names the defect.
     """
 
@@ -486,7 +489,8 @@ _NATIVE_REPEAT = re.compile(
 _NATIVE_CAPACITY_CODE = " [index_position_exceeds_int32]"
 
 # csrc/native_abi.h, SCORCH_EXTENT_MISMATCH_CODE: a prebuilt kernel's refusal of operands
-# that give one index two extents ends its line with this code.
+# that give one index two extents ends its line with this code, and so do a generated
+# kernel's (validate_jit_index_extents and the extra tensor check).
 _NATIVE_EXTENT_CODE = " [einsum_index_extent_mismatch]"
 
 

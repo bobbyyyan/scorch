@@ -623,7 +623,7 @@ def test_a_permuted_compressed_result_converts_the_operand(arm):
             ((shape, torch.float32),),
             compile_options=options,
         )
-    assert "index_extent_mismatch" in str(mismatch.value)
+    assert "einsum_index_extent_mismatch" in str(mismatch.value)
 
     with pytest.raises(InvalidSchedule) as refusal:
         legacy_generated_cpp(

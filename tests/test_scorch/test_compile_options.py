@@ -769,9 +769,10 @@ def test_default_explicit_options_preserve_csr_dense_generated_cpp_anchor() -> N
     _, _, _, cpp = _compile_spmm(_build_spmm_source(), options)
 
     # The result check names the level kinds, {0, 0}, where it named the rank (0038).
-    assert len(cpp) == 2510
+    # 2694 with the entry's index-extent check (validate_jit_index_extents), one line.
+    assert len(cpp) == 2694
     assert hashlib.sha256(cpp.encode()).hexdigest() == (
-        "058ed102cbd95a123af90dde7d6d10362b7dabc2262236b3880c13dea6b27714"
+        "2fe1cd7d2f4207dda09e42a0af100ed3cb57b06a0d485db59366ac4da9574f40"
     )
 
 
@@ -961,9 +962,9 @@ def test_production_lowering_delegates_once_to_each_snapshotted_manager_pipeline
     assert first_result.artifact.value is not second_result.artifact.value
     assert production_cpp == debug_cpp
     # The result check names the level kinds, {0, 0}, where it named the rank (0038).
-    assert len(production_cpp) == 2510
+    assert len(production_cpp) == 2694
     assert hashlib.sha256(production_cpp.encode()).hexdigest() == (
-        "058ed102cbd95a123af90dde7d6d10362b7dabc2262236b3880c13dea6b27714"
+        "2fe1cd7d2f4207dda09e42a0af100ed3cb57b06a0d485db59366ac4da9574f40"
     )
 
 

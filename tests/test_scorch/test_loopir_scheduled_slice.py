@@ -1169,7 +1169,7 @@ def test_scheduled_entry_runs_dense_operands_stored_in_another_mode_order(
     The shipped compiler and this entry without a schedule both compute it.
     With a schedule the entry passed such an operand as stored and the kernel
     read it in the declared order: wrong values where the extents are equal
-    (``(3, 3, 3)``, largest error about 3.4) and ``index_extent_mismatch``
+    (``(3, 3, 3)``, largest error about 3.4) and ``einsum_index_extent_mismatch``
     where they are not (``(2, 3, 4)``).  Each operand is now copied into the
     declared order first, and the caller's operands are left as they were.
     """

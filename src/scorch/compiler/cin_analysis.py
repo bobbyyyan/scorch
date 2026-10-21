@@ -2942,7 +2942,7 @@ def _compute_cin_analysis(cin: IndexStmt) -> CINAnalysis:  # noqa: C901
             previous = known_extents.get(index_id)
             if previous is not None and previous[0] != extent:
                 diagnose(
-                    "index_extent_mismatch",
+                    "einsum_index_extent_mismatch",
                     f"IndexId {index_id.value} has incompatible extents "
                     f"{previous[0]} and {extent}",
                     occurrence_paths.get(access_id, ("root",))

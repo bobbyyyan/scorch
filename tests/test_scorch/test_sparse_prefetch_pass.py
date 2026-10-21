@@ -1439,9 +1439,10 @@ def test_production_routes_the_detached_list_at_the_original_optimization_seam(
     assert second_coordinate_read.tensor_access is None
     assert second_lowerer.llir_pass_run_records == lowerer.llir_pass_run_records
     # The result check names the level kinds, {0, 0}, where it named the rank (0038).
-    assert len(cpp) == 2510
+    # 2694 with the entry's index-extent check (validate_jit_index_extents), one line.
+    assert len(cpp) == 2694
     assert hashlib.sha256(cpp.encode()).hexdigest() == (
-        "058ed102cbd95a123af90dde7d6d10362b7dabc2262236b3880c13dea6b27714"
+        "2fe1cd7d2f4207dda09e42a0af100ed3cb57b06a0d485db59366ac4da9574f40"
     )
     assert "int pA1_end = A1_pos[pA0 + 1];" in cpp
     assert "pA1 < pA1_end; pA1++" in cpp
@@ -1590,10 +1591,11 @@ def test_production_all_coo_sddmm_activates_single_iteration_and_factor_hoist() 
     # The loop over the mask runs in parallel.  Before patch 0047 it wrote the result
     # at a shared counter (pSampled1++) inside that loop, a data race; it now writes at
     # the mask entry's own position (pMask0).  This is the text whose loop
-    # test_loop_invariant_factor_hoist_validity.py pins for the coordinate mask.
-    assert len(cpp) == 3500
+    # test_loop_invariant_factor_hoist_validity.py pins for the coordinate mask.  3734
+    # with the entry's index-extent check (validate_jit_index_extents), one line.
+    assert len(cpp) == 3734
     assert hashlib.sha256(cpp.encode()).hexdigest() == (
-        "82cdc300ad6acc1ded85dc583dd1d8e0b8dc8bcec1aa41ff677e3ac28a2a0179"
+        "e19d82f5fd4a03323e7361e6cbf69c399669d0d19e4617c295742d16d1c2b828"
     )
     assert shared_scalar_writes(cpp) == []
     assert "pMask1_end" not in cpp
