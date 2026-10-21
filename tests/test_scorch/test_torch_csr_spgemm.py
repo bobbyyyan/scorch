@@ -24,7 +24,6 @@ import torch
 import scorch
 import scorch_ops
 from scorch import ops
-from scorch.exceptions import ScorchNotImplementedError
 
 warnings.filterwarnings("ignore", message=".*Sparse.*")
 
@@ -263,19 +262,71 @@ def test_mismatched_inner_extent_is_the_ordinary_paths_error():
     assert served() == before
 
 
+def gradient_reference(a, b, g):
+    """float64 dL/da and dL/db for L = sum(to_dense(a @ b) * g), and the number of
+    coordinates each stores. to_dense's gradient is G on the product's stored coordinates
+    (masked_grad), which are those the operands' structures imply (every value here is
+    nonzero, so a structure is where the dense copy is). Each operand's gradient is
+    unmasked, as torch.matmul's is, and stores the coordinates its factors imply."""
+    a64, b64 = a.detach().to_dense().double(), b.detach().to_dense().double()
+    sa, sb = (a64 != 0).double(), (b64 != 0).double()
+    implied = (sa @ sb) != 0
+    gm = g.double() * implied
+    return (
+        (gm @ b64.t(), int(((implied.double() @ sb.t()) != 0).sum())),
+        (a64.t() @ gm, int(((sa.t() @ implied.double()) != 0).sum())),
+    )
+
+
+def check_gradients(a, b, g, which, dtype):
+    tol = 1e-12 if dtype is torch.float64 else 1e-5
+    for operand, (want, count), wanted in zip(
+        (a, b), gradient_reference(a, b, g), (which != "b", which != "a")
+    ):
+        if not wanted:
+            assert operand.grad is None
+            continue
+        got = operand.grad
+        assert got.layout is torch.sparse_csr and got.dtype is dtype
+        torch.testing.assert_close(got.to_dense().double(), want, rtol=tol, atol=tol)
+        assert got._nnz() == count
+
+
+def same_tensor(got, want):
+    """Whether two torch sparse matrices of one layout are the same: index arrays, their
+    dtype, and the values, bit for bit."""
+    if got.layout is torch.sparse_csc:
+        pairs = (
+            (got.ccol_indices(), want.ccol_indices()),
+            (got.row_indices(), want.row_indices()),
+        )
+    else:
+        pairs = (
+            (got.crow_indices(), want.crow_indices()),
+            (got.col_indices(), want.col_indices()),
+        )
+    pairs += ((got.values(), want.values()),)
+    return got.layout is want.layout and all(
+        x.dtype is y.dtype and torch.equal(x, y) for x, y in pairs
+    )
+
+
 @pytest.mark.parametrize("dtype", [torch.float32, torch.float64])
 @pytest.mark.parametrize("index", [torch.int64, torch.int32])
 @pytest.mark.parametrize("which", ["a", "b", "both"])
 @pytest.mark.parametrize("route", sorted(ROUTES))
-def test_a_gradient_call_is_recorded_and_refuses_with_a_code(dtype, index, which, route):
-    """A product a gradient is wanted through is autograd.py's: the forward is right, and
-    asking for the gradient raises scorch's coded refusal rather than torch's uncoded one.
-
-    The result is a torch CSR tensor, which has no view: autograd.py hands it to its
-    Function held and returns a new tensor object over its arrays (draft 1c; 84357 found
-    the forward raising NotImplementedError for aten::view on SparseCsrCPU)."""
+def test_a_gradient_call_gives_torch_s_gradient(dtype, index, which, route):
+    """A product a gradient is wanted through is autograd.py's, recorded with the einsum's
+    derivative (series step 21; patch A refused it with matmul_derivative_unsupported). The
+    result is the torch CSR tensor of the call without a gradient -- the same arrays, index
+    dtype and value bits -- over values that carry the record, and each operand that wants
+    a gradient gets torch's: unmasked, in CSR. It is a new tensor object over the product's
+    arrays, as a torch CSR tensor has no view (draft 1c; 84357 found the forward raising
+    NotImplementedError for aten::view on SparseCsrCPU)."""
     a = random_csr(20, 15, 0.2, dtype, index=index, seed=14)
     b = random_csr(15, 10, 0.2, dtype, index=index, seed=15)
+    with torch.no_grad():
+        plain = ROUTES[route](a, b)
     if which in ("a", "both"):
         a.requires_grad_(True)
     if which in ("b", "both"):
@@ -284,9 +335,10 @@ def test_a_gradient_call_is_recorded_and_refuses_with_a_code(dtype, index, which
     check(result.detach(), a.detach(), b.detach())
     assert result.grad_fn is not None
     assert result is not a and result is not b
-    with pytest.raises(ScorchNotImplementedError) as refused:
-        result.to_dense().sum().backward()
-    assert refused.value.code == "matmul_derivative_unsupported"
+    assert same_tensor(result.detach(), plain)
+    g = torch.from_numpy(np.random.default_rng(16).uniform(0.5, 1.5, (20, 10))).to(dtype)
+    (result.to_dense() * g).sum().backward()
+    check_gradients(a, b, g, which, dtype)
 
 
 def test_a_forced_schedule_is_not_served_by_the_c_entry():
@@ -415,6 +467,26 @@ def test_a_keyword_without_a_format_or_schedule_keeps_torch_type(dtype, call, in
         check_csc(result, a, b)
     else:
         check(result, a, b)
+
+
+@pytest.mark.parametrize("call", sorted(TORCH_TYPE_CALLS))
+@pytest.mark.parametrize("which", ["a", "both"])
+def test_a_gradient_call_with_a_keyword_keeps_torch_type(call, which):
+    """A keyword that leaves torch's type keeps it when a gradient is wanted: torch CSR, or
+    torch CSC for output_mode_order=[1, 0], the same tensor as without a gradient, and
+    torch's gradient for each operand that wants one."""
+    a, b = keyword_operands()
+    with torch.no_grad():
+        plain = ops.matmul(a, b, **TORCH_TYPE_CALLS[call]())
+    a.requires_grad_(True)
+    if which == "both":
+        b.requires_grad_(True)
+    result = ops.matmul(a, b, **TORCH_TYPE_CALLS[call]())
+    assert result.grad_fn is not None
+    assert same_tensor(result.detach(), plain)
+    g = torch.from_numpy(np.random.default_rng(17).uniform(0.5, 1.5, (30, 20)))
+    (result.to_dense() * g).sum().backward()
+    check_gradients(a, b, g, which, torch.float64)
 
 
 @pytest.mark.parametrize("operand", ["reversed", "repeated"])

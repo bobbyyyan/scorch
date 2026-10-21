@@ -211,7 +211,9 @@ def test_the_generated_kernel_s_product_has_the_einsums_derivative(generated, dt
     """The generated kernel's product is differentiable.  A keyword argument takes the
     product out of what autograd.py's product Functions cover, and the product is
     recorded with the einsum's derivative instead, for both operands, as the product of
-    two matrices is (test_autograd_matmul.py).  Before step 3 its backward raised
+    two matrices is (test_autograd_matmul.py): the torch CSR matrix gets torch's
+    gradient, dense and everywhere, as torch.matmul gives it.  Before step 20 that
+    gradient was the stored-entries one; before step 3 the backward raised
     matmul_derivative_unsupported, and before that the dense result left as an STensor,
     which carried no autograd at all."""
 
@@ -233,11 +235,9 @@ def test_the_generated_kernel_s_product_has_the_einsums_derivative(generated, dt
     tolerance = 1e-12 if dtype == torch.float64 else 1e-5
     close = dict(rtol=tolerance, atol=tolerance)
     torch.testing.assert_close(weights.grad.double(), a64.t() @ upstream, **close)
-    assert matrix.grad.layout is torch.sparse_csr
+    assert matrix.grad.layout is torch.strided
     torch.testing.assert_close(
-        matrix.grad.to_dense().double(),
-        torch.outer(upstream, x64) * (a64 != 0),
-        **close,
+        matrix.grad.double(), torch.outer(upstream, x64), **close
     )
 
 

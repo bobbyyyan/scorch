@@ -18,7 +18,7 @@ import torch.autograd.forward_ad as fwAD
 import scorch
 import scorch_ops
 from scorch import STensor
-from scorch.exceptions import ScorchNotImplementedError, TensorIndexError
+from scorch.exceptions import TensorIndexError
 from scorch import autograd as grad_mod
 from scorch import einsum_grad as einsum_grad_mod
 from scorch import plan as plan_mod
@@ -102,11 +102,10 @@ def check_against_torch(kind, dtype, side, dense_shape, sparse_grad):
     torch.testing.assert_close(out, ref, **tol)
     torch.testing.assert_close(w.grad, w_ref.grad, **tol)
     if sparse_grad:
-        assert a.grad.layout == a.layout
-        torch.testing.assert_close(a.grad.to_dense(), d_ref.grad * (d != 0), **tol)
-        if a.layout is torch.sparse_csr:
-            assert torch.equal(a.grad.crow_indices(), a.crow_indices())
-            assert torch.equal(a.grad.col_indices(), a.col_indices())
+        # torch's gradient for a torch sparse operand (Bobby, 2026-10-15: "match torch"):
+        # the one a dense operand gets, dense and strided, as torch.matmul gives it.
+        assert a.grad.layout is torch.strided and a.grad.shape == d.shape
+        torch.testing.assert_close(a.grad, d_ref.grad, **tol)
 
 
 @pytest.mark.parametrize("kind", sorted(OPERANDS))
@@ -139,22 +138,47 @@ def _csr_parts():
     return a.crow_indices(), a.col_indices(), a.values().clone()
 
 
+def _outcome(check, *args):
+    """``check(*args)``'s result, or the first line of the error it raises."""
+    try:
+        return check(*args)
+    except RuntimeError as error:
+        return "raises: " + str(error).splitlines()[0]
+
+
 def test_gradcheck_and_gradgradcheck():
+    """Through a CSR tensor built from values that require grad. The first derivative
+    checks, and so does the second with respect to the dense operand. The second with
+    respect to the values goes through torch's backward of the tensor's construction,
+    given the dense gradient torch.matmul gives the tensor (step 20); torch 2.13 has no
+    derivative of that backward for CSR and raises inside it for torch.matmul too
+    (is_coalesced on a SparseCsr). So that check is held to torch's own outcome; the
+    second derivative with respect to a CSR operand itself is checked against dense
+    autograd in test_the_c_entry_s_product_differentiates_twice and
+    test_a_recorded_products_gradient_takes_in_place_writes_and_differentiates_again."""
     crow, col, values = _csr_parts()
 
-    def left(v, w):
-        return scorch.matmul(torch.sparse_csr_tensor(crow, col, v, (6, 5)), w)
+    def product(matmul):
+        def left(v, w):
+            return matmul(torch.sparse_csr_tensor(crow, col, v, (6, 5)), w)
 
-    def right(v, x):
-        return scorch.matmul(x, torch.sparse_csr_tensor(crow, col, v, (6, 5)))
+        def right(v, x):
+            return matmul(x, torch.sparse_csr_tensor(crow, col, v, (6, 5)))
 
+        return left, right
+
+    left, right = product(scorch.matmul)
     v = values.requires_grad_()
     w = rand(5, 3).requires_grad_()
     x = rand(4, 6).requires_grad_()
     assert torch.autograd.gradcheck(left, (v, w))
     assert torch.autograd.gradcheck(right, (v, x))
-    assert torch.autograd.gradgradcheck(left, (v, w))
-    assert torch.autograd.gradgradcheck(right, (v, x))
+    assert torch.autograd.gradgradcheck(lambda w_: left(v.detach(), w_), (w,))
+    assert torch.autograd.gradgradcheck(lambda x_: right(v.detach(), x_), (x,))
+    torch_left, torch_right = product(torch.matmul)
+    for mine, theirs, dense in ((left, torch_left, w), (right, torch_right, x)):
+        got = _outcome(torch.autograd.gradgradcheck, mine, (v, dense))
+        assert got == _outcome(torch.autograd.gradgradcheck, theirs, (v, dense))
 
 
 def test_forward_mode_ad():
@@ -306,7 +330,7 @@ def test_the_c_entry_records_a_planned_product(dtype, wants):
     out.backward(g)
     ref_a = d.to_sparse_csr().requires_grad_(a.requires_grad)
     ref_w = w.detach().clone().requires_grad_(w.requires_grad)
-    ref = torch.sparse.mm(ref_a, ref_w)
+    ref = torch.matmul(ref_a, ref_w)
     torch.testing.assert_close(out.detach(), ref.detach(), **tolerance(dtype))
     ref.backward(g)
     if w.requires_grad:
@@ -314,12 +338,10 @@ def test_the_c_entry_records_a_planned_product(dtype, wants):
     else:
         assert w.grad is None
     if a.requires_grad:
-        assert a.grad.layout == torch.sparse_csr
-        assert torch.equal(a.grad.crow_indices(), ref_a.grad.crow_indices())
-        assert torch.equal(a.grad.col_indices(), ref_a.grad.col_indices())
-        torch.testing.assert_close(
-            a.grad.values(), ref_a.grad.values(), **tolerance(dtype)
-        )
+        # torch.matmul's gradient, by torch's own call (g @ w^T): dense, bit for bit.
+        assert a.grad.layout is torch.strided and ref_a.grad.layout is torch.strided
+        assert a.grad.stride() == ref_a.grad.stride()
+        assert torch.equal(a.grad, ref_a.grad)
     else:
         assert a.grad is None
 
@@ -333,8 +355,8 @@ def test_the_c_entry_s_product_differentiates_twice():
     assert C_NODE in scorch.matmul(a, w).grad_fn.name()
     assert torch.autograd.gradcheck(lambda w_: scorch.matmul(a, w_), (w,))
     assert torch.autograd.gradgradcheck(lambda w_: scorch.matmul(a, w_) ** 2, (w,))
-    # Across operands: d/dA of a gradient taken with respect to w, against dense autograd
-    # masked to A's pattern (A's gradient is masked; torch.sparse.mm's second one is not).
+    # Across operands: d/dA of a gradient taken with respect to w, against dense autograd.
+    # A's gradient is torch's at every order, so the second one is not masked either.
     a.requires_grad_()
     (gw,) = torch.autograd.grad(
         scorch.matmul(a, w).pow(2).sum(), (w,), create_graph=True
@@ -343,12 +365,14 @@ def test_the_c_entry_s_product_differentiates_twice():
     dense = a.detach().to_dense().requires_grad_()
     (ref_gw,) = torch.autograd.grad((dense @ w).pow(2).sum(), (w,), create_graph=True)
     (ref_second,) = torch.autograd.grad(ref_gw.sum(), (dense,))
-    torch.testing.assert_close(second.to_dense(), ref_second * (dense != 0))
+    assert second.layout is torch.strided
+    torch.testing.assert_close(second, ref_second)
 
 
 def test_the_c_entry_checks_saved_values_like_torch():
-    """A's values are saved for b's gradient, so writing them in place between the forward
-    and the backward is an error, as it is for torch.sparse.mm and the Python path."""
+    """A is saved for b's gradient, and its values() share its version counter, so writing
+    them in place between the forward and the backward is an error, as it is for
+    torch.matmul and the Python path."""
     a = _planned(dense_matrix().to_sparse_csr(), rand(5, 3))
     w = rand(5, 3).requires_grad_()
     out = scorch.matmul(a, w)
@@ -369,7 +393,7 @@ def test_an_error_in_the_c_entry_s_backward_arrives_as_itself(monkeypatch):
     a = _planned(dense_matrix().to_sparse_csr(), rand(5, 3))
     out = scorch.matmul(a, rand(5, 3).requires_grad_())
     assert C_NODE in out.grad_fn.name()
-    monkeypatch.setattr(grad_mod, "_mm_backward", fail)
+    monkeypatch.setattr(grad_mod, "_torch_mm_backward", fail)
     with pytest.raises(Marker, match="from the backward"):
         out.sum().backward()
 
@@ -474,8 +498,13 @@ def test_the_c_entry_records_x_times_a(dtype, rows, wants):
     else:
         assert x.grad is None
     if a.requires_grad:
-        assert a.grad.layout == torch.sparse_csr
-        torch.testing.assert_close(a.grad.to_dense(), d_ref.grad * (d != 0), **tol)
+        # torch.matmul's gradient for a sparse operand: x^T @ g, dense, bit for bit.
+        a_ref = d.to_sparse_csr().requires_grad_()
+        torch.matmul(x.detach(), a_ref).backward(g)
+        assert a.grad.layout is torch.strided
+        assert a.grad.stride() == a_ref.grad.stride()
+        assert torch.equal(a.grad, a_ref.grad)
+        torch.testing.assert_close(a.grad, d_ref.grad, **tol)
     else:
         assert a.grad is None
 
@@ -498,7 +527,7 @@ def test_the_c_entry_s_x_times_a_is_the_python_function_s_bit_for_bit(dtype, row
             plain = scorch.matmul(x, a)
         with torch.inference_mode():
             inference = scorch.matmul(x.detach(), a)
-        return [out.detach(), x.grad, a.grad.values(), plain, inference], _right_node(out)
+        return [out.detach(), x.grad, a.grad, plain, inference], _right_node(out)
 
     before = _served(a)
     served, node = run()
@@ -574,10 +603,10 @@ def test_x_times_a_is_not_served_from_an_operand_written_in_place(write):
 
 
 def test_the_c_entry_s_x_times_a_checks_saved_tensors_like_torch():
-    """x^T is saved for A's gradient and A's values for x's, so writing either in place
-    between the forward and the backward is an error, as on the Python path. (With A
-    requiring grad too, a write to its values fails the backward with a different message,
-    on every path; see test_a_values_write_fails_the_backward_on_every_path.)"""
+    """x^T is saved for A's gradient and A for x's, so writing x or A's values in place
+    between the forward and the backward is an error, as on the Python path and under
+    torch.matmul. (With A requiring grad too, see
+    test_a_values_write_fails_the_backward_on_every_path.)"""
     a = _planned_right(dense_matrix().to_sparse_csr(), 4).requires_grad_()
     x = rand(4, 7).requires_grad_()
     out = scorch.matmul(x, a)
@@ -599,10 +628,10 @@ def test_the_c_entry_s_x_times_a_checks_saved_tensors_like_torch():
 @pytest.mark.parametrize("side", ["A @ B", "x @ A"])
 def test_a_values_write_fails_the_backward_on_every_path(path, side):
     """A requiring grad, its values written in place between the forward and the backward:
-    the backward fails, on every path. torch.sparse.mm reports "modified by an inplace
-    operation"; scorch's paths save A.values(), a view of A, and torch fails regenerating
-    that view's history instead ("Sparse CSR tensors do not have strides"). The message
-    differs from torch's; what matters here is that no gradient is computed."""
+    the backward fails, on every path, as torch.matmul's does and with its message. Every
+    path saves A itself, whose values() share its version counter. (Until step 20 they
+    saved A.values(), a view of A, and torch failed regenerating that view's history
+    instead: "Sparse CSR tensors do not have strides".)"""
     d = dense_matrix()
     if side == "A @ B":
         a = _planned(d.to_sparse_csr(), rand(5, 3))
@@ -622,9 +651,9 @@ def test_a_values_write_fails_the_backward_on_every_path(path, side):
         assert ("PlannedMatmulGrad" in node) == (path == "c entry")
         with torch.no_grad():
             a.values().mul_(2.0)
-        with pytest.raises(RuntimeError):
+        with pytest.raises(RuntimeError, match="modified by an inplace operation"):
             out.sum().backward()
-        assert dense.grad is None
+        assert dense.grad is None and a.grad is None
     finally:
         scorch_ops.set_planned_matmul_backward(grad_mod.planned_mm_backward)
         _restore_right()
@@ -826,11 +855,7 @@ def test_the_structure_dies_with_its_torch_operand(layout, sparse_grad):
     a.requires_grad_(sparse_grad)
     w = rand(5, 3).requires_grad_()
     for _ in range(2):
-        # Reset before each backward pass: accumulating a second sparse CSR gradient
-        # needs a torch built with MKL, which the ARM host's is not.
-        a.grad = None
         scorch.matmul(a, w).sum().backward()
-        a.grad = None
         scorch.matmul(rand(4, 7).requires_grad_(), a).sum().backward()  # x @ A
     key = id(a)
     assert plan_mod.GRAD_ATTR in plan_mod.TORCH_OPERANDS[key][1]
@@ -897,12 +922,12 @@ def _write(write, *tensors):
 # Function's output itself; the C entry records the two contiguous matrix products of a
 # planned operand.
 RECORDED_PRODUCTS = {
-    "A @ b": ("left", "matrix", "python", "_SparseMMBackward"),
-    "A @ b.t()": ("left", "transposed", "python", "_SparseMMBackward"),
-    "A @ v": ("left", "vector", "python", "_SparseMMBackward"),
-    "x @ A": ("right", "matrix", "python", "_SparseXABackward"),
-    "x.t() @ A": ("right", "transposed", "python", "_SparseXABackward"),
-    "v @ A": ("right", "vector", "python", "_SparseMMTBackward"),
+    "A @ b": ("left", "matrix", "python", "_TorchSparseMMBackward"),
+    "A @ b.t()": ("left", "transposed", "python", "_TorchSparseMMBackward"),
+    "A @ v": ("left", "vector", "python", "_TorchSparseMMBackward"),
+    "x @ A": ("right", "matrix", "python", "_TorchSparseXABackward"),
+    "x.t() @ A": ("right", "transposed", "python", "_TorchSparseXABackward"),
+    "v @ A": ("right", "vector", "python", "_TorchSparseMMTBackward"),
     "A @ b, C entry": ("left", "matrix", "c entry", C_NODE),
     "x @ A, C entry": ("right", "matrix", "c entry", C_NODE_T),
 }
@@ -981,9 +1006,8 @@ def test_a_recorded_products_output_takes_in_place_writes(path, write, wants, dt
     else:
         assert raw.grad is None
     if a.requires_grad:
-        assert a.grad.layout == torch.sparse_csr
-        mask = a64.detach() != 0
-        torch.testing.assert_close(a.grad.to_dense().double(), a64.grad * mask, **tol)
+        assert a.grad.layout is torch.strided
+        torch.testing.assert_close(a.grad.double(), a64.grad, **tol)
     else:
         assert a.grad is None
 
@@ -994,9 +1018,10 @@ def test_a_recorded_products_gradient_takes_in_place_writes_and_differentiates_a
     path, dtype
 ):
     """With create_graph=True the backward records each gradient as a product too
-    (_SparseMMT for the dense operand's of A @ b, _SparseMM for that of x @ A), so the same
-    holds one order up: relu_ on the dense operand's gradient in grad mode, then that
-    gradient's derivative with respect to both operands, against dense float64 torch."""
+    (_TorchSparseMMT for the dense operand's of A @ b, _TorchSparseMM for that of x @ A),
+    so the same holds one order up: relu_ on the dense operand's gradient in grad mode,
+    then that gradient's derivative with respect to both operands, against dense float64
+    torch, A's unmasked as torch's is."""
     out, a, raw, ref, a64, raw64 = _recorded_product(path, dtype, "both")
     (gd,) = torch.autograd.grad(out.pow(2).sum(), (raw,), create_graph=True)
     (gd64,) = torch.autograd.grad(ref.pow(2).sum(), (raw64,), create_graph=True)
@@ -1009,8 +1034,8 @@ def test_a_recorded_products_gradient_takes_in_place_writes_and_differentiates_a
     tol = tolerance(dtype)
     torch.testing.assert_close(gd.detach().double(), gd64.detach(), **tol)
     torch.testing.assert_close(graw.double(), graw64, **tol)
-    mask = a64.detach() != 0
-    torch.testing.assert_close(ga.to_dense().double(), ga64 * mask, **tol)
+    assert ga.layout is torch.strided
+    torch.testing.assert_close(ga.double(), ga64, **tol)
 
 
 @pytest.mark.parametrize("dtype", [torch.float32, torch.float64])
@@ -1053,8 +1078,10 @@ def test_the_generated_kernels_product_has_the_einsums_derivative(dtype):
     """The generated kernel's product is differentiable.  use_cache=False asks for the
     generated kernel, which the SpMM Functions above do not cover; the product is the
     einsum ij,jk->ik and is recorded with that einsum's derivative (einsum_grad), for
-    both operands.  Before step 3 its backward raised matmul_derivative_unsupported.
-    (use_cache=True is the default, and since patch 0072 the call without it.)"""
+    both operands, the torch sparse one getting torch's gradient: dense, everywhere.
+    Before step 3 its backward raised matmul_derivative_unsupported; before step 20 A's
+    gradient was the stored-entries one.  (use_cache=True is the default, and since
+    patch 0072 the call without it.)"""
     d = dense_matrix(dtype=dtype)
     a = d.to_sparse_csr().requires_grad_()
     w = rand(5, 3, dtype=dtype).requires_grad_()
@@ -1067,10 +1094,8 @@ def test_the_generated_kernels_product_has_the_einsums_derivative(dtype):
     # The float64 reference, on the values rounded to the key's dtype.
     d64, w64, g64 = d.double(), w.detach().double(), upstream.double()
     torch.testing.assert_close(w.grad.double(), d64.t() @ g64, **tolerance(dtype))
-    assert a.grad.layout is torch.sparse_csr
-    torch.testing.assert_close(
-        a.grad.to_dense().double(), (g64 @ w64.t()) * (d64 != 0), **tolerance(dtype)
-    )
+    assert a.grad.layout is torch.strided
+    torch.testing.assert_close(a.grad.double(), g64 @ w64.t(), **tolerance(dtype))
 
 
 @pytest.mark.parametrize("dtype", [torch.float32, torch.float64])
@@ -1096,9 +1121,8 @@ def test_the_generated_kernels_product_takes_in_place_writes(write, dtype):
     tol = tolerance(dtype)
     torch.testing.assert_close(out.detach().double(), ref.detach(), **tol)
     torch.testing.assert_close(w.grad.double(), w64.grad, **tol)
-    assert a.grad.layout is torch.sparse_csr
-    mask = a64.detach() != 0
-    torch.testing.assert_close(a.grad.to_dense().double(), a64.grad * mask, **tol)
+    assert a.grad.layout is torch.strided
+    torch.testing.assert_close(a.grad.double(), a64.grad, **tol)
 
 
 # What each of autograd.py's Functions returns, seen at the Function itself: never a view
@@ -1114,6 +1138,9 @@ SPIED = (
     (grad_mod, "_SparseMM"),
     (grad_mod, "_SparseMMT"),
     (grad_mod, "_SparseXA"),
+    (grad_mod, "_TorchSparseMM"),
+    (grad_mod, "_TorchSparseMMT"),
+    (grad_mod, "_TorchSparseXA"),
     (grad_mod, "_SparseSDDMM"),
     (grad_mod, "_NotDifferentiable"),
     (einsum_grad_mod, "_EinsumValues"),
@@ -1186,14 +1213,17 @@ def test_no_function_returns_a_view_or_an_input(kind, dtype, side, layout, shape
         first = scorch.matmul(a, dense) if left else scorch.matmul(dense, a)
         # the same product again: the plan the first call installed serves it (the warm call)
         out = scorch.matmul(a, dense) if left else scorch.matmul(dense, a)
-        # a graph asked of the backward records the gradients as products too, and the
-        # values' gradient of a differentiable sparse operand as _SparseSDDMM
+        # a graph asked of the backward records the gradients as products too; a torch
+        # operand's own gradient is torch's G @ B^T (torch.mm, recorded by torch)
         grads = torch.autograd.grad(
             out.pow(2).sum(), (a, raw) if sparse_grad else (raw,), create_graph=True
         )
-    _owned(seen, ["_SparseMM" if left else "_SparseXA"])
+    # a torch sparse operand is the Function's input itself, an STensor's values otherwise
+    prefix = "_TorchSparse" if kind.startswith("torch") else "_Sparse"
+    _owned(seen, [prefix + ("MM" if left else "XA")])
     if sparse_grad:
-        assert "_SparseSDDMM" in {name for name, _, _ in seen}
+        # torch's gradient for a sparse operand: dense and strided, as a dense one's
+        assert grads[0].layout is torch.strided and grads[0].shape == a.shape
     # and what the caller receives is the Function's output itself, not a view of it
     assert first._base is None and out._base is None
 
@@ -1254,7 +1284,7 @@ def test_a_parameter_operand_s_product_is_not_a_view(side):
     w = torch.nn.Parameter(rand(*((5, 3) if left else (4, 7))) - 0.5)
     with _recorded_by("python"), _function_outputs() as seen:
         outs = [scorch.matmul(a, w) if left else scorch.matmul(w, a) for _ in range(2)]
-    _owned(seen, ["_SparseMM" if left else "_SparseXA"])
+    _owned(seen, ["_TorchSparseMM" if left else "_TorchSparseXA"])
     ref = d @ w.detach() if left else w.detach() @ d
     for out in outs:
         torch.testing.assert_close(out.detach(), ref)
@@ -1269,7 +1299,7 @@ def test_the_prebuilt_route_s_result_is_its_own_buffer(recorded, monkeypatch):
     one handle, two calls with the same operands give two buffers, and writing the first
     result in place changes neither the second nor a third call's.  An nn.Parameter dense
     operand is not a plain tensor, so no plan serves the product and every call takes that
-    route: in _SparseMM's forward (recorded) or in an ordinary call; the spy on the kernel's
+    route: in _TorchSparseMM's forward (recorded) or in an ordinary call; the spy on the kernel's
     call fails the test where a call does not."""
     from scorch import ops
 
@@ -1311,20 +1341,22 @@ def test_the_prebuilt_route_s_result_is_its_own_buffer(recorded, monkeypatch):
 
 def test_a_result_einsums_derivative_cannot_read_is_refused_by_name():
     """A product recorded as its einsum whose result the einsum's derivative cannot read
-    (a torch sparse tensor) carries matmul_derivative_unsupported, and the message names
-    the product, why it has no derivative, and which products have one
-    (autograd._MATMUL_DIFFERENTIABLE).  No product scorch.matmul computes here returns
-    such a result, so autograd.matmul is given an ``ordinary`` that does: the torch CSR
-    product a torch CSR times torch CSR call returns once torch CSR results are kept."""
+    (a torch sparse tensor other than the CSR and CSC products it reads) carries
+    matmul_derivative_unsupported, and the message names the product, why it has no
+    derivative, and which products have one (autograd._MATMUL_DIFFERENTIABLE).  No
+    product scorch.matmul computes here returns such a result, so autograd.matmul is
+    given an ``ordinary`` that does: the product as a torch COO tensor, which
+    einsum_grad._over_torch_result does not read (it reads the torch CSR and CSC
+    products scorch.matmul returns for two torch CSR operands)."""
     d = dense_matrix(5, 5)
     a = d.to_sparse_csr().requires_grad_()
     b = d.t().contiguous().to_sparse_csr()
 
     def ordinary(x, y):
-        return (x.detach().to_dense() @ y.to_dense()).to_sparse_csr()
+        return (x.detach().to_dense() @ y.to_dense()).to_sparse_coo()
 
     out = grad_mod.matmul(a, b, ordinary, {})
-    assert type(out) is torch.Tensor and out.layout is torch.sparse_csr
+    assert type(out) is torch.Tensor and out.layout is torch.sparse_coo
     torch.testing.assert_close(out.detach().to_dense(), d @ d.t())
     assert out.grad_fn is not None
     with pytest.raises(NotImplementedError) as refused:
@@ -1333,8 +1365,8 @@ def test_a_result_einsums_derivative_cannot_read_is_refused_by_name():
     what = "a 2-D torch.sparse_csr torch.float64 tensor"
     message = str(refused.value)
     assert message.startswith(
-        f"scorch.matmul has no derivative for {what} @ {what} (the call is not in the "
-        "form the derivative reads); differentiable products are "
+        f"scorch.matmul has no derivative for {what} @ {what} (its torch sparse result "
+        "is not one it reads); differentiable products are "
     ), message
     assert message.endswith("as the einsum it is (scorch.einsum's derivative)"), message
     assert "float32/float64 CPU" in message and "scorch's SpMM" in message, message
@@ -1363,22 +1395,44 @@ def test_the_uncovered_products_function_returns_no_input():
         torch.testing.assert_close(y.detach(), (d @ w.detach()).relu())
 
 
-def test_torch_csr_times_csr_returns_torch_csr_and_refuses_grad():
-    """Two torch CSR operands: the product is torch's sparse CSR, as torch's own is, and a
-    gradient asked through it is refused with the code every product without a derivative
-    has (autograd._not_differentiable), until series step 20 gives it torch's gradient.
-    The full grid is test_torch_csr_spgemm's
-    test_a_gradient_call_is_recorded_and_refuses_with_a_code."""
-    d = dense_matrix(5, 5)
-    a = d.to_sparse_csr().requires_grad_()
-    b = d.t().contiguous().to_sparse_csr()
+@pytest.mark.parametrize("dtype", [torch.float32, torch.float64])
+@pytest.mark.parametrize("wants", ["a", "b", "both"])
+def test_sparse_times_sparse_has_torch_s_gradient(dtype, wants):
+    """CSR x CSR: the torch sparse CSR result patch A returns, the same tensor in both
+    grad modes, whose values carry the einsum's derivative. That gives each torch CSR
+    operand torch's gradient -- not masked to the operand's stored entries, and in CSR,
+    as torch.matmul gives a CSR x CSR product's operands (MmBackward0 on sparse
+    operands). The result's own gradient is that of its stored values, so it is G on
+    the coordinates the operands' structures imply, as torch's to_dense gives a sparse
+    result's (masked_grad). The full grid is test_torch_csr_spgemm's
+    test_a_gradient_call_gives_torch_s_gradient."""
+    d = dense_matrix(5, 6, dtype=dtype)
+    e = dense_matrix(6, 4, dtype=dtype, seed=3)
+    a = d.to_sparse_csr().requires_grad_(wants in ("a", "both"))
+    b = e.to_sparse_csr().requires_grad_(wants in ("b", "both"))
     out = scorch.matmul(a, b)
     assert type(out) is torch.Tensor and out.layout is torch.sparse_csr
-    torch.testing.assert_close(out.detach().to_dense(), d @ d.t(), rtol=1e-12, atol=1e-12)
     assert out.grad_fn is not None
-    with pytest.raises(ScorchNotImplementedError) as refused:
-        out.to_dense().sum().backward()
-    assert refused.value.code == "matmul_derivative_unsupported"
+    with torch.no_grad():
+        plain = scorch.matmul(a, b)
+    for got, want in zip(
+        (out.crow_indices(), out.col_indices(), out.values()),
+        (plain.crow_indices(), plain.col_indices(), plain.values()),
+    ):
+        assert got.dtype == want.dtype and torch.equal(got, want)
+    g = rand(5, 4, dtype=dtype, seed=2)
+    (out.to_dense() * g).sum().backward()
+    d64, e64 = d.double(), e.double()
+    # The result's structure, from the operands' structures (not their values).
+    implied = ((d != 0).double() @ (e != 0).double()) != 0
+    g64 = g.double() * implied
+    tol = tolerance(dtype)
+    for operand, want in ((a, g64 @ e64.t()), (b, d64.t() @ g64)):
+        if not operand.requires_grad:
+            assert operand.grad is None
+            continue
+        assert operand.grad.layout is torch.sparse_csr
+        torch.testing.assert_close(operand.grad.to_dense().double(), want, **tol)
 
 
 # --------------------------------------------------------------------------- #

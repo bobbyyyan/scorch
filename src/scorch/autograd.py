@@ -10,18 +10,24 @@ For ``out = A @ B`` with ``A`` sparse (stored values ``v``), ``B`` dense and
 ``G = dL/d(out)``::
 
     dL/dB = A^T @ G              an SpMM against A's transpose
-    dL/dv = SDDMM(A; G, B)       G[i, :] . B[j, :] at each stored (i, j)
+    dL/dA = G @ B^T              dense, for a torch sparse A (torch's gradient)
+    dL/dv = SDDMM(A; G, B)       G[i, :] . B[j, :] at each stored (i, j), for an STensor
 
-Three Functions -- ``A @ B``, ``A^T @ B`` and the SDDMM -- are closed under
-differentiation: each one's backward is built from the three, so a second derivative
-(``create_graph=True``) is recorded the same way as the first, and each has a ``jvp`` for
-forward-mode AD.
+For an STensor, three Functions -- ``A @ B``, ``A^T @ B`` and the SDDMM -- are closed
+under differentiation: each one's backward is built from the three, so a second
+derivative (``create_graph=True``) is recorded the same way as the first, and each has a
+``jvp`` for forward-mode AD. For a torch sparse operand, three -- ``A @ B``, ``A^T @ B``
+and ``x @ A``, with the operand itself as the input -- are closed with torch.mm, which
+computes A's gradient.
 
 Which inputs carry gradients:
 
-- a torch sparse CSR or COO tensor that requires grad: its gradient arrives through
-  ``values()``, so ``A.grad`` is a sparse tensor with A's structure, as
-  ``torch.sparse.mm`` gives (``torch.matmul`` raises on such an input);
+- a torch sparse CSR or COO tensor that requires grad: ``A.grad`` is the gradient a dense
+  ``A`` would get, a dense strided tensor, as ``torch.matmul`` gives it (MmBackward0 for a
+  sparse self). ``torch.sparse.mm``, which scorch does not define, keeps torch's
+  stored-entries gradient. An operand built from values that require grad
+  (``torch.sparse_csr_tensor(crow, col, v)``) passes that gradient to ``v`` through the
+  constructor's own backward, which keeps the stored entries, as under torch;
 - an STensor whose ``requires_grad`` is set: its gradient arrives through the tensor
   autograd tracks for its values (``stensor_grad.AUTOGRAD_VALUES``: the same memory as
   the detached values every kernel reads), so ``A.grad`` is an STensor over A's index
@@ -36,12 +42,15 @@ keeps with the operand; the transpose's values are refilled from A's only when A
 changed, so a training loop over a fixed matrix does no per-step work for them, and the
 STensor gets plans of its own like any other operand.
 
-A product this module does not cover (a sparse x sparse product, a batched one, keyword
-arguments, an unsupported dtype or device) is computed without autograd and given a
-``grad_fn`` that raises when a gradient is actually asked of it -- on the result itself,
-or, for an STensor result, on the tensor autograd tracks for its values. That is torch's
-own convention for an operation with no derivative, and it keeps a forward pass that
-never calls ``backward`` -- inference with parameters that require grad, say -- working.
+A product of matrices and vectors the Functions here do not cover (a sparse x sparse
+product, keyword arguments, the generated kernel's product) is recorded with the
+derivative of the einsum it is (einsum_grad), which gives each operand the gradient the
+list above names, a torch sparse operand torch's. Any other product (a batched one, an
+unsupported dtype or device) is computed without autograd and given a ``grad_fn`` that
+raises when a gradient is actually asked of it -- on the result itself, or, for an STensor
+result, on the tensor autograd tracks for its values. That is torch's own convention for an
+operation with no derivative, and it keeps a forward pass that never calls ``backward`` --
+inference with parameters that require grad, say -- working.
 """
 
 from __future__ import annotations
@@ -745,52 +754,54 @@ def _mm_t_backward(
     return gv, gb
 
 
+def _planned_operand(a: Optional[torch.Tensor]) -> Optional[_Operand]:
+    """The _Operand over a planned product's saved operand, or None when none was saved."""
+    if a is None:
+        return None
+    held = _torch_operand(a)
+    if held is None:  # unreachable: the C entry serves only 2-D torch CSR operands
+        raise RuntimeError(
+            "scorch: a planned product's operand is no longer sparse CSR"
+        )
+    return held[0]
+
+
 def planned_mm_backward(
-    a: torch.Tensor,
-    values: Optional[torch.Tensor],
+    a: Optional[torch.Tensor],
     b: Optional[torch.Tensor],
     g: torch.Tensor,
-    want_values: bool,
+    want_a: bool,
     want_b: bool,
 ) -> Tuple[Optional[torch.Tensor], Optional[torch.Tensor]]:
     """The backward of ``a @ b`` for a torch CSR ``a`` whose product the C entry point
     served from its plan and recorded itself (csrc/planned_matmul.h, PlannedMatmulGrad).
 
-    The same gradients as :class:`_SparseMM`'s, by the same code: only the forward moved
-    to C, because that is where a step through a small matrix spent its cold time -- the
-    Python layers in front of the kernel, not the kernel. ``values`` is ``a.values()`` as
-    the forward saw it (version-checked by the node) and ``b`` the dense operand, each
+    The same gradients as :class:`_TorchSparseMM`'s, by the same code: only the forward
+    moved to C, because that is where a step through a small matrix spent its cold time --
+    the Python layers in front of the kernel, not the kernel. ``a`` is the operand and
+    ``b`` the dense operand as the forward saw them (version-checked by the node), each
     present only when the other's gradient is wanted, as :func:`_record` saves them.
     """
-    held = _torch_operand(a)
-    if held is None:  # unreachable: the C entry serves only 2-D torch CSR operands
-        raise RuntimeError(
-            "scorch: a planned product's operand is no longer sparse CSR"
-        )
-    return _mm_backward(held[0], values, b, g, want_values, want_b, False)
+    op = _planned_operand(a)
+    return _torch_mm_backward(op, a, b, g, want_a, want_b, False)
 
 
 def planned_mm_t_backward(
-    a: torch.Tensor,
-    values: Optional[torch.Tensor],
+    a: Optional[torch.Tensor],
     b: Optional[torch.Tensor],
     g: torch.Tensor,
-    want_values: bool,
+    want_a: bool,
     want_b: bool,
     b_transposed: bool,
 ) -> Tuple[Optional[torch.Tensor], Optional[torch.Tensor]]:
-    """The backward of ``x @ A`` for a torch CSR ``a`` whose product the C entry point served
-    and recorded itself (csrc/planned_matmul.h, PlannedMatmulGradT): :class:`_SparseMMT`'s
-    gradients by the same code. ``b`` is ``x^T``, and ``b_transposed`` whether it is laid out
-    as the transpose of a contiguous matrix, as ``_SparseMMT`` records it; ``g`` is the gradient
-    of ``A^T @ b``, which the node passes as the transpose of ``x @ A``'s, as
-    ``_SparseMMT.backward`` does."""
-    held = _torch_operand(a)
-    if held is None:  # unreachable: the C entry serves only 2-D torch CSR operands
-        raise RuntimeError(
-            "scorch: a planned product's operand is no longer sparse CSR"
-        )
-    return _mm_t_backward(held[0], values, b, g, want_values, want_b, b_transposed)
+    """The backward of ``x @ A`` for a torch CSR ``a`` whose product the C entry point
+    served and recorded itself (csrc/planned_matmul.h, PlannedMatmulGradT):
+    :class:`_TorchSparseXA`'s gradients by the same code. ``b`` is ``x^T``, and
+    ``b_transposed`` whether it is laid out as the transpose of a contiguous matrix, as
+    ``_TorchSparseXA`` records it; ``g`` is the gradient of ``A^T @ b``, which the node
+    passes as the transpose of ``x @ A``'s, as ``_TorchSparseXA.backward`` does."""
+    op = _planned_operand(a)
+    return _torch_mm_t_backward(op, a, b, g, want_a, want_b, b_transposed)
 
 
 class _SparseMMT(torch.autograd.Function):
@@ -887,6 +898,242 @@ class _SparseXA(torch.autograd.Function):
         total = _add(
             op.mm_t(dv, b) if dv is not None else None,
             op.mm_t(values, db) if db is not None else None,
+        )
+        assert total is not None  # forward AD asks for this only with some tangent
+        return _x_at_a(total, ctx.b_transposed)
+
+
+# --------------------------------------------------------------------------- #
+# A torch sparse operand: torch's gradient
+# --------------------------------------------------------------------------- #
+#
+# torch.matmul gives a sparse operand the gradient a dense one would get: for out = A @ B,
+# dL/dA = G @ B^T as a dense strided tensor, which MmBackward0 computes with torch.mm for a
+# sparse self (FunctionsManual.cpp, mm_mat1_backward's general branch; mm_mat2_backward's for
+# x @ A). scorch.matmul gives a torch sparse operand the same (Bobby, 2026-10-15: "match
+# torch"). So the three Functions below take the operand itself as their input, where
+# _SparseMM, _SparseMMT and _SparseXA take its values: a gradient through a.values() reaches
+# A only at its stored entries. Their products are those Functions' products on the same
+# _Operand, so the forward and the dense operand's gradient are unchanged; only A's gradient
+# differs. An STensor keeps the stored-entries gradient of its values, by its own contract.
+
+
+def _torch_mm_backward(
+    op: Optional[_Operand],
+    a: Optional[torch.Tensor],
+    b: Optional[torch.Tensor],
+    g: torch.Tensor,
+    want_a: bool,
+    want_b: bool,
+    b_transposed: bool,
+) -> Tuple[Optional[torch.Tensor], Optional[torch.Tensor]]:
+    """The gradients of ``A @ b`` for a torch sparse ``A``, given the output's gradient ``g``:
+    of ``A``, ``g @ b^T``, by the torch.mm call torch makes, so the same values bit for bit
+    in the same layout; of ``b``, ``A^T @ g``, as :func:`_mm_backward` computes it. Under grad
+    mode torch records its own call, and ``A^T @ g`` is recorded as :class:`_TorchSparseMMT`,
+    whose input is ``A`` again, so a second derivative also reaches ``A`` as torch's would.
+    ``op`` is read only for ``b``'s gradient. ``b`` and ``g`` are vectors for a matrix x
+    vector product, whose ``A`` gradient is then their outer product, as torch's is: the same
+    torch.mm of the two as one-column matrices."""
+    ga = gb = None
+    if want_a:
+        if b is None:  # saved whenever A's gradient is wanted (_record)
+            raise ScorchAssertionError(
+                "b is not None", code="autograd_saved_tensor_missing"
+            )
+        ga = torch.mm(
+            g if g.dim() == 2 else g.unsqueeze(1),
+            (b if b.dim() == 2 else b.unsqueeze(1)).t(),
+        )
+    if want_b:
+        if a is None or op is None:  # and A whenever b's is
+            raise ScorchAssertionError(
+                "a is not None", code="autograd_saved_tensor_missing"
+            )
+        if torch.is_grad_enabled():
+            gb = _TorchSparseMMT.apply(op, a, g)
+        else:
+            gb = _in_layout(op.mm_t(op.owner_values, g), b_transposed)
+    return ga, gb
+
+
+def _torch_mm_t_backward(
+    op: Optional[_Operand],
+    a: Optional[torch.Tensor],
+    b: Optional[torch.Tensor],
+    g: torch.Tensor,
+    want_a: bool,
+    want_b: bool,
+    b_transposed: bool,
+) -> Tuple[Optional[torch.Tensor], Optional[torch.Tensor]]:
+    """The gradients of ``A^T @ b`` for a torch sparse ``A``: of ``A``, ``b @ g^T``, and of
+    ``b``, ``A @ g``, as :func:`_torch_mm_backward` computes them. For ``x @ A``, computed as
+    ``(A^T @ x^T)^T`` (:class:`_TorchSparseXA`), ``b`` is ``x^T`` and ``g`` the transpose of
+    the output's gradient ``G``, so ``b @ g^T`` is torch's own ``x^T @ G``, bit for bit. For
+    ``v @ A``, ``b`` and ``g`` are vectors and ``A``'s gradient their outer product."""
+    ga = gb = None
+    if want_a:
+        if b is None:
+            raise ScorchAssertionError(
+                "b is not None", code="autograd_saved_tensor_missing"
+            )
+        ga = torch.mm(
+            b if b.dim() == 2 else b.unsqueeze(1),
+            (g if g.dim() == 2 else g.unsqueeze(1)).t(),
+        )
+    if want_b:
+        if a is None or op is None:
+            raise ScorchAssertionError(
+                "a is not None", code="autograd_saved_tensor_missing"
+            )
+        if torch.is_grad_enabled():
+            gb = _TorchSparseMM.apply(op, a, g)
+        else:
+            gb = _in_layout(op.mm(op.owner_values, g), b_transposed)
+    return ga, gb
+
+
+class _TorchSparseMM(torch.autograd.Function):
+    """``A @ b`` for a torch sparse ``A``, with ``A`` itself the input: :class:`_SparseMM`'s
+    product, for a dense matrix or vector ``b``, and torch's gradient for ``A`` (see above).
+    ``forward`` as for _SparseMM."""
+
+    @staticmethod
+    def forward(
+        ctx: Any,
+        op: _Operand,
+        a: torch.Tensor,
+        b: torch.Tensor,
+        *forward: Callable[[], torch.Tensor],
+    ) -> torch.Tensor:
+        _record(ctx, op, a, b)
+        if not forward:
+            # not a view: see the note above _x_at_a
+            return _in_layout(op.mm(op.owner_values, b), ctx.b_transposed)
+        return _scheduled_out(forward[0](), ctx.b_transposed)
+
+    @staticmethod
+    def backward(ctx: Any, g: torch.Tensor):
+        a, b = ctx.saved_tensors
+        need = ctx.needs_input_grad
+        return (
+            (None,)
+            + _torch_mm_backward(ctx.op, a, b, g, need[1], need[2], ctx.b_transposed)
+            + (None,) * (len(need) - 3)  # a forced forward's argument, if any
+        )
+
+    @staticmethod
+    def jvp(
+        ctx: Any,
+        _op: Any,
+        da: Optional[torch.Tensor],
+        db: Optional[torch.Tensor],
+        *_forward: Any,
+    ):
+        _, b = ctx.saved_tensors
+        op = ctx.op
+        # A's tangent is a sparse tensor of its own structure, not A's: scorch's product
+        # of it as given.
+        total = _add(
+            _matmul(da, _plain(b)) if da is not None else None,
+            op.mm(op.owner_values, db) if db is not None else None,
+        )
+        assert total is not None  # forward AD asks for this only with some tangent
+        return _in_layout(total, ctx.b_transposed)
+
+
+class _TorchSparseMMT(torch.autograd.Function):
+    """``A^T @ b`` for a torch sparse ``A``, with ``A`` itself the input: :class:`_SparseMMT`'s
+    product, for a dense matrix or vector ``b`` (``v @ A``, and ``A @ b``'s gradient of
+    ``b``), and torch's gradient for ``A``. ``forward`` as for _SparseMM."""
+
+    @staticmethod
+    def forward(
+        ctx: Any,
+        op: _Operand,
+        a: torch.Tensor,
+        b: torch.Tensor,
+        *forward: Callable[[], torch.Tensor],
+    ) -> torch.Tensor:
+        _record(ctx, op, a, b)
+        if not forward:
+            # not a view: see the note above _x_at_a
+            return _in_layout(op.mm_t(op.owner_values, b, right=True), ctx.b_transposed)
+        return _scheduled_out(forward[0](), ctx.b_transposed)
+
+    @staticmethod
+    def backward(ctx: Any, g: torch.Tensor):
+        a, b = ctx.saved_tensors
+        need = ctx.needs_input_grad
+        return (
+            (None,)
+            + _torch_mm_t_backward(ctx.op, a, b, g, need[1], need[2], ctx.b_transposed)
+            + (None,) * (len(need) - 3)  # a forced forward's argument, if any
+        )
+
+    @staticmethod
+    def jvp(
+        ctx: Any,
+        _op: Any,
+        da: Optional[torch.Tensor],
+        db: Optional[torch.Tensor],
+        *_forward: Any,
+    ):
+        _, b = ctx.saved_tensors
+        op = ctx.op
+        total = _add(
+            _matmul(da.t(), _plain(b)) if da is not None else None,
+            op.mm_t(op.owner_values, db) if db is not None else None,
+        )
+        assert total is not None  # forward AD asks for this only with some tangent
+        return _in_layout(total, ctx.b_transposed)
+
+
+class _TorchSparseXA(torch.autograd.Function):
+    """``x @ A`` for a torch sparse ``A`` and a dense matrix ``x``, given ``b = x^T``, with
+    ``A`` itself the input: :class:`_SparseXA`'s product, returned as ``x @ A`` itself
+    (``_x_at_a``), and torch's gradient for ``A``. ``forward`` as for _SparseXA: the
+    caller's ``x @ A``."""
+
+    @staticmethod
+    def forward(
+        ctx: Any,
+        op: _Operand,
+        a: torch.Tensor,
+        b: torch.Tensor,
+        *forward: Callable[[], torch.Tensor],
+    ) -> torch.Tensor:
+        _record(ctx, op, a, b)
+        if not forward:
+            return _x_at_a(op.mm_t(op.owner_values, b, right=True), ctx.b_transposed)
+        return _scheduled_out(forward[0](), ctx.b_transposed, x_at_a=True)
+
+    @staticmethod
+    def backward(ctx: Any, g: torch.Tensor):
+        a, b = ctx.saved_tensors
+        need = ctx.needs_input_grad
+        # x @ A's gradient is that of A^T @ x^T, transposed
+        return (
+            (None,)
+            + _torch_mm_t_backward(
+                ctx.op, a, b, g.t(), need[1], need[2], ctx.b_transposed
+            )
+            + (None,) * (len(need) - 3)  # a forced forward's argument, if any
+        )
+
+    @staticmethod
+    def jvp(
+        ctx: Any,
+        _op: Any,
+        da: Optional[torch.Tensor],
+        db: Optional[torch.Tensor],
+        *_forward: Any,
+    ):
+        _, b = ctx.saved_tensors
+        op = ctx.op
+        total = _add(
+            _matmul(da.t(), _plain(b)) if da is not None else None,
+            op.mm_t(op.owner_values, db) if db is not None else None,
         )
         assert total is not None  # forward AD asks for this only with some tangent
         return _x_at_a(total, ctx.b_transposed)
@@ -1235,14 +1482,23 @@ def _differentiable(
         and _SCHEDULE_FORCE.get() is not None
     ):
         forced = (_scheduled_product(a, b, ordinary),)
+    owner = op.owner
+    if type(owner) is not STensor:
+        # A torch sparse operand is the input itself, so its gradient is torch's. (For an
+        # uncoalesced COO operand, op.owner is its differentiable coalesce, through which
+        # the gradient reaches the caller's tensor, as torch's own product coalesces it.)
+        if left:
+            return _TorchSparseMM.apply(op, owner, dense, *forced)
+        if dense.dim() == 1:
+            return _TorchSparseMMT.apply(op, owner, dense, *forced)
+        return _TorchSparseXA.apply(op, owner, dense.t(), *forced)
     # An STensor's values enter as the tensor autograd tracks for them, when it has one:
     # the same memory as the detached values the operand reads (_Operand._owns holds), so
     # the product is the one computed without autograd, and the gradient of the values
     # reaches the STensor's leaf through whatever recorded them (stensor_grad). The
     # metadata flag is set exactly when it has one, so an STensor whose values autograd
-    # does not track, and every torch operand, is passed by with no call.
-    owner = op.owner
-    if type(owner) is STensor and owner._metadata.requires_grad:
+    # does not track is passed by with no call.
+    if owner._metadata.requires_grad:
         values = owner.__dict__.get(AUTOGRAD_VALUES, values)
     if left:
         return _SparseMM.apply(op, values, dense, *forced)

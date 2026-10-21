@@ -870,43 +870,54 @@ inline bool planned_matmul_wants_grad(const at::Tensor& t) {
 // dense operand (the Python path lays the product out like a transposed one), no forward-mode
 // tangent on either operand (a C++ Function has no forward derivative), no functorch transform.
 // Every other product, and every operand without a plan yet, goes to the Python function.
+//
+// The operand itself is the Function's input, as for autograd._TorchSparseMM, so its gradient is
+// torch's: the dense G @ B^T torch.matmul gives a sparse operand, not the stored-entries gradient
+// one through its values() would be.
+//
+// The product, computed by the plan before the Function records it, reaches the forward in a
+// struct, not as a tensor argument: torch makes a tensor argument that a Function returns into a
+// view of that argument (see the note above autograd.py's _x_at_a), so it would have to be
+// detached on every call.
 struct PlannedMatmulProduct {
-  at::Tensor a;    // the operand: the backward finds the structure its gradients run on
-  at::Tensor out;  // the product, computed by the plan before the Function records it
+  at::Tensor out;
 };
 
 struct PlannedMatmulGrad : public torch::autograd::Function<PlannedMatmulGrad> {
-  static at::Tensor forward(torch::autograd::AutogradContext* ctx, const at::Tensor& values,
+  static at::Tensor forward(torch::autograd::AutogradContext* ctx, const at::Tensor& a,
                             const at::Tensor& b, PlannedMatmulProduct product) {
-    ctx->saved_data["a"] = std::move(product.a);
+    at::Tensor out = std::move(product.out);
     // Only what a requested gradient reads, as autograd._record saves it: b's gradient reads the
-    // values, the values' gradient reads b, and b can be a large activation.
-    ctx->save_for_backward({b.requires_grad() ? values : at::Tensor(),
-                            values.requires_grad() ? b : at::Tensor()});
+    // operand, the operand's reads b, and b can be a large activation. The operand is saved as
+    // itself: torch's values() of it shares its version counter, so a write through any alias of
+    // the values between this forward and its backward is caught there, as torch.matmul catches
+    // it (the values member's counter is its own, and saving it let the backward read new values
+    // silently).
+    ctx->save_for_backward({b.requires_grad() ? a : at::Tensor(),
+                            a.requires_grad() ? b : at::Tensor()});
     // Never a view: see the note above autograd.py's _x_at_a. The kernel allocates the product as
     // the [rows, k] matrix it is (csrc/spmm.h), so `out` is a tensor of its own; it is detached
     // only if it ever arrives as a view.
-    at::Tensor out = std::move(product.out);
     return out.is_view() ? out.detach() : out;
   }
 
   static torch::autograd::variable_list backward(torch::autograd::AutogradContext* ctx,
                                                  torch::autograd::variable_list grads) {
-    const bool want_values = ctx->needs_input_grad(0), want_b = ctx->needs_input_grad(1);
-    torch::autograd::variable_list out(3);  // values, b, and the product (not a tensor)
-    if (!grads[0].defined() || !(want_values || want_b)) return out;
+    const bool want_a = ctx->needs_input_grad(0), want_b = ctx->needs_input_grad(1);
+    torch::autograd::variable_list out(3);  // a, b, and the product (not a tensor)
+    if (!grads[0].defined() || !(want_a || want_b)) return out;
     torch::autograd::variable_list saved = ctx->get_saved_variables();  // checks versions
     pybind11::gil_scoped_acquire gil;
     PyObject* fn = planned_matmul_state().mm_backward;
     TORCH_CHECK(fn != nullptr, "scorch: the planned product's backward is no longer installed");
-    THPObjectPtr a(THPVariable_Wrap(ctx->saved_data["a"].toTensor()));
-    THPObjectPtr values(THPVariable_Wrap(saved[0]));
+    // An undefined saved tensor (one no requested gradient reads) wraps as None.
+    THPObjectPtr a(THPVariable_Wrap(saved[0]));
     THPObjectPtr b(THPVariable_Wrap(saved[1]));
     THPObjectPtr g(THPVariable_Wrap(grads[0]));
     THPObjectPtr result;
-    if (a && values && b && g)
-      result = PyObject_CallFunctionObjArgs(fn, a.get(), values.get(), b.get(), g.get(),
-                                            want_values ? Py_True : Py_False,
+    if (a && b && g)
+      result = PyObject_CallFunctionObjArgs(fn, a.get(), b.get(), g.get(),
+                                            want_a ? Py_True : Py_False,
                                             want_b ? Py_True : Py_False, nullptr);
     if (!result) {
       // Raised again, as itself, by the Python call that ran the backward.
@@ -915,7 +926,7 @@ struct PlannedMatmulGrad : public torch::autograd::Function<PlannedMatmulGrad> {
       throw std::move(err);
     }
     TORCH_CHECK(PyTuple_Check(result.get()) && PyTuple_GET_SIZE(result.get()) == 2,
-                "scorch: planned_mm_backward must return (values' gradient, b's gradient)");
+                "scorch: planned_mm_backward must return (a's gradient, b's gradient)");
     for (Py_ssize_t i = 0; i < 2; ++i) {
       PyObject* item = PyTuple_GET_ITEM(result.get(), i);
       if (item == Py_None) continue;
@@ -952,53 +963,46 @@ inline PyObject* planned_matmul_torch_grad(const PlannedMatmul& s, PyObject* a, 
                            planned_matmul_nthreads(s), s.atparallel);
   }
   if (!served.has_value()) return nullptr;
-  // torch's values(), not the member the plan read: it is a view of `a` that shares `a`'s version
-  // counter, so a write through any alias of the values between this forward and its backward is
-  // caught there, as torch.sparse.mm and the Python path catch it (the member's counter is its
-  // own, and saving it let the backward read the new values silently); and when `a` requires grad
-  // the values' gradient reaches `a` by torch's own values() backward.
-  at::Tensor values = at_a.values();
   return THPVariable_Wrap(
-      PlannedMatmulGrad::apply(values, bt, PlannedMatmulProduct{at_a, std::move(*served)}));
+      PlannedMatmulGrad::apply(at_a, bt, PlannedMatmulProduct{std::move(*served)}));
 }
 
-// x @ A's recorded product, as autograd._SparseXA records it: A(values)^T @ b with b = x^T,
-// returned as x @ A, its transpose, which the caller receives as it is. Its backward is
-// autograd.planned_mm_t_backward on the gradient's transpose (the gradient of A^T @ b), the same
-// gradients by the same code as _SparseXA's.
+// x @ A's recorded product, as autograd._TorchSparseXA records it: A^T @ b with b = x^T, returned
+// as x @ A, its transpose, which the caller receives as it is, with the operand itself as the
+// input (see PlannedMatmulGrad). Its backward is autograd.planned_mm_t_backward on the gradient's
+// transpose (the gradient of A^T @ b), the same gradients by the same code as _TorchSparseXA's.
 struct PlannedMatmulGradT : public torch::autograd::Function<PlannedMatmulGradT> {
-  static at::Tensor forward(torch::autograd::AutogradContext* ctx, const at::Tensor& values,
-                            const at::Tensor& b, PlannedMatmulProduct product, bool b_transposed) {
-    ctx->saved_data["a"] = std::move(product.a);
+  static at::Tensor forward(torch::autograd::AutogradContext* ctx, const at::Tensor& a,
+                            const at::Tensor& b, PlannedMatmulProduct product,
+                            bool b_transposed) {
+    at::Tensor out = std::move(product.out);
     ctx->saved_data["b_transposed"] = b_transposed;
-    // As autograd._record saves them: b's gradient reads the values, the values' gradient reads b.
-    ctx->save_for_backward({b.requires_grad() ? values : at::Tensor(),
-                            values.requires_grad() ? b : at::Tensor()});
+    // As PlannedMatmulGrad saves them: b's gradient reads the operand, the operand's reads b.
+    ctx->save_for_backward({b.requires_grad() ? a : at::Tensor(),
+                            a.requires_grad() ? b : at::Tensor()});
     // Never a view: see the note above autograd.py's _x_at_a. planned_matmul_torch_right makes x @ A
     // a tensor of its own (planned_matmul_x_at_a); this detaches it only where it could not.
-    at::Tensor out = std::move(product.out);
     return out.is_view() ? out.detach() : out;
   }
 
   static torch::autograd::variable_list backward(torch::autograd::AutogradContext* ctx,
                                                  torch::autograd::variable_list grads) {
-    const bool want_values = ctx->needs_input_grad(0), want_b = ctx->needs_input_grad(1);
-    torch::autograd::variable_list out(4);  // values, b, the product and the layout flag
-    if (!grads[0].defined() || !(want_values || want_b)) return out;
+    const bool want_a = ctx->needs_input_grad(0), want_b = ctx->needs_input_grad(1);
+    torch::autograd::variable_list out(4);  // a, b, the product and the layout flag
+    if (!grads[0].defined() || !(want_a || want_b)) return out;
     torch::autograd::variable_list saved = ctx->get_saved_variables();  // checks versions
     pybind11::gil_scoped_acquire gil;
     PyObject* fn = planned_matmul_state().mm_t_backward;
     TORCH_CHECK(fn != nullptr, "scorch: x @ A's planned backward is no longer installed");
-    THPObjectPtr a(THPVariable_Wrap(ctx->saved_data["a"].toTensor()));
-    THPObjectPtr values(THPVariable_Wrap(saved[0]));
+    THPObjectPtr a(THPVariable_Wrap(saved[0]));
     THPObjectPtr b(THPVariable_Wrap(saved[1]));
-    // the gradient of x @ A, transposed: that of A^T @ b, as _SparseXA.backward passes it
+    // the gradient of x @ A, transposed: that of A^T @ b, as _TorchSparseXA.backward passes it
     THPObjectPtr g(THPVariable_Wrap(grads[0].t()));
     const bool b_transposed = ctx->saved_data["b_transposed"].toBool();
     THPObjectPtr result;
-    if (a && values && b && g)
-      result = PyObject_CallFunctionObjArgs(fn, a.get(), values.get(), b.get(), g.get(),
-                                            want_values ? Py_True : Py_False,
+    if (a && b && g)
+      result = PyObject_CallFunctionObjArgs(fn, a.get(), b.get(), g.get(),
+                                            want_a ? Py_True : Py_False,
                                             want_b ? Py_True : Py_False,
                                             b_transposed ? Py_True : Py_False, nullptr);
     if (!result) {
@@ -1007,7 +1011,7 @@ struct PlannedMatmulGradT : public torch::autograd::Function<PlannedMatmulGradT>
       throw std::move(err);
     }
     TORCH_CHECK(PyTuple_Check(result.get()) && PyTuple_GET_SIZE(result.get()) == 2,
-                "scorch: planned_mm_t_backward must return (values' gradient, b's gradient)");
+                "scorch: planned_mm_t_backward must return (a's gradient, b's gradient)");
     for (Py_ssize_t i = 0; i < 2; ++i) {
       PyObject* item = PyTuple_GET_ITEM(result.get(), i);
       if (item == Py_None) continue;
@@ -1047,7 +1051,7 @@ inline at::Tensor planned_matmul_x_at_a(const PlannedMatmul& s, at::Tensor produ
 
 // x @ A for a dense `x` and a torch CSR `a` whose transposed product holds a TransposedProductPlan
 // (see above), computed as autograd.py computes it and, when `grad`, recorded as it records it:
-// _SparseXA.apply(op, values, x.t()), or right_product's unrecorded (A^T @ x^T)^T, each x @ A
+// _TorchSparseXA.apply(op, a, x.t()), or right_product's unrecorded (A^T @ x^T)^T, each x @ A
 // itself and not a view (planned_matmul_x_at_a). The result
 // as a new reference, or nullptr with no error set when the Python function is to compute it.
 //
@@ -1107,10 +1111,8 @@ inline PyObject* planned_matmul_torch_right(const PlannedMatmul& s, PyObject* x,
     out = planned_matmul_x_at_a(s, std::move(*served), b_transposed);
   }
   if (!grad) return THPVariable_Wrap(std::move(out));
-  // torch's values(), sharing `a`'s version counter, as PlannedMatmulGrad saves it.
-  at::Tensor values = at_a.values();
-  return THPVariable_Wrap(PlannedMatmulGradT::apply(
-      values, b, PlannedMatmulProduct{at_a, std::move(out)}, b_transposed));
+  return THPVariable_Wrap(
+      PlannedMatmulGradT::apply(at_a, b, PlannedMatmulProduct{std::move(out)}, b_transposed));
 }
 
 inline PyObject* planned_matmul_call(PyObject* /*module*/, PyObject* const* args,

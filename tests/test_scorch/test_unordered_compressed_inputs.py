@@ -349,7 +349,9 @@ def test_well_formed_csr_still_shares_the_callers_arrays():
 @pytest.mark.parametrize("dtype", [torch.float32, torch.float64])
 def test_gradients_through_an_out_of_order_csr_equal_torch(dtype):
     """Rows out of order but distinct: the gradient reaches each of the caller's stored
-    values, in the caller's order, as torch.sparse.mm gives it."""
+    values, in the caller's order, as torch.sparse.mm gives it. scorch.matmul gives the
+    operand torch.matmul's dense gradient, and the operand's construction samples it at
+    the stored coordinates, so the values get torch.sparse.mm's gradient."""
     a_ref = unordered_csr(36, 28, 6, dtype, seed=21, repeats=False)
     b_ref = torch.rand(28, 5, generator=torch.Generator().manual_seed(7), dtype=dtype)
     g = torch.rand(36, 5, generator=torch.Generator().manual_seed(8), dtype=dtype)
@@ -373,30 +375,34 @@ def test_gradients_through_an_out_of_order_csr_equal_torch(dtype):
     assert torch.allclose(gv_s.double(), gv_t.double(), atol=ATOL, rtol=RTOL)
 
 
-def test_a_repeated_column_gives_torchs_own_error_for_a_values_gradient():
-    """torch cannot carry a gradient into the values of a CSR tensor with a repeated
-    column: its own backward through the tensor's construction returns one value per
-    distinct coordinate and then rejects it (torch 2.13, also for torch.sparse.mm and for
-    ``a.values()`` alone). So no product over such an operand can give that gradient;
-    scorch's fails in the same place, in torch's part of the graph."""
+def test_a_repeated_column_gives_torchs_own_values_gradient():
+    """A CSR tensor with a repeated column, built from values that require grad: the
+    values' gradient comes from torch's backward through the tensor's construction, given
+    the operand's gradient. scorch.matmul gives the operand torch.matmul's (dense), so
+    whatever torch's construction backward makes of it -- a values gradient, or its own
+    error -- is the same for both, value for value or message for message. (torch 2.13's
+    backward rejects the gradient torch.sparse.mm gives such an operand, one value per
+    distinct coordinate: SparseCompressedTensorBackward0.)"""
     a_ref = unordered_csr(12, 10, 4, torch.float64, seed=23)
     b = torch.rand(10, 3, dtype=torch.float64)
-    a = torch.sparse_csr_tensor(
-        a_ref.crow_indices(),
-        a_ref.col_indices(),
-        a_ref.values().clone().requires_grad_(True),
-        size=a_ref.shape,
-    )
-    with pytest.raises(RuntimeError, match="SparseCompressedTensorBackward0"):
-        torch.sparse.mm(a, b).sum().backward()
-    a = torch.sparse_csr_tensor(
-        a_ref.crow_indices(),
-        a_ref.col_indices(),
-        a_ref.values().clone().requires_grad_(True),
-        size=a_ref.shape,
-    )
-    with pytest.raises(RuntimeError, match="SparseCompressedTensorBackward0"):
-        scorch.matmul(a, b).sum().backward()
+
+    def run(matmul):
+        values = a_ref.values().clone().requires_grad_(True)
+        a = torch.sparse_csr_tensor(
+            a_ref.crow_indices(), a_ref.col_indices(), values, size=a_ref.shape
+        )
+        try:
+            matmul(a, b).sum().backward()
+        except RuntimeError as error:
+            return "raises", str(error).splitlines()[0]
+        return "gradient", values.grad
+
+    got, want = run(scorch.matmul), run(torch.matmul)
+    assert got[0] == want[0]
+    if got[0] == "raises":
+        assert got[1] == want[1]
+    else:
+        torch.testing.assert_close(got[1], want[1], rtol=1e-12, atol=1e-12)
 
 
 @pytest.mark.parametrize("dtype", [torch.float32, torch.float64])
