@@ -17,6 +17,7 @@ from scorch.compiler.cin import (
 )
 from scorch.compiler.diagnostics import UnsupportedFeature
 from scorch.compiler.scheduler import Scheduler
+from scorch.exceptions import defect_code
 
 from tests.test_scorch.test_helpers import (
     lower_and_print,
@@ -412,6 +413,13 @@ def test_spmm_dd_ds_dd_tiled():
 def test_spmm_dd_oo_dd_ikj_gustavson_workspace():
     """
     Sparse matrix-matrix multiplication with COO input format and Gustavson workspace pattern
+
+    The sparse workspace is drained into a result that is dense in both modes.  The
+    shipped compiler's drains assemble a compressed or coordinate level, and the
+    kernel it used to print for this statement did not build ('pC1' was not
+    declared), so it refuses it with a code.  Lowering it (a scatter into the dense
+    row) is a known gap: test_known_compiler_gaps.py's
+    test_known_gap_gustavson_workspace_into_a_dense_result.
     """
     i = IndexVar("i")
     j = IndexVar("j")
@@ -454,7 +462,9 @@ def test_spmm_dd_oo_dd_ikj_gustavson_workspace():
     print("\nCIN statement:")
     print(cin_stmt)
 
-    lower_and_print(cin_stmt)
+    with pytest.raises(UnsupportedFeature) as refusal:
+        lower_and_print(cin_stmt)
+    assert defect_code(refusal.value) == "unsupported_workspace_result_level"
 
 
 def test_spmm_dd_ds_ds():
@@ -495,6 +505,12 @@ def test_spmm_sd_ds_ds():
     """
     Sparse matrix-matrix multiplication with mixed formats
     taco "A(i, j) = B(i, k) * C(k, j)" -f=A:sd -f=B:ds -f=C:ds -print-evaluate
+
+    This test only lowers the program.  The kernel it lowers to appends a row of A
+    once per iteration of the reduction loop over k, so A's compressed row level
+    holds repeated rows and the result's validation rejects it: a known gap,
+    test_known_compiler_gaps.py's
+    test_known_gap_sd_result_with_a_reduction_below_its_compressed_level.
     """
     i = IndexVar("i")
     j = IndexVar("j")

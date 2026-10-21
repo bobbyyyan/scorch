@@ -1,8 +1,20 @@
+import pytest
 import torch
 
 from scorch import STensor
-from scorch.compiler.cin import ForAll, IndexVar, Operation, TensorAssign, TensorVar
+from scorch.compiler.cin import (
+    ForAll,
+    IndexVar,
+    Operation,
+    TensorAssign,
+    TensorVar,
+    Where,
+    Workspace,
+)
 from scorch.compiler.cin_analysis import canonical_cin_dump
+from scorch.compiler.compile_options import CompileOptions
+from scorch.compiler.diagnostics import UnsupportedFeature
+from scorch.exceptions import TensorIndexError, defect_code
 from scorch.ops import lower_and_exec_cin
 
 
@@ -133,3 +145,115 @@ def test_known_gap_broadcast_lhs_vector():
 
     expected = a_torch.reshape(n, 1) * b_torch.sum(dim=0).reshape(1, n)
     assert torch.allclose(result.to_torch(), expected, atol=1e-4, rtol=1e-4)
+
+
+@pytest.mark.xfail(
+    raises=UnsupportedFeature,
+    strict=True,
+    reason="a sparse workspace drained into a result dense in every mode is refused "
+    "(unsupported_workspace_result_level): the drains assemble a compressed or "
+    "coordinate level, and a dense row needs a scatter",
+)
+def test_known_gap_gustavson_workspace_into_a_dense_result():
+    """A[i, j] = sum_k B[i, k] * C[k, j] with B COO, C and A dense, through a Gustavson
+    workspace over j (codegen/test_matmul_operations.py's
+    test_spmm_dd_oo_dd_ikj_gustavson_workspace asserts the refusal's code).  When the
+    drain into a dense result lands, this passes and strict=True fails it: remove the
+    mark then."""
+    torch.manual_seed(3)
+    n = 16
+    b_torch = torch.rand(n, n) * (torch.rand(n, n) > 0.8)
+    c_torch = torch.rand(n, n)
+
+    b = STensor.from_torch(b_torch, "B").to_sparse("oo")
+    c = STensor.from_torch(c_torch, "C").to_dense()
+
+    i = IndexVar("i")
+    j = IndexVar("j")
+    k = IndexVar("k")
+    A = TensorVar("A", fmt="dd")
+    B = TensorVar("B", fmt="oo")
+    C = TensorVar("C", fmt="dd")
+    workspace = Workspace(name="wksp", dim=1, dtype=A.dtype)
+    cin_stmt = ForAll(
+        i,
+        Where(
+            producer=ForAll(
+                k,
+                ForAll(
+                    j,
+                    TensorAssign(workspace[j], B[i, k] * C[k, j], op=Operation.ADD),
+                ),
+            ),
+            consumer=ForAll(j, TensorAssign(A[i, j], workspace[j])),
+        ),
+    )
+    try:
+        result = lower_and_exec_cin(cin_stmt, (n, n), b, c)
+    except UnsupportedFeature as refusal:
+        # Only this refusal is the gap; any other code fails the test (an
+        # AssertionError is not the xfail's UnsupportedFeature).
+        assert defect_code(refusal) == "unsupported_workspace_result_level", refusal
+        raise
+
+    expected = torch.matmul(b_torch, c_torch)
+    assert torch.allclose(result.to_torch(), expected, atol=1e-4, rtol=1e-4)
+
+
+@pytest.mark.xfail(
+    raises=TensorIndexError,
+    strict=True,
+    reason="a result stored sd with a reduction loop between its compressed row level "
+    "and its dense leaf appends the row once per iteration of that loop; the "
+    "result's validation rejects it (compressed_coordinates_unordered)",
+)
+@pytest.mark.parametrize("arm", [0, 1])
+def test_known_gap_sd_result_with_a_reduction_below_its_compressed_level(
+    monkeypatch, arm
+):
+    """A = B C with A stored sd (compressed rows, dense columns), B and C stored ds,
+    the loop order i, k, j and a plain assignment (codegen/test_matmul_operations.py's
+    test_spmm_sd_ds_ds, which only lowers it), executed in both automatic arms.  The
+    kernel appends row i of A inside the loop over k, once per nonzero B[i, k], so the
+    row level holds repeated coordinates.  The lowering refuses a reduction loop
+    around the append only when the result's last level is compressed or coordinate
+    (unscheduled_sparse_result_reduction); here the last level is dense.  The shipped
+    compiler the series starts from fails the same way.  When the lowering computes
+    this program, or refuses it with a code, this test fails under strict=True:
+    update it then.  Compared with a float64 reference to a relative 1e-12; every
+    operand entry is nonnegative, so no sum cancels."""
+    n, inner, m = 7, 6, 5
+    generator = torch.Generator().manual_seed(16)
+    b = torch.rand(n, inner, generator=generator, dtype=torch.float64)
+    b[b < 0.5] = 0.0
+    b[1] = 0.0
+    c = torch.rand(inner, m, generator=generator, dtype=torch.float64)
+    c[c < 0.4] = 0.0
+
+    i, j, k = IndexVar("i"), IndexVar("j"), IndexVar("k")
+    A = TensorVar("A", fmt=["sparse", "dense"], shape=(n, m), dtype=torch.float64)
+    B = TensorVar("B", fmt=["dense", "sparse"], shape=(n, inner), dtype=torch.float64)
+    C = TensorVar("C", fmt=["dense", "sparse"], shape=(inner, m), dtype=torch.float64)
+    A[i, j] = B[i, k] * C[k, j]
+    cin_stmt = ForAll(i, ForAll(k, ForAll(j, A._assignment)))
+
+    monkeypatch.setenv("SCORCH_REGBLOCK", str(arm))
+    assert CompileOptions.from_environment().scheduler.regblock_enabled == bool(arm)
+    try:
+        result = lower_and_exec_cin(
+            cin_stmt,
+            (n, m),
+            STensor.from_torch(b).to_sparse("ds"),
+            STensor.from_torch(c).to_sparse("ds"),
+        )
+    except TensorIndexError as error:
+        # Only this rejection is the gap; any other code fails the test (an
+        # AssertionError is not the xfail's TensorIndexError).
+        assert defect_code(error) == "compressed_coordinates_unordered", error
+        raise
+
+    got = result.to_torch()
+    got = got if got.layout == torch.strided else got.to_dense()
+    assert got.shape == (n, m)
+    assert torch.isfinite(got).all(), got
+    assert torch.allclose(got, b @ c, rtol=1e-12, atol=0.0), (got, b @ c)

@@ -3665,8 +3665,16 @@ class CINLowerer:
         The drain under :meth:`_lower_mixed_key_drain` handles a sparse
         workspace keyed on unsplit index variables that are, in order, the
         result's trailing levels, below at least one result level bound by an
-        enclosing loop, when at least one of those trailing levels is dense.
-        None for every other drain, which keeps its existing lowering.
+        enclosing loop, when at least one of those trailing levels is dense and
+        the result has a compressed level.  None for every other drain, which
+        keeps its existing lowering.
+
+        The drain stores a dense leaf into the value vector a sparse result
+        grows (``dense_block_leaf_store``).  A result whose levels are all
+        dense has no such vector: its values are one array of its full size,
+        handed to the kernel.  The drain admitted it and emitted vector calls
+        on that array, C++ that did not build; it now refuses it, as a dense
+        result level, with ``unsupported_workspace_result_level``.
         """
 
         key = list(wksp_access.get_index_vars())
@@ -3683,6 +3691,8 @@ class CINLowerer:
             level_type not in (LevelType.DENSE, LevelType.COMPRESSED)
             for level_type in level_types
         ):
+            return None
+        if LevelType.COMPRESSED not in level_types:
             return None
         if all(
             level_type == LevelType.COMPRESSED for level_type in level_types[first:]
