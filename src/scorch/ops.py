@@ -51,7 +51,6 @@ from .compiler.compile_options import (
     CompileOptions,
     environment_reuse_key,
     note_environment_parsed,
-    parsed_options_key,
 )
 from .compiler.codegen import LLIRLowerer
 from .compiler.diagnostics import (
@@ -303,15 +302,23 @@ class _DeferredOptions:
             self._take_options()
             return
         if kwargs.get("_compile_options") is None:
-            self._environment_key = environment_reuse_key()
-            if (
-                self._environment_key is not None
-                and kwargs.get("_compilation_context") is None
-            ):
-                requested = _requested_schedule(kwargs)
-                schedule = requested if requested is not None else get_forced_schedule()
-                schedule_key = _schedule_cache_key(schedule)
-                known = parsed_options_key(self._environment_key, schedule_key)
+            key = environment_reuse_key()
+            self._environment_key = key
+            if key is not None and kwargs.get("_compilation_context") is None:
+                # The steps above with a schedule named first: ``_requested_schedule``
+                # checks one named by either keyword, and answers None when neither is
+                # given.  Then, as above, the context's forced schedule and the parse
+                # memo are read in place of their accessors.
+                requested = (
+                    _requested_schedule(kwargs)
+                    if "schedule" in kwargs or "_schedule" in kwargs
+                    else None
+                )
+                schedule = requested if requested is not None else _SCHEDULE_FORCE.get()
+                schedule_key = schedule.cache_key if schedule is not None else None
+                known = _compile_options_module._parsed_options_keys.get(
+                    (key, schedule_key)
+                )
                 if known is not None:
                     self.requested_schedule = schedule
                     self.schedule_key = schedule_key
@@ -774,26 +781,31 @@ def _logical_index_sizes(
     input_index_strs: Sequence[Sequence[str]],
     tensors: Sequence[Any],
 ) -> dict:
-    """Map logical einsum indices to sizes after physical mode reordering."""
-    index_to_size = {}
+    """Map logical einsum indices to sizes after physical mode reordering.
+
+    Each operand's mode order and shape are read once (every einsum that reaches a
+    kernel asks this), and an index's size is stored the first time it is seen.
+    """
+    index_to_size: Dict[str, int] = {}
     for operand, (index_strs, tensor) in enumerate(zip(input_index_strs, tensors)):
-        mode_order = list(tensor.mode_order)
+        mode_order = tuple(tensor.mode_order)
         if len(index_strs) != len(mode_order):
             raise CompileSpecError(
                 f"einsum operand {operand} has {len(index_strs)} indices but "
                 f"tensor rank {len(mode_order)}",
                 code="einsum_operand_rank_mismatch",
             )
+        shape = tensor.shape
         for logical_axis, index_str in enumerate(index_strs):
-            physical_axis = mode_order.index(logical_axis)
-            size = tensor.shape[physical_axis]
+            size = shape[mode_order.index(logical_axis)]
             previous = index_to_size.get(index_str)
-            if previous is not None and previous != size:
+            if previous is None:
+                index_to_size[index_str] = size
+            elif previous != size:
                 raise IndexExtentMismatchError(
                     f"einsum index {index_str!r} has incompatible dimensions "
                     f"{previous} and {size}"
                 )
-            index_to_size[index_str] = size
     return index_to_size
 
 
@@ -2077,20 +2089,25 @@ def _entry_keywords(
     keyword holding its default is dropped (``_KEYWORD_DEFAULTS``).  ``output_format=``
     is ``format=`` by another name: it is read as ``format``, and the two given together
     must name the same format.  Called only with keywords: a call with none pays nothing.
+    One pass reads every name, and the first one refused raises before anything is
+    dropped.
     """
 
-    for name in kwargs:
+    defaults = None
+    for name, value in kwargs.items():
         if name not in accepted:
             raise KeywordArgumentError(
                 f"{entry}() got an unexpected keyword argument '{name}'",
                 code="unknown_keyword_argument",
             )
-    for name in [
-        name
-        for name, value in kwargs.items()
-        if value is _KEYWORD_DEFAULTS.get(name, _NO_DEFAULT)
-    ]:
-        del kwargs[name]
+        if value is _KEYWORD_DEFAULTS.get(name, _NO_DEFAULT):
+            if defaults is None:
+                defaults = [name]
+            else:
+                defaults.append(name)
+    if defaults is not None:
+        for name in defaults:
+            del kwargs[name]
     if "output_format" in kwargs:
         alias = kwargs.pop("output_format")
         kwargs["format"] = _format_alias(entry, kwargs.get("format"), alias)
@@ -2143,6 +2160,10 @@ def _is_sparse_matrix(x: Any) -> bool:
 
 
 def _is_dense_operand(x: Any) -> bool:
+    if type(x) is STensor:
+        # ``x.format``, read from the metadata where that property reads it: every
+        # einsum asks this of its first operand.
+        return x._metadata.layout.format.is_dense()
     if isinstance(x, STensor):
         return x.format.is_dense()
     return isinstance(x, torch.Tensor) and x.layout is torch.strided
@@ -4349,21 +4370,24 @@ def _validated_einsum_request(
             f"einsum expression expects {len(input_groups)} operands, got {len(tensors)}",
             code="einsum_operand_count_mismatch",
         )
-    if any(tensor is None for tensor in tensors):
-        raise TensorTypeError(
-            "einsum operands cannot be None", code="einsum_operand_type_invalid"
-        )
-    invalid = [
-        type(tensor).__name__
-        for tensor in tensors
-        if not isinstance(tensor, (STensor, TensorSpec))
-    ]
-    if invalid:
-        raise TensorTypeError(
-            "einsum operands must be torch.Tensor, STensor, or TensorSpec; got "
-            + ", ".join(invalid),
-            code="einsum_operand_type_invalid",
-        )
+    for tensor in tensors:
+        if not isinstance(tensor, (STensor, TensorSpec)):
+            # Built once an operand fails: None first, then every operand's type.
+            if any(operand is None for operand in tensors):
+                raise TensorTypeError(
+                    "einsum operands cannot be None",
+                    code="einsum_operand_type_invalid",
+                )
+            invalid = [
+                type(operand).__name__
+                for operand in tensors
+                if not isinstance(operand, (STensor, TensorSpec))
+            ]
+            raise TensorTypeError(
+                "einsum operands must be torch.Tensor, STensor, or TensorSpec; got "
+                + ", ".join(invalid),
+                code="einsum_operand_type_invalid",
+            )
     input_index_strs, result_index_strs = _validated_labels(
         expression, input_groups, result_expression
     )
@@ -4371,10 +4395,8 @@ def _validated_einsum_request(
         kwargs.get("format"), len(result_index_strs), "einsum"
     )
     if requested_output_format is not None:
-        if any(
-            level_type == LevelType.SINGLETON
-            for level_type in requested_output_format.get_level_types()
-        ):
+        # ``level_types`` is the format's own tuple; ``in`` compares as ``==`` does.
+        if LevelType.SINGLETON in requested_output_format.level_types:
             raise CompileSpecError(
                 "singleton output levels are not supported by the compiler",
                 code="singleton_level_unsupported",
@@ -5268,9 +5290,13 @@ def _requests_sparse_result(kwargs: Dict[str, Any]) -> bool:
 
 
 def _dense_einsum(
-    expression: Any, tensors: Tuple[Any, ...], kwargs: Dict[str, Any]
+    expression: Any,
+    tensors: Tuple[Any, ...],
+    kwargs: Dict[str, Any],
+    operands: Tuple[Any, ...],
 ) -> Union[torch.Tensor, STensor]:
     """An einsum whose operands and result are all dense, computed by ``torch.einsum``.
+    ``operands`` are the call's operands as ``einsum`` read them (``_einsum_operands``).
 
     Under ``import scorch as torch`` a dense model's every ``torch.einsum`` arrives here,
     so this is torch's own call: torch records its gradient and it compiles nothing.
@@ -5298,10 +5324,7 @@ def _dense_einsum(
     stensor_result = (
         "format" in kwargs
         or "output_mode_order" in kwargs
-        or any(
-            type(operand) is STensor
-            for operand in _einsum_operands(expression, tensors)
-        )
+        or any(type(operand) is STensor for operand in operands)
     )
     if not kwargs:
         result = torch.einsum(*arguments)
@@ -5311,7 +5334,7 @@ def _dense_einsum(
     with torch.no_grad():
         stensors = tuple(
             STensor.from_torch(item) if isinstance(item, torch.Tensor) else item
-            for item in _einsum_operands(expression, tensors)
+            for item in operands
         )
     (
         _input_groups,
@@ -5382,7 +5405,9 @@ def einsum(
     # call's options (``_deferred_options``, from ``matmul``) or fused
     # post-operations (``_post_ops``, ``_post_ops_tensors``), keep the compiler path,
     # ``_einsum_compiler_path``.  This is the one decision between the two routes:
-    # neither hands a call to the other.
+    # neither hands a call to the other.  The operands read here are handed on, so a
+    # call reads them once.
+    operands: Optional[Tuple[Any, ...]] = None
     if (
         not compile_only
         and "_deferred_options" not in kwargs
@@ -5390,16 +5415,19 @@ def einsum(
         and "_post_ops_tensors" not in kwargs
     ):
         operands = _einsum_operands(expression, tensors)
+        dense = bool(operands)
+        for operand in operands:
+            if not _is_dense_operand(operand):
+                dense = False
+                break
         if (
-            operands
-            and all(_is_dense_operand(operand) for operand in operands)
+            dense
             and not _requests_sparse_result(kwargs)
             and not _requests_schedule(kwargs)
         ):
-            return _dense_einsum(expression, tensors, kwargs)
-    return _einsum_compiler_path(
-        expression, *tensors, compile_only=compile_only, **kwargs
-    )
+            return _dense_einsum(expression, tensors, kwargs, operands)
+    # ``kwargs`` is this call's own dict, so the compiler path takes it as it is.
+    return _einsum_compiled(expression, tensors, compile_only, kwargs, operands)
 
 
 def _einsum_via_compiler(
@@ -5444,27 +5472,47 @@ def _einsum_compiler_path(
     operands.
     """
 
+    return _einsum_compiled(expression, tensors, compile_only, kwargs, None)
+
+
+def _einsum_compiled(
+    expression: Any,
+    tensors: Tuple[Any, ...],
+    compile_only: Optional[bool],
+    kwargs: Dict[str, Any],
+    operands: Optional[Tuple[Any, ...]],
+) -> Union[torch.Tensor, STensor, TensorSpec]:
+    """``_einsum_compiler_path`` with its arguments as they are held: ``kwargs`` a dict
+    the call owns, which this changes, and ``operands`` the call's operands
+    (``_einsum_operands``) when the caller has read them, else ``None``.  ``einsum``
+    calls it directly, with the operands it chose the route by."""
+
     if not compile_only and "_deferred_options" not in kwargs:
         # autograd.wanted_by_any written out, grad mode and the operands' flags first and
         # forward-mode AD after, so a call through which no gradient is wanted makes no
-        # call into autograd.py. The operands are _einsum_operands', read in place.
+        # call into autograd.py. The operands are the ones einsum handed on, else
+        # _einsum_operands', read in place.
         grad_wanted = False
         if torch.is_grad_enabled():
-            if isinstance(expression, str):
-                operands = tensors
-                if len(tensors) == 1 and isinstance(tensors[0], (list, tuple)):
-                    operands = tensors[0]
-            else:
-                arguments = (expression,) + tensors
-                operands = arguments[0 : 2 * (len(arguments) // 2) : 2]
-            for operand in operands:
+            checked: Optional[Sequence[Any]] = operands
+            if checked is None:
+                if isinstance(expression, str):
+                    checked = tensors
+                    if len(tensors) == 1 and isinstance(tensors[0], (list, tuple)):
+                        checked = tensors[0]
+                else:
+                    arguments = (expression,) + tensors
+                    checked = arguments[0 : 2 * (len(arguments) // 2) : 2]
+            for operand in checked:
                 if (isinstance(operand, torch.Tensor) and operand.requires_grad) or (
                     type(operand) is STensor and operand._metadata.requires_grad
                 ):
                     grad_wanted = True
                     break
         if not grad_wanted and _fwad._current_level >= 0:
-            grad_wanted = _autograd.wanted_by_any(_einsum_operands(expression, tensors))
+            grad_wanted = _autograd.wanted_by_any(
+                _einsum_operands(expression, tensors) if operands is None else operands
+            )
         if grad_wanted:
             return _einsum_recorded(expression, tensors, kwargs)
     # ``_deferred_options``: the options holder of a call this one runs inside
