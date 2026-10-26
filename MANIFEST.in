@@ -1,2 +1,3 @@
 include scorch_build.py
+include scorch_build_backend.py
 include src/scorch/csrc/native_abi.h

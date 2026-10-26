@@ -5,7 +5,10 @@ requires = [
     "torch",
     "wheel",
 ]
-build-backend = "setuptools.build_meta"
+# scorch_build_backend.py is setuptools.build_meta, imported from the root, which also
+# lets the backend import the build_ext cmdclass below (scorch_build.py, at the root).
+build-backend = "scorch_build_backend"
+backend-path = ["."]
 
 [project]
 name = "scorch"
