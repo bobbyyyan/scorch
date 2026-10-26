@@ -1355,9 +1355,6 @@ _SPARSE_CSC = torch.sparse_csc
 # end_time = time.time()
 # compile_time = end_time - start_time
 # print(f"Pybind load time: {compile_time:.5f} seconds")
-#
-# load_to_kernel_cache("spmm_csr", _kernel_cache, "spmm-csr.cpp")
-# load_to_kernel_cache("spmm_csr_ones", _kernel_cache, "spmm-csr-ones.cpp")
 
 
 def spmv(

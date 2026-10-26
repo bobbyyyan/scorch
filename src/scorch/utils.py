@@ -8,7 +8,6 @@ import shutil
 import subprocess
 import sys
 import tempfile
-import time
 from collections import defaultdict, deque
 from dataclasses import dataclass, replace
 from importlib import resources
@@ -45,13 +44,24 @@ _NATIVE_RESOURCES = resources.files("scorch").joinpath("csrc")
 
 
 def native_resource_text(filename: str) -> str:
-    """Read a packaged native source or header as UTF-8 text."""
+    """Read a packaged native source or header as UTF-8 text.
+
+    A name the package does not ship raises ``ScorchOSError`` with code
+    ``native_resource_missing``: still an ``OSError``, and a refusal with a code
+    rather than the bare ``FileNotFoundError`` of the resource reader.
+    """
     if filename in {"", ".", ".."} or "/" in filename or "\\" in filename:
         raise ScorchValueError(
             "filename must name a file directly under scorch/csrc",
             code="internal_argument_type_invalid",
         )
-    return _NATIVE_RESOURCES.joinpath(filename).read_text(encoding="utf-8")
+    try:
+        return _NATIVE_RESOURCES.joinpath(filename).read_text(encoding="utf-8")
+    except FileNotFoundError as error:
+        raise ScorchOSError(
+            f"scorch/csrc/{filename} is not in the installed package",
+            code="native_resource_missing",
+        ) from error
 
 
 def _policy_header_text() -> str:
@@ -944,65 +954,6 @@ def get_extra_ldflags(
     """
     options = _resolve_compile_options(compile_options)
     return list(options.build.extra_ldflags)
-
-
-def load_to_kernel_cache(
-    kernel_name: str,
-    kernel_cache: Dict,
-    kernel_code_filename: Optional[str],
-    *,
-    compile_options: Optional["CompileOptions"] = None,
-) -> None:
-    """Load a kernel to the kernel cache.
-
-    Args:
-        kernel_name (str): Name of the kernel.
-        kernel_cache (Dict): Kernel cache.
-        kernel_code_filename (str): Filename of the kernel code.
-    """
-
-    if kernel_code_filename is None:
-        kernel_code_filename = f"{kernel_name}.cpp"
-
-    options = _resolve_compile_options(compile_options)
-    header_cpp_code = options.build.preamble_source
-    cpp_code = native_resource_text(kernel_code_filename)
-    build_name = kernel_name
-
-    # Load special kernels. Their historical no-signed-zeros policy is distinct
-    # from generated kernels and therefore has its own frozen flag tuple.
-    start_time = time.time()
-    from torch.utils.cpp_extension import _get_build_directory
-
-    build_root = _get_build_directory(build_name, verbose=False)
-    build_digest = _build_identity_digest(
-        (header_cpp_code, cpp_code),
-        ("evaluate",),
-        options.build.special_kernel_cflags,
-        options.build.extra_ldflags,
-        options.build,
-    )
-    request = _validate_jit_build_request(
-        _JITBuildRequest(
-            name=build_name,
-            cpp_sources=(header_cpp_code, cpp_code),
-            functions=("evaluate",),
-            extra_cflags=options.build.special_kernel_cflags,
-            extra_ldflags=options.build.extra_ldflags,
-            build_directory=os.path.join(build_root, f"scorch_{build_digest}"),
-            build_options=options.build,
-        )
-    )
-    cache_key = (build_name, _request_cache_key(request))
-    if cache_key in _so_cache:
-        module = _so_cache[cache_key]
-    else:
-        module = _build_and_load_extension(request)
-        _so_cache[cache_key] = module
-    end_time = time.time()
-    print(f"Loading {kernel_name} took {end_time - start_time} s")
-
-    kernel_cache[kernel_name] = module
 
 
 def _letters_in_order_of_first_appearance(substrings):
