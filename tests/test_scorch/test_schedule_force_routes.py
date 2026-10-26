@@ -853,3 +853,90 @@ def test_a_forced_forward_has_the_unforced_strides_and_copies_only_out_of_order(
     in_order = all(s == w for n, s, w in pairs if n > 1)
     shared = got.untyped_storage().data_ptr() == product.untyped_storage().data_ptr()
     assert shared == in_order, ("shared" if shared else "copied", product.stride())
+
+
+# matmul(format="dd") under a forced schedule.  Two routes:
+# - a product whose plain result is a dense matrix: format="dd" names that result, so
+#   _matmul_keyword_call takes it out and makes the plain call, which reads the forced
+#   schedule from the context (get_forced_schedule).  The keyword call must run the forced
+#   schedule's kernel and return exactly what the forced call without the keyword returns.
+# - a product whose plain result is sparse (two CSR STensors): format="dd" stays in the
+#   call, and the schedule comes through _matmul_compile_policy.  The forced plain call
+#   refuses (S writes dense results only), so the keyword call is compared with the einsum
+#   matmul sends the product to, forced the same way.
+
+
+@pytest.fixture
+def einsum_schedules(monkeypatch):
+    """The schedule each einsum that reaches a kernel is keyed on, cache hits included, with
+    the schedule key it was handed (or the unread marker)."""
+    seen = []
+    real = ops._einsum_cache_key
+
+    def spy(expression, tensors, output_format, output_mode_order, schedule, *args, **kwargs):
+        seen.append((schedule, kwargs.get("schedule_key", ops._SCHEDULE_KEY_UNREAD)))
+        return real(expression, tensors, output_format, output_mode_order, schedule, *args, **kwargs)
+
+    monkeypatch.setattr(ops, "_einsum_cache_key", spy)
+    return seen
+
+
+_DENSE_RESULT_PRODUCTS = {
+    "stensor@dense": (lambda: (stensor(), rhs(N, K)), lambda: dense_a() @ rhs(N, K).numpy()),
+    "torch_csr@dense": (lambda: (torch_csr(), rhs(N, K)), lambda: dense_a() @ rhs(N, K).numpy()),
+    "dense@stensor": (lambda: (rhs(K, N), stensor()), lambda: rhs(K, N).numpy() @ dense_a()),
+}
+
+
+@pytest.mark.parametrize("name", _DENSE_RESULT_PRODUCTS)
+def test_format_dd_under_a_forced_schedule_takes_the_schedule(generated, einsum_schedules, name):
+    operands, reference = _DENSE_RESULT_PRODUCTS[name]
+    a, b = operands()
+    sparse = b if name.startswith("dense@") else a
+    ops.matmul(a, b), ops.matmul(a, b)  # unforced: installs the operand's plan where it has one
+    before = served(sparse)
+    del generated[:], einsum_schedules[:]
+    with scorch.schedule_force(S):
+        plain = ops.matmul(a, b)
+        plain_keys = len(einsum_schedules)
+        keyword = ops.matmul(a, b, format="dd")
+    # Each call went to the generated kernel with S forced, and every einsum it ran was
+    # keyed on S; no plan served either call.
+    assert generated == [S, S]
+    assert plain_keys >= 1 and len(einsum_schedules) > plain_keys
+    assert all(schedule == S for schedule, _ in einsum_schedules), einsum_schedules
+    unread = ops._SCHEDULE_KEY_UNREAD
+    assert all(key is unread or key == ops._schedule_cache_key(S) for _, key in einsum_schedules)
+    assert served(sparse) == before
+    # The same result as the forced plain call, bit for bit, and the right one.
+    assert isinstance(keyword, torch.Tensor) and keyword.layout == torch.strided
+    assert (keyword.shape, keyword.dtype, keyword.stride()) == (plain.shape, plain.dtype, plain.stride())
+    assert torch.equal(keyword, plain)
+    close(keyword, reference())
+
+
+def _as_torch(x):
+    x = x.to_torch() if isinstance(x, STensor) else x
+    assert x.layout == torch.strided
+    return x.detach()
+
+
+def test_format_dd_on_a_sparse_product_under_a_forced_schedule_takes_the_schedule(
+    generated, einsum_schedules
+):
+    a, b = stensor(), stensor(4)
+    with scorch.schedule_force(S):
+        keyword = ops.matmul(a, b, format="dd")
+        keyword_keys = len(einsum_schedules)
+        direct = scorch.einsum("ij,jk->ik", a, b, format="dd")
+    # The keyword call went to the generated kernel with S forced, and every einsum it ran
+    # (and the direct one) was keyed on S.
+    assert generated == [S]
+    assert keyword_keys >= 1 and len(einsum_schedules) > keyword_keys
+    assert all(schedule == S for schedule, _ in einsum_schedules), einsum_schedules
+    unread = ops._SCHEDULE_KEY_UNREAD
+    assert all(key is unread or key == ops._schedule_cache_key(S) for _, key in einsum_schedules)
+    got, want = _as_torch(keyword), _as_torch(direct)
+    assert (got.shape, got.dtype) == (want.shape, want.dtype)
+    assert torch.equal(got, want)
+    close(got, dense_a() @ dense_a(4))

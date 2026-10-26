@@ -449,7 +449,16 @@ def _native_operand(fmt: str, dense: torch.Tensor, index: torch.dtype) -> STenso
     if fmt == "d,s":
         return _csr_stensor(dense, index)
     if fmt == "o,o":
-        return STensor.from_torch(dense).to_sparse("oo")
+        # Built with the index dtype asked for.  This helper used to return
+        # to_sparse("oo") whatever ``index`` said, so one COO width was never tested.
+        coo = dense.to_sparse_coo().coalesce()
+        rows, cols = coo.indices()
+        built = STensor.from_components(
+            tuple(dense.shape), "oo", [[rows.to(index)], [cols.to(index)]], coo.values(),
+            index_dtype=index,
+        )
+        assert all(level[0].dtype == index for level in built._native_mode_indices())
+        return built
     return STensor.from_torch(dense)
 
 
@@ -469,8 +478,6 @@ def _result_mistakes(rank: int) -> Dict[str, Tuple[int, int, List[int]]]:
 )
 def test_every_prebuilt_kernel_codes_every_extent_mismatch(symbol, dtype, lhs, rhs, index):
     """Called directly, so the arguments can carry a result shape matmul never builds."""
-    if lhs == "o,o" and index == "idx64":
-        pytest.skip("the COO operands here are built one way; the idx32 case runs them")
     fn = getattr(scorch_ops, symbol)
     rank = 1 if rhs == "d" else 2
     for name, (a_cols, b_rows, result_shape) in _result_mistakes(rank).items():
