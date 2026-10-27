@@ -301,7 +301,8 @@ def test_matrix_vector_refuses_with_its_code(call):
 # cuts k, A's compressed level, into sparse panels, as test_schedule_api's tile-j-panel
 # cuts A's compressed level in SpMM; a panel tile needs the level's dense parent row loop
 # as Schedule.parallel_loop, here the reduction index j, and SVP names none
-# (panel_parallel_loop_invalid; sapling 85441).
+# (panel_parallel_parent, the LoopPlan route's code for the same rule; it was
+# panel_parallel_loop_invalid when sapling 85441 ran).
 SVO = scorch.Schedule(loop_order=("j", "k"), tag="order-j-k")
 SVP = scorch.Schedule(
     loop_order=("j", "k"),
@@ -394,7 +395,7 @@ def test_a_forced_recorded_product_is_a_tensor_of_its_own(
     [
         (S, "schedule_loop_order_incomplete"),
         (SV, "reduction_tiling_accumulator_unsupported"),
-        (SVP, "panel_parallel_loop_invalid"),
+        (SVP, "panel_parallel_parent"),
     ],
     ids=["S", "SV", "SVP"],
 )

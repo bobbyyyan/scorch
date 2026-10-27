@@ -39,7 +39,7 @@ from .cin import (
     _is_exact_index_stmt,
     _is_index_stmt_instance,
 )
-from .diagnostics import VerificationError
+from .diagnostics import UnsupportedFeature, VerificationError
 from .identity import AccessId, IndexId, NodeId, SymbolId
 from .compile_options import CompileOptions
 from .compilation_context import CompilerStageId, CompilationContext
@@ -3188,6 +3188,87 @@ def _initialize_cin_clone(clone: object, node_id: NodeId) -> None:
     object.__setattr__(clone, "no_tile_list", [])
 
 
+CALLER_TILED_CIN_UNSUPPORTED = "caller_tiled_cin_unsupported"
+
+
+def _refuse_caller_tiled_cin(cin: IndexStmt) -> None:
+    """Refuse a statement that carries a tile its caller made (``Scheduler.add_tile``,
+    or a hand-built ``TileSizeVar``).
+
+    Normalized CIN carries no schedule.  The clone in :func:`_normalize_cin_owned`
+    keeps an index's sum (``i = i_out + i_in``) but clears every tile size and split
+    role, so a tiled statement would lower as two plain loops over the whole extent
+    that never bind ``i``: C++ that does not compile, or computes nothing.  A tile is
+    requested as ``Schedule(tiles=(TileSpec(...),))`` instead; the scheduler tiles
+    the normalized statement and the lowering replays the tile from the verified
+    plan.
+
+    Only tiling gives an index a sum, so every index variable with one is refused,
+    each with its own diagnostic, before any lowering.  The fields the clone clears
+    (split roles, tile sizes, parent and workspace backlinks) are not read:
+    whatever they hold cannot change what normalization admits.  Runs after the
+    structural preflight, which bounds the walk and fixes every field's type.
+    """
+
+    diagnostics: List[CINDiagnostic] = []
+    reason = (
+        "is the sum of the two loops of a tile its caller made, and normalization "
+        "keeps the sum but not the tile; request the tile as "
+        "Schedule(tiles=(TileSpec(...),)) through einsum, matmul or "
+        "Scheduler.apply_schedule"
+    )
+    pending: List[Tuple[object, Tuple[str, ...]]] = [(cin, ("root",))]
+    seen: set[int] = set()
+    position = 0
+    while position < len(pending):
+        node, path = pending[position]
+        position += 1
+        if id(node) in seen:
+            continue
+        seen.add(id(node))
+        if isinstance(node, IndexVar):
+            if isinstance(node._expr, IndexVarAdd):
+                diagnostics.append(
+                    CINDiagnostic(
+                        code=CALLER_TILED_CIN_UNSUPPORTED,
+                        message=f"index {node.name!r} {reason}",
+                        path=path,
+                        entity_id=node.index_id,
+                        pass_name="normalize_cin",
+                    )
+                )
+                pending.append((node._expr.lhs, path + ("_expr", "lhs")))
+                pending.append((node._expr.rhs, path + ("_expr", "rhs")))
+        elif isinstance(node, ForAll):
+            pending.append((node.index_var, path + ("index_var",)))
+            pending.append((node.stmt, path + ("stmt",)))
+        elif isinstance(node, Where):
+            pending.append((node.producer, path + ("producer",)))
+            pending.append((node.consumer, path + ("consumer",)))
+        elif isinstance(node, TensorAssign):
+            pending.append((node.lhs, path + ("lhs",)))
+            pending.append((node.rhs, path + ("rhs",)))
+        elif isinstance(node, WorkspaceAccess):
+            for number, index in enumerate(node.indices):
+                pending.append((index, path + ("indices", str(number))))
+        elif isinstance(node, TensorAccess):
+            for number, index in enumerate(node.indices):
+                pending.append((index, path + ("indices", str(number))))
+        elif isinstance(node, BinaryOp):
+            pending.append((node.left, path + ("left",)))
+            pending.append((node.right, path + ("right",)))
+        elif isinstance(node, UnaryOp):
+            pending.append((node.expr, path + ("expr",)))
+    if diagnostics:
+        first = diagnostics[0]
+        raise UnsupportedFeature(
+            f"stage=normalized CIN: {first.code} at "
+            f"{'/'.join(first.path)}: {first.message}",
+            diagnostics=tuple(diagnostics),
+            code="caller_tiled_cin_unsupported",
+        )
+
+
 def normalize_cin(
     cin: IndexStmt,
     compile_options: Optional[CompileOptions] = None,
@@ -3197,7 +3278,9 @@ def normalize_cin(
 
     The returned graph is still a mutable legacy CIN graph; only its ownership is
     normalized.  Parent pointers, reverse access lists, result ``_assignment``,
-    and schedule metadata are deliberately absent.
+    and schedule metadata are deliberately absent.  A statement that carries a
+    tile its caller made is refused with ``caller_tiled_cin_unsupported``
+    (:func:`_refuse_caller_tiled_cin`) rather than lowered without its tile.
     """
 
     if not _is_index_stmt_instance(cin):
@@ -3230,6 +3313,7 @@ def _normalize_cin_owned(cin: IndexStmt, options: CompileOptions) -> IndexStmt:
     # bounded iterative preflight also caps the depth the recursive clone can
     # observe.
     verify_cin_structure(cin)
+    _refuse_caller_tiled_cin(cin)
     verify_cin_if_enabled(cin, options.verification.verify_cin)
 
     index_memo: Dict[int, IndexVar] = {}

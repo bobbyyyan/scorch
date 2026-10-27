@@ -4556,6 +4556,7 @@ class CINLowerer:
         if not self.outermost_stmt:
             self.outermost_stmt = stmt
             self.has_explicit_parallel_loop = self._contains_explicit_parallel(stmt)
+            self._refuse_parallel_loops_with_shared_cells(stmt)
 
         if isinstance(stmt, TensorAssign):
             return self.lower_TensorAssign(stmt)
@@ -5257,6 +5258,100 @@ class CINLowerer:
             f"for result {result_tensor.get_name()!r}",
             diagnostics=(diagnostic,),
         )
+
+    @staticmethod
+    def _loop_selects_cells_of(index_var: IndexVar, access: TensorAccess) -> bool:
+        """Whether two iterations of a loop over ``index_var`` always write different
+        cells of ``access``: the access names the variable, or names the variable a
+        tile split into this loop and its partner loop (each iteration of either
+        covers values of that variable no other iteration covers)."""
+
+        if access.has_index_var(index_var):
+            return True
+        return index_var.has_parent and bool(access.has_index_var(index_var.parent))
+
+    def _refuse_parallel_loops_with_shared_cells(self, stmt: IndexStmt) -> None:
+        """Refuse ``stmt`` if a loop it marks parallel can write one cell from two
+        iterations (``_refuse_parallel_loop_with_shared_cells``).
+
+        Runs once, on the whole statement, before anything is lowered.  A check in
+        ``lower_ForAll`` would miss inner loops: the iteration lattice lowers a
+        loop's body from a rebuilt copy (``LatticePoint.get_simplified_cin``) whose
+        loops carry no mark.
+        """
+
+        if isinstance(stmt, ForAll):
+            if stmt.parallel is True:
+                self._refuse_parallel_loop_with_shared_cells(stmt)
+            self._refuse_parallel_loops_with_shared_cells(stmt.stmt)
+        elif isinstance(stmt, Where):
+            self._refuse_parallel_loops_with_shared_cells(stmt.producer)
+            self._refuse_parallel_loops_with_shared_cells(stmt.consumer)
+
+    def _refuse_parallel_loop_with_shared_cells(self, stmt: ForAll) -> None:
+        """Refuse a loop marked parallel whose iterations can write one cell.
+
+        ``omp parallel for`` hands the loop's iterations to workers with no
+        synchronization, so every tensor the loop body writes must be written at
+        cells the loop's variable selects (``_loop_selects_cells_of``).  A loop over a
+        reduction variable fails this: every iteration adds into the same result
+        cells, and the workers' unsynchronized updates are lost.  A workspace that a
+        Where inside the loop produces is private to one iteration (declared in the
+        loop body, or allocated once per worker by the parallel marking), so it is
+        not checked; a loop marked inside a producer is checked against the
+        workspace that producer writes, which the loop does not enclose.  The
+        Schedule and LoopPlan routes refuse the same schedules with the same code
+        and exception type (``loop_plan_legality.refuse_parallel_mark``).
+        """
+
+        from .loop_plan_legality import PARALLEL_REDUCTION, refuse_parallel_mark
+
+        index_var = stmt.get_index_var()
+        private: Set[SymbolId] = set()
+        writes: List[TensorAccess] = []
+
+        def collect(node: IndexStmt, in_producer: bool) -> None:
+            if isinstance(node, ForAll):
+                collect(node.stmt, in_producer)
+            elif isinstance(node, Where):
+                collect(node.producer, True)
+                collect(node.consumer, in_producer)
+            elif isinstance(node, TensorAssign):
+                writes.append(node.lhs)
+                if in_producer and node.lhs.is_workspace():
+                    private.add(node.lhs.tensor_id)
+            else:
+                raise ScorchTypeError(
+                    f"unsupported CIN statement {type(node).__name__}",
+                    code="cin_node_unknown",
+                )
+
+        collect(stmt.stmt, False)
+        for access in writes:
+            if access.tensor_id in private:
+                continue
+            if self._loop_selects_cells_of(index_var, access):
+                continue
+            tensor = access.get_tensor()
+            diagnostic = CINDiagnostic(
+                code=PARALLEL_REDUCTION,
+                message=(
+                    f"loop {index_var.name} is marked parallel, and "
+                    f"{tensor.get_name()!r} is written at cells that "
+                    f"{index_var.name} does not select, so two workers can "
+                    "update one cell"
+                ),
+                path=("root",),
+                entity_id=tensor.symbol_id,
+                stage="legacy_cin_lowering",
+                pass_name="explicit_parallel_loop",
+            )
+            refuse_parallel_mark(
+                PARALLEL_REDUCTION,
+                f"stage=legacy CIN lowering: {PARALLEL_REDUCTION} for "
+                f"{tensor.get_name()!r} (loop {index_var.name})",
+                (diagnostic,),
+            )
 
     def _should_parallelize_outer_forall(self, index_var: IndexVar) -> bool:
         if (

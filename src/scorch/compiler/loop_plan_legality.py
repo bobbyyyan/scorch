@@ -9,7 +9,7 @@ lifetime facts are local values; none are attached to CIN or enter cache identit
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Hashable, List, Optional, Tuple, cast
+from typing import Dict, Hashable, List, NoReturn, Optional, Tuple, Type, Union, cast
 
 from .cin import Operation
 from .cin_analysis import (
@@ -150,6 +150,84 @@ def _verification_error(code: str, message: str, path: Tuple[str, ...]) -> None:
     raise VerificationError(
         f"stage=LoopPlan: {code} at {'/'.join(path)}: {message}",
         diagnostics=(diagnostic,),
+    )
+
+
+# The rules on which loops may, or must, be marked parallel (``Schedule.parallel_loop``
+# or a tile's ``parallel``) that more than one route checks.  The Schedule route
+# (``Scheduler._apply_schedule_legacy``) checks them on loop names before a plan
+# exists, this module checks them on the plan, and the direct CIN route's lowering
+# (``CINLowerer._refuse_parallel_loop_with_shared_cells``) checks the reduction rule
+# on the CIN.  Each rule has one code and one exception type on every route, so an
+# ``except`` clause or a ``defect_code`` check does not depend on the route that
+# refused.  Each code is the one this module gave the rule before the routes agreed.
+PARALLEL_REDUCTION = "parallel_reduction"
+PARALLEL_RAGGED_INNER = "parallel_ragged_inner"
+PARALLEL_SPARSE_RESULT = "parallel_sparse_result"
+PARALLEL_PANEL_LOOP = "parallel_panel_loop"
+PANEL_PARALLEL_PARENT = "panel_parallel_parent"
+HEAP_PARALLEL_TILE = "heap_parallel_tile"
+HEAP_PARALLEL_PREFIX = "heap_parallel_prefix"
+HEAP_PARALLEL_OWNERSHIP = "heap_parallel_ownership"
+RELAYOUT_PARALLEL_ROW = "relayout_parallel_row"
+_PARALLEL_MARK_ERRORS: Dict[
+    str, Union[Type[InvalidSchedule], Type[UnsupportedFeature]]
+] = {
+    PARALLEL_REDUCTION: InvalidSchedule,
+    PARALLEL_RAGGED_INNER: InvalidSchedule,
+    PARALLEL_SPARSE_RESULT: UnsupportedFeature,
+    PARALLEL_PANEL_LOOP: InvalidSchedule,
+    PANEL_PARALLEL_PARENT: InvalidSchedule,
+    HEAP_PARALLEL_TILE: InvalidSchedule,
+    HEAP_PARALLEL_PREFIX: InvalidSchedule,
+    HEAP_PARALLEL_OWNERSHIP: InvalidSchedule,
+    RELAYOUT_PARALLEL_ROW: InvalidSchedule,
+}
+
+
+def refuse_parallel_mark(
+    code: str, message: str, diagnostics: Tuple[object, ...]
+) -> NoReturn:
+    """Raise the refusal of the parallel-mark rule ``code``, the same on every route.
+
+    The exception is the rule's type (``_PARALLEL_MARK_ERRORS``), with ``code`` set
+    and the refusing route's ``diagnostics``, each of which names ``code`` as well:
+    a ``LoopPlanDiagnostic`` on the Schedule and plan routes, a ``CINDiagnostic`` on
+    the direct route.  ``message`` is the route's own text.
+    """
+
+    error_type = _PARALLEL_MARK_ERRORS.get(code)
+    if error_type is None:
+        raise ScorchAssertionError(
+            f"{code!r} is not a parallel-mark rule",
+            code="parallel_mark_rule_unknown",
+        )
+    if not diagnostics or any(
+        getattr(diagnostic, "code", None) != code for diagnostic in diagnostics
+    ):
+        raise ScorchAssertionError(
+            f"a {code} refusal needs diagnostics that name {code}",
+            code="parallel_mark_diagnostics_invalid",
+        )
+    # ``code`` is a key of ``_PARALLEL_MARK_ERRORS`` here, so it is never empty and the
+    # fallback is never taken.  It is spelled out because the refusal-code gate
+    # (tests/test_scorch/refusal_code_inventory.py, ``literal_code``) reads a ``code=``
+    # only as a literal or as ``<expression> or "<literal>"``.
+    raise error_type(
+        message, diagnostics=diagnostics, code=code or "parallel_mark_rule_unknown"
+    )
+
+
+def _refuse_parallel(
+    code: str, message: str, path: Tuple[str, ...], *, index_id: Optional[IndexId]
+) -> NoReturn:
+    """The plan route's spelling of :func:`refuse_parallel_mark`, as ``_invalid``
+    spells its other refusals."""
+
+    refuse_parallel_mark(
+        code,
+        f"stage=LoopPlan: {code} at {'/'.join(path)}: {message}",
+        (_diagnostic(code, message, path, index_id=index_id),),
     )
 
 
@@ -920,10 +998,10 @@ def _effective_parallel_loop(plan: LoopPlan) -> Optional[LoopRef]:
     if parallel_tile is None:
         return None
     if parallel_tile.kind != "affine":
-        _invalid(
-            "parallel_panel_loop",
+        _refuse_parallel(
+            PARALLEL_PANEL_LOOP,
             "a sparse panel window cannot be selected as an affine parallel loop",
-            ("tiles", "parallel"),
+            ("tiles", str(plan.tiles.index(parallel_tile)), "parallel"),
             index_id=parallel_tile.loop.index_id,
         )
     return LoopRef(parallel_tile.loop.index_id, LoopPart.OUTER)
@@ -976,15 +1054,15 @@ def _verify_parallel_legality(
         return None
     base = parallel.index_id
     if parallel.part == LoopPart.INNER:
-        _invalid(
-            "parallel_ragged_inner",
+        _refuse_parallel(
+            PARALLEL_RAGGED_INNER,
             "ragged affine inner loops cannot be parallelized",
             ("parallel_loop",),
             index_id=base,
         )
     if base in facts.reduction_index_ids:
-        _invalid(
-            "parallel_reduction",
+        _refuse_parallel(
+            PARALLEL_REDUCTION,
             "reduction loops cannot own independent result writes",
             ("parallel_loop",),
             index_id=base,
@@ -997,8 +1075,8 @@ def _verify_parallel_legality(
             index_id=base,
         )
     if not _all_dense_results(facts):
-        _unsupported(
-            "parallel_sparse_result",
+        _refuse_parallel(
+            PARALLEL_SPARSE_RESULT,
             "explicit parallel selection currently requires dense results",
             ("parallel_loop",),
             index_id=base,
@@ -1086,10 +1164,21 @@ def _verify_panel(
             ("tiles", str(panel_position)),
             index_id=panel.loop.index_id,
         )
-    if panel.parallel or panel.accumulation != "direct":
+    if panel.parallel:
+        # The rule _effective_parallel_loop already refuses: no plan reaches this
+        # check with a parallel panel tile, because loop_plan's structural check
+        # refuses a plan that marks a tile and names a parallel loop.  Kept so the
+        # rule keeps its one code if either earlier check changes.
+        _refuse_parallel(
+            PARALLEL_PANEL_LOOP,
+            "a sparse panel window cannot be selected as an affine parallel loop",
+            ("tiles", str(panel_position), "parallel"),
+            index_id=panel.loop.index_id,
+        )
+    if panel.accumulation != "direct":
         _unsupported(
             "panel_policy",
-            "panel tiles require the canonical serial/direct panel policy",
+            "panel tiles require direct accumulation",
             ("tiles", str(panel_position)),
             index_id=panel.loop.index_id,
         )
@@ -1176,8 +1265,8 @@ def _verify_panel(
                 index_id=parent_id,
             )
     if parallel != LoopRef(parent_id):
-        _invalid(
-            "panel_parallel_parent",
+        _refuse_parallel(
+            PANEL_PARALLEL_PARENT,
             "the dense parent row must be the explicit parallel loop",
             ("parallel_loop",),
             index_id=parent_id,
@@ -1273,10 +1362,10 @@ def _verify_result_tile(
         raise ScorchAssertionError(
             "result_tile is not None", code="loop_plan_legality_state_missing"
         )
-    if tile.placement.kind != PlacementKind.OUTERMOST or tile.parallel:
+    if tile.placement.kind != PlacementKind.OUTERMOST:
         _invalid(
             "heap_tile_lifetime",
-            "the heap tile must be an outermost serial affine loop",
+            "the heap tile must be an outermost affine loop",
             ("tiles", str(plan.tiles.index(tile))),
             index_id=tile.loop.index_id,
         )
@@ -1299,19 +1388,27 @@ def _verify_result_tile(
             ("tiles", str(plan.tiles.index(tile))),
             index_id=tile.loop.index_id,
         )
+    if tile.parallel:
+        _refuse_parallel(
+            HEAP_PARALLEL_TILE,
+            "the shared heap tile loop must remain serial",
+            ("tiles", str(tile_position), "parallel"),
+            index_id=tile.loop.index_id,
+        )
     if parallel is None:
-        _invalid(
-            "heap_parallel_prefix",
+        _refuse_parallel(
+            HEAP_PARALLEL_PREFIX,
             "heap accumulation requires an explicit parallel result prefix",
             ("parallel_loop",),
+            index_id=None,
         )
     if parallel is None:
         raise ScorchAssertionError(
             "parallel is not None", code="loop_plan_legality_state_missing"
         )
     if parallel.index_id == tile.loop.index_id:
-        _invalid(
-            "heap_parallel_tile",
+        _refuse_parallel(
+            HEAP_PARALLEL_TILE,
             "the shared heap tile loop must remain serial",
             ("parallel_loop",),
             index_id=parallel.index_id,
@@ -1360,8 +1457,8 @@ def _verify_result_tile(
             access_id=result.access_id,
         )
     if parallel.index_id not in expected_prefix:
-        _invalid(
-            "heap_parallel_ownership",
+        _refuse_parallel(
+            HEAP_PARALLEL_OWNERSHIP,
             "parallelism may select only a complete dense result-prefix axis",
             ("parallel_loop",),
             index_id=parallel.index_id,
@@ -1561,8 +1658,8 @@ def _verify_relayout_shape(  # noqa: C901
             ("loop_order",),
         )
     if parallel != LoopRef(row_id) or plan.parallel_loop != LoopRef(row_id):
-        _invalid(
-            "relayout_parallel_row",
+        _refuse_parallel(
+            RELAYOUT_PARALLEL_ROW,
             "relayout requires the logical CSR row as explicit parallel loop",
             ("parallel_loop",),
             index_id=row_id,

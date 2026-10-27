@@ -1236,6 +1236,28 @@ def _schedule_field_diagnostic(
     )
 
 
+def _refuse_parallel_marks(
+    code: str, paths: Sequence[Tuple[str, ...]], reason: str
+) -> NoReturn:
+    """Refuse the schedule's parallel marks at ``paths`` by the parallel-mark rule
+    ``code``, with one diagnostic per mark.
+
+    The plan boundary checks the same rules on the plan, and
+    ``loop_plan_legality.refuse_parallel_mark`` gives each rule its one code and
+    exception type on both routes.
+    """
+
+    from .loop_plan_legality import refuse_parallel_mark
+
+    diagnostics = tuple(
+        _schedule_field_diagnostic(code, path, reason)[1] for path in paths
+    )
+    where = ", ".join("/".join(("schedule", *path)) for path in paths)
+    refuse_parallel_mark(
+        code, f"stage=Schedule: {code} at {where}: {reason}", diagnostics
+    )
+
+
 def _unsupported_assembly(strategy: str, reason: str) -> NoReturn:
     message, diagnostic = _assembly_diagnostic(
         "unsupported_schedule_assembly", strategy, reason
@@ -3869,21 +3891,29 @@ class Scheduler:
                 f"tiles would wrap it: {outer_wrappers}",
                 code="heap_tile_schedule_invalid",
             )
+        from .loop_plan_legality import (
+            HEAP_PARALLEL_OWNERSHIP,
+            HEAP_PARALLEL_PREFIX,
+            HEAP_PARALLEL_TILE,
+        )
+
         if tile.parallel:
-            raise ScorchValueError(
+            _refuse_parallel_marks(
+                HEAP_PARALLEL_TILE,
+                (("tiles", str(tile_position), "parallel"),),
                 "A heap-backed result tile uses shared reusable storage; its "
                 "outer tile loop must be serial",
-                code="heap_tile_schedule_invalid",
             )
         if schedule.parallel_loop in (
             tile.index_var,
             f"{tile.index_var}_out",
             f"{tile.index_var}_in",
         ):
-            raise ScorchValueError(
+            _refuse_parallel_marks(
+                HEAP_PARALLEL_TILE,
+                (("parallel_loop",),),
                 "A heap-backed result tile cannot select its shared tile loop "
                 "for parallel execution",
-                code="heap_tile_schedule_invalid",
             )
 
         assignment: CIN = cin
@@ -3928,12 +3958,16 @@ class Scheduler:
                 "result's trailing storage level",
                 code="heap_accumulation_tile_unsupported",
             )
-        parallel_anchors = [
-            candidate.index_var for candidate in schedule.tiles if candidate.parallel
+        # Each parallel mark with its place in the schedule, as the parallel checks
+        # in _apply_schedule_legacy list them.
+        parallel_anchors: List[Tuple[str, Tuple[str, ...]]] = [
+            (candidate.index_var, ("tiles", str(position), "parallel"))
+            for position, candidate in enumerate(schedule.tiles)
+            if candidate.parallel
         ]
         if schedule.parallel_loop is not None:
-            parallel_anchors.append(schedule.parallel_loop)
-        for anchor in parallel_anchors:
+            parallel_anchors.append((schedule.parallel_loop, ("parallel_loop",)))
+        for anchor, anchor_path in parallel_anchors:
             logical_anchor = anchor
             for candidate in schedule.tiles:
                 if anchor in (
@@ -3943,10 +3977,11 @@ class Scheduler:
                     logical_anchor = candidate.index_var
                     break
             if logical_anchor not in result_names[:-1]:
-                raise ScorchValueError(
+                _refuse_parallel_marks(
+                    HEAP_PARALLEL_OWNERSHIP,
+                    (anchor_path,),
                     "Heap accumulation may parallelize only a dense result-prefix "
                     f"loop; {anchor!r} does not partition compact result rows",
-                    code="heap_tile_schedule_invalid",
                 )
         if any(level != LevelType.DENSE for level in result_access.level_types()):
             raise ScorchNotImplementedError(
@@ -3967,11 +4002,12 @@ class Scheduler:
                 code="heap_accumulation_result_unsupported",
             )
         if not parallel_anchors:
-            raise ScorchValueError(
+            _refuse_parallel_marks(
+                HEAP_PARALLEL_PREFIX,
+                (("parallel_loop",),),
                 "Heap accumulation requires an explicit parallel dense "
                 "result-prefix loop so the shared outer result-tile loop remains "
                 "serial",
-                code="heap_tile_schedule_invalid",
             )
 
         return _ResultTilePlan(
@@ -4198,10 +4234,13 @@ class Scheduler:
                 code="relayout_schedule_invalid",
             )
         if schedule.parallel_loop != row_var:
-            raise ScorchValueError(
+            from .loop_plan_legality import RELAYOUT_PARALLEL_ROW
+
+            _refuse_parallel_marks(
+                RELAYOUT_PARALLEL_ROW,
+                (("parallel_loop",),),
                 "Packed relayout requires the CSR row loop to be selected for "
                 "parallel execution",
-                code="relayout_schedule_invalid",
             )
 
         tensors = [access.tensor for access in rhs_accesses] + [result_access.tensor]
@@ -4384,10 +4423,16 @@ class Scheduler:
                 code="panel_tile_sparse_result_unsupported",
             )
         if panel_tiles and panel_tiles[0].parallel:
-            raise ScorchValueError(
+            from .loop_plan_legality import PARALLEL_PANEL_LOOP
+
+            position = next(
+                n for n, tile in enumerate(schedule.tiles) if tile.kind == "panel"
+            )
+            _refuse_parallel_marks(
+                PARALLEL_PANEL_LOOP,
+                (("tiles", str(position), "parallel"),),
                 "Sparse panel outer loops must be serial; select the row loop "
                 "with Schedule.parallel_loop",
-                code="panel_parallel_loop_invalid",
             )
         for tile in schedule.tiles:
             if tile.kind == "panel" and tile.accum != "direct":
@@ -4435,29 +4480,41 @@ class Scheduler:
         Scheduler._require_legal_assembly_request(cin, schedule)
         Scheduler._require_legal_accumulator_request(cin, schedule)
 
-        parallel_names = [tile.index_var for tile in schedule.tiles if tile.parallel]
+        # Each parallel mark with its place in the schedule: a tile's ``parallel``
+        # flag, then ``parallel_loop``.
+        parallel_marks: List[Tuple[str, Tuple[str, ...]]] = [
+            (tile.index_var, ("tiles", str(position), "parallel"))
+            for position, tile in enumerate(schedule.tiles)
+            if tile.parallel
+        ]
         if schedule.parallel_loop is not None:
-            parallel_names.append(schedule.parallel_loop)
-        if parallel_names and not Scheduler._has_dense_output(cin):
-            raise ScorchNotImplementedError(
+            parallel_marks.append((schedule.parallel_loop, ("parallel_loop",)))
+        if parallel_marks and not Scheduler._has_dense_output(cin):
+            from .loop_plan_legality import PARALLEL_SPARSE_RESULT
+
+            _refuse_parallel_marks(
+                PARALLEL_SPARSE_RESULT,
+                [path for _, path in parallel_marks],
                 "Explicit parallel-loop selection currently requires a dense "
                 "result tensor",
-                code="explicit_parallel_sparse_result_unsupported",
             )
         tiled_inner_loops = {
             f"{tile.index_var}_in" for tile in schedule.tiles if tile.kind == "affine"
         }
         parallel_inner_loops = [
-            name for name in parallel_names if name in tiled_inner_loops
+            (name, path) for name, path in parallel_marks if name in tiled_inner_loops
         ]
         if parallel_inner_loops:
-            raise ScorchValueError(
+            from .loop_plan_legality import PARALLEL_RAGGED_INNER
+
+            _refuse_parallel_marks(
+                PARALLEL_RAGGED_INNER,
+                [path for _, path in parallel_inner_loops],
                 "Tiled inner loops contain a ragged-tail break and cannot be "
-                f"parallelized: {parallel_inner_loops}",
-                code="parallel_ragged_tile_invalid",
+                f"parallelized: {[name for name, _ in parallel_inner_loops]}",
             )
         parallel_reductions = []
-        for parallel_name in parallel_names:
+        for parallel_name, path in parallel_marks:
             logical_name = parallel_name
             for tile in schedule.tiles:
                 if tile.kind != "affine":
@@ -4470,12 +4527,15 @@ class Scheduler:
                     logical_name = tile.index_var
                     break
             if logical_name in reduction_names:
-                parallel_reductions.append(parallel_name)
+                parallel_reductions.append((parallel_name, path))
         if parallel_reductions:
-            raise ScorchValueError(
+            from .loop_plan_legality import PARALLEL_REDUCTION
+
+            _refuse_parallel_marks(
+                PARALLEL_REDUCTION,
+                [path for _, path in parallel_reductions],
                 "Reduction loops cannot be selected for parallel execution: "
-                f"{parallel_reductions}",
-                code="parallel_reduction_loop_invalid",
+                f"{[name for name, _ in parallel_reductions]}",
             )
 
         result_tile_plan = Scheduler._validate_heap_result_tile(
@@ -4510,10 +4570,13 @@ class Scheduler:
                     code="panel_tile_format_unsupported",
                 )
             if schedule.parallel_loop != parent.name:
-                raise ScorchValueError(
+                from .loop_plan_legality import PANEL_PARALLEL_PARENT
+
+                _refuse_parallel_marks(
+                    PANEL_PARALLEL_PARENT,
+                    (("parallel_loop",),),
                     "Sparse panel tiling requires its CSR dense-parent row loop "
                     f"{parent.name!r} as Schedule.parallel_loop",
-                    code="panel_parallel_loop_invalid",
                 )
             if schedule.loop_order is None:
                 panel_logical_order = [
