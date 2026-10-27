@@ -151,12 +151,46 @@ assert torch.equal(W.to_torch(), dense)
 
 :::{note}
 Index arrays retain their validated int32 or int64 dtype, recorded in
-`tensor.layout.index_dtype`. Existing native kernels use int32 pointers, so the
-checked native view range-checks int64 indices and converts only its private,
-by-value argument copy. Scorch owns copies of structural index arrays and returns
-defensive copies from public accessors, so caller mutation cannot invalidate a
-validated tensor. Caller tensors and containers are never rewritten.
+`tensor.layout.index_dtype`. Native kernels use int32 pointers: they read int32
+index arrays in place, and int64 ones through an int32 copy Scorch has
+range-checked and owns. Public accessors such as `x.index.mode_indices` return
+copies, and Scorch never writes into an index array it was given. The arrays
+themselves may be the caller's: see
+[Index arrays must not change after construction](#index-arrays-must-not-change).
 :::
+
+(index-arrays-must-not-change)=
+### Index arrays must not change after construction
+
+`from_torch`, `from_csr` and `from_coo` given a torch sparse tensor keep that
+tensor's own index arrays instead of copying them, exactly as PyTorch does:
+`torch.sparse_csr_tensor(crow, col, values)` keeps `crow` and `col`, and so does
+an STensor built from it. (`from_components`, and `from_coo` given raw arrays,
+copy them.) Copying would cost two O(nnz) copies per conversion and defeat the
+per-array checks Scorch caches between calls.
+
+So the index arrays must not change after construction, except through writes
+Scorch can see. It sees every write that moves PyTorch's version counter
+(`tensor._version`): an in-place torch operation on the array, on a view of it,
+or through the accessors (`crow_indices()`, `col_indices()`, `indices()`) of the
+torch sparse tensor you built the STensor from, or passed to `scorch.matmul`.
+After such a write the next call re-checks the indices (an invalid index raises
+an error), and a call plan cached before the write is not used.
+
+Scorch cannot see a write that moves no counter it holds:
+
+| Write | Why it is not seen |
+|---|---|
+| inside `torch.inference_mode()` | inference tensors have no version counter; re-checking there would put an O(nnz) scan back on every inference call |
+| through `.data`, or a tensor made with `set_()` | the alias has a version counter of its own |
+| through a numpy array (`.numpy()`, `torch.from_numpy`) or a raw pointer | numpy and raw writes move no counter at all |
+| through the accessors of a *different* torch sparse tensor built on the same arrays | its counter is shared with no tensor Scorch holds |
+
+After such a write a result can be wrong. Kernels read int32 index arrays in
+place, so a bad int32 index written this way can make a kernel read memory out of
+bounds, as `torch.sparse.mm` can; int64 index arrays are read through Scorch's own
+checked copy, so the result is stale instead. To change a sparse structure, build
+a new tensor.
 
 ## Conversion
 

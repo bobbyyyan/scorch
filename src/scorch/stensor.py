@@ -1336,6 +1336,31 @@ class STensor:
     ``str(x.format)`` (e.g. ``"d,s"``), :attr:`values`, and
     ``x.index.mode_indices`` instead.
 
+    **Index arrays must not change after construction.** :meth:`from_torch`,
+    :meth:`from_csr` and :meth:`from_coo` given a torch sparse tensor keep that
+    tensor's own index arrays rather than copying them, as torch itself does
+    (``torch.sparse_csr_tensor(crow, col, values)`` keeps ``crow`` and ``col``);
+    ``scorch.from_components``, and :meth:`from_coo` given raw arrays, copy them.
+    Scorch sees a write that moves PyTorch's version counter (``tensor._version``):
+    an in-place torch operation on the array, on a view of it, or through the
+    accessors of the torch sparse tensor the STensor was built from. The next call
+    re-checks the indices, and a call plan cached before the write is not used.
+    Scorch cannot see a write that moves no counter it holds:
+
+    - a write made inside ``torch.inference_mode()``, whose tensors have no version
+      counter (re-checking there would put an O(nnz) scan back on every inference
+      call);
+    - a write through another tensor that aliases the array's memory with a counter
+      of its own: one made with ``.data`` or ``set_()``, a numpy array
+      (``.numpy()``, ``torch.from_numpy``), or a raw pointer;
+    - a write through the accessors (``crow_indices()``, ``col_indices()``,
+      ``indices()``) of a different torch sparse tensor built on the same arrays.
+
+    After such a write a result can be wrong. Kernels read int32 index arrays in
+    place, so a bad int32 index written this way can make a kernel read out of
+    bounds; int64 index arrays are read through an int32 copy Scorch has checked and
+    owns, so the result is stale instead. To change a structure, build a new tensor.
+
     Examples
     --------
     >>> import torch
@@ -2686,6 +2711,19 @@ class STensor:
         -----
         ``mode_order`` is how Scorch represents a transposed/relaid-out operand
         without recomputing; most tensors use the identity order.
+
+        A sparse input's index arrays are shared, not copied: the STensor keeps the
+        torch tensor's own compressed and plain index arrays (CSR, and CSC in its
+        natural order; a CSC input converted to CSR by an explicit identity
+        ``mode_order`` is a copy) or its ``indices`` (COO: the caller's arrays when
+        the input is already coalesced, else those of the coalesced tensor torch
+        makes), as torch does. They must
+        not change afterwards except through in-place torch operations, which
+        Scorch sees and re-checks at the next call. A write that moves no version
+        counter -- inside ``torch.inference_mode()``, through ``.data``,
+        ``set_()``, numpy or a raw pointer -- is not seen and can give a wrong
+        result, or for int32 indices an out-of-bounds read. :class:`STensor`
+        states the whole contract.
 
         Examples
         --------
