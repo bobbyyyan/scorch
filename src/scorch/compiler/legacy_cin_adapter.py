@@ -31,6 +31,7 @@ from .cin import (
     Workspace,
     WorkspaceAccess,
 )
+from .cin_analysis import verify_cin_structure
 from .diagnostics import VerificationError
 from .identity import AccessId, IndexId, SymbolId
 from ..format import TensorFormat
@@ -138,6 +139,9 @@ def _prepare_legacy_cin(
         # Schedule replay can introduce derived display names, so validate the
         # resulting private tree as well as its semantic source.
         validate_legacy_cin_display_names(working)
+        # The replayed tree is the scheduler's own output.  Check its
+        # structure before canonicalization can merge copies that share an id.
+        verify_cin_structure(working)
     _canonicalize_legacy_entities(working)
     _materialize_legacy_backreferences(working)
     return working

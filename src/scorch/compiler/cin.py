@@ -1266,6 +1266,84 @@ class Where(IndexStmt):
         return visitor.workspaces
 
 
+def copy_statement(stmt: IndexStmt) -> IndexStmt:
+    """Copy a statement's syntax and share its index variables and tensors.
+
+    Every statement and expression node of the copy is a new object with a
+    fresh ``node_id``.  The ``IndexVar``, ``TensorVar``, ``Workspace`` and
+    ``TileSizeVar`` objects are the source's own, so a copy placed beside its
+    source names each index variable and tensor through one object, as
+    hand-built CIN does.  ``copy.deepcopy`` of a subtree instead duplicates
+    those objects and keeps every ``node_id``, which the structure check
+    refuses once the copy and its source share a tree.
+
+    An access keeps its ``access_id``: the copy stands in for its source, and
+    the legacy lowering orders an index variable's accesses by that id.  So
+    each access may stay in the source or in the copy, not in both; the
+    structure check refuses a tree that keeps both.  Statement parent links
+    are left unset, as ``_materialize_legacy_backreferences`` rebuilds them.
+    """
+
+    def keep_flags(source: CIN, clone: CIN) -> None:
+        # Set only what differs from a new node's defaults, so a frozen
+        # operation keeps reading its class default for the workspace flag.
+        if source.inserted_workspace:
+            object.__setattr__(clone, "inserted_workspace", True)
+        if source.no_tile_list:
+            object.__setattr__(clone, "no_tile_list", list(source.no_tile_list))
+
+    def copy_access(access: TensorAccess) -> TensorAccess:
+        clone: TensorAccess
+        if type(access) is WorkspaceAccess:
+            clone = WorkspaceAccess(access.wksp, access.indices)
+        elif type(access) is TensorAccess:
+            clone = TensorAccess(access.tensor, access.indices)
+        else:
+            raise ScorchTypeError(
+                f"cannot copy an access of type {type(access).__name__}",
+                code="internal_argument_type_invalid",
+            )
+        clone.access_id = access.access_id
+        keep_flags(access, clone)
+        return clone
+
+    def copy_expr(expr: IndexExpr) -> IndexExpr:
+        clone: IndexExpr
+        if isinstance(expr, TensorAccess):
+            return copy_access(expr)
+        if type(expr) is BinaryOp:
+            clone = BinaryOp(expr.op, copy_expr(expr.left), copy_expr(expr.right))
+        elif type(expr) is UnaryOp:
+            clone = UnaryOp(expr.op, copy_expr(expr.expr))
+        else:
+            raise ScorchTypeError(
+                f"cannot copy an expression of type {type(expr).__name__}",
+                code="internal_argument_type_invalid",
+            )
+        keep_flags(expr, clone)
+        return clone
+
+    def copy_stmt(node: IndexStmt) -> IndexStmt:
+        clone: IndexStmt
+        if type(node) is ForAll:
+            clone = ForAll(node.index_var, copy_stmt(node.stmt), parallel=node.parallel)
+        elif type(node) is Where:
+            clone = Where(
+                producer=copy_stmt(node.producer), consumer=copy_stmt(node.consumer)
+            )
+        elif type(node) is TensorAssign:
+            clone = TensorAssign(copy_access(node.lhs), copy_expr(node.rhs), node.op)
+        else:
+            raise ScorchTypeError(
+                f"cannot copy a statement of type {type(node).__name__}",
+                code="internal_argument_type_invalid",
+            )
+        keep_flags(node, clone)
+        return clone
+
+    return copy_stmt(stmt)
+
+
 class CINVisitor:
     def visit(self, node: CIN) -> None:
         method_name = "visit_" + node.__class__.__name__

@@ -42,7 +42,6 @@ from scorch.compiler.compile_options import (  # type: ignore[import-untyped]
 )
 from scorch.compiler.diagnostics import (  # type: ignore[import-untyped]
     UnsupportedFeature,
-    VerificationError,
 )
 from scorch.compiler.scheduler import (  # type: ignore[import-untyped]
     Schedule,
@@ -140,26 +139,11 @@ def _case_id(case: Tuple[str, str, bool, bool]) -> str:
     return f"{layout}-tile_{target}-parallel_{parallel}-use_workspace_{use_workspace}"
 
 
-def _copies_node_ids(case: Tuple[str, str, bool, bool]) -> bool:
-    """``add_tile``'s workspace for a tile of the innermost ``j`` copies the producer's
-    index variables with their node ids, so two distinct ``IndexVar`` objects share a
-    ``NodeId``.  Normalization's structural preflight (``verify_cin_structure``)
-    refuses that as ``duplicate_node_id`` before the tile check runs, on main too.
-    It is a defect of ``add_tile`` of its own; the program is still refused before
-    any lowering."""
-
-    layout, target, _, use_workspace = case
-    return layout == "no_ws" and target == "j" and use_workspace
-
-
-def _assert_case_refused(
-    error: BaseException, case: Tuple[str, str, bool, bool]
-) -> None:
-    if _copies_node_ids(case):
-        assert type(error) is VerificationError
-        assert defect_code(error) == "duplicate_node_id"
-        return
-    _assert_refusal(error, case[1])
+# ``add_tile``'s workspace for a tile of the innermost ``j`` (no_ws, use_workspace)
+# used to copy the producer's index variables with their node ids, and normalization's
+# structural preflight refused that tree as ``duplicate_node_id`` before the tile check
+# ran.  Workspace insertion now shares the index variables and gives each copied
+# statement its own node id, so that tree reaches the tile check like every other.
 
 
 @pytest.mark.parametrize("arm", [0, 1])
@@ -169,9 +153,9 @@ def test_the_direct_route_refuses_a_caller_tile(
 ) -> None:
     _set_arm(monkeypatch, arm)
     _forbid_builds(monkeypatch)
-    with pytest.raises((UnsupportedFeature, VerificationError)) as caught:
+    with pytest.raises(UnsupportedFeature) as caught:
         ops.lower_and_exec_cin(_tiled(*case), (N, M), *_operands())
-    _assert_case_refused(caught.value, case)
+    _assert_refusal(caught.value, case[1])
 
 
 @pytest.mark.parametrize("case", CASES, ids=_case_id)
@@ -184,9 +168,9 @@ def test_normalization_and_the_schedule_route_refuse_a_caller_tile(
         lambda cin: Scheduler.apply_schedule(cin, Schedule()),
         Scheduler.auto_schedule_plan,
     ):
-        with pytest.raises((UnsupportedFeature, VerificationError)) as caught:
+        with pytest.raises(UnsupportedFeature) as caught:
             entry(_tiled(*case))
-        _assert_case_refused(caught.value, case)
+        _assert_refusal(caught.value, case[1])
 
 
 def test_a_hand_built_tile_is_refused() -> None:

@@ -1037,8 +1037,18 @@ def test_public_lowerer_rejects_malformed_raw_cin_before_legacy_copy() -> None:
     assert _assert_structured_diagnostics(error) == {"invalid_cin_field"}
 
 
-def test_public_lowerer_scopes_scheduler_owned_workspace_id_aliases() -> None:
-    """Release compatibility does not silently weaken requested verification."""
+def test_scheduled_workspace_cin_passes_the_strict_structure_check() -> None:
+    """Workspace insertion's output is strictly structured CIN.
+
+    Its producer and consumer share their index variables and tensors and have
+    their own node ids and workspace accesses, so the strict check,
+    normalization, the canonical dump and both lowering boundaries accept it,
+    and the debug lowerer verifies it rather than refusing it.  That holds for
+    an untiled schedule (register blocking off, as here): a tiled one is not
+    normalized CIN, and the debug lowerer refuses a caller-owned one
+    (``caller_tiled_cin_unsupported``).  The root's workspace marker licenses
+    nothing.
+    """
 
     from scorch.compiler.compile_options import CompileOptions
 
@@ -1071,73 +1081,30 @@ def test_public_lowerer_scopes_scheduler_owned_workspace_id_aliases() -> None:
         verify_cin_override=True,
     )
     scheduled = Scheduler.auto_schedule(source, compile_options=release_options)
+    assert scheduled.inserted_workspace
+    assert isinstance(scheduled, ForAll) and isinstance(scheduled.stmt, Where)
 
-    with pytest.raises(VerificationError) as strict_error:
-        verify_cin_structure(scheduled)
-    assert _assert_structured_diagnostics(strict_error) == {
-        "duplicate_index_id",
-        "duplicate_node_id",
-        "duplicate_node_reference",
-    }
-    with pytest.raises(VerificationError) as normalize_error:
-        normalize_cin(scheduled, compile_options=debug_options)
-    assert _assert_structured_diagnostics(normalize_error) == {
-        "duplicate_index_id",
-        "duplicate_node_id",
-        "duplicate_node_reference",
-    }
-    scheduled_dump = canonical_cin_dump(scheduled)
-    assert '"kind":"where"' in scheduled_dump
+    verify_cin_structure(scheduled)
+    normalize_cin(scheduled, compile_options=debug_options)
+    assert '"kind":"where"' in canonical_cin_dump(scheduled)
+    assert CINLowerer(compile_options=release_options).lower_IndexStmt(scheduled)
 
-    lowered = CINLowerer(compile_options=release_options).lower_IndexStmt(scheduled)
-    debug_scheduled = Scheduler.auto_schedule(
-        source,
-        compile_options=debug_options,
-    )
-    with pytest.raises(VerificationError) as debug_error:
-        CINLowerer(compile_options=debug_options).lower_IndexStmt(debug_scheduled)
-    assert _assert_structured_diagnostics(debug_error) == {
-        "unverifiable_legacy_schedule_aliases"
-    }
+    debug_scheduled = Scheduler.auto_schedule(source, compile_options=debug_options)
+    assert CINLowerer(compile_options=debug_options).lower_IndexStmt(debug_scheduled)
 
-    # The underscore boundary receives a compiler-owned tree immediately after
-    # Scheduler verified its normalized source; no caller work can intervene.
-    owned_scheduled = Scheduler.auto_schedule(
-        source,
-        compile_options=debug_options,
-    )
-    owned_lowered = CINLowerer(compile_options=debug_options)._lower_owned_IndexStmt(
+    owned_scheduled = Scheduler.auto_schedule(source, compile_options=debug_options)
+    assert CINLowerer(compile_options=debug_options)._lower_owned_IndexStmt(
         owned_scheduled
     )
 
-    assert lowered
-    assert owned_lowered
-
-    missing_marker = Scheduler.auto_schedule(
-        source,
-        compile_options=release_options,
-    )
-    missing_marker.inserted_workspace = False
-    with pytest.raises(VerificationError) as missing_marker_error:
-        CINLowerer(compile_options=release_options).lower_IndexStmt(missing_marker)
-    assert _assert_structured_diagnostics(missing_marker_error) == {
-        "duplicate_index_id",
-        "duplicate_node_id",
-        "duplicate_node_reference",
-    }
-    with pytest.raises(VerificationError) as missing_dump_marker_error:
-        canonical_cin_dump(missing_marker)
-    assert _assert_structured_diagnostics(missing_dump_marker_error) == {
-        "duplicate_index_id",
-        "duplicate_node_id",
-        "duplicate_node_reference",
-    }
+    unmarked = Scheduler.auto_schedule(source, compile_options=release_options)
+    unmarked.inserted_workspace = False
+    verify_cin_structure(unmarked)
+    assert '"kind":"where"' in canonical_cin_dump(unmarked)
 
 
-def test_public_debug_lowerer_never_skips_semantic_checks_for_workspace_aliases() -> (
-    None
-):
-    """A post-schedule semantic mutation cannot opt out of requested checks."""
+def test_public_debug_lowerer_verifies_scheduled_workspace_cin() -> None:
+    """A post-schedule semantic mutation is caught by the requested verifier."""
 
     from scorch.compiler.compile_options import CompileOptions
 
@@ -1175,9 +1142,7 @@ def test_public_debug_lowerer_never_skips_semantic_checks_for_workspace_aliases(
     with pytest.raises(VerificationError) as error:
         CINLowerer(compile_options=options).lower_IndexStmt(scheduled)
 
-    assert _assert_structured_diagnostics(error) == {
-        "unverifiable_legacy_schedule_aliases"
-    }
+    assert _assert_structured_diagnostics(error) == {"einsum_index_extent_mismatch"}
 
 
 @pytest.mark.parametrize(
@@ -1190,11 +1155,12 @@ def test_public_debug_lowerer_never_skips_semantic_checks_for_workspace_aliases(
         ("access", "duplicate_access_id"),
     ),
 )
-def test_public_lowerer_legacy_alias_compatibility_is_narrow(
+def test_public_lowerer_refuses_every_duplicate_identity(
     forgery: str,
     expected_code: str,
 ) -> None:
-    """Only same-kind node clones and same-node/name index clones are admitted."""
+    """The legacy lowering boundary admits no two nodes, index variables,
+    tensors or accesses that share an id, same-kind node copies included."""
 
     program, nodes = _reduction_program()
     if forgery == "same_kind_node":
@@ -1220,10 +1186,11 @@ def test_public_lowerer_legacy_alias_compatibility_is_narrow(
 
 
 @pytest.mark.parametrize("mismatch", ("node_id", "display_name"))
-def test_public_lowerer_rejects_incompatible_same_id_index_aliases(
+def test_public_lowerer_rejects_same_id_index_copies(
     mismatch: str,
 ) -> None:
-    """Index aliases must retain both their cloned node identity and name."""
+    """Two index variables with one id are refused, whether or not they also
+    share a node id and a name."""
 
     program, outer, inner = _same_name_nested_program()
     inner.index_id = outer.index_id
@@ -1266,8 +1233,8 @@ def test_public_lowerer_rejects_malformed_legacy_index_metadata(
     assert "invalid_cin_field" in _assert_structured_diagnostics(error)
 
 
-def test_workspace_alias_classifier_requires_corresponding_branch_binders() -> None:
-    """A workspace marker cannot license an unrelated cross-branch identity."""
+def test_scheduled_workspace_cin_refuses_a_forged_cross_branch_identity() -> None:
+    """Two index variables of a scheduled tree forged to share ids are refused."""
 
     from scorch.compiler.compile_options import CompileOptions
 
@@ -1322,11 +1289,8 @@ def test_workspace_alias_classifier_requires_corresponding_branch_binders() -> N
     } & _assert_structured_diagnostics(error)
 
 
-@pytest.mark.parametrize("forgery", ("workspace_role", "assignment_operator"))
-def test_workspace_alias_classifier_requires_exact_region_shape(
-    forgery: str,
-) -> None:
-    """Only the exact producer-write/consumer-read clone region licenses IDs."""
+def test_scheduled_workspace_cin_refuses_a_shared_access() -> None:
+    """An access object the consumer both writes and reads has two parents."""
 
     from scorch.compiler.compile_options import CompileOptions
 
@@ -1361,15 +1325,12 @@ def test_workspace_alias_classifier_requires_exact_region_shape(
     while isinstance(consumer, ForAll):
         consumer = consumer.stmt
     assert isinstance(consumer, TensorAssign)
-    if forgery == "workspace_role":
-        consumer.rhs = consumer.lhs
-    else:
-        consumer.op = Operation.SUB
+    consumer.rhs = consumer.lhs
 
     with pytest.raises(VerificationError) as error:
         CINLowerer(compile_options=options).lower_IndexStmt(scheduled)
 
-    assert "duplicate_node_id" in _assert_structured_diagnostics(error)
+    assert "duplicate_node_reference" in _assert_structured_diagnostics(error)
 
 
 @pytest.mark.parametrize(
@@ -1575,11 +1536,20 @@ def test_public_lowerer_rejects_missing_optional_tile_storage() -> None:
     assert "missing_cin_field" in _assert_structured_diagnostics(error)
 
 
-@pytest.mark.parametrize("missing_field", ("_parent", "tile_size_var"))
+@pytest.mark.parametrize("missing_field", (None, "_parent", "tile_size_var"))
 def test_public_lowerer_rejects_missing_detached_tile_parent_storage(
-    missing_field: str,
+    missing_field: str | None,
 ) -> None:
-    """A detached logical parent must still own every copied optional field."""
+    """A tile component's logical parent must be in the forward graph.
+
+    Workspace insertion used to copy the logical index for its producer and
+    consumer, so a caller could point every access at a plain copy with the
+    parent's identity and leave the parent reachable only through its tile
+    components; the structure check admitted that state whole and refused it
+    with a field missing.  Scheduler output never has it (producer and consumer
+    share the logical index, and the accesses name it), and the check refuses
+    it whole or with a field missing.
+    """
 
     from scorch.compiler.compile_options import CompileOptions
 
@@ -1618,14 +1588,36 @@ def test_public_lowerer_rejects_missing_detached_tile_parent_storage(
         for index in scheduled.index_vars
         if index.name == "c" and index._expr is not None
     )
-    forward_alias = accesses["B"].indices[1]
-    accesses["R"].indices[1] = forward_alias
-    accesses["R"].index_ids = tuple(index.index_id for index in accesses["R"].indices)
-
-    # Successive legacy tiling can legitimately detach this logical parent.
+    # The scheduler's output names the logical index in both accesses, and lowers.
+    assert accesses["R"].indices[1] is logical_parent
+    assert accesses["B"].indices[1] is logical_parent
     assert CINLowerer(compile_options=options).lower_IndexStmt(scheduled)
 
-    del logical_parent.__dict__[missing_field]
+    # A hand-built plain copy with the parent's identity takes its place in every
+    # access, so the parent is reachable only through its tile components.
+    twin = copy.copy(logical_parent)
+    for field, plain in (
+        ("_expr", None),
+        ("_parent", None),
+        ("tile_size_var", None),
+        ("is_tiled", False),
+        ("is_outer", False),
+        ("is_inner", False),
+    ):
+        twin.__dict__[field] = plain
+    for name in ("R", "B"):
+        accesses[name].indices[1] = twin
+        accesses[name].index_ids = tuple(
+            index.index_id for index in accesses[name].indices
+        )
+    assert all(
+        index is not logical_parent
+        for access in scheduled.tensor_accesses
+        for index in access.indices
+    )
+
+    if missing_field is not None:
+        del logical_parent.__dict__[missing_field]
     with pytest.raises(VerificationError) as error:
         CINLowerer(compile_options=options).lower_IndexStmt(scheduled)
 
@@ -2708,8 +2700,8 @@ def test_aliased_index_twins_require_equivalent_schedule_state() -> None:
 
     The forged plain twin of a validated tile component is refused with a
     structured VerificationError (here at the adapter's display-name
-    boundary; the preflight's schedule-state equivalence check stands behind
-    it as defense in depth), never merged and never a raw exception.
+    boundary; the preflight's duplicate-IndexId check stands behind it),
+    never merged and never a raw exception.
     """
 
     scheduled, options = _tiled_spmm_graph()
@@ -2727,9 +2719,9 @@ def test_aliased_index_twins_require_equivalent_schedule_state() -> None:
         CINLowerer(compile_options=options).lower_IndexStmt(scheduled)
 
 
-def test_workspace_clone_of_tiled_logical_index_stays_admitted() -> None:
-    """Workspace insertion legitimately pairs a tiled logical index with a
-    plain clone across branches; that historical divergence must lower."""
+def test_regblock_workspace_schedule_lowers() -> None:
+    """Automatic scheduling of SpGEMM on the regblock arm, whose workspace
+    insertion copies the reduction subtree, lowers."""
 
     from scorch.compiler.compile_options import CompileOptions
 

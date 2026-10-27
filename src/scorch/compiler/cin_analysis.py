@@ -43,7 +43,7 @@ from .diagnostics import UnsupportedFeature, VerificationError
 from .identity import AccessId, IndexId, NodeId, SymbolId
 from .compile_options import CompileOptions
 from .compilation_context import CompilerStageId, CompilationContext
-from ..exceptions import ScorchAssertionError, ScorchKeyError, ScorchTypeError
+from ..exceptions import ScorchKeyError, ScorchTypeError
 
 K = TypeVar("K")
 V = TypeVar("V")
@@ -266,8 +266,8 @@ def _safe_exact_dict_value(value: object, field_name: str) -> object:
 def _preflight_cin_structure_impl(  # noqa: C901
     cin: IndexStmt,
     *,
-    allow_legacy_schedule_aliases: bool = False,
-) -> Tuple[Tuple[CINDiagnostic, ...], bool]:
+    validate_legacy_compatibility_fields: bool = False,
+) -> Tuple[CINDiagnostic, ...]:
     """Validate stored forward structure without recursive Python calls.
 
     CIN remains a mutable legacy object graph, so callers can forge missing
@@ -289,17 +289,14 @@ def _preflight_cin_structure_impl(  # noqa: C901
     consumer another.  Exact-class admission makes the stored fields the sole
     authoritative view without executing attacker-controlled descriptors.
 
-    The private ``allow_legacy_schedule_aliases`` mode exists only for the
-    direct legacy-lowering adapter.  It additionally validates mutable
+    The private ``validate_legacy_compatibility_fields`` mode exists only for
+    the direct legacy-lowering adapter.  It additionally validates mutable
     scheduler compatibility fields because that adapter's forward copier
     consumes them; normalization deliberately discards those fields and
-    therefore does not let their contents affect semantic admission.
-    Workspace insertion historically clones producer and consumer syntax while
-    retaining same-kind ``NodeId`` values and clones logical ``IndexVar``
-    objects while retaining their paired ``NodeId``, ``IndexId``, and display
-    name.  The adapter does not consume node identity and canonicalizes the
-    index aliases before lowering. Normalization, analysis, LoopIR, and request
-    identity never enable this compatibility mode.
+    therefore does not let their contents affect semantic admission.  Its
+    identity rules are the strict ones: scheduler output, workspace insertion
+    included, has one object per index variable and tensor and a distinct
+    ``NodeId`` per node.
 
     Once the structure is valid, every assignment that reads a workspace must
     write a tensor of the workspace's element type (``workspace_type_mismatch``).
@@ -308,26 +305,13 @@ def _preflight_cin_structure_impl(  # noqa: C901
     mismatch is otherwise a silent narrowing in the emitted kernel.
     """
 
-    if type(allow_legacy_schedule_aliases) is not bool:
+    if type(validate_legacy_compatibility_fields) is not bool:
         raise ScorchTypeError(
-            "legacy schedule alias policy must be an exact bool",
+            "legacy compatibility-field policy must be an exact bool",
             code="internal_argument_type_invalid",
         )
 
     diagnostics: List[CINDiagnostic] = []
-    legacy_alias_candidates: List[
-        Tuple[
-            type,
-            object,
-            object,
-            Tuple[str, ...],
-            Tuple[str, ...],
-            str,
-        ]
-    ] = []
-    workspace_branch_prefixes: set[Tuple[str, ...]] = set()
-    where_paths: set[Tuple[str, ...]] = set()
-    root_has_workspace_marker = False
     active: set[int] = set()
     complete: set[int] = set()
     forward_index_objects: Dict[int, Tuple[IndexVar, Tuple[str, ...]]] = {}
@@ -338,10 +322,6 @@ def _preflight_cin_structure_impl(  # noqa: C901
     pending_index_references: List[Tuple[IndexVar, Tuple[str, ...], str]] = []
     pending_access_references: List[Tuple[TensorAccess, Tuple[str, ...], str]] = []
     pending_tile_size_vars: List[Tuple[TileSizeVar, Tuple[str, ...]]] = []
-    workspace_access_occurrences: Dict[
-        int,
-        List[Tuple[str, ...]],
-    ] = {}
     depth_reported = False
     identity_owners: Dict[type, Dict[int, Tuple[object, Tuple[str, ...]]]] = {
         NodeId: {},
@@ -395,49 +375,6 @@ def _preflight_cin_structure_impl(  # noqa: C901
             return
         previous = identity_owners[identity_type].get(identity_value)
         if previous is not None and previous[0] is not owner:
-            if (
-                allow_legacy_schedule_aliases
-                and identity_type is NodeId
-                and type(previous[0]) is type(owner)
-            ):
-                legacy_alias_candidates.append(
-                    (
-                        identity_type,
-                        previous[0],
-                        owner,
-                        previous[1],
-                        path,
-                        duplicate_code,
-                    )
-                )
-                return
-            if allow_legacy_schedule_aliases and identity_type is IndexId:
-                previous_node_id = _safe_exact_dict_value(previous[0], "node_id")
-                current_node_id = _safe_exact_dict_value(owner, "node_id")
-                previous_node_value = exact_identity_value(previous_node_id, NodeId)
-                current_node_value = exact_identity_value(current_node_id, NodeId)
-                previous_name = _safe_exact_dict_value(previous[0], "_name")
-                current_name = _safe_exact_dict_value(owner, "_name")
-                if (
-                    type(previous[0]) is IndexVar
-                    and type(owner) is IndexVar
-                    and previous_node_value is not None
-                    and previous_node_value == current_node_value
-                    and type(previous_name) is str
-                    and type(current_name) is str
-                    and previous_name == current_name
-                ):
-                    legacy_alias_candidates.append(
-                        (
-                            identity_type,
-                            previous[0],
-                            owner,
-                            previous[1],
-                            path,
-                            duplicate_code,
-                        )
-                    )
-                    return
             diagnose(
                 duplicate_code,
                 f"{identity_type.__name__} belongs to distinct CIN entities",
@@ -677,8 +614,6 @@ def _preflight_cin_structure_impl(  # noqa: C901
                 )
                 depth_reported = True
             continue
-        if type(node) is WorkspaceAccess:
-            workspace_access_occurrences.setdefault(object_id, []).append(path)
         if object_id in active:
             diagnose(
                 "cyclic_cin_structure",
@@ -688,18 +623,16 @@ def _preflight_cin_structure_impl(  # noqa: C901
             continue
         if object_id in complete:
             # Symbol-like leaves (index binders, tensor symbols, workspace
-            # declarations) are intrinsically shared by every use.  The one
-            # admissible shared occurrence node is the legacy workspace
-            # producer/consumer access pair, classified by the receipt
-            # post-pass below.  Every other statement, expression, or access
-            # object referenced from multiple parents previously escaped as a
-            # raw ValueError/IndexError from lowering or kernel-ABI assembly.
+            # declarations) are intrinsically shared by every use.  Every
+            # statement, expression, or access object -- a workspace access
+            # included -- has one parent; one referenced from multiple parents
+            # previously escaped as a raw ValueError/IndexError from lowering
+            # or kernel-ABI assembly.
             revisit_type = type(node)
             if (
                 revisit_type is not IndexVar
                 and revisit_type is not TensorVar
                 and revisit_type is not Workspace
-                and revisit_type is not WorkspaceAccess
             ):
                 diagnose(
                     "duplicate_node_reference",
@@ -721,8 +654,6 @@ def _preflight_cin_structure_impl(  # noqa: C901
             forward_index_objects[object_id] = (cast(IndexVar, node), path)
         elif node_type is TensorAccess or node_type is WorkspaceAccess:
             forward_access_objects[object_id] = (cast(TensorAccess, node), path)
-        elif node_type is Where:
-            where_paths.add(path)
         node_state = object.__getattribute__(node, "__dict__")
         if type(node_state) is not dict:
             diagnose(
@@ -743,7 +674,7 @@ def _preflight_cin_structure_impl(  # noqa: C901
         stack.append((True, node, path, depth))
         children: List[Tuple[object, Tuple[str, ...]]] = []
 
-        if allow_legacy_schedule_aliases:
+        if validate_legacy_compatibility_fields:
             # Normalization deliberately discards these mutable scheduler
             # compatibility fields.  Validate them only at the raw legacy
             # lowering boundary, whose forward copier consumes them.  Treating
@@ -769,8 +700,6 @@ def _preflight_cin_structure_impl(  # noqa: C901
                     f"{node_type.__name__}.inserted_workspace must be an exact bool",
                     path + ("inserted_workspace",),
                 )
-            if path == ("root",):
-                root_has_workspace_marker = inserted_workspace is True
             no_tile_list = stored_field(node, "no_tile_list", path)
             if no_tile_list is not _MISSING_CIN_FIELD:
                 if type(no_tile_list) is not list:
@@ -862,13 +791,6 @@ def _preflight_cin_structure_impl(  # noqa: C901
                     path + ("op",),
                 )
         elif type(node) is TensorAccess or type(node) is WorkspaceAccess:
-            if type(node) is WorkspaceAccess:
-                for edge_position in range(len(path) - 1, -1, -1):
-                    if path[edge_position] in ("producer", "consumer"):
-                        candidate_prefix = path[:edge_position]
-                        if candidate_prefix in where_paths:
-                            workspace_branch_prefixes.add(candidate_prefix)
-                        break
             tensor = stored_field(node, "tensor", path)
             if tensor is not _MISSING_CIN_FIELD:
                 expected_tensor_type = (
@@ -1021,7 +943,7 @@ def _preflight_cin_structure_impl(  # noqa: C901
                     "IndexVar._name must be an exact str",
                     path + ("_name",),
                 )
-            if allow_legacy_schedule_aliases:
+            if validate_legacy_compatibility_fields:
                 parent = stored_field(node, "_parent", path)
                 if parent is not _MISSING_CIN_FIELD and parent is not None:
                     validate_legacy_index_reference(
@@ -1256,7 +1178,7 @@ def _preflight_cin_structure_impl(  # noqa: C901
                         "Workspace.dense must be an exact bool",
                         path + ("dense",),
                     )
-                if allow_legacy_schedule_aliases:
+                if validate_legacy_compatibility_fields:
                     tile_size_var = stored_field(node, "_tile_size_var", path)
                     if (
                         tile_size_var is not _MISSING_CIN_FIELD
@@ -1335,11 +1257,10 @@ def _preflight_cin_structure_impl(  # noqa: C901
         for child, child_path in reversed(children):
             stack.append((False, child, child_path, depth + 1))
 
+    # Every reference, a tile component's parent and a tile's base index included,
+    # names an index of the forward graph: the logical index a tile splits is one.
     for index_var, path, owner in pending_index_references:
-        if id(index_var) not in forward_index_objects and owner not in (
-            "IndexVar._parent",
-            "TileSizeVar._index_var",
-        ):
+        if id(index_var) not in forward_index_objects:
             diagnose(
                 "invalid_cin_field",
                 f"{owner} references an IndexVar outside the forward CIN graph",
@@ -1353,109 +1274,8 @@ def _preflight_cin_structure_impl(  # noqa: C901
                 path,
             )
 
-    def valid_detached_tile_parent(
-        parent: IndexVar,
-        outer: IndexVar,
-        inner: IndexVar,
-    ) -> bool:
-        """Recognize one scheduler-created logical split parent.
-
-        Two successive legacy tiles can replace every forward occurrence of an
-        earlier logical index while the later outer/inner components retain
-        that logical object as their parent. It is schedule-authoritative, but
-        intentionally not a forward expression node. Admit only the exact,
-        bounded state produced by ``Scheduler.add_tile``; arbitrary foreign
-        parent graphs remain invalid and the forward copier follows no other
-        compatibility state.
-        """
-
-        parent_state = object.__getattribute__(parent, "__dict__")
-        if type(parent_state) is not dict or any(
-            type(key) is not str for key in parent_state
-        ):
-            return False
-        if (
-            exact_identity_value(parent_state.get("node_id"), NodeId) is None
-            or exact_identity_value(parent_state.get("index_id"), IndexId) is None
-            or type(parent_state.get("_name")) is not str
-            or parent_state.get("inserted_workspace") is not False
-            or "_parent" not in parent_state
-            or parent_state["_parent"] is not None
-            or parent_state.get("is_tiled") is not True
-            or parent_state.get("is_outer") is not False
-            or parent_state.get("is_inner") is not False
-            or "tile_size_var" not in parent_state
-            or parent_state["tile_size_var"] is not None
-        ):
-            return False
-        parent_node_value = exact_identity_value(
-            parent_state.get("node_id"),
-            NodeId,
-        )
-        parent_index_value = exact_identity_value(
-            parent_state.get("index_id"),
-            IndexId,
-        )
-        parent_name = parent_state.get("_name")
-        matching_forward_alias = any(
-            exact_identity_value(
-                _safe_exact_dict_value(candidate, "node_id"),
-                NodeId,
-            )
-            == parent_node_value
-            and exact_identity_value(
-                _safe_exact_dict_value(candidate, "index_id"),
-                IndexId,
-            )
-            == parent_index_value
-            and _safe_exact_dict_value(candidate, "_name") == parent_name
-            for candidate, _ in forward_index_objects.values()
-        )
-        if not matching_forward_alias:
-            return False
-        no_tile_list = parent_state.get("no_tile_list")
-        legacy_accesses = parent_state.get("_legacy_tensor_accesses")
-        if (
-            type(no_tile_list) is not list
-            or any(
-                type(index_var) is not IndexVar
-                or id(index_var) not in forward_index_objects
-                for index_var in no_tile_list
-            )
-            or type(legacy_accesses) is not list
-            or any(
-                (
-                    type(access) is not TensorAccess
-                    and type(access) is not WorkspaceAccess
-                )
-                or id(access) not in forward_access_objects
-                for access in legacy_accesses
-            )
-        ):
-            return False
-        expression = parent_state.get("_expr")
-        if type(expression) is not IndexVarAdd:
-            return False
-        expression_state = object.__getattribute__(expression, "__dict__")
-        if type(expression_state) is not dict or any(
-            type(key) is not str for key in expression_state
-        ):
-            return False
-        expression_no_tile = expression_state.get("no_tile_list", [])
-        return (
-            exact_identity_value(expression_state.get("node_id"), NodeId) is not None
-            and expression_state.get("inserted_workspace", False) is False
-            and type(expression_no_tile) is list
-            and all(
-                type(index_var) is IndexVar and id(index_var) in forward_index_objects
-                for index_var in expression_no_tile
-            )
-            and expression_state.get("lhs") is outer
-            and expression_state.get("rhs") is inner
-        )
-
     for index_var, path in forward_index_objects.values():
-        if not allow_legacy_schedule_aliases:
+        if not validate_legacy_compatibility_fields:
             # Normalization keeps the semantic IndexVar expression but resets
             # every mutable scheduling backlink/role below.
             continue
@@ -1554,10 +1374,11 @@ def _preflight_cin_structure_impl(  # noqa: C901
             or id(outer) not in forward_index_objects
             or id(inner) not in forward_index_objects
             or logical_parent is None
-            or (
-                id(logical_parent) not in forward_index_objects
-                and not valid_detached_tile_parent(logical_parent, outer, inner)
-            )
+            # The logical index a tile splits is in the forward graph: scheduler
+            # output names it in its accesses (workspace insertion shares it
+            # between producer and consumer).  A parent reachable only through
+            # its components is a graph the scheduler does not build.
+            or id(logical_parent) not in forward_index_objects
             or inner_parent is not logical_parent
             or type(logical_expression) is not IndexVarAdd
             or lhs is not outer
@@ -1687,211 +1508,6 @@ def _preflight_cin_structure_impl(  # noqa: C901
                 path + ("tensor_id",),
             )
 
-    def workspace_branch(
-        path: Tuple[str, ...],
-        prefix: Tuple[str, ...],
-    ) -> Optional[str]:
-        if len(path) <= len(prefix) or path[: len(prefix)] != prefix:
-            return None
-        edge = path[len(prefix)]
-        return edge if edge == "producer" or edge == "consumer" else None
-
-    def workspace_suffix(
-        path: Tuple[str, ...],
-        prefix: Tuple[str, ...],
-    ) -> Optional[Tuple[str, ...]]:
-        branch = workspace_branch(path, prefix)
-        if branch is None:
-            return None
-        return path[len(prefix) + 1 :]
-
-    def is_access_index_path(path: Tuple[str, ...]) -> bool:
-        return any(
-            component.startswith("indices[") and component.endswith("]")
-            for component in path
-        )
-
-    def same_index_identity(first: object, second: object) -> bool:
-        if type(first) is not IndexVar or type(second) is not IndexVar:
-            return False
-        first_node = exact_identity_value(
-            _safe_exact_dict_value(first, "node_id"),
-            NodeId,
-        )
-        second_node = exact_identity_value(
-            _safe_exact_dict_value(second, "node_id"),
-            NodeId,
-        )
-        first_index = exact_identity_value(
-            _safe_exact_dict_value(first, "index_id"),
-            IndexId,
-        )
-        second_index = exact_identity_value(
-            _safe_exact_dict_value(second, "index_id"),
-            IndexId,
-        )
-        first_name = _safe_exact_dict_value(first, "_name")
-        second_name = _safe_exact_dict_value(second, "_name")
-        return (
-            first_node is not None
-            and first_node == second_node
-            and first_index is not None
-            and first_index == second_index
-            and type(first_name) is str
-            and first_name == second_name
-        )
-
-    def plain_index_state(state_owner: object) -> bool:
-        return (
-            _safe_exact_dict_value(state_owner, "is_tiled") is False
-            and _safe_exact_dict_value(state_owner, "is_outer") is False
-            and _safe_exact_dict_value(state_owner, "is_inner") is False
-            and _safe_exact_dict_value(state_owner, "_parent") is None
-            and _safe_exact_dict_value(state_owner, "tile_size_var") is None
-            and _safe_exact_dict_value(state_owner, "_expr") is None
-        )
-
-    def tiled_logical_index_state(state_owner: object) -> bool:
-        return (
-            _safe_exact_dict_value(state_owner, "is_tiled") is True
-            and _safe_exact_dict_value(state_owner, "is_outer") is False
-            and _safe_exact_dict_value(state_owner, "is_inner") is False
-            and _safe_exact_dict_value(state_owner, "_parent") is None
-            and _safe_exact_dict_value(state_owner, "tile_size_var") is None
-            and type(_safe_exact_dict_value(state_owner, "_expr")) is IndexVarAdd
-        )
-
-    def same_index_schedule_state(first: object, second: object) -> bool:
-        """Aliased index objects must carry compatible schedule state.
-
-        The adapter canonicalizes same-identity aliases onto one object, so a
-        divergent pair (for example a plain twin of a validated tile
-        component) would merge into a state no validator approved and leak
-        raw assertions from legacy consumers.  Exactly one divergent pairing
-        is historical and admitted: workspace insertion clones a tiled
-        logical index as a plain twin in the paired branch (each side is
-        individually validated by the relational tile loops).
-        """
-
-        for field in ("is_tiled", "is_outer", "is_inner"):
-            if _safe_exact_dict_value(first, field) is not _safe_exact_dict_value(
-                second, field
-            ):
-                return (
-                    plain_index_state(first) and tiled_logical_index_state(second)
-                ) or (plain_index_state(second) and tiled_logical_index_state(first))
-        for field in ("_parent", "tile_size_var", "_expr"):
-            first_value = _safe_exact_dict_value(first, field)
-            second_value = _safe_exact_dict_value(second, field)
-            if first_value is None and second_value is None:
-                continue
-            if first_value is not second_value:
-                return (
-                    plain_index_state(first) and tiled_logical_index_state(second)
-                ) or (plain_index_state(second) and tiled_logical_index_state(first))
-        return True
-
-    def paired_statement_clone(
-        first: object,
-        second: object,
-    ) -> bool:
-        if type(first) is ForAll and type(second) is ForAll:
-            first_index = _safe_exact_dict_value(first, "index_var")
-            second_index = _safe_exact_dict_value(second, "index_var")
-            return same_index_identity(
-                first_index, second_index
-            ) and _safe_exact_dict_value(first, "parallel") == _safe_exact_dict_value(
-                second, "parallel"
-            )
-        if type(first) is TensorAssign and type(second) is TensorAssign:
-            return _safe_exact_dict_value(first, "op") is _safe_exact_dict_value(
-                second,
-                "op",
-            )
-        return False
-
-    legacy_aliases_used = False
-    candidate_workspace_prefix = (
-        next(iter(workspace_branch_prefixes))
-        if root_has_workspace_marker and len(workspace_branch_prefixes) == 1
-        else None
-    )
-    workspace_prefix = None
-    if (
-        candidate_workspace_prefix is not None
-        and len(workspace_access_occurrences) == 1
-    ):
-        access_paths = next(iter(workspace_access_occurrences.values()))
-        access_roles = {
-            (
-                workspace_branch(path, candidate_workspace_prefix),
-                path[-1] if path else None,
-            )
-            for path in access_paths
-        }
-        if len(access_paths) == 2 and access_roles == {
-            ("producer", "lhs"),
-            ("consumer", "rhs"),
-        }:
-            workspace_prefix = candidate_workspace_prefix
-    for occurrence_paths in workspace_access_occurrences.values():
-        if len(occurrence_paths) < 2:
-            continue
-        if workspace_prefix is not None:
-            # Exactly one shared access at exactly the producer-LHS and
-            # consumer-RHS roles: the admitted legacy receipt pair.
-            continue
-        diagnose(
-            "duplicate_node_reference",
-            "WorkspaceAccess object is referenced from multiple parents",
-            occurrence_paths[1],
-        )
-    for (
-        identity_type,
-        previous_owner,
-        current_owner,
-        previous_path,
-        path,
-        duplicate_code,
-    ) in legacy_alias_candidates:
-        allowed = False
-        if workspace_prefix is not None:
-            previous_branch = workspace_branch(previous_path, workspace_prefix)
-            branch = workspace_branch(path, workspace_prefix)
-            previous_suffix = workspace_suffix(previous_path, workspace_prefix)
-            suffix = workspace_suffix(path, workspace_prefix)
-            if identity_type is IndexId or (
-                identity_type is NodeId
-                and type(previous_owner) is IndexVar
-                and type(current_owner) is IndexVar
-            ):
-                allowed = (
-                    same_index_identity(previous_owner, current_owner)
-                    and same_index_schedule_state(previous_owner, current_owner)
-                    and (
-                        is_access_index_path(previous_path)
-                        or is_access_index_path(path)
-                        or (
-                            {previous_branch, branch} == {"producer", "consumer"}
-                            and previous_suffix == suffix
-                        )
-                    )
-                )
-            elif identity_type is NodeId:
-                allowed = (
-                    {previous_branch, branch} == {"producer", "consumer"}
-                    and previous_suffix == suffix
-                    and paired_statement_clone(previous_owner, current_owner)
-                )
-        if allowed:
-            legacy_aliases_used = True
-        else:
-            diagnose(
-                duplicate_code,
-                f"{identity_type.__name__} belongs to distinct CIN entities",
-                path,
-            )
-
     if not diagnostics:
         # Every field read below was admitted by the walk above. Expression
         # objects are never shared, so each right-hand side is walked once.
@@ -1935,16 +1551,13 @@ def _preflight_cin_structure_impl(  # noqa: C901
                             expression_path,
                         )
 
-    return tuple(diagnostics), legacy_aliases_used
+    return tuple(diagnostics)
 
 
 def _preflight_cin_structure(cin: IndexStmt) -> Tuple[CINDiagnostic, ...]:
     """Run the strict normalized-CIN structural preflight."""
 
-    diagnostics, aliases_used = _preflight_cin_structure_impl(cin)
-    if aliases_used:
-        raise ScorchAssertionError("not aliases_used", code="cin_aliases_unexpected")
-    return diagnostics
+    return _preflight_cin_structure_impl(cin)
 
 
 def _raise_cin_verification(diagnostics: Tuple[CINDiagnostic, ...]) -> None:
@@ -1971,17 +1584,14 @@ def verify_cin_structure(cin: IndexStmt) -> None:
         _raise_cin_verification(diagnostics)
 
 
-def _verify_legacy_cin_lowering_structure(cin: IndexStmt) -> bool:
-    """Validate raw legacy-lowering input without rejecting scheduler aliases.
+def _verify_legacy_cin_lowering_structure(cin: IndexStmt) -> None:
+    """Validate raw legacy-lowering input, scheduler fields included.
 
     A plan-free ``Scheduler.auto_schedule`` result is a private compatibility
-    graph, not normalized CIN: workspace insertion duplicates same-kind
-    statement nodes and paired-node, same-named logical index objects while
-    preserving their stable IDs. ``legacy_cin_working_copy`` canonicalizes
-    those index aliases before any recursive legacy consumer runs. Admit
-    exactly that historical shape here while retaining every field, type,
-    cycle, depth, reference, symbol, and access-identity check from the shared
-    preflight.
+    graph, not normalized CIN: it carries mutable scheduler fields that the
+    legacy forward copier consumes.  Check those fields as well as every
+    field, type, cycle, depth, reference, symbol, and identity rule of the
+    strict preflight.
     """
 
     if not _is_index_stmt_instance(cin):
@@ -1989,13 +1599,12 @@ def _verify_legacy_cin_lowering_structure(cin: IndexStmt) -> bool:
             "legacy CIN lowering expects an IndexStmt",
             code="internal_argument_type_invalid",
         )
-    diagnostics, aliases_used = _preflight_cin_structure_impl(
+    diagnostics = _preflight_cin_structure_impl(
         cin,
-        allow_legacy_schedule_aliases=True,
+        validate_legacy_compatibility_fields=True,
     )
     if diagnostics:
         _raise_cin_verification(diagnostics)
-    return aliases_used
 
 
 @dataclass(frozen=True)
@@ -3193,7 +2802,8 @@ CALLER_TILED_CIN_UNSUPPORTED = "caller_tiled_cin_unsupported"
 
 def _refuse_caller_tiled_cin(cin: IndexStmt) -> None:
     """Refuse a statement that carries a tile its caller made (``Scheduler.add_tile``,
-    or a hand-built ``TileSizeVar``).
+    or a hand-built ``TileSizeVar``): :func:`_tile_split_diagnostics`, raised by
+    :func:`_raise_tile_splits`.
 
     Normalized CIN carries no schedule.  The clone in :func:`_normalize_cin_owned`
     keeps an index's sum (``i = i_out + i_in``) but clears every tile size and split
@@ -3208,6 +2818,25 @@ def _refuse_caller_tiled_cin(cin: IndexStmt) -> None:
     (split roles, tile sizes, parent and workspace backlinks) are not read:
     whatever they hold cannot change what normalization admits.  Runs after the
     structural preflight, which bounds the walk and fixes every field's type.
+    """
+
+    _raise_tile_splits(_tile_split_diagnostics(cin), stage="normalized CIN")
+
+
+def _tile_split_diagnostics(
+    cin: IndexStmt, *, pass_name: str = "normalize_cin"
+) -> Tuple[CINDiagnostic, ...]:
+    """One ``caller_tiled_cin_unsupported`` diagnostic per index variable of ``cin``
+    that is the sum of a tile's two loops (its ``_expr`` an ``IndexVarAdd``: only
+    tiling gives an index a sum), in forward order; empty when ``cin`` has no tile.
+
+    Normalization refuses every one (:func:`_refuse_caller_tiled_cin`).  The legacy
+    lowering boundary reads them before full CIN verification
+    (``CINLowerer._prepare_scheduled_cin``): that verification is defined over
+    normalized CIN, whose index variables a loop binds, so a tiled statement cannot
+    pass it; the accesses name the sum, which no loop binds, and would be reported
+    as unbound (``dangling_index_reference``).  Runs after the structural preflight,
+    which bounds the walk and fixes every field's type.
     """
 
     diagnostics: List[CINDiagnostic] = []
@@ -3234,7 +2863,7 @@ def _refuse_caller_tiled_cin(cin: IndexStmt) -> None:
                         message=f"index {node.name!r} {reason}",
                         path=path,
                         entity_id=node.index_id,
-                        pass_name="normalize_cin",
+                        pass_name=pass_name,
                     )
                 )
                 pending.append((node._expr.lhs, path + ("_expr", "lhs")))
@@ -3259,12 +2888,19 @@ def _refuse_caller_tiled_cin(cin: IndexStmt) -> None:
             pending.append((node.right, path + ("right",)))
         elif isinstance(node, UnaryOp):
             pending.append((node.expr, path + ("expr",)))
+    return tuple(diagnostics)
+
+
+def _raise_tile_splits(diagnostics: Tuple[CINDiagnostic, ...], *, stage: str) -> None:
+    """Raise ``caller_tiled_cin_unsupported`` for :func:`_tile_split_diagnostics`'s
+    result at the boundary ``stage`` names, or return when it is empty."""
+
     if diagnostics:
         first = diagnostics[0]
         raise UnsupportedFeature(
-            f"stage=normalized CIN: {first.code} at "
+            f"stage={stage}: {first.code} at "
             f"{'/'.join(first.path)}: {first.message}",
-            diagnostics=tuple(diagnostics),
+            diagnostics=diagnostics,
             code="caller_tiled_cin_unsupported",
         )
 
@@ -3619,30 +3255,7 @@ def canonical_cin_dump(cin: IndexStmt) -> str:
 
     if not _is_index_stmt_instance(cin):
         raise TypeError("canonical_cin_dump expects an IndexStmt")
-    try:
-        verify_cin_structure(cin)
-    except VerificationError as strict_error:
-        diagnostics = cast(
-            Tuple[CINDiagnostic, ...],
-            strict_error.diagnostics,
-        )
-        if not diagnostics or any(
-            diagnostic.code
-            not in {
-                "duplicate_node_id",
-                "duplicate_index_id",
-                "duplicate_node_reference",
-            }
-            for diagnostic in diagnostics
-        ):
-            raise
-        # Legacy automatic workspace insertion clones producer/consumer
-        # syntax with one exact, validated stable-ID alias receipt.  The dump
-        # has historically been usable to compare those detached schedule
-        # artifacts.  Admit only the same narrow shape as raw legacy lowering;
-        # any unrelated duplicate or malformed compatibility field still
-        # fails closed.
-        _verify_legacy_cin_lowering_structure(cin)
+    verify_cin_structure(cin)
 
     node_ids: Dict[NodeId, int] = {}
     access_ids: Dict[AccessId, int] = {}

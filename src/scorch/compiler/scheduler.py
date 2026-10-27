@@ -43,11 +43,13 @@ from scorch.compiler.cin import (
     WorkspaceAccess,
     _is_index_stmt_instance,
     coordinate_result_driver,
+    copy_statement,
 )
 from .cin_analysis import (
     _compile_options_at_cin_boundary,
     _trusted_normalized_cin,
     normalize_cin,
+    verify_cin_structure,
 )
 from .compilation_context import CompilerStageId, CompilationContext
 from .compile_options import CompileOptions, SchedulerCostModel, SchedulerPolicy
@@ -3384,7 +3386,9 @@ class Scheduler:
             stmt=cin,
             parallel=True if parallel else None,
         )
-        return Scheduler._insert_loop_at_depth(cin, outer_forall, insertion_depth)
+        tiled = Scheduler._insert_loop_at_depth(cin, outer_forall, insertion_depth)
+        verify_cin_structure(tiled)
+        return tiled
 
     @staticmethod
     def insert_workspace(cin: CIN, allow_dense=False) -> CIN:
@@ -3486,7 +3490,13 @@ class Scheduler:
             dense=are_all_dense_levels,
         )
 
-        workspace_access = WorkspaceAccess(
+        # The producer writes the workspace and the consumer reads it: two
+        # accesses of one workspace, as a hand-built where statement has.
+        producer_workspace_access = WorkspaceAccess(
+            wksp=workspace,
+            indices=workspace_indices,
+        )
+        consumer_workspace_access = WorkspaceAccess(
             wksp=workspace,
             indices=workspace_indices,
         )
@@ -3554,8 +3564,11 @@ class Scheduler:
         if isinstance(reduction_forall, Where):
             return cin
 
-        # Create the producer forall
-        producer_forall = copy.deepcopy(reduction_forall)
+        # Create the producer forall.  The producer and the consumer are copies
+        # of one subtree in one tree, so they share its index variables and
+        # tensors and get fresh node ids (``copy_statement``); each access
+        # survives on one side only, as the other side's is replaced below.
+        producer_forall = copy_statement(reduction_forall)
 
         producer_forall_tensor_access_parent = producer_forall
 
@@ -3566,10 +3579,10 @@ class Scheduler:
             )
 
         # Replace the TensorAssign's lhs with the workspace
-        producer_forall_tensor_access_parent.stmt.lhs = workspace_access
+        producer_forall_tensor_access_parent.stmt.lhs = producer_workspace_access
 
         # Create the consumer forall
-        consumer_forall = copy.deepcopy(reduction_forall)
+        consumer_forall = copy_statement(reduction_forall)
 
         consumer_forall_tensor_access_parent = consumer_forall
         # Iterate until the TensorAssign statement
@@ -3579,7 +3592,7 @@ class Scheduler:
             )
 
         # Replace the TensorAssign's rhs with the workspace
-        consumer_forall_tensor_access_parent.stmt.rhs = workspace_access
+        consumer_forall_tensor_access_parent.stmt.rhs = consumer_workspace_access
 
         # Create the Where statement
         where_stmt = Where(
@@ -3606,6 +3619,7 @@ class Scheduler:
 
         new_cin.inserted_workspace = True
 
+        verify_cin_structure(new_cin)
         return new_cin
 
     @staticmethod
