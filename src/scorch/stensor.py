@@ -1340,7 +1340,9 @@ class STensor:
     :meth:`from_csr` and :meth:`from_coo` given a torch sparse tensor keep that
     tensor's own index arrays rather than copying them, as torch itself does
     (``torch.sparse_csr_tensor(crow, col, values)`` keeps ``crow`` and ``col``);
-    ``scorch.from_components``, and :meth:`from_coo` given raw arrays, copy them.
+    ``scorch.from_components``, and :meth:`from_coo` given raw arrays, copy them,
+    and a torch COO tensor flagged coalesced whose coordinates are out of order is
+    sorted into arrays of Scorch's own.
     Scorch sees a write that moves PyTorch's version counter (``tensor._version``):
     an in-place torch operation on the array, on a view of it, or through the
     accessors of the torch sparse tensor the STensor was built from. The next call
@@ -1522,6 +1524,7 @@ class STensor:
         index_dtype: Optional[torch.dtype] = None,
         adopt: bool = False,
         requires_grad: Optional[bool] = False,
+        repair_coo: bool = False,
     ) -> "STensor":
         """Internal constructor from a format, its index arrays and the values.
 
@@ -1536,6 +1539,10 @@ class STensor:
         has the measurement). Every construction inside Scorch that starts from arrays
         goes through here; the public constructor keeps the full audit for an index
         object a caller brings.
+
+        ``repair_coo`` is for a torch COO tensor's arrays: coordinates out of order or
+        repeated are then sorted and summed into a private copy, as torch defines them,
+        instead of refused (``SparseStorage``'s ``_repair_coo``).
         """
         audited = _index_components(
             tensor_format, mode_indices, mode_order, index_dtype, not adopt
@@ -1556,7 +1563,9 @@ class STensor:
         layout = TensorLayout.from_physical_shape(
             shape, index_format, order, index_dtype
         )
-        storage = SparseStorage(layout, value, _audited_index=audited)
+        storage = SparseStorage(
+            layout, value, _audited_index=audited, _repair_coo=repair_coo
+        )
         # The storage's own values tensor, read directly: the `value` property hands
         # out a new detached tensor per read, and two reads were 2 of this path's calls.
         owned_value = storage._value
@@ -2547,6 +2556,10 @@ class STensor:
                     "hybrid COO tensors with dense value dimensions are unsupported",
                     code="hybrid_coo_unsupported",
                 )
+            # coalesce() does nothing to a tensor torch flags coalesced, and torch keeps
+            # that flag through a permute that leaves dimension 0 first but reorders the
+            # coordinates, so its arrays are repaired at construction (`repair_coo`), not
+            # trusted.
             coo_matrix = coo_matrix.coalesce()
             (indices,) = _torch_index_members(coo_matrix)
             values = coo_matrix.values().resolve_conj().resolve_neg()
@@ -2659,6 +2672,8 @@ class STensor:
             mode_indices,
             values,
             adopt=True,  # the coalesced tensor's own, as torch shares them
+            # A caller's torch tensor only: raw arrays were sorted by torch above.
+            repair_coo=coo_matrix is not None,
         )
         return _linked(built, values, mode_indices)
 
@@ -2716,8 +2731,12 @@ class STensor:
         torch tensor's own compressed and plain index arrays (CSR, and CSC in its
         natural order; a CSC input converted to CSR by an explicit identity
         ``mode_order`` is a copy) or its ``indices`` (COO: the caller's arrays when
-        the input is already coalesced, else those of the coalesced tensor torch
-        makes), as torch does. They must
+        the input is coalesced with its coordinates in order, those of the coalesced
+        tensor torch makes when it is not coalesced, and a sorted copy of Scorch's
+        own when torch flags it coalesced although its coordinates are out of order,
+        as torch's ``permute`` leaves them when dimension 0 stays first; a
+        ``mode_order`` other than the identity reads torch's permute of the input,
+        whose indices are new arrays), as torch does. They must
         not change afterwards except through in-place torch operations, which
         Scorch sees and re-checks at the next call. A write that moves no version
         counter -- inside ``torch.inference_mode()``, through ``.data``,
@@ -2803,6 +2822,13 @@ class STensor:
         if tensor.is_sparse or tensor.is_sparse_csr:
             if tensor.layout == torch.sparse_coo:
                 mode_indices = []
+                # coalesce() does nothing to a tensor torch flags coalesced, and torch
+                # (2.13) keeps that flag through a permute that leaves dimension 0 first
+                # but reorders the coordinates -- the permute above, for a mode_order
+                # [0, 2, 1], and one a caller made. The arrays are therefore repaired at
+                # construction (`repair_coo`), not trusted: the order screen that
+                # validates every COO tensor's arrays finds the disorder, and only then
+                # are they sorted, into a private copy.
                 tensor = tensor.coalesce()
                 (tensor_indices,) = _torch_index_members(tensor)
                 for i in range(tensor.dim()):
@@ -2817,6 +2843,7 @@ class STensor:
                     coo_values,
                     mode_order=mode_order,
                     adopt=True,  # shared with `tensor`, as torch shares them
+                    repair_coo=True,
                 )
                 return _linked(built, coo_values, mode_indices)
 

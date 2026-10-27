@@ -85,7 +85,12 @@ from .plan import GRAD_ATTR, torch_object_state
 from . import einsum_grad
 from .stensor import STensor
 from .stensor_grad import AUTOGRAD_VALUES, attach
-from .storage import _canonical_index, _first_unsorted_parent, tensor_version
+from .storage import (
+    _canonical_index,
+    _coo_order_violated,
+    _first_unsorted_parent,
+    tensor_version,
+)
 
 _Stamp = Tuple[int, int, int, int]
 
@@ -286,6 +291,11 @@ class _Structure:
     computed from). :meth:`describes` compares their stamps, so a structure whose operand
     has changed is rebuilt rather than reused, and the transpose is shared by every
     structure over the same ones (``_TRANSPOSES``).
+
+    ``destination`` is the map from the operand's stored values to ``positions`` and
+    ``coordinates``, when the caller put the operand's entries in canonical form before
+    building these arrays (a COO operand whose coalesced flag hides disorder); None when
+    the arrays hold the operand's entries in its own order.
     """
 
     def __init__(
@@ -295,6 +305,7 @@ class _Structure:
         rows: int,
         cols: int,
         sources: Tuple[torch.Tensor, ...] = (),
+        destination: Optional[torch.Tensor] = None,
     ) -> None:
         # Detached: an operand's index accessor can return a view whose base is the operand
         # itself (a COO tensor's indices()), and this structure lives in the operand's own
@@ -308,7 +319,6 @@ class _Structure:
         # increasing. Only when it finds something is the range checked on its own, so a row
         # whose columns are out of order or repeated -- which torch accepts and sums -- is
         # told apart from a structure that is invalid.
-        destination: Optional[torch.Tensor] = None
         if positions.numel() != rows + 1 or _native.abi_screen_compressed_level(
             positions, coordinates, cols, True
         ):
@@ -327,10 +337,17 @@ class _Structure:
                 layout = TensorLayout.from_physical_shape(
                     (rows, cols), "ds", index_dtype=positions.dtype
                 )
-                index, _, destination = _canonical_index(
+                index, _, repaired = _canonical_index(
                     layout, ((), (positions, coordinates)), coordinates.numel()
                 )
                 positions, coordinates = index[1]
+                # Composed with the caller's map, when the caller had put the entries in
+                # a canonical form already: each of the operand's values goes where its
+                # entry went.
+                if destination is None:
+                    destination = repaired
+                elif repaired is not None:
+                    destination = repaired[destination]
         self.positions = positions
         self.coordinates = coordinates
         self.rows = rows
@@ -1228,6 +1245,30 @@ def _torch_operand(a: torch.Tensor) -> Optional[Tuple[_Operand, torch.Tensor]]:
         state = torch_object_state(a, create=True)
 
         def build() -> _Structure:
+            if _coo_order_violated((row_of, coordinates), row_of.numel()):
+                # Flagged coalesced with its coordinates out of order or repeated: a
+                # caller's is_coalesced=True, which torch does not check, and under which
+                # the conversion below reads unsorted rows as wrong, still increasing
+                # positions. The positions are computed from the entries in canonical
+                # form instead (storage._canonical_index), with the map that sums the
+                # operand's values into it and carries gradients back to the operand's
+                # own entries, as for a CSR operand's unsorted row.
+                layout = TensorLayout.from_physical_shape(
+                    (rows, cols), "oo", index_dtype=indices.dtype
+                )
+                index, _, destination = _canonical_index(
+                    layout, ((row_of,), (coordinates,)), row_of.numel()
+                )
+                (canonical_rows,), (canonical_columns,) = index
+                positions = torch._convert_indices_from_coo_to_csr(canonical_rows, rows)
+                return _Structure(
+                    positions,
+                    canonical_columns,
+                    rows,
+                    cols,
+                    sources=(indices,),
+                    destination=destination,
+                )
             positions = torch._convert_indices_from_coo_to_csr(row_of, rows)
             return _Structure(positions, coordinates, rows, cols, sources=(indices,))
 

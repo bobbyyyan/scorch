@@ -709,6 +709,27 @@ def _first_coo_order_defect(
     return None
 
 
+def _coo_order_violated(levels: Sequence[torch.Tensor], count: int) -> bool:
+    """Whether some COO coordinate tuple is not strictly greater than the one before it:
+    ``_first_coo_order_defect``'s verdict without the position, for a caller that repairs
+    the coordinates rather than reporting where they first go wrong.
+
+    The native screen's False proves the order. Its True also covers an input it cannot
+    serve, so a True is confirmed exactly by one vectorized pass per level instead of the
+    loop over every entry in Python: a tuple is greater when, at the first level where
+    the two differ, its coordinate is the greater one.
+    """
+    if _screen_lex_levels(levels, count) is False or count < 2:
+        return False
+    greater = torch.zeros(count - 1, dtype=torch.bool)
+    tied = torch.ones(count - 1, dtype=torch.bool)
+    for level in levels:
+        before, after = level[: count - 1], level[1:count]
+        greater |= tied & (after > before)
+        tied &= after == before
+    return not bool(greater.all())
+
+
 def _screen_compressed_level(
     positions: torch.Tensor, coordinates: torch.Tensor, extent: int
 ) -> bool:
@@ -797,10 +818,13 @@ def _validate_index_storage(
     canonical form (``_canonical_storage``). Every other defect still raises, and so
     does an unordered level in any other format. Returns False for well-formed storage.
 
-    A COO tensor whose coordinates repeat or descend is never repaired on construction:
-    a repeat raises ``RepeatedCoordinateError``. ``repair_coo`` is for
-    ``STensor.coalesce()`` alone, the call that sums repeats on request: such COO
-    coordinates are then reported by returning True instead.
+    A COO tensor's arrays whose coordinates repeat or descend are not repaired on
+    construction: a repeat raises ``RepeatedCoordinateError``. ``repair_coo`` is for the
+    two callers that sum repeats, as torch defines a COO tensor's: ``STensor.coalesce()``,
+    on request, and the intake of a torch COO tensor (``STensor.from_torch``,
+    ``STensor.from_coo``), whose coalesced flag torch can keep through a ``permute`` that
+    reorders its coordinates. Such COO coordinates are then reported by returning True
+    instead.
     """
     nnz = values.numel()
     level_types = layout.format.level_types
@@ -845,11 +869,11 @@ def _validate_index_storage(
                 coordinate, layout.physical_shape[mode], f"COO mode {mode}"
             )
             coordinates_per_mode.append(coordinate)
+        if repair_coo:
+            return _coo_order_violated(coordinates_per_mode, nnz)
         defect = _first_coo_order_defect(coordinates_per_mode, nnz)
         if defect is None:
             return False
-        if repair_coo:
-            return True
         position, repeated = defect
         if not repeated:
             raise TensorIndexError(
@@ -1287,7 +1311,8 @@ def _canonical_index(
     torch accepts in a CSR tensor and sums in every operation on it, but which Scorch's
     kernels cannot read, since co-iterating two sparse operands assumes distinct,
     increasing coordinates; and for COO levels that store a coordinate twice or out of
-    order, which Scorch refuses and ``STensor.coalesce()`` repairs. Every stored entry's
+    order, which Scorch refuses and ``STensor.coalesce()`` and a torch COO tensor's
+    intake repair. Every stored entry's
     full coordinate is recovered, the entries are sorted lexicographically, and the levels
     are rebuilt in the same format from the distinct coordinates.
 
@@ -1492,7 +1517,12 @@ class SparseStorage:
         _trusted_index: bool = False,
         index: Optional[TensorIndex] = None,
         _audited_index: Optional[AuditedIndex] = None,
+        _repair_coo: bool = False,
     ) -> None:
+        # ``_repair_coo`` is internal too: a torch COO tensor's intake, whose coordinates
+        # torch may hand over out of order under a coalesced flag (``from_torch``), gets
+        # the canonical form below instead of the refusal a caller's COO arrays get.
+        #
         # ``_audited_index`` is internal, like ``_trusted_index``: the four values that
         # ``_index_components`` returned to the caller's own frame a moment ago. The
         # arrays are retained as they are, with no second audit, and the layout is held
@@ -1638,11 +1668,17 @@ class SparseStorage:
             # sums. The storage then holds a sorted, repeat-summed private copy instead
             # (_canonical_storage), so it shares no arrays with the caller and a later
             # write to theirs does not reach it, as with an uncoalesced COO tensor, which
-            # `from_torch` coalesces into a new one. A kernel's result is never repaired:
-            # the branch below makes the same defect in one an error, because it means
-            # the compiler emitted something wrong.
+            # `from_torch` coalesces into a new one. A torch COO tensor's coordinates get
+            # the same copy (`_repair_coo`) when they are out of order or repeated although
+            # torch flags them coalesced. A kernel's result is never repaired: the branch
+            # below makes the same defect in one an error, because it means the compiler
+            # emitted something wrong.
             if _validate_index_storage(
-                layout, normalized, owned_value, allow_unordered=True
+                layout,
+                normalized,
+                owned_value,
+                allow_unordered=True,
+                repair_coo=_repair_coo,
             ):
                 normalized, owned_value = _canonical_storage(
                     layout, normalized, owned_value

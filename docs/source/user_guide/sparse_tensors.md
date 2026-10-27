@@ -166,8 +166,10 @@ themselves may be the caller's: see
 tensor's own index arrays instead of copying them, exactly as PyTorch does:
 `torch.sparse_csr_tensor(crow, col, values)` keeps `crow` and `col`, and so does
 an STensor built from it. (`from_components`, and `from_coo` given raw arrays,
-copy them.) Copying would cost two O(nnz) copies per conversion and defeat the
-per-array checks Scorch caches between calls.
+copy them, and a torch COO tensor flagged coalesced whose coordinates are out of
+order, as `permute` can leave one, is sorted into arrays of Scorch's own.)
+Copying would cost two O(nnz) copies per conversion and defeat the per-array
+checks Scorch caches between calls.
 
 So the index arrays must not change after construction, except through writes
 Scorch can see. It sees every write that moves PyTorch's version counter
