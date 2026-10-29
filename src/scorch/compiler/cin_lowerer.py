@@ -50,6 +50,7 @@ from .diagnostics import (
     CompileOptionsDiagnostic,
     CompileOptionsError,
     CompilerInvariantError,
+    InvalidSchedule,
     UnsupportedFeature,
     VerificationError,
 )
@@ -132,6 +133,14 @@ if TYPE_CHECKING:
 _SPARSE_POSITION_DISCOVERY_CONTEXT = LLIRTraversalContext(
     stage="CIN lowering",
     pass_name="collect_sparse_position_arrays",
+)
+
+# Why ``_mark_parallel`` left an explicitly marked loop serial
+# (``mark_first_for_loop_parallel`` returned False).
+_MARK_NOT_PLACED = (
+    "its first OpenMP-compatible loop must stay serial (it carries a value between "
+    "iterations or shares an object between workers), or the lowering has no "
+    "OpenMP-compatible counted loop at its top level"
 )
 
 # Short names for the statement-level result-storage marker's vocabulary; the
@@ -402,6 +411,11 @@ class CINLowerer:
         # caller-supplied recurse flag (which must not).
         self._active_lowerings: int = 0
         self.has_explicit_parallel_loop = False
+        # How many ForAlls of each name the statement marks parallel=True, and, per
+        # name, why a pass that tried to mark its loop did not mark it
+        # (``_require_explicit_parallel_marks_kept``).
+        self._explicit_parallel_loop_counts: Dict[str, int] = {}
+        self._explicit_parallel_marks_missed: Dict[str, str] = {}
         self.loop_plan: Optional[LoopPlan] = None
         self.normalized_cin: Optional[IndexStmt] = None
 
@@ -4866,6 +4880,10 @@ class CINLowerer:
             self.outermost_stmt = stmt
             self.has_explicit_parallel_loop = self._contains_explicit_parallel(stmt)
             self._refuse_parallel_loops_with_shared_cells(stmt)
+            if self.has_explicit_parallel_loop:
+                self._explicit_parallel_loop_counts = (
+                    self._count_explicit_parallel_loops(stmt, {})
+                )
 
         if isinstance(stmt, TensorAssign):
             return self.lower_TensorAssign(stmt)
@@ -5446,6 +5464,7 @@ class CINLowerer:
         if not isinstance(lowered, llir.Function):
             return lowered
         if self.loop_plan is None:
+            self._require_explicit_parallel_marks_kept(lowered)
             self._place_unplaced_workspace_clusters(lowered)
             return lowered
         compilation_context = self._compilation_context
@@ -5467,6 +5486,7 @@ class CINLowerer:
                 result_tile_plan,
             ) = materialize_legacy_schedule(self.normalized_cin or stmt, self.loop_plan)
             self._apply_explicit_parallel_schedule(lowered, legacy_schedule)
+            self._require_explicit_parallel_marks_kept(lowered)
             self._place_unplaced_workspace_clusters(lowered)
             from .schedule_lowerer import apply_schedule_to_llir
 
@@ -5660,6 +5680,118 @@ class CINLowerer:
                 f"stage=legacy CIN lowering: {PARALLEL_REDUCTION} for "
                 f"{tensor.get_name()!r} (loop {index_var.name})",
                 (diagnostic,),
+            )
+
+    @staticmethod
+    def _count_explicit_parallel_loops(
+        stmt: IndexStmt, counts: Dict[str, int]
+    ) -> Dict[str, int]:
+        """Add to ``counts``, per loop name, the ForAlls of ``stmt`` marked
+        parallel=True (the value ``lower_ForAll`` marks), and return it."""
+
+        if isinstance(stmt, ForAll):
+            if stmt.parallel is True:
+                name = stmt.get_index_var().name
+                counts[name] = counts.get(name, 0) + 1
+            CINLowerer._count_explicit_parallel_loops(stmt.stmt, counts)
+        elif isinstance(stmt, Where):
+            CINLowerer._count_explicit_parallel_loops(stmt.producer, counts)
+            CINLowerer._count_explicit_parallel_loops(stmt.consumer, counts)
+        return counts
+
+    @staticmethod
+    def _count_parallel_loops(
+        stmts: Sequence[llir.Stmt], counts: Dict[str, int]
+    ) -> Dict[str, int]:
+        """Add to ``counts``, per ``_tag_first_loop`` name, the loops of ``stmts``,
+        nested ones included, that run their iterations on several workers: marked
+        ``omp parallel for``, or given the atomic work-stealing that
+        ``mark_first_for_loop_parallel`` puts in its place; and return it."""
+
+        for stmt in stmts:
+            bodies: List[List[llir.Stmt]] = []
+            if isinstance(stmt, llir.ForLoop):
+                name = stmt.scorch_index_var
+                if name is not None and (
+                    stmt.omp_parallel_for
+                    or getattr(stmt, "_use_atomic_scheduling", False)
+                ):
+                    counts[name] = counts.get(name, 0) + 1
+                bodies.append(stmt.body)
+                for extra in (
+                    stmt.before_parallel_body,
+                    stmt.pre_parallel_body,
+                    stmt.post_parallel_body,
+                ):
+                    if extra:
+                        bodies.append(extra)
+            elif isinstance(stmt, (llir.WhileLoop, llir.ForLoopAuto, llir.LambdaDef)):
+                bodies.append(stmt.body)
+            elif isinstance(stmt, llir.IfThenElse):
+                if stmt.then_body:
+                    bodies.append(stmt.then_body)
+                if stmt.else_body:
+                    bodies.append(stmt.else_body)
+                if stmt.then_body_list:
+                    bodies.extend(stmt.then_body_list)
+            for body in bodies:
+                CINLowerer._count_parallel_loops(body, counts)
+        return counts
+
+    def _require_explicit_parallel_marks_kept(self, function: llir.Function) -> None:
+        """Refuse the statement if a loop it marks parallel=True does not run in
+        parallel in the lowered kernel.
+
+        A mark reaches the kernel only through ``_mark_parallel``: in
+        ``lower_ForAll``, for a ForAll object the statement itself holds, and in
+        the Schedule API's pass that marks its loop by name after lowering
+        (``_apply_explicit_parallel_schedule``).  Two ways a mark is lost there:
+        the iteration lattice lowers an inner loop from a copy it rebuilds without
+        the mark (``LatticePoint.get_simplified_cin``), so the loop is lowered
+        serially; and ``mark_first_for_loop_parallel`` marks nothing when the
+        first OpenMP-compatible loop must stay serial or there is no such loop at
+        the top of the list (a while loop that merges two compressed levels).
+        An explicit mark also switches off the automatic parallelization of the
+        outer loop (``has_explicit_parallel_loop``), so such a kernel ran on one
+        worker and nothing said so.
+
+        Runs after the last pass that marks a loop and before any kernel is
+        built.  Each name must have at least as many parallel loops tagged with
+        it as the statement marks ForAlls of that name: two sibling nests can
+        both loop over one variable, and one of their marks can be lost while
+        the other is kept.  Lost marks are refused, not kept: keeping them
+        changes the emitted C++, which needs its own timing.  Only this check
+        gives the code, so it is not one of ``loop_plan_legality``'s rules that
+        several routes check (``refuse_parallel_mark``); the code is set on the
+        error as those rules set theirs.
+        """
+
+        if not self._explicit_parallel_loop_counts:
+            return
+        kept = self._count_parallel_loops(function.body, {})
+        for name, marked in self._explicit_parallel_loop_counts.items():
+            if kept.get(name, 0) >= marked:
+                continue
+            reason = self._explicit_parallel_marks_missed.get(
+                name,
+                "the iteration lattice lowers it from a copy of the loop that "
+                "carries no mark",
+            )
+            diagnostic = CINDiagnostic(
+                code="parallel_mark_dropped",
+                message=(
+                    f"loop {name} is marked parallel, and the lowered kernel runs "
+                    f"{kept.get(name, 0)} of its {marked} marked loop(s) over "
+                    f"{name} in parallel: {reason}"
+                ),
+                path=("root",),
+                stage="legacy_cin_lowering",
+                pass_name="explicit_parallel_loop",
+            )
+            raise InvalidSchedule(
+                f"stage=legacy CIN lowering: parallel_mark_dropped (loop {name})",
+                diagnostics=(diagnostic,),
+                code="parallel_mark_dropped",
             )
 
     def _should_parallelize_outer_forall(self, index_var: IndexVar) -> bool:
@@ -5967,18 +6099,24 @@ class CINLowerer:
             level, f"{result_name}{level}_size"
         )
 
-    def _mark_parallel(self, stmts: List[llir.Stmt]) -> None:
-        """Mark the first compatible loop parallel and record what it placed."""
+    def _mark_parallel(self, stmts: List[llir.Stmt]) -> bool:
+        """Mark the first compatible loop parallel and record what it placed.
+
+        Returns whether a loop was marked: ``mark_first_for_loop_parallel`` marks
+        none when the first OpenMP-compatible loop of ``stmts`` must stay serial,
+        or when ``stmts`` holds no such loop at its top level.
+        """
 
         cluster = self._parallel_workspace_cluster
         if not mark_first_for_loop_parallel(stmts, cluster):
-            return
+            return False
         self._kernel_has_parallel_region = True
         self._unplaced_workspace_clusters = [
             unplaced
             for unplaced in self._unplaced_workspace_clusters
             if unplaced is not cluster
         ]
+        return True
 
     def _place_unplaced_workspace_clusters(self, function: llir.Function) -> None:
         """Allocate, serially, each dense workspace no parallel loop placed.
@@ -6123,7 +6261,8 @@ class CINLowerer:
         if not loop.omp_parallel_for and not getattr(
             loop, "_use_atomic_scheduling", False
         ):
-            self._mark_parallel([loop])
+            if not self._mark_parallel([loop]):
+                self._explicit_parallel_marks_missed[loop_name] = _MARK_NOT_PLACED
 
     # Min work per thread for the SpGEMM 2-phase path, where `work` is the true flop
     # (A_nnz*avg_B_row). Emitted by NAME (not as a literal) so the codegen flop grain
@@ -6893,7 +7032,13 @@ class CINLowerer:
             # the loop object's identity does not.
             self._outermost_loop_name = index_var.name
         if stmt.parallel is True:
-            self._mark_parallel(stmts)
+            if not self._mark_parallel(stmts):
+                self._explicit_parallel_marks_missed[index_var.name] = _MARK_NOT_PLACED
+            elif not self._count_parallel_loops(stmts, {}).get(index_var.name):
+                self._explicit_parallel_marks_missed[index_var.name] = (
+                    "the marking placed it on a later loop of the lowering, not on "
+                    "the first loop over the variable"
+                )
         elif (
             is_outermost_forall
             and not self.has_explicit_parallel_loop
