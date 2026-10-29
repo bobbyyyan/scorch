@@ -385,9 +385,12 @@ def test_change_mode_order_3d_random_sss():
         ]
     )
     a = STensor.from_torch(tensor_a_torch, "a", [0, 1, 2]).to_sparse("sss")
+    # The test's own seeded generator: the module-level one gave each suite run a
+    # different walk, and so a different set of compiled kernels.
+    rng = random.Random(20261028)
     mode_order = [0, 1, 2]
     for _ in range(10):
-        random.shuffle(mode_order)
+        rng.shuffle(mode_order)
         a.change_mode_order(mode_order)
 
     a.change_mode_order([0, 1, 2])
