@@ -1218,7 +1218,15 @@ def test_build_boundary_uses_snapshotted_compiler_without_parent_environment_mut
         None,
         explicit_options.build.cxx_compiler,
     }
-    implicit_toolchain = str(Path(requests[0].build_directory) / ".scorch-toolchain")
+    # One launcher directory per compiler path: the build directory is keyed on the
+    # programs the build runs, so two paths to one compiler can share it.
+    implicit_toolchain = str(
+        Path(requests[0].build_directory)
+        / ".scorch-toolchain"
+        / hashlib.sha256(implicit_options.build.cxx_compiler_path.encode()).hexdigest()[
+            :16
+        ]
+    )
     assert set(observed_paths) == {
         implicit_toolchain + os.pathsep + implicit_options.build.executable_search_path,
         explicit_options.build.executable_search_path,

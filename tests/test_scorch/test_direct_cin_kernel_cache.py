@@ -17,8 +17,10 @@ each operand's layout and dtypes, and the options key.  These tests pin:
    and it does what the full path does with the cache off; a statement a warm call
    used, then written in place in any field the lowering reads (as 864745d's entry
    wrote shapes into it), is seen; a call writes nothing into the caller's statement;
-   the options key holds the build options (a directory put on ``PATH`` misses), and an
-   environment that parses to the same options hits;
+   the options key holds the build options (another compiler, found on ``PATH`` or
+   named by ``CXX``, misses; a directory without one on ``PATH`` hits, as does a
+   ``c++`` ahead on ``PATH`` when ``CXX`` names the compiler by its absolute path), and
+   an environment that parses to the same options hits;
 3. another operand of the same layout hits and reads its own arrays, as do one tensor
    passed as both operands and values written in place between two hits;
 4. the hit check (``SCORCH_CHECK_KERNEL_CACHE_HITS``) passes a correct hit and refuses
@@ -626,23 +628,91 @@ def test_another_options_snapshot_of_other_policy_misses(seen: _Seen) -> None:
     assert_matches(verified, call.reference, call.dtype)
 
 
+def _stand_in_compiler(directory: Any, driver: str, tag: str) -> Any:
+    """A ``c++`` in ``directory`` that runs ``driver``; ``tag`` makes its bytes its own."""
+
+    directory.mkdir()
+    stand_in = directory / "c++"
+    stand_in.write_text(f'#!/bin/sh\n# {tag}\nexec "{driver}" "$@"\n')
+    stand_in.chmod(0o755)
+    return stand_in
+
+
+@pytest.mark.parametrize("route", ["path", "cxx"])
 def test_a_build_option_enters_the_options_key(
-    seen: _Seen, monkeypatch: pytest.MonkeyPatch, tmp_path: Any
+    route: str, seen: _Seen, monkeypatch: pytest.MonkeyPatch, tmp_path: Any
 ) -> None:
     """The options key is the snapshot's cache fingerprint, which holds its build
-    options.  ``PATH`` is one of them (``build.executable_search_path``): an empty
-    directory put in front of it changes only the options key, and the call builds
-    again."""
+    options, the programs the build runs among them (``build.toolchain_identity``):
+    another compiler changes only the options key, and the call builds again. The test
+    names the compiler itself, by each route the build finds one, so the host's own
+    ``CXX`` cannot decide which route it takes: with ``CXX`` unset, the ``c++`` first on
+    ``PATH``; with ``CXX`` set, that path."""
 
+    host = compile_options.CompileOptions.from_environment().build.cxx_compiler_path
+    driver = os.path.realpath(host)
+    first_compiler = _stand_in_compiler(tmp_path / "first", driver, "first")
+    second_compiler = _stand_in_compiler(tmp_path / "second", driver, "second")
+    rest = os.environ["PATH"]
+
+    def use(compiler: Any) -> None:
+        if route == "path":
+            monkeypatch.delenv("CXX", raising=False)
+            monkeypatch.setenv("PATH", f"{compiler.parent}{os.pathsep}{rest}")
+        else:
+            monkeypatch.setenv("CXX", str(compiler))
+
+    use(first_compiler)
     call = _spmm()
     first = call()
-    monkeypatch.setenv("PATH", f"{tmp_path}{os.pathsep}{os.environ['PATH']}")
+    use(second_compiler)
     seen.reset()
     second = call()
     assert seen.compiles == 1
     first_key, second_key = _store().direct_keys()
     differs = {at for at in range(len(first_key)) if first_key[at] != second_key[at]}
     assert differs == {OPTIONS}
+    _assert_same(_parts(second), _parts(first))
+
+
+def test_a_c_plus_plus_ahead_on_path_leaves_an_absolute_cxx_key(
+    seen: _Seen, monkeypatch: pytest.MonkeyPatch, tmp_path: Any
+) -> None:
+    """With ``CXX`` naming a compiler by its absolute path, a ``c++`` put in front of
+    ``PATH`` is not a program the build runs, so the options key stays and the second
+    call hits: the key holds the programs, not the ``PATH`` string."""
+
+    host = compile_options.CompileOptions.from_environment().build.cxx_compiler_path
+    driver = os.path.realpath(host)
+    compiler = _stand_in_compiler(tmp_path / "named", driver, "named")
+    ahead = _stand_in_compiler(tmp_path / "ahead", driver, "ahead")
+    monkeypatch.setenv("CXX", str(compiler))
+    call = _spmm()
+    first = call()
+    monkeypatch.setenv("PATH", f"{ahead.parent}{os.pathsep}{os.environ['PATH']}")
+    seen.reset()
+    second = call()
+    assert seen.compiles == 0
+    first_key, second_key = _store().direct_keys()
+    assert first_key == second_key
+    _assert_same(_parts(second), _parts(first))
+
+
+def test_a_directory_without_programs_on_path_keeps_the_hit(
+    seen: _Seen, monkeypatch: pytest.MonkeyPatch, tmp_path: Any
+) -> None:
+    """A directory that holds none of the build's programs, put in front of ``PATH``
+    (as a profiler or an environment activation does), leaves the programs the build
+    runs, and so the options key, unchanged: the second call hits."""
+
+    call = _spmm()
+    first = call()
+    monkeypatch.setenv("PATH", f"{tmp_path}{os.pathsep}{os.environ['PATH']}")
+    seen.reset()
+    second = call()
+    assert seen.compiles == 0
+    first_key, second_key = _store().direct_keys()
+    assert first_key == second_key
     _assert_same(_parts(second), _parts(first))
 
 

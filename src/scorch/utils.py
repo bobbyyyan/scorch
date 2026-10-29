@@ -676,6 +676,7 @@ def _run_jit_build_child_privately(
     try:
         if os.path.isfile(so_path):  # published while this process waited
             return subprocess.CompletedProcess([], 0, None, b"")
+        _refuse_changed_toolchain(request)
         if held:
             for entry in os.scandir(build_directory):
                 if entry.name.startswith(_JIT_STAGING_PREFIX) and entry.is_dir(
@@ -720,6 +721,29 @@ def _run_jit_build_child_privately(
             os.close(descriptor)  # releases the lock
 
 
+def _refuse_changed_toolchain(request: _JITBuildRequest) -> None:
+    """Refuse to build when the programs the build would run are not the snapshot's.
+
+    The build directory is keyed on the snapshot's toolchain identity, and a process
+    keeps its snapshot, so a compiler, assembler or linker replaced since then would
+    otherwise put a kernel it built under the old programs' key.  Asking again reads
+    the kept probe, so this costs a few ``stat`` calls before a build.
+    """
+
+    from .compiler.compile_options import _probe_toolchain
+    from .compiler.toolchain_identity import PROBED
+
+    build_options = request.build_options
+    if build_options.toolchain_probe != PROBED:
+        return  # keyed on the PATH string and the resolved paths, as before
+    if _probe_toolchain(build_options)[0] != build_options.toolchain_identity:
+        raise ScorchRuntimeError(
+            "JIT build runtime differs from CompileOptions snapshot: "
+            "toolchain_identity",
+            code="jit_build_runtime_mismatch",
+        )
+
+
 def _build_and_load_extension(request: _JITBuildRequest) -> Any:
     """Compile in a child with frozen process state, then import the result.
 
@@ -750,9 +774,13 @@ def _prepare_compiler_toolchain(request: _JITBuildRequest) -> Optional[str]:
     build_options = request.build_options
     if os.path.isabs(build_options.cxx_compiler):
         return None
+    # The build directory is keyed on the programs the build runs, not on the path
+    # that found the driver, so two snapshots that reach the same driver through
+    # different paths share it.  Each such path gets a launcher directory of its own.
     toolchain_directory = os.path.join(
         request.build_directory,
         ".scorch-toolchain",
+        hashlib.sha256(build_options.cxx_compiler_path.encode()).hexdigest()[:16],
     )
     os.makedirs(toolchain_directory, exist_ok=True)
     launcher = os.path.join(toolchain_directory, build_options.cxx_compiler)
@@ -779,27 +807,8 @@ def _jit_build_environment_from_request(
 ) -> Dict[str, str]:
     """Build a child environment without requiring a second option snapshot."""
 
-    build_options = request.build_options
-    search_path = build_options.executable_search_path
-    if toolchain_directory is not None:
-        search_path = toolchain_directory + os.pathsep + search_path
-    environment = {
-        "PATH": search_path,
-        "PYTHONPATH": build_options.scorch_python_path,
-    }
-    from .compiler.compile_options import CompilerWrapperPolicy
-
-    if build_options.compiler_wrapper_policy is CompilerWrapperPolicy.DISABLED:
-        environment["TORCH_NO_COMPILER_WRAPPER"] = "1"
-    if build_options.cxx_compiler_from_environment:
-        environment["CXX"] = build_options.cxx_compiler
-    darwin_toolchain = build_options.darwin_toolchain
-    if darwin_toolchain is not None:
-        environment["DEVELOPER_DIR"] = darwin_toolchain.developer_dir
-        environment["SDKROOT"] = darwin_toolchain.sdk_root
-        if darwin_toolchain.deployment_target is not None:
-            environment["MACOSX_DEPLOYMENT_TARGET"] = darwin_toolchain.deployment_target
-    return environment
+    # One definition, so the toolchain probe asks the driver under this environment.
+    return request.build_options.build_child_environment(toolchain_directory)
 
 
 def _prepare_jit_build(

@@ -553,6 +553,11 @@ class KernelBuildOptions:
     cxx_compiler_from_environment: bool
     executable_search_path: str
     preamble_source: str
+    # What the build key holds in place of the PATH string and the two paths resolved
+    # through it: the programs the build runs (toolchain_identity.py).  A snapshot made
+    # without a probe holds those three strings instead, as the key did before.
+    toolchain_identity: Tuple[object, ...] = ()
+    toolchain_probe: str = ""
 
     def __post_init__(self) -> None:
         enum_fields = (
@@ -774,6 +779,55 @@ class KernelBuildOptions:
             special_cflags,
             ldflags,
         )
+        if (
+            type(self.toolchain_identity) is not tuple
+            or type(self.toolchain_probe) is not str
+        ):
+            _raise_options_error(
+                "invalid_type",
+                "build.toolchain_identity",
+                "expected an exact tuple and an exact string",
+            )
+        if not self.toolchain_identity:
+            from .toolchain_identity import unprobed_identity
+
+            object.__setattr__(
+                self,
+                "toolchain_identity",
+                unprobed_identity(
+                    self.executable_search_path,
+                    self.cxx_compiler_path,
+                    self.compiler_wrapper_path,
+                ),
+            )
+            object.__setattr__(
+                self, "toolchain_probe", "unprobed: made without a probe"
+            )
+        elif not self.toolchain_probe:
+            _raise_options_error(
+                "invalid_toolchain_identity",
+                "build.toolchain_probe",
+                "a toolchain identity must say how it was found",
+            )
+
+    def build_child_environment(
+        self, toolchain_directory: Optional[str] = None
+    ) -> dict[str, str]:
+        """The whole environment a build child runs in; nothing else reaches it.
+
+        ``toolchain_directory`` (the launcher directory) goes in front of ``PATH``.
+        The toolchain probe asks the driver under this environment without it.
+        """
+
+        return _build_child_environment(
+            executable_search_path=self.executable_search_path,
+            scorch_python_path=self.scorch_python_path,
+            compiler_wrapper_policy=self.compiler_wrapper_policy,
+            cxx_compiler=self.cxx_compiler,
+            cxx_compiler_from_environment=self.cxx_compiler_from_environment,
+            darwin_toolchain=self.darwin_toolchain,
+            toolchain_directory=toolchain_directory,
+        )
 
     @property
     def cache_key(self) -> tuple[object, ...]:
@@ -802,7 +856,6 @@ class KernelBuildOptions:
             self.compiler_abi_check_policy.value,
             self.compiler_wrapper_policy.value,
             self.compiler_wrapper_name,
-            self.compiler_wrapper_path,
             darwin_toolchain_key,
             self.extra_cflags,
             self.direct_extension_cflags,
@@ -820,9 +873,10 @@ class KernelBuildOptions:
             self.python_include_path,
             self.scorch_python_path,
             self.cxx_compiler,
-            self.cxx_compiler_path,
             self.cxx_compiler_from_environment,
-            self.executable_search_path,
+            # PATH, and the driver's and wrapper's paths found through it, enter only
+            # as the programs they resolve to.
+            self.toolchain_identity,
             preamble_digest,
         )
 
@@ -2078,6 +2132,25 @@ def _resolve_kernel_build_options(
     special_cflags.extend(cflags[len(_BASE_CFLAGS) :])
 
     preamble_source = jit_preamble_text()
+    from .toolchain_identity import toolchain_identity
+
+    cxx_compiler_path = os.path.abspath(resolved_cxx)
+    identity, probe = toolchain_identity(
+        cxx_compiler=normalized_cxx,
+        cxx_compiler_path=cxx_compiler_path,
+        compiler_wrapper_path=compiler_wrapper_path,
+        environment=_build_child_environment(
+            executable_search_path=executable_search_path,
+            scorch_python_path=scorch_python_path,
+            compiler_wrapper_policy=compiler_wrapper_policy,
+            cxx_compiler=normalized_cxx,
+            cxx_compiler_from_environment=cxx_compiler_from_environment,
+            darwin_toolchain=darwin_toolchain,
+        ),
+        cflags=tuple(cflags),
+        ldflags=tuple(ldflags),
+        memo_directory=toolchain_memo_directory(),
+    )
     return KernelBuildOptions(
         target_os=target_os,
         target_arch=target_arch,
@@ -2111,8 +2184,73 @@ def _resolve_kernel_build_options(
         python_include_path=python_include_path,
         scorch_python_path=scorch_python_path,
         cxx_compiler=normalized_cxx,
-        cxx_compiler_path=os.path.abspath(resolved_cxx),
+        cxx_compiler_path=cxx_compiler_path,
         cxx_compiler_from_environment=cxx_compiler_from_environment,
         executable_search_path=executable_search_path,
         preamble_source=preamble_source,
+        toolchain_identity=identity,
+        toolchain_probe=probe,
     )
+
+
+def _build_child_environment(
+    *,
+    executable_search_path: str,
+    scorch_python_path: str,
+    compiler_wrapper_policy: CompilerWrapperPolicy,
+    cxx_compiler: str,
+    cxx_compiler_from_environment: bool,
+    darwin_toolchain: Optional[DarwinToolchainOptions],
+    toolchain_directory: Optional[str] = None,
+) -> dict[str, str]:
+    """See ``KernelBuildOptions.build_child_environment``."""
+
+    search_path = executable_search_path
+    if toolchain_directory is not None:
+        search_path = toolchain_directory + os.pathsep + search_path
+    environment = {"PATH": search_path, "PYTHONPATH": scorch_python_path}
+    if compiler_wrapper_policy is CompilerWrapperPolicy.DISABLED:
+        environment["TORCH_NO_COMPILER_WRAPPER"] = "1"
+    if cxx_compiler_from_environment:
+        environment["CXX"] = cxx_compiler
+    if darwin_toolchain is not None:
+        environment["DEVELOPER_DIR"] = darwin_toolchain.developer_dir
+        environment["SDKROOT"] = darwin_toolchain.sdk_root
+        if darwin_toolchain.deployment_target is not None:
+            environment["MACOSX_DEPLOYMENT_TARGET"] = darwin_toolchain.deployment_target
+    return environment
+
+
+def _probe_toolchain(build: KernelBuildOptions) -> Tuple[Tuple[object, ...], str]:
+    """The toolchain identity of ``build``'s programs, asked under its build environment."""
+
+    from .toolchain_identity import toolchain_identity
+
+    return toolchain_identity(
+        cxx_compiler=build.cxx_compiler,
+        cxx_compiler_path=build.cxx_compiler_path,
+        compiler_wrapper_path=build.compiler_wrapper_path,
+        environment=build.build_child_environment(),
+        cflags=build.extra_cflags,
+        ldflags=build.extra_ldflags,
+        memo_directory=toolchain_memo_directory(),
+    )
+
+
+def toolchain_memo_directory() -> str:
+    """Where kept toolchain probes live: in the extensions root torch builds under.
+
+    It is a cache, so its place changes no result.  It is found the way torch finds
+    the root (``TORCH_EXTENSIONS_DIR``, else torch's user cache directory) without
+    importing ``torch.utils.cpp_extension``, which costs about 80 ms and which a
+    process that builds and loads no kernel does not otherwise import.
+    """
+
+    root = os.environ.get("TORCH_EXTENSIONS_DIR")
+    if root is None:
+        import torch._appdirs
+
+        root = os.path.realpath(
+            torch._appdirs.user_cache_dir(appname="torch_extensions")
+        )
+    return os.path.join(root, "scorch_toolchain")

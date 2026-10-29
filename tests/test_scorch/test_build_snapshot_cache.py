@@ -259,29 +259,38 @@ def test_compiler_wrapper_policy_is_part_of_the_key() -> None:
     assert automatic_again.build == automatic.build
 
 
-def test_compiler_and_search_path_are_part_of_the_key(tmp_path: Path) -> None:
+def test_the_programs_a_compiler_path_reaches_are_the_key_not_the_path(
+    tmp_path: Path,
+) -> None:
+    """Two directories holding a link to the same compiler, put in front of ``PATH``,
+    resolve different compiler paths but reach the same programs, so they share the
+    key (``build.toolchain_identity``); naming one through ``CXX`` changes the name the
+    compiler is invoked as, which the key holds."""
+
     base = _snapshot()
+    rest = base.build.executable_search_path
     first, second = tmp_path / "first", tmp_path / "second"
     for directory in (first, second):
         directory.mkdir()
         (directory / "c++").symlink_to(base.build.cxx_compiler_path)
 
-    found_in_first = _snapshot({"PATH": str(first)})
-    found_in_second = _snapshot({"PATH": str(second)})
-    named = _snapshot({"CXX": str(second / "c++"), "PATH": str(first)})
+    found_in_first = _snapshot({"PATH": f"{first}{os.pathsep}{rest}"})
+    found_in_second = _snapshot({"PATH": f"{second}{os.pathsep}{rest}"})
+    named = _snapshot(
+        {"CXX": str(second / "c++"), "PATH": f"{first}{os.pathsep}{rest}"}
+    )
 
     assert found_in_first.build.cxx_compiler_path == str(first / "c++")
     assert found_in_second.build.cxx_compiler_path == str(second / "c++")
     assert named.build.cxx_compiler_path == str(second / "c++")
     assert named.build.cxx_compiler_from_environment
     assert not found_in_second.build.cxx_compiler_from_environment
-    keys = {
-        base.build_cache_key,
-        found_in_first.build_cache_key,
-        found_in_second.build_cache_key,
-        named.build_cache_key,
-    }
-    assert len(keys) == 4
+    assert (
+        found_in_first.build_cache_key
+        == found_in_second.build_cache_key
+        == base.build_cache_key
+    )
+    assert named.build_cache_key != base.build_cache_key
 
 
 def test_working_directory_is_part_of_the_key(
