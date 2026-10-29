@@ -6,11 +6,13 @@ Main lowered such programs serially and said nothing, in three ways.  The iterat
 lattice lowers an inner loop from a copy it rebuilds without the mark
 (``LatticePoint.get_simplified_cin``), so a mark on any loop under another one was
 dropped.  ``mark_first_for_loop_parallel`` marks nothing when the loop must stay serial
-(appending to a compressed result carries its position between iterations) or is a
-while loop (two compressed levels merged).  The Schedule API marks its loop by name
-after lowering with the same helper, so ``Schedule(parallel_loop="i")`` over a COO
-operand went serial too.  Because any explicit mark also switches off the automatic
-parallelization of the outer loop, each of those kernels ran on one worker.
+(appending to a compressed result carries its position between iterations: a
+compressed vector, or the rows of a Gustavson product through a sparse workspace,
+post-merge item 23) or is a while loop (two compressed levels merged).  The Schedule
+API marks its loop by name after lowering with the same helper, so
+``Schedule(parallel_loop="i")`` over a COO operand went serial too.  Because any
+explicit mark also switches off the automatic parallelization of the outer loop, each
+of those kernels ran on one worker.
 
 The check counts, per loop name, the loops of the lowered kernel that run in parallel,
 after the last pass that marks one, and compares them with the ForAlls the statement
@@ -143,6 +145,24 @@ def _consumer_j(shape: Tuple[int, int, int]) -> Any:
     return ForAll(i, Where(producer=producer, consumer=consumer))
 
 
+def _gustavson_i(shape: Tuple[int, int, int]) -> Any:
+    """``C = A @ B`` with all three ``ds``, row by row through a sparse workspace
+    (Gustavson), the loop over i marked: appending row i to the compressed result
+    carries C's position from one row to the next."""
+
+    i, j, k = IndexVar("i"), IndexVar("j"), IndexVar("k")
+    n, kk, m = shape
+    c = TensorVar("C", fmt="ds", shape=(n, m), dtype=F64)
+    a = TensorVar("A", fmt="ds", shape=(n, kk), dtype=F64)
+    b = TensorVar("B", fmt="ds", shape=(kk, m), dtype=F64)
+    w = Workspace(name="w", dim=1, dtype=F64, dense=False)
+    producer = ForAll(
+        k, ForAll(j, TensorAssign(w[j], a[i, k] * b[k, j], op=Operation.ADD))
+    )
+    consumer = ForAll(j, TensorAssign(c[i, j], w[j]))
+    return ForAll(i, Where(producer=producer, consumer=consumer), parallel=True)
+
+
 def _sparse_result_i(n: int) -> Any:
     """``y(i) = a(i) * b(i)``, y and a compressed, i marked: appending to y carries
     y's position from one iteration to the next."""
@@ -207,6 +227,13 @@ REFUSED: Dict[str, RefusedCase] = {
         lambda: (_wrap(A_SMALL, "ds"), _wrap(B_SMALL, "ds")),
         "j",
         "copy of the loop that carries no mark",
+    ),
+    "i over Gustavson's compressed result": (
+        lambda: _gustavson_i(SMALL),
+        (SMALL[0], SMALL[2]),
+        lambda: (_wrap(A_SMALL, "ds"), _wrap(B_SMALL, "ds")),
+        "i",
+        "must stay serial",
     ),
     "i over a compressed result": (
         lambda: _sparse_result_i(SMALL[0]),
