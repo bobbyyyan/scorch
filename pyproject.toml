@@ -87,6 +87,7 @@ scorch = [
     "csrc/pybind.cpp",
     "csrc/scorch_policy.h",
     "csrc/spmm.h",
+    "csrc/workspace_pool.h",
 ]
 
 [tool.setuptools.cmdclass]

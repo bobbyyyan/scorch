@@ -4,6 +4,7 @@ import json
 import math
 import os
 import pickle
+import re
 import shutil
 import subprocess
 import sys
@@ -178,6 +179,58 @@ def _read_jit_preamble_text() -> str:
             code="packaged_header_invalid",
         )
     return template.replace(include, _policy_header_text(), 1)
+
+
+# (file identity, text) of each packaged header ``packaged_header_text`` has read, by
+# file name.
+_packaged_header_memo: Dict[str, Tuple[Tuple[object, ...], str]] = {}
+
+
+def _packaged_header_identity(filename: str) -> Optional[Tuple[object, ...]]:
+    """Path, size, modification time in nanoseconds and inode number of one packaged
+    header, as ``jit_preamble_file_identity`` identifies the preamble's files; None when
+    the package is not plain files or the file cannot be read by ``stat``."""
+    root = _NATIVE_RESOURCES
+    if not isinstance(root, os.PathLike):
+        return None
+    path = os.path.join(os.fspath(root), filename)
+    try:
+        status = os.stat(path)
+    except OSError:
+        return None
+    return (path, status.st_size, status.st_mtime_ns, status.st_ino)
+
+
+def packaged_header_text(filename: str) -> str:
+    """Return a packaged header that code generation places in a kernel's own source.
+
+    Such a header defines types the JIT preamble does not (``DataType.packaged_header``).
+    Its text follows the preamble in the source of each kernel that names one of them,
+    so it is part of that kernel's name (``_kernel_name``) and of no other kernel's.
+    ``load_inline``'s build directory cannot find the packaged headers, so a header
+    with an ``#include`` line is refused.
+
+    The file is read again only when its identity changes, as ``jit_preamble_text``
+    reads the preamble; without an identity it is read on every call.
+    """
+    identity = _packaged_header_identity(filename)
+    memo = _packaged_header_memo.get(filename)
+    if identity is not None and memo is not None and memo[0] == identity:
+        return memo[1]
+    text = native_resource_text(filename)
+    if any(_INCLUDE_LINE.match(line) for line in text.splitlines()):
+        raise ScorchRuntimeError(
+            f"packaged {filename} must not include another file: its text is placed "
+            "in a kernel's source, where no packaged header can be found",
+            code="packaged_header_invalid",
+        )
+    # Kept only if the file did not change while it was read, as the preamble is.
+    if identity is not None and identity == _packaged_header_identity(filename):
+        _packaged_header_memo[filename] = (identity, text)
+    return text
+
+
+_INCLUDE_LINE = re.compile(r"\s*#\s*include\b")
 
 
 def _resolve_compile_options(

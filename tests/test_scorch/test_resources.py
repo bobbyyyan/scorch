@@ -6,8 +6,9 @@ import pytest
 
 import scorch
 from scorch import utils
-from scorch.exceptions import ScorchOSError, defect_code
-from scorch.utils import jit_preamble_text, native_resource_text
+from scorch.compiler import llir
+from scorch.exceptions import ScorchOSError, ScorchRuntimeError, defect_code
+from scorch.utils import jit_preamble_text, native_resource_text, packaged_header_text
 
 EXPECTED_NATIVE_RESOURCES = {
     "header.h",
@@ -17,6 +18,7 @@ EXPECTED_NATIVE_RESOURCES = {
     "pybind.cpp",
     "scorch_policy.h",
     "spmm.h",
+    "workspace_pool.h",
 }
 
 # The names scorch's own code reads today; the scan below must find each of them.
@@ -43,6 +45,57 @@ def test_jit_preamble_embeds_packaged_policy_header() -> None:
     assert "typedef struct" in preamble
     assert "scorch_tensor_from_vector" in preamble
     assert "class cvector" not in preamble
+
+
+def test_workspace_pool_header_is_packaged_and_kept_out_of_the_preamble() -> None:
+    # Only kernels that hold a coordinate-list workspace pool carry this text (in their
+    # own source, ahead of the function); the preamble every kernel shares does not.
+    pool_text = packaged_header_text("workspace_pool.h")
+
+    assert "class coo_workspace_owner_1d" in pool_text
+    assert "class coo_workspace_view_1d" in pool_text
+    assert "scorch_check_workspace_pool" in pool_text
+    assert "#include" not in pool_text
+    preamble = jit_preamble_text()
+    assert "coo_workspace_owner_1d" not in preamble
+    assert "scorch_make_unique_array_nothrow" not in preamble
+    assert packaged_header_text("workspace_pool.h") is pool_text  # kept, not re-read
+
+
+def _inline_macro_block(text: str) -> str:
+    """The ``#if`` block that defines SCORCH_FORCE_INLINE and SCORCH_RESTRICT."""
+    start = text.index("#if defined(__GNUC__) || defined(__clang__)\n")
+    end = text.index("#endif\n", start) + len("#endif\n")
+    block = text[start:end]
+    assert "#define SCORCH_FORCE_INLINE" in block and "#define SCORCH_RESTRICT" in block
+    return block
+
+
+def test_workspace_pool_defines_the_inline_macros_as_header_h_does() -> None:
+    # header.h undefines both macros at its end, so the pool header, which follows the
+    # preamble in a kernel's source, defines them itself: with header.h's exact block,
+    # undefined again at its own end.
+    header = native_resource_text("header.h")
+    pool_text = native_resource_text("workspace_pool.h")
+
+    assert _inline_macro_block(pool_text) == _inline_macro_block(header)
+    for text in (header, pool_text):
+        tail = text[text.rindex("#define SCORCH_RESTRICT") :]
+        assert "#undef SCORCH_FORCE_INLINE\n#undef SCORCH_RESTRICT\n" in tail
+    assert pool_text.count("#if defined(__GNUC__) || defined(__clang__)") == 1
+
+
+def test_packaged_header_with_an_include_is_refused(monkeypatch) -> None:
+    monkeypatch.setattr(
+        utils,
+        "native_resource_text",
+        lambda filename: '#include "header.h"\nint scorch_x;\n',
+    )
+    monkeypatch.setattr(utils, "_packaged_header_memo", {})
+
+    with pytest.raises(ScorchRuntimeError) as refused:
+        utils.packaged_header_text("workspace_pool.h")
+    assert defect_code(refused.value) == "packaged_header_invalid"
 
 
 @pytest.mark.parametrize("filename", ["", ".", "..", "../header.h", "csrc/header.h"])
@@ -108,6 +161,17 @@ def test_every_native_resource_named_in_the_package_is_shipped() -> None:
     assert LIVE_RESOURCE_LITERALS <= {name for _, _, name in literals}, literals
     shipped = _shipped_native_resources()
     assert [found for found in literals if found[2] not in shipped] == []
+
+
+def test_every_packaged_header_a_type_names_is_shipped() -> None:
+    # A packaged header reaches native_resource_text through a variable
+    # (DataType.packaged_header, then packaged_header_text), which the literal scan
+    # above cannot see, so each name a type gives is checked here.  The equality keeps
+    # this from passing by finding no named header.
+    named = {member.packaged_header() for member in llir.DataType} - {None}
+
+    assert named == {"workspace_pool.h"}
+    assert named <= _shipped_native_resources()
 
 
 def test_the_resource_scan_flags_a_name_the_package_does_not_ship() -> None:

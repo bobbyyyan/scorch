@@ -8,12 +8,9 @@ from scorch.compiler.cin import (
     Operation,
     TensorAssign,
     TensorVar,
-    Where,
-    Workspace,
 )
 from scorch.compiler.cin_analysis import canonical_cin_dump
 from scorch.compiler.compile_options import CompileOptions
-from scorch.compiler.diagnostics import UnsupportedFeature
 from scorch.exceptions import TensorIndexError, defect_code
 from scorch.ops import lower_and_exec_cin
 
@@ -144,59 +141,6 @@ def test_known_gap_broadcast_lhs_vector():
     result = lower_and_exec_cin(cin_stmt, (n, n), a, b)
 
     expected = a_torch.reshape(n, 1) * b_torch.sum(dim=0).reshape(1, n)
-    assert torch.allclose(result.to_torch(), expected, atol=1e-4, rtol=1e-4)
-
-
-@pytest.mark.xfail(
-    raises=UnsupportedFeature,
-    strict=True,
-    reason="a sparse workspace drained into a result dense in every mode is refused "
-    "(unsupported_workspace_result_level): the drains assemble a compressed or "
-    "coordinate level, and a dense row needs a scatter",
-)
-def test_known_gap_gustavson_workspace_into_a_dense_result():
-    """A[i, j] = sum_k B[i, k] * C[k, j] with B COO, C and A dense, through a Gustavson
-    workspace over j (codegen/test_matmul_operations.py's
-    test_spmm_dd_oo_dd_ikj_gustavson_workspace asserts the refusal's code).  When the
-    drain into a dense result lands, this passes and strict=True fails it: remove the
-    mark then."""
-    torch.manual_seed(3)
-    n = 16
-    b_torch = torch.rand(n, n) * (torch.rand(n, n) > 0.8)
-    c_torch = torch.rand(n, n)
-
-    b = STensor.from_torch(b_torch, "B").to_sparse("oo")
-    c = STensor.from_torch(c_torch, "C").to_dense()
-
-    i = IndexVar("i")
-    j = IndexVar("j")
-    k = IndexVar("k")
-    A = TensorVar("A", fmt="dd")
-    B = TensorVar("B", fmt="oo")
-    C = TensorVar("C", fmt="dd")
-    workspace = Workspace(name="wksp", dim=1, dtype=A.dtype)
-    cin_stmt = ForAll(
-        i,
-        Where(
-            producer=ForAll(
-                k,
-                ForAll(
-                    j,
-                    TensorAssign(workspace[j], B[i, k] * C[k, j], op=Operation.ADD),
-                ),
-            ),
-            consumer=ForAll(j, TensorAssign(A[i, j], workspace[j])),
-        ),
-    )
-    try:
-        result = lower_and_exec_cin(cin_stmt, (n, n), b, c)
-    except UnsupportedFeature as refusal:
-        # Only this refusal is the gap; any other code fails the test (an
-        # AssertionError is not the xfail's UnsupportedFeature).
-        assert defect_code(refusal) == "unsupported_workspace_result_level", refusal
-        raise
-
-    expected = torch.matmul(b_torch, c_torch)
     assert torch.allclose(result.to_torch(), expected, atol=1e-4, rtol=1e-4)
 
 

@@ -17,7 +17,7 @@ from scorch.compiler.cin import (
 )
 from scorch.compiler.diagnostics import UnsupportedFeature
 from scorch.compiler.scheduler import Scheduler
-from scorch.exceptions import defect_code
+from scorch.utils import packaged_header_text
 
 from tests.test_scorch.test_helpers import (
     lower_and_print,
@@ -414,12 +414,13 @@ def test_spmm_dd_oo_dd_ikj_gustavson_workspace():
     """
     Sparse matrix-matrix multiplication with COO input format and Gustavson workspace pattern
 
-    The sparse workspace is drained into a result that is dense in both modes.  The
-    shipped compiler's drains assemble a compressed or coordinate level, and the
-    kernel it used to print for this statement did not build ('pC1' was not
-    declared), so it refuses it with a code.  Lowering it (a scatter into the dense
-    row) is a known gap: test_known_compiler_gaps.py's
-    test_known_gap_gustavson_workspace_into_a_dense_result.
+    The sparse workspace is drained into a result that is dense in both modes, by a
+    scatter into the dense row: each entry's sum is stored at its cell, with no sort
+    and no coordinate appended.  The sorted drains assemble a compressed or
+    coordinate level, and the kernel they printed for this statement did not build
+    ('pC1' was not declared).  The workspace is made once, before the loop over B's
+    row segments, with capacity A's column extent, and cleared after each drain.
+    test_sparse_workspace_dense_result.py runs it.
     """
     i = IndexVar("i")
     j = IndexVar("j")
@@ -462,9 +463,24 @@ def test_spmm_dd_oo_dd_ikj_gustavson_workspace():
     print("\nCIN statement:")
     print(cin_stmt)
 
-    with pytest.raises(UnsupportedFeature) as refusal:
-        lower_and_print(cin_stmt)
-    assert defect_code(refusal.value) == "unsupported_workspace_result_level"
+    cpp_code = lower_and_print(cin_stmt)
+    # The pool's definitions (workspace_pool.h) open the kernel's own source; the
+    # checks below read the function after them.
+    pool_definitions = packaged_header_text("workspace_pool.h").rstrip("\n") + "\n\n"
+    assert cpp_code.startswith(pool_definitions)
+    cpp_code = cpp_code[len(pool_definitions) :]
+    scatter = cpp_code[cpp_code.index("Scatter the sparse workspace") :]
+    assert "for (const auto& it : wksp)" in scatter
+    assert "A_values[pA1] = wksp_value;" in scatter
+    assert "wksp.sort()" not in cpp_code
+    assert "push_back" not in cpp_code
+    # COO A's loop over row segments stays serial: one owner, allocated before
+    # the loop, and its view (item 5).
+    assert "wksp_pool_owner.emplace_back(A1_size);" in cpp_code
+    assert "auto wksp = wksp_pool_owner[0].make_view();" in cpp_code
+    assert "wksp.insert_unchecked({" in cpp_code
+    assert "coo_workspace_1d<" not in cpp_code
+    assert "wksp.clear();" in scatter
 
 
 def test_spmm_dd_ds_ds():

@@ -588,6 +588,15 @@ _MECHANISMS: Tuple[Mechanism, ...] = (
         unthreaded_constructions=1,
     ),
     Mechanism(
+        "compiler/parallel_marking_pass.py::_workspace_pool_check",
+        KIND_REBUILD,
+        INERT,
+        "not a rebuild: 'spec.name' is the pool spec's workspace name, spelled "
+        "into the owner vector's name, an llir.Var argument of the new check call "
+        "after the region, which collides with FunctionCallStmt.name",
+        unthreaded_constructions=1,
+    ),
+    Mechanism(
         "compiler/torch_cpp_abi.py::TorchCppKernelABI.emit_validation",
         KIND_REBUILD,
         INERT,

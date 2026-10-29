@@ -275,6 +275,24 @@ def _validate_cluster_expression(
                 active,
             )
             return
+        if type(value) is llir.ArrayAccess:
+            # A worker's element of a pool of workspace objects.
+            if fields.get("tensor_access", _MISSING_PARALLEL_FIELD) is not None:
+                raise ScorchTypeError(
+                    f"{owner}.tensor_access must be absent",
+                    code="parallel_workspace_cluster_invalid",
+                )
+            _validate_cluster_expression(
+                fields.get("array", _MISSING_PARALLEL_FIELD),
+                f"{owner}.array",
+                active,
+            )
+            _validate_cluster_expression(
+                fields.get("index", _MISSING_PARALLEL_FIELD),
+                f"{owner}.index",
+                active,
+            )
+            return
         if type(value) is llir.Cast:
             if (
                 type(fields.get("data_type", _MISSING_PARALLEL_FIELD))
@@ -361,20 +379,47 @@ def _validate_pool_spec_fields(spec: object) -> None:
             "ParallelWorkspacePoolSpec.extent must be a C++ identifier",
             code="parallel_workspace_cluster_invalid",
         )
+    container = fields.get("container", _MISSING_PARALLEL_FIELD)
+    if type(container) is not str or container not in _POOL_CONTAINERS:
+        raise ScorchTypeError(
+            "ParallelWorkspacePoolSpec.container must be one of "
+            f"{sorted(_POOL_CONTAINERS)}",
+            code="parallel_workspace_cluster_invalid",
+        )
+
+
+#: A pool of dense workspaces: one aligned buffer of ``workers x extent``
+#: scalars, which each worker slices.
+POOL_ALIGNED_BUFFER = "aligned_buffer"
+#: A pool of sparse workspaces: one ``coo_workspace_owner_1d<T>`` per worker,
+#: each with capacity ``extent``, from which each worker takes its
+#: ``coo_workspace_view_1d<T>``: inside a region ``make_region_view()``, which
+#: allocates the owner's arrays there and never throws, and in a serial
+#: kernel ``make_view()``.
+POOL_COO_WORKSPACE_1D = "coo_workspace_1d"
+_POOL_CONTAINERS = frozenset({POOL_ALIGNED_BUFFER, POOL_COO_WORKSPACE_1D})
 
 
 @dataclass(frozen=True)
 class ParallelWorkspacePoolSpec:
-    """One per-worker dense workspace pool requirement.
+    """One per-worker workspace pool requirement.
 
     ``name`` is the workspace identifier, ``scalar_type`` the pool element
-    type used as the aligned-buffer template argument, and ``extent`` the
-    per-worker slice length variable declared by the kernel prologue.
+    type, ``extent`` the per-worker length variable declared by the kernel
+    prologue, and ``container`` what each worker gets: a slice of one aligned
+    buffer (a dense workspace, the default) or a view of a
+    ``coo_workspace_owner_1d`` of capacity ``extent`` (a sparse workspace).
+    The pool is built before the parallel region.  An aligned buffer is
+    allocated there, so an allocation failure unwinds through the caller; a
+    sparse workspace's owners allocate nothing there, each worker allocating
+    its own owner's arrays inside the region without throwing, and
+    ``scorch_check_workspace_pool`` after the region throws for a failed one.
     """
 
     name: str
     scalar_type: llir.DataType
     extent: str
+    container: str = POOL_ALIGNED_BUFFER
 
     def __post_init__(self) -> None:
         _validate_pool_spec_fields(self)
@@ -917,6 +962,64 @@ def apply_parallel_policy(
     )
 
 
+def _coo_workspace_pool_statements(
+    spec: ParallelWorkspacePoolSpec,
+    worker_count: Callable[[], llir.Expr],
+    *,
+    in_region: bool,
+) -> List[llir.Stmt]:
+    """Build a pool of ``coo_workspace_owner_1d<T>``, one per worker.
+
+    ``std::vector<coo_workspace_owner_1d<T>> <name>_pool_owner;``, a
+    ``reserve`` of the worker count, then one ``emplace_back(<extent>)`` per
+    worker: an owner of capacity ``extent``, the extent of the result level the
+    workspace's key stands for, which native_abi.h validated every coordinate
+    against.  For a parallel region (``in_region``) each owner is made with
+    ``allocate_in_region`` (``emplace_back(<extent>, true)``): it allocates
+    nothing here, so the serial work before the region grows with the team,
+    not the capacity, and each worker allocates and zero-fills its own owner's
+    arrays at its first ``make_region_view()``, inside the region.  A serial
+    kernel's owner allocates here.  ``worker_count`` returns a fresh expression
+    on every call: no LLIR node is shared between two statements.
+    """
+
+    pool_type = llir.DataType.coo_workspace_1d_pool_type(spec.scalar_type)
+
+    def owner() -> llir.Var:
+        return llir.Var(name=f"{spec.name}_pool_owner", type=pool_type)
+
+    def worker() -> llir.Var:
+        return llir.Var(name="_worker", type=llir.DataType.INT)
+
+    return [
+        llir.VarDecl(var=owner()),
+        llir.MemberCallStmt(
+            base=owner(),
+            member="reserve",
+            args=(llir.Cast(expr=worker_count(), data_type=llir.DataType.SIZE_T),),
+        ),
+        llir.ForLoop(
+            init=llir.VarInit(var=worker(), value=llir.Literal(0, llir.DataType.INT)),
+            cond=llir.BinOp("<", worker(), worker_count()),
+            update=llir.Increment(worker()),
+            body=[
+                llir.MemberCallStmt(
+                    base=owner(),
+                    member="emplace_back",
+                    args=(
+                        llir.Var(name=spec.extent, type=llir.DataType.INT64),
+                        *(
+                            (llir.Literal(True, llir.DataType.BOOL),)
+                            if in_region
+                            else ()
+                        ),
+                    ),
+                )
+            ],
+        ),
+    ]
+
+
 def attach_serial_workspace_pools(
     loop: llir.ForLoop,
     pool_specs: Sequence[ParallelWorkspacePoolSpec],
@@ -957,19 +1060,31 @@ def attach_serial_workspace_pools(
 
     before: List[llir.Stmt] = []
     for spec in pool_specs:
+        before.append(
+            llir.VarInit(
+                var=llir.Var(
+                    name=f"{spec.name}_thread_count",
+                    type=llir.DataType.INT,
+                ),
+                value=(
+                    thread_policy_factory()
+                    if thread_policy_factory is not None
+                    else llir.FunctionCall("omp_get_max_threads")
+                ),
+            )
+        )
+        if spec.container == POOL_COO_WORKSPACE_1D:
+            count_name = f"{spec.name}_thread_count"
+            before.extend(
+                _coo_workspace_pool_statements(
+                    spec,
+                    lambda: llir.Var(name=count_name, type=llir.DataType.INT),
+                    in_region=True,
+                )
+            )
+            continue
         before.extend(
             [
-                llir.VarInit(
-                    var=llir.Var(
-                        name=f"{spec.name}_thread_count",
-                        type=llir.DataType.INT,
-                    ),
-                    value=(
-                        thread_policy_factory()
-                        if thread_policy_factory is not None
-                        else llir.FunctionCall("omp_get_max_threads")
-                    ),
-                ),
                 llir.VarInit(
                     var=llir.Var(
                         name=f"{spec.name}_pool_owner",
@@ -1030,7 +1145,7 @@ def mark_first_for_loop_parallel(
     # loop) cannot couple each other through shared mutable LLIR nodes.
     cluster_alloc = _detach_cluster_statements(cluster.alloc)
     cluster_free = _detach_cluster_statements(cluster.free)
-    for llir_stmt in stmts:
+    for position, llir_stmt in enumerate(stmts):
         if isinstance(llir_stmt, llir.ForLoop) and is_openmp_compatible_for_loop(
             llir_stmt
         ):
@@ -1109,8 +1224,77 @@ def mark_first_for_loop_parallel(
                 cluster.pool_specs,
                 thread_policy_factory,
             )
+            _place_region_view_checks(stmts, position, llir_stmt, cluster.pool_specs)
             return True
     return False
+
+
+def _region_view_failed_skip(spec: ParallelWorkspacePoolSpec) -> llir.IfThenElse:
+    """``if (<workspace>.failed()) continue;``, the first statement of the row body.
+
+    A worker whose owner could not allocate inside the region holds a view with
+    no storage.  It skips each row it takes, so the region's result is
+    incomplete, and :func:`_workspace_pool_check` after the region throws.  The
+    test reads the worker's own local view, which no row changes, so it is
+    loop-invariant (compressed_where_openmp_pass's skip for its views).
+    """
+
+    return llir.IfThenElse(
+        cond=llir.MemberCall(
+            base=llir.Var(name=spec.name, type=llir.DataType.NO_TYPE),
+            member="failed",
+        ),
+        then_body=[llir.Continue()],
+    )
+
+
+def _workspace_pool_check(spec: ParallelWorkspacePoolSpec) -> llir.FunctionCallStmt:
+    """``scorch_check_workspace_pool(<workspace>_pool_owner);`` after the region.
+
+    Throws ``std::bad_alloc`` in serial code when a worker's owner failed to
+    allocate inside the region, the exception an allocation before the region
+    would have thrown.
+    """
+
+    return llir.FunctionCallStmt(
+        name="scorch_check_workspace_pool",
+        args=[
+            llir.Var(
+                name=f"{spec.name}_pool_owner",
+                type=llir.DataType.coo_workspace_1d_pool_type(spec.scalar_type),
+            )
+        ],
+    )
+
+
+def _place_region_view_checks(
+    stmts: Sequence[llir.Stmt],
+    position: int,
+    loop: llir.ForLoop,
+    pool_specs: Sequence[ParallelWorkspacePoolSpec],
+) -> None:
+    """Each sparse workspace pool's skip in the row body and check after the region.
+
+    The worker's view comes from ``make_region_view()``, which never throws: a
+    worker whose owner failed to allocate skips its rows
+    (:func:`_region_view_failed_skip`, the row body's first statement), and
+    :func:`_workspace_pool_check`, the statement after the loop -- in serial
+    code, after the region the loop's code becomes -- throws.  The check needs
+    the statement list the loop is in, so a sequence other than a list fails
+    closed.
+    """
+
+    specs = [spec for spec in pool_specs if spec.container == POOL_COO_WORKSPACE_1D]
+    if not specs:
+        return
+    if type(stmts) is not list or stmts[position] is not loop:
+        raise CompilerInvariantError(
+            "a sparse workspace pool's check after its region needs the "
+            "statement list the region's loop is in",
+            code="workspace_placement_failed",
+        )
+    loop.body = [_region_view_failed_skip(spec) for spec in specs] + list(loop.body)
+    stmts[position + 1 : position + 1] = [_workspace_pool_check(spec) for spec in specs]
 
 
 def serial_workspace_cluster_placement(
@@ -1125,7 +1309,9 @@ def serial_workspace_cluster_placement(
     then never declared at all.  This is their serial placement: one owner
     per workspace sized for one worker, and each worker borrow taking slice
     zero rather than ``omp_get_thread_num()``'s, which outside a region of
-    this kernel's own is not this kernel's to index by.
+    this kernel's own is not this kernel's to index by.  A pool of sparse
+    workspaces holds one owner, made with its arrays, and its borrow takes
+    element zero's ``make_view()``, which may throw in this serial code.
 
     Returns the statements to place before the loop the workspaces are used
     in and the statements to place after it.
@@ -1135,6 +1321,13 @@ def serial_workspace_cluster_placement(
     owners = {f"{spec.name}_pool_owner" for spec in cluster.pool_specs}
     before: List[llir.Stmt] = []
     for spec in cluster.pool_specs:
+        if spec.container == POOL_COO_WORKSPACE_1D:
+            before.extend(
+                _coo_workspace_pool_statements(
+                    spec, lambda: llir.Literal(1, llir.DataType.INT), in_region=False
+                )
+            )
+            continue
         before.append(
             llir.VarInit(
                 var=llir.Var(name=f"{spec.name}_pool_owner", type=llir.DataType.AUTO),
@@ -1163,6 +1356,28 @@ def serial_workspace_cluster_placement(
             statement = llir.VarInit(
                 var=statement.var,
                 value=statement.value.left,
+                op=statement.op,
+                cast=statement.cast,
+                result_storage=statement.result_storage,
+            )
+        elif (
+            type(statement) is llir.VarInit
+            and type(statement.value) is llir.MemberCall
+            and statement.value.member == "make_region_view"
+            and type(statement.value.base) is llir.ArrayAccess
+            and type(statement.value.base.array) is llir.Var
+            and statement.value.base.array.name in owners
+        ):
+            # The pool's one owner, element zero, and its serial view.
+            statement = llir.VarInit(
+                var=statement.var,
+                value=llir.MemberCall(
+                    base=llir.ArrayAccess(
+                        array=statement.value.base.array,
+                        index=llir.Literal(0, llir.DataType.SIZE_T),
+                    ),
+                    member="make_view",
+                ),
                 op=statement.op,
                 cast=statement.cast,
                 result_storage=statement.result_storage,

@@ -19,6 +19,7 @@ from . import llir
 from .cin import (
     IndexStmt,
     IndexVar,
+    IndexVarAdd,
     TensorVar,
     CINVisitorAccept,
     TensorAssign,
@@ -93,6 +94,7 @@ from .llir_traversal import LLIRTraversalContext
 from .scalar_workspace_visit import place_visit_flag, visit_flag, visit_flag_set
 from .parallel_marking_pass import (
     EMPTY_PARALLEL_WORKSPACE_CLUSTER,
+    POOL_COO_WORKSPACE_1D,
     ParallelWorkspaceCluster,
     ParallelWorkspacePoolSpec,
     apply_parallel_policy,
@@ -429,6 +431,11 @@ class CINLowerer:
         # ``_place_unplaced_workspace_clusters``.
         self._unplaced_workspace_clusters: List[ParallelWorkspaceCluster] = []
         self._kernel_has_parallel_region = False
+        # The sparse workspaces a scatter into a dense result drains that are
+        # made once per worker; each is a worker's coo_workspace_view_1d, its
+        # inserts unchecked, and the scatter clears it after its drain.  See
+        # ``_scatter_pool_extent``.
+        self._pooled_scatter_workspaces: Set[str] = set()
         # Whether some loop over a DENSE result level visits only stored
         # coordinates (set by the lattice that emits such a loop).
         self.result_dense_level_sparse_driven = False
@@ -1076,10 +1083,21 @@ class CINLowerer:
 
                     else:
                         # <workspace name>.insert(<C++ array of indices>, <rhs_llir>);
-
+                        # A pooled scatter workspace is a worker's view, whose
+                        # capacity is the extent native_abi.h validated every
+                        # coordinate against: insert_unchecked, as the views of
+                        # compressed_where_openmp_pass.
+                        wksp_tensor_name = (
+                            self.result_tensor_access.get_tensor().get_name()
+                        )
+                        insert_member = (
+                            "insert_unchecked"
+                            if wksp_tensor_name in self._pooled_scatter_workspaces
+                            else "insert"
+                        )
                         llir_stmts.append(
                             llir.FunctionCallStmt(
-                                name=f"{self.result_tensor_access.get_tensor().get_name()}.insert",
+                                name=f"{wksp_tensor_name}.{insert_member}",
                                 args=[
                                     llir.Array(
                                         values=[
@@ -1630,6 +1648,46 @@ class CINLowerer:
                     self._where_workspace_name = wname
                     self._where_workspace_ctype = wksp_ctype.value
                     self._where_workspace_dim = wksp.dim
+                    pool_extent = self._scatter_pool_extent(stmt, wksp)
+                    if pool_extent is not None:
+                        # Drained by a scatter into a dense result: one
+                        # workspace owner per worker, made before the parallel
+                        # region (or once before a serial kernel's outermost
+                        # loop), and in the region each worker's view, which
+                        # allocates the owner's arrays at the worker's first
+                        # make_region_view() and is cleared after each drain,
+                        # instead of one workspace made and freed in every
+                        # iteration.  The serial placement takes make_view().
+                        self._pooled_scatter_workspaces.add(wname)
+                        workspace_pool_specs.append(
+                            ParallelWorkspacePoolSpec(
+                                name=wname,
+                                scalar_type=wksp_ctype,
+                                extent=pool_extent,
+                                container=POOL_COO_WORKSPACE_1D,
+                            )
+                        )
+                        workspace_alloc_stmts.append(
+                            llir.VarInit(
+                                var=llir.Var(name=wname, type=llir.DataType.AUTO),
+                                value=llir.MemberCall(
+                                    base=llir.ArrayAccess(
+                                        array=llir.Var(
+                                            name=f"{wname}_pool_owner",
+                                            type=llir.DataType.NO_TYPE,
+                                        ),
+                                        index=llir.Cast(
+                                            expr=llir.FunctionCall(
+                                                "omp_get_thread_num"
+                                            ),
+                                            data_type=llir.DataType.SIZE_T,
+                                        ),
+                                    ),
+                                    member="make_region_view",
+                                ),
+                            )
+                        )
+                        continue
                     workspace_init_stmts.append(
                         llir.VarInit(
                             var=llir.Var(
@@ -2282,15 +2340,19 @@ class CINLowerer:
         ]
 
     def _refuse_consumer_result_cell(
-        self, result_tensor_access: TensorAccess, level: int, why: str
+        self,
+        result_tensor_access: TensorAccess,
+        level: int,
+        why: str,
+        workspace_kind: str = "dense",
     ) -> NoReturn:
-        """Refuse a dense workspace whose entries have no result cell to go to."""
+        """Refuse a workspace whose entries have no result cell to go to."""
 
         result_tensor = result_tensor_access.get_tensor()
         diagnostic = CINDiagnostic(
             code="unsupported_workspace_result_level",
             message=(
-                f"a dense workspace is copied into level {level} of "
+                f"a {workspace_kind} workspace is copied into level {level} of "
                 f"{result_tensor.get_name()!r}, and {why}"
             ),
             path=("root",),
@@ -2305,9 +2367,12 @@ class CINLowerer:
         )
 
     def _consumer_result_cell(
-        self, result_tensor_access: TensorAccess, level: int
+        self,
+        result_tensor_access: TensorAccess,
+        level: int,
+        key: Sequence[IndexVar] = (),
     ) -> Tuple[List[llir.Stmt], llir.Var]:
-        """Positions of the result cell one entry of a dense workspace goes to.
+        """Positions of the result cell one entry of a workspace goes to.
 
         ``level`` is the result level the workspace's variable indexes.  The
         cell's position is the position of the result's LAST level, which is
@@ -2318,6 +2383,12 @@ class CINLowerer:
         workspace over ``d``, the result's middle level.  The copy-out wrote
         ``C_values[pC1]`` there, the position of a row, not of a cell.
 
+        ``key`` names the result variables the consumer binds itself, beside
+        the enclosing loops: a sparse workspace's key, which its drain reads
+        from each entry (:meth:`_lower_dense_result_scatter`), with ``level``
+        the first level among them.  A dense workspace's copy-out loops over
+        its one variable, the variable of ``level``, and passes none.
+
         Returned are the declarations of the position at ``level`` and at every
         deeper level, each from the one above it, and the last one's variable.
         With ``level`` the last level these are the declarations this lowering
@@ -2325,8 +2396,9 @@ class CINLowerer:
 
         Refused, with ``unsupported_workspace_result_level``: a level from
         ``level`` down that is not dense (its position is a counter, not
-        arithmetic), and a level above or below whose variable no enclosing
-        loop binds.
+        arithmetic), a level above whose variable no enclosing loop binds, and
+        a level below whose variable neither an enclosing loop nor ``key``
+        binds.
         """
 
         level_types = result_tensor_access.level_types()
@@ -2336,20 +2408,28 @@ class CINLowerer:
             loop.parent if loop.has_parent else loop
             for loop in self._enclosing_forall_vars
         ]
-        if level_types[level] != LevelType.DENSE:
+        binders = (
+            "neither an enclosing loop nor the workspace key binds"
+            if key
+            else "no enclosing loop binds"
+        )
+
+        def refuse(why: str) -> NoReturn:
             self._refuse_consumer_result_cell(
                 result_tensor_access,
                 level,
-                f"that level is {level_types[level].name.lower()}",
+                why,
+                workspace_kind="sparse" if key else "dense",
             )
+
+        if level_types[level] != LevelType.DENSE:
+            refuse(f"that level is {level_types[level].name.lower()}")
         above = level - 1
         while above >= 0 and level_types[above] == LevelType.DENSE:
             if level_vars[above] not in bound:
-                self._refuse_consumer_result_cell(
-                    result_tensor_access,
-                    level,
+                refuse(
                     f"no enclosing loop binds {level_vars[above].name}, the "
-                    f"variable of level {above} above it",
+                    f"variable of level {above} above it"
                 )
             above -= 1
         stmts: List[llir.Stmt] = []
@@ -2366,18 +2446,11 @@ class CINLowerer:
             )
         for deeper in range(level + 1, len(level_types)):
             if level_types[deeper] != LevelType.DENSE:
-                self._refuse_consumer_result_cell(
-                    result_tensor_access,
-                    level,
-                    f"level {deeper} below it is "
-                    f"{level_types[deeper].name.lower()}",
-                )
-            if level_vars[deeper] not in bound:
-                self._refuse_consumer_result_cell(
-                    result_tensor_access,
-                    level,
-                    f"no enclosing loop binds {level_vars[deeper].name}, the "
-                    f"variable of level {deeper} below it",
+                refuse(f"level {deeper} below it is {level_types[deeper].name.lower()}")
+            if level_vars[deeper] not in bound and level_vars[deeper] not in key:
+                refuse(
+                    f"{binders} {level_vars[deeper].name}, the "
+                    f"variable of level {deeper} below it"
                 )
             stmts.extend(
                 result_tensor_access.get_level_iterator_resolve_stmts(level=deeper)
@@ -2759,6 +2832,11 @@ class CINLowerer:
                 *stmts,
                 llir.BlankLine(),
             ]
+
+        if self._is_dense_result_scatter(wksp_access, result_tensor_access):
+            return self._lower_dense_result_scatter(
+                wksp, wksp_access, result_tensor_access, reductions_around
+            )
 
         wksp_last_index_var = wksp_index_vars[-1]
 
@@ -3385,6 +3463,250 @@ class CINLowerer:
             *assembly_stmts,
         ]
 
+    def _lower_dense_result_scatter(
+        self,
+        wksp: Workspace,
+        wksp_access: WorkspaceAccess,
+        result_tensor_access: TensorAccess,
+        reductions_around: List[IndexVar],
+    ) -> List[llir.Stmt]:
+        """Drain a sparse workspace into a result whose levels are all dense.
+
+        A dense result is one array of its full size, zeroed before the loop
+        nest runs, and a cell's position is arithmetic: the position of level
+        ``l`` is the position of level ``l - 1`` times the extent of ``l`` plus
+        the coordinate at ``l``.  So the drain is a scatter.  It reads each
+        entry's key and sum, computes the entry's cell from the key and the
+        enclosing loops, and stores the sum there.  It appends no coordinate and
+        needs no order, and the cells no entry names keep their zero.  Under a
+        reduction loop around the Where, each entry is one iteration's partial
+        sum, so it is added into its cell.  The other drains assemble a
+        compressed or coordinate level, which such a result does not have; the
+        kernel they printed for ``dd = oo dd`` did not build.
+
+        The key's components are read in the workspace's storage order, the
+        order its producer inserts them in.  A component that is the inner
+        variable of a split stands for its parent, the result's variable, which
+        is resolved from the outer variable an enclosing loop binds.  The levels
+        above the key's first level are bound by enclosing loops, which declare
+        their positions; from that level down the positions are declared here
+        (:meth:`_consumer_result_cell`).
+
+        ``coo_workspace_1d`` iterates its entries in insertion order without a
+        sort.  ``coo_workspace<T, N>``, the workspace of a key with several
+        components, iterates through the index its ``sort`` builds, so it is
+        sorted first.
+
+        The post-ops are left to the result's assembler, which applies them to
+        the finished values (:meth:`_value_post_ops`): the scatter does not reach
+        the cells no entry names, and a bias add makes those nonzero.
+
+        Refused, with ``unsupported_workspace_result_level``: a key whose
+        components do not stand for distinct variables of the result, one per
+        component of the workspace, a split whose outer variable no enclosing
+        loop binds, and a result level whose variable neither the key nor an
+        enclosing loop binds.
+        """
+
+        result_tensor_name = result_tensor_access.get_tensor().get_name()
+        result_value_metadata = self._tensor_access_metadata(
+            result_tensor_access,
+            llir.TensorAccessRole.RESULT_WRITE,
+        )
+        level_vars = list(result_tensor_access.get_sorted_index_vars())
+        key = list(wksp_access.get_sorted_index_vars())
+        key_vars = [var.parent if var.has_parent else var for var in key]
+        wksp_name = wksp.get_name()
+
+        def refuse(level: int, why: str) -> NoReturn:
+            self._refuse_consumer_result_cell(
+                result_tensor_access, level, why, workspace_kind="sparse"
+            )
+
+        if len(key) != wksp.dim:
+            refuse(
+                len(level_vars) - 1,
+                f"its access names {len(key)} of the workspace's {wksp.dim} "
+                "key components",
+            )
+        for var, key_var in zip(key, key_vars):
+            if key_var not in level_vars:
+                refuse(
+                    len(level_vars) - 1,
+                    f"its key component {var.name} stands for no variable of "
+                    "the result",
+                )
+        if len(set(key_vars)) != len(key_vars):
+            refuse(
+                len(level_vars) - 1,
+                "two of its key components stand for one variable of the result",
+            )
+        enclosing = list(self._enclosing_forall_vars)
+        for var in key:
+            if not var.has_parent:
+                continue
+            split = var.parent.expr
+            outer = [split.lhs, split.rhs] if isinstance(split, IndexVarAdd) else []
+            outer = [operand for operand in outer if operand != var]
+            if len(outer) != 1 or outer[0] not in enclosing:
+                refuse(
+                    level_vars.index(var.parent),
+                    f"no enclosing loop binds the outer variable of the split "
+                    f"of {var.parent.name} its key component {var.name} is in",
+                )
+
+        loop_var = llir.Var(name="it", type=llir.DataType.CONST_AUTO_REF)
+        loop_body: List[llir.Stmt] = []
+        for key_position, var in enumerate(key):
+            entry_key: llir.Expr = llir.MemberAccess(
+                base=llir.Var(name=loop_var.name, type=loop_var.type),
+                member="first",
+            )
+            if wksp.dim > 1:
+                entry_key = llir.ArrayAccess(
+                    array=entry_key,
+                    index=llir.Literal(key_position, llir.DataType.INT64),
+                )
+            loop_body.append(
+                llir.VarInit(
+                    var=llir.Var(name=var.name, type=llir.DataType.INT64),
+                    value=entry_key,
+                )
+            )
+        for var in key:
+            if var.has_parent:
+                loop_body.extend(var.parent.get_resolve_llir_stmts())
+        loop_body.append(
+            llir.VarInit(
+                var=llir.Var(
+                    name=f"{wksp_name}_value",
+                    type=dtype_to_c_datatype(wksp.dtype),
+                ),
+                value=llir.MemberAccess(
+                    base=llir.Var(name=loop_var.name, type=loop_var.type),
+                    member="second",
+                ),
+            )
+        )
+        position_stmts, cell = self._consumer_result_cell(
+            result_tensor_access,
+            min(level_vars.index(key_var) for key_var in key_vars),
+            key=key_vars,
+        )
+        loop_body.extend(position_stmts)
+        loop_body.append(
+            llir.Assign(
+                var=llir.ArrayAccess(
+                    array=llir.Var(
+                        name=f"{result_tensor_name}_values",
+                        type=llir.DataType.NO_TYPE,
+                    ),
+                    index=cell,
+                    tensor_access=result_value_metadata,
+                ),
+                value=llir.Var(name=f"{wksp_name}_value", type=llir.DataType.NO_TYPE),
+                op=AssignOp.ADD_ASSIGN if reductions_around else AssignOp.ASSIGN,
+                result_storage=self._result_storage(
+                    result_tensor_access,
+                    (RESULT_VALUES, None, STORAGE_WRITE),
+                ),
+            )
+        )
+
+        stmts: List[llir.Stmt] = [
+            llir.BlankLine(),
+            llir.Comment("Scatter the sparse workspace into the dense result"),
+        ]
+        if wksp.dim > 1:
+            stmts.append(llir.FunctionCallStmt(name=f"{wksp_name}.sort", args=[]))
+        stmts.append(
+            llir.ForLoopAuto(
+                var=loop_var,
+                array=llir.Var(name=wksp_name, type=llir.DataType.AUTO),
+                body=loop_body,
+            )
+        )
+        if wksp_name in self._pooled_scatter_workspaces:
+            # The worker's workspace outlives this drain: empty it for the
+            # next, resetting only the coordinates this drain read.
+            stmts.append(
+                llir.MemberCallStmt(
+                    base=llir.Var(name=wksp_name, type=llir.DataType.NO_TYPE),
+                    member="clear",
+                )
+            )
+        return stmts
+
+    @staticmethod
+    def _is_dense_result_scatter(
+        wksp_access: WorkspaceAccess, result_tensor_access: TensorAccess
+    ) -> bool:
+        """Whether a consumer drains a sparse workspace by a scatter.
+
+        The route :meth:`lower_ConsumerIndexStmt` sends to
+        :meth:`_lower_dense_result_scatter`: a sparse workspace drained into a
+        result that is not a workspace and whose levels are all dense.
+        """
+        return (
+            not wksp_access.is_dense()
+            and not result_tensor_access.is_workspace()
+            and all(
+                level_type == LevelType.DENSE
+                for level_type in result_tensor_access.level_types()
+            )
+        )
+
+    def _scatter_pool_extent(self, stmt: Where, wksp: Workspace) -> Optional[str]:
+        """The capacity of ``wksp``'s per-worker pool, if a scatter drains it.
+
+        Read before the consumer is lowered, by the predicate the consumer is
+        routed by (:meth:`_is_dense_result_scatter`), so that the workspace is
+        declared for its drain: one ``coo_workspace_owner_1d`` per worker, of
+        capacity the extent of the result level its key stands for, which
+        native_abi.h validated every coordinate against, so the worker's view
+        inserts unchecked and never grows; the view is cleared after each
+        drain.  In a parallel region each worker allocates its owner's arrays
+        once, at its first ``make_region_view()``, without throwing.  Made in
+        every iteration, the workspace was three allocations and a zeroed flag
+        array regrown up to the widest column, freed again at the end of the
+        iteration.
+
+        ``None`` keeps the declaration inside the loop: a consumer of the
+        outermost statement (lowered by :meth:`lower_outer_ConsumerIndexStmt`),
+        another drain, a key that stands for no variable of the result (which
+        the scatter refuses), or a scalar type that has no pool.
+        """
+        consumer = stmt.consumer
+        if consumer.parent == self.outermost_stmt:
+            return None
+        workspaces = consumer.get_workspaces()
+        workspace_accesses = consumer.get_workspace_accesses()
+        result_accesses = consumer.get_result_tensor_accesses()
+        if (
+            not workspaces
+            or not workspace_accesses
+            or not result_accesses
+            or workspaces[0].get_name() != wksp.get_name()
+        ):
+            return None
+        wksp_access = workspace_accesses[0]
+        result_access = result_accesses[0]
+        if not self._is_dense_result_scatter(wksp_access, result_access):
+            return None
+        key = list(wksp_access.get_sorted_index_vars())
+        if len(key) != 1:
+            return None
+        key_var = key[0].parent if key[0].has_parent else key[0]
+        level_vars = list(result_access.get_sorted_index_vars())
+        if key_var not in level_vars:
+            return None
+        try:
+            llir.DataType.coo_workspace_1d_pool_type(dtype_to_c_datatype(wksp.dtype))
+        except ValueError:
+            return None
+        result_name = result_access.get_tensor().get_name()
+        return f"{result_name}{level_vars.index(key_var)}_size"
+
     @staticmethod
     def _nested_ordered_key_level(
         wksp_access: WorkspaceAccess, result_tensor_access: TensorAccess
@@ -3675,8 +3997,9 @@ class CINLowerer:
         grows (``dense_block_leaf_store``).  A result whose levels are all
         dense has no such vector: its values are one array of its full size,
         handed to the kernel.  The drain admitted it and emitted vector calls
-        on that array, C++ that did not build; it now refuses it, as a dense
-        result level, with ``unsupported_workspace_result_level``.
+        on that array, C++ that did not build.  Such a result is scattered
+        into by :meth:`_lower_dense_result_scatter`, which the consumer
+        lowering takes before it asks this method, so this returns None for it.
         """
 
         key = list(wksp_access.get_index_vars())

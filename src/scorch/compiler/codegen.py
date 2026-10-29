@@ -123,9 +123,25 @@ class LLIRLowerer:
             not compile_options.emit_comments if compile_options is not None else False
         )
         self._emission_depth = 0
+        # The packaged headers the types rendered so far need, in first-use order
+        # (``_type_text``); ``lower_function_definition`` places them ahead of a
+        # function.
+        self._packaged_headers: List[str] = []
 
-    @staticmethod
-    def _lower_typed_var(var: llir.Var) -> str:
+    def _type_text(self, data_type: llir.DataType) -> str:
+        """The C++ spelling of ``data_type``, recording the packaged header that
+        defines it when the JIT preamble does not (``llir.DataType.packaged_header``).
+
+        Every type the emitted code names is rendered here, so a function's source
+        carries exactly the headers of the types it names.
+        """
+        if type(data_type) is llir.DataType:
+            name = data_type.packaged_header()
+            if name is not None and name not in self._packaged_headers:
+                self._packaged_headers.append(name)
+        return data_type.value
+
+    def _lower_typed_var(self, var: llir.Var) -> str:
         if type(var) is not llir.Var:
             raise CodegenError(
                 "typed variable emission requires an exact LLIR Var; got "
@@ -133,10 +149,9 @@ class LLIRLowerer:
                 code="unknown_llir_node",
             )
         qualifier = "__restrict__ " if var.is_restrict else ""
-        return f"{var.type.value} {qualifier}{var.name}"
+        return f"{self._type_text(var.type)} {qualifier}{var.name}"
 
-    @staticmethod
-    def _render_call_template_args(value: object, *, owner: str) -> str:
+    def _render_call_template_args(self, value: object, *, owner: str) -> str:
         """Render one explicit ``<...>`` call template-argument list."""
 
         if type(value) is not tuple or any(
@@ -148,7 +163,7 @@ class LLIRLowerer:
             )
         if not value:
             return ""
-        return "<" + ", ".join(argument.value for argument in value) + ">"
+        return "<" + ", ".join(self._type_text(argument) for argument in value) + ">"
 
     @staticmethod
     def _validate_expression_sequence(value: object, field: str) -> None:
@@ -347,7 +362,7 @@ class LLIRLowerer:
                     code="invalid_fixed_stack_array_declaration",
                 ) from error
             return self.lower_llir(
-                f"{declaration.element_type.value} {declaration.name}"
+                f"{self._type_text(declaration.element_type)} {declaration.name}"
                 f"[{self._render_expression(declaration.extent)}] = "
                 f"{self._render_expression(declaration.initializer)};",
                 indent_level,
@@ -619,7 +634,7 @@ class LLIRLowerer:
                 parent_precedence=self._UNARY_PRECEDENCE,
                 is_right_child=True,
             )
-            return f"({ir.data_type.value}){operand}"
+            return f"({self._type_text(ir.data_type)}){operand}"
 
         if type(ir) is llir.Select:
             return self._render_select(cast(llir.Select, ir))
@@ -631,7 +646,7 @@ class LLIRLowerer:
                     "Sizeof.data_type must be a DataType",
                     code="invalid_sizeof_data_type",
                 )
-            return f"sizeof({data_type.value})"
+            return f"sizeof({self._type_text(data_type)})"
 
         if type(ir) is llir.AddressOf:
             address_operand = self._validated_address_of_operand(ir)
@@ -1159,7 +1174,7 @@ class LLIRLowerer:
                 )
             self._validate_statement_sequence(ir.body, "LLIR ForLoopAuto.body")
             header = (
-                f"for ({ir.var.type.value} {self.lower_llir(ir.var)}"
+                f"for ({self._type_text(ir.var.type)} {self.lower_llir(ir.var)}"
                 f" : {self.lower_llir(ir.array)}) {{"
             )
         else:
@@ -1368,14 +1383,41 @@ class LLIRLowerer:
             raise CodegenError(
                 "All LLIR Function arguments must have types", code="invalid_llir_value"
             )
-        header = (
-            f"{ir.return_type.value} {ir.name}"
-            + f"({', '.join([self._lower_typed_var(arg) for arg in args])}) {{"
-        )
-        return (
-            self.lower_llir(header, indent_level)
-            + "\n"
-            + self.lower_llir(ir.body, indent_level + 1)
-            + "\n"
-            + self.lower_llir("}", indent_level)
+        # The types this definition renders record the packaged headers they need
+        # (``_type_text``); the definition's own list starts empty and the enclosing
+        # one is restored after it.
+        enclosing_headers = self._packaged_headers
+        self._packaged_headers = []
+        try:
+            header = (
+                f"{self._type_text(ir.return_type)} {ir.name}"
+                + f"({', '.join([self._lower_typed_var(arg) for arg in args])}) {{"
+            )
+            definition = (
+                self.lower_llir(header, indent_level)
+                + "\n"
+                + self.lower_llir(ir.body, indent_level + 1)
+                + "\n"
+                + self.lower_llir("}", indent_level)
+            )
+            needed = self._packaged_headers
+        finally:
+            self._packaged_headers = enclosing_headers
+        return self._packaged_header_text(needed) + definition
+
+    @staticmethod
+    def _packaged_header_text(names: Sequence[str]) -> str:
+        """The text of the packaged headers ``names``, ahead of a function definition.
+
+        Placed in the kernel's own source, after the JIT preamble, so the kernel's name
+        covers it; a function that renders only types the preamble defines gets the
+        empty string, and its source is unchanged.  Each header has an include guard,
+        so a source with two functions that need one header defines it once.
+        """
+        if not names:
+            return ""
+        from ..utils import packaged_header_text
+
+        return "".join(
+            packaged_header_text(name).rstrip("\n") + "\n\n" for name in names
         )

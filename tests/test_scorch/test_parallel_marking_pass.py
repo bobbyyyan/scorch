@@ -16,11 +16,13 @@ from scorch.compiler.llir_traversal import (  # type: ignore[import-untyped]
 )
 from scorch.compiler.parallel_marking_pass import (  # type: ignore[import-untyped]
     EMPTY_PARALLEL_WORKSPACE_CLUSTER,
+    POOL_COO_WORKSPACE_1D,
     ParallelWorkspaceCluster,
     ParallelWorkspacePoolSpec,
     atomic_work_stealing_prelude,
     mark_first_for_loop_parallel,
     scalars_carried_between_iterations,
+    serial_workspace_cluster_placement,
 )
 
 
@@ -655,3 +657,162 @@ def test_a_scalar_declared_inside_the_parallel_region_is_one_per_worker() -> Non
 
     assert scalars_carried_between_iterations(loop) == ("wksp_count",)
     assert scalars_carried_between_iterations(loop, per_worker) == ()
+
+
+def _coo_pool_spec() -> ParallelWorkspacePoolSpec:
+    return ParallelWorkspacePoolSpec(
+        name="w",
+        scalar_type=llir.DataType.FLOAT64,
+        extent="C1_size",
+        container=POOL_COO_WORKSPACE_1D,
+    )
+
+
+def _coo_borrow(array: llir.Expr) -> llir.Stmt:
+    return llir.VarInit(
+        var=llir.Var(name="w", type=llir.DataType.AUTO),
+        value=llir.MemberCall(
+            base=llir.ArrayAccess(
+                array=array,
+                index=llir.Cast(
+                    expr=llir.FunctionCall("omp_get_thread_num"),
+                    data_type=llir.DataType.SIZE_T,
+                ),
+            ),
+            member="make_region_view",
+        ),
+    )
+
+
+def _owner() -> llir.Var:
+    return llir.Var(name="w_pool_owner", type=llir.DataType.NO_TYPE)
+
+
+def _render(statements: list) -> str:
+    return "\n".join(LLIRLowerer().lower_llir(s).strip() for s in statements)
+
+
+def _row_store() -> llir.Stmt:
+    """``out[i] = 1.0``: each iteration writes its own element, so nothing is
+    carried from one iteration to the next."""
+
+    return llir.Assign(
+        llir.ArrayAccess(
+            array=llir.Var(name="out", type=llir.DataType.PTR_FLOAT64),
+            index=llir.Var(name="i", type=llir.DataType.INT64),
+        ),
+        llir.Literal(1.0, llir.DataType.FLOAT64),
+    )
+
+
+def test_a_sparse_workspace_pool_is_built_before_the_region() -> None:
+    """One ``coo_workspace_owner_1d`` per worker, of capacity ``extent``, built
+    before the parallel region with nothing allocated; inside it each worker
+    takes its view by ``make_region_view()``, skips its rows if that view
+    failed, and the statement after the loop checks the pool."""
+
+    loop = _plain_dense_loop()
+    loop.body = [_row_store()]
+    statements: list = [loop]
+    cluster = ParallelWorkspaceCluster(
+        alloc=(_coo_borrow(_owner()),), pool_specs=(_coo_pool_spec(),)
+    )
+    assert mark_first_for_loop_parallel(statements, cluster)
+    before = _render(loop.before_parallel_body)
+    assert before.index("int w_thread_count = ") < before.index(
+        "std::vector<coo_workspace_owner_1d<double>> w_pool_owner;"
+    )
+    assert "w_pool_owner.reserve((size_t)w_thread_count);" in before
+    assert "for (int _worker = 0; _worker < w_thread_count; _worker++)" in before
+    assert "w_pool_owner.emplace_back(C1_size, true);" in before
+    assert "scorch_make_aligned_buffer" not in before
+    assert loop.omp_num_threads == "w_thread_count"
+    assert _render(loop.pre_parallel_body) == (
+        "auto w = w_pool_owner[(size_t)omp_get_thread_num()].make_region_view();"
+    )
+    skip = loop.body[0]
+    assert type(skip) is llir.IfThenElse
+    assert " ".join(_render([skip]).split()) == "if (w.failed()) { continue; }"
+    assert type(loop.body[1]) is llir.Assign
+    assert len(statements) == 2 and statements[0] is loop
+    assert _render(statements[1:]) == "scorch_check_workspace_pool(w_pool_owner);"
+
+
+def test_a_loop_carrying_a_scalar_gets_no_pool_skip_or_check() -> None:
+    """A row loop whose body advances a scalar from one iteration to the next
+    (``rows++``) must run in order, so the pass leaves it unmarked: no pool, no
+    skip in its body and no check after it (the caller places the cluster
+    serially)."""
+
+    loop = _plain_dense_loop()
+    loop.body = [llir.Increment(_int("rows"))]
+    statements: list = [loop]
+    cluster = ParallelWorkspaceCluster(
+        alloc=(_coo_borrow(_owner()),), pool_specs=(_coo_pool_spec(),)
+    )
+    assert not mark_first_for_loop_parallel(statements, cluster)
+    assert statements == [loop]
+    assert len(loop.body) == 1 and type(loop.body[0]) is llir.Increment
+    assert not loop.omp_parallel_for
+    assert not loop.before_parallel_body
+    assert not loop.pre_parallel_body
+
+
+def test_the_pool_check_needs_the_loops_statement_list() -> None:
+    """The check after the region is placed in the loop's own statement list;
+    a sequence that cannot take it fails closed."""
+
+    cluster = ParallelWorkspaceCluster(
+        alloc=(_coo_borrow(_owner()),), pool_specs=(_coo_pool_spec(),)
+    )
+    with pytest.raises(CompilerInvariantError) as raised:
+        mark_first_for_loop_parallel((_plain_dense_loop(),), cluster)
+    assert raised.value.code == "workspace_placement_failed"
+
+
+def test_a_dense_workspace_pool_gets_no_check() -> None:
+    loop = _plain_dense_loop()
+    statements: list = [loop]
+    dense = ParallelWorkspacePoolSpec(
+        name="w", scalar_type=llir.DataType.FLOAT64, extent="C1_size"
+    )
+    assert mark_first_for_loop_parallel(
+        statements, ParallelWorkspaceCluster(pool_specs=(dense,))
+    )
+    assert statements == [loop]
+    assert loop.body == []
+
+
+def test_a_serial_kernel_takes_the_pools_one_view() -> None:
+    cluster = ParallelWorkspaceCluster(
+        alloc=(_coo_borrow(_owner()),), pool_specs=(_coo_pool_spec(),)
+    )
+    before, after = serial_workspace_cluster_placement(cluster)
+    text = _render(before)
+    assert "std::vector<coo_workspace_owner_1d<double>> w_pool_owner;" in text
+    assert "w_pool_owner.reserve((size_t)1);" in text
+    assert "w_pool_owner.emplace_back(C1_size);" in text
+    assert text.endswith("auto w = w_pool_owner[0].make_view();")
+    assert "omp_get_thread_num" not in text
+    assert "make_region_view" not in text
+    assert "scorch_check_workspace_pool" not in text
+    assert after == []
+
+
+def test_the_pool_container_and_the_element_borrow_fail_closed() -> None:
+    with pytest.raises(TypeError, match=r"ParallelWorkspacePoolSpec\.container"):
+        ParallelWorkspacePoolSpec(
+            name="w",
+            scalar_type=llir.DataType.FLOAT64,
+            extent="C1_size",
+            container="hash_map",
+        )
+    with pytest.raises(TypeError, match="workspace-borrow expression grammar"):
+        ParallelWorkspaceCluster(
+            alloc=(_coo_borrow(llir.Literal(0, llir.DataType.INT)),)
+        )
+    forged = _coo_borrow(_owner())
+    view_call = cast(llir.MemberCall, cast(llir.VarInit, forged).value)
+    object.__setattr__(view_call.base, "tensor_access", object())
+    with pytest.raises(TypeError, match="tensor_access must be absent"):
+        ParallelWorkspaceCluster(alloc=(forged,))

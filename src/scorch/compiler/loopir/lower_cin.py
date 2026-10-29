@@ -185,64 +185,11 @@ def refuse_where_program(cin: IndexStmt) -> None:
     plan without a code.
     """
 
-    enclosing: List[IndexVar] = []
     current: IndexStmt = cin
     while isinstance(current, ForAll):
-        enclosing.append(current.index_var)
         current = current.stmt
     if isinstance(current, Where):
-        _fail(*_where_refusal(enclosing, current))
-
-
-def _where_refusal(enclosing: Sequence[IndexVar], where: Where) -> Tuple[str, str]:
-    """The refusal (code, message) of a Where program below the loops ``enclosing``.
-
-    Every Where program is outside the dense families (``unsupported_statement``),
-    and one kind is refused by the code the shipped lowering gives it, so that the two
-    compilers refuse it alike: below at least one loop, a consumer that drains an
-    indexed, untiled sparse workspace, keyed on index variables of the result, into a
-    result whose levels are all dense, with no reduction loop around it.  The shipped
-    lowering refuses that drain with ``unsupported_workspace_result_level``
-    (``CINLowerer``: the drain assembles a compressed or coordinate level, and such a
-    result has none).  Every other Where program keeps the general refusal, among
-    them a Where below no loop, which the shipped lowering computes into any result
-    format through a coordinate intermediate and a conversion, and a consumer that a
-    reduction loop encloses, which it refuses with another code.  The callers raise
-    the refusal (``refuse_where_program`` and ``_collect_loop_nest``), so each route
-    still refuses in the function it refused in before.
-    """
-
-    consumer: IndexStmt = where.consumer
-    while isinstance(consumer, ForAll):
-        consumer = consumer.stmt
-    if enclosing and isinstance(consumer, TensorAssign):
-        drained, result = consumer.rhs, consumer.lhs
-        # A tile loop counts as the loop over its parent variable, as in
-        # ``CINLowerer._reductions_around_consumer``.
-        loops = [loop.parent if loop.has_parent else loop for loop in enclosing]
-        if (
-            isinstance(drained, TensorAccess)
-            and isinstance(drained.tensor, cin_nodes.Workspace)
-            and not drained.tensor.is_dense()
-            and not drained.tensor.is_tiled
-            and len(drained.get_index_vars()) > 0
-            and isinstance(result, TensorAccess)
-            and not result.is_workspace()
-            and all(
-                level_type is LevelType.DENSE for level_type in result.level_types()
-            )
-            and all(
-                index_var in result.get_index_vars()
-                for index_var in (*loops, *drained.get_index_vars())
-            )
-        ):
-            return (
-                "unsupported_workspace_result_level",
-                f"a sparse workspace is drained into {result.tensor.name!r}, whose "
-                "levels are all dense; the drain assembles a compressed or "
-                "coordinate level",
-            )
-    return "unsupported_statement", _WHERE_REFUSAL
+        _fail("unsupported_statement", _WHERE_REFUSAL)
 
 
 def _collect_loop_nest(cin: IndexStmt) -> Tuple[List[IndexVar], TensorAssign]:
@@ -258,7 +205,7 @@ def _collect_loop_nest(cin: IndexStmt) -> Tuple[List[IndexVar], TensorAssign]:
         loop_vars.append(current.index_var)
         current = current.stmt
     if isinstance(current, Where):
-        _fail(*_where_refusal(loop_vars, current))
+        _fail("unsupported_statement", _WHERE_REFUSAL)
     if not isinstance(current, TensorAssign):
         _fail(
             "unsupported_statement",

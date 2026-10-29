@@ -25,6 +25,7 @@ EXPECTED_NATIVE_RESOURCES = (
     "pybind.cpp",
     "scorch_policy.h",
     "spmm.h",
+    "workspace_pool.h",
 )
 
 
@@ -110,12 +111,67 @@ def _assert_jit_kernel() -> None:
         raise AssertionError("generic operation did not produce a JIT extension")
 
 
+def _assert_workspace_pool_kernel() -> None:
+    """A kernel that holds a coordinate-list workspace pool builds from the installed
+    package: code generation reads csrc/workspace_pool.h at run time and places it in
+    the kernel's own source, ahead of the function."""
+    from scorch import ops
+    from scorch.compiler.cin import (
+        ForAll,
+        IndexVar,
+        Operation,
+        TensorAssign,
+        TensorVar,
+        Where,
+        Workspace,
+    )
+
+    jit_dir = Path(os.environ["TORCH_EXTENSIONS_DIR"])
+    f64 = torch.float64
+    lhs_torch = torch.tensor(
+        [[1.0, 0.0, 2.0], [0.0, 0.0, 0.0], [0.0, 3.0, 0.0]], dtype=f64
+    )
+    rhs_torch = torch.tensor([[1.0, 0.0], [0.0, 4.0], [5.0, 0.0]], dtype=f64)
+    lhs = scorch.STensor.from_torch(lhs_torch.clone()).to_sparse("ds")
+    rhs = scorch.STensor.from_torch(rhs_torch.clone()).to_sparse("ds")
+    i, j, k = IndexVar("i"), IndexVar("j"), IndexVar("k")
+    c = TensorVar("C", fmt="dd", shape=(3, 2), dtype=f64)
+    a = TensorVar("A", fmt="ds", shape=(3, 3), dtype=f64)
+    b = TensorVar("B", fmt="ds", shape=(3, 2), dtype=f64)
+    w = Workspace(name="w", dim=1, dtype=f64, dense=False)
+    program = ForAll(
+        i,
+        Where(
+            producer=ForAll(
+                k, ForAll(j, TensorAssign(w[j], a[i, k] * b[k, j], op=Operation.ADD))
+            ),
+            consumer=ForAll(j, TensorAssign(c[i, j], w[j])),
+        ),
+    )
+
+    before = _shared_objects(jit_dir)
+    actual = ops.lower_and_exec_cin(program, (3, 2), lhs, rhs).to_torch()
+    torch.testing.assert_close(actual, lhs_torch @ rhs_torch)
+    built = _shared_objects(jit_dir) - before
+    sources = [path.parent / "main.cpp" for path in built]
+    if not any(
+        source.is_file() and "class coo_workspace_owner_1d" in source.read_text()
+        for source in sources
+    ):
+        raise AssertionError(
+            "no kernel built for the sparse workspace scatter carries workspace_pool.h"
+        )
+
+
 def main() -> None:
     _assert_clean_install()
     _assert_packaged_native_resources()
     _assert_native_kernel()
     _assert_jit_kernel()
-    print("installed Scorch distribution passed native and JIT smoke tests")
+    _assert_workspace_pool_kernel()
+    print(
+        "installed Scorch distribution passed native, JIT and workspace pool smoke tests"
+    )
 
 
 if __name__ == "__main__":

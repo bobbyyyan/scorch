@@ -3505,3 +3505,98 @@ def test_conditional_codegen_rejects_mismatched_condition_bodies() -> None:
 
     with pytest.raises(CodegenError, match="condition and body counts"):
         LLIRLowerer().lower_llir(conditional)
+
+
+_POOL = llir.DataType.STD_VECTOR_COO_WORKSPACE_OWNER_1D_FLOAT64
+
+
+def _pool_text() -> str:
+    from scorch.utils import packaged_header_text
+
+    return packaged_header_text("workspace_pool.h").rstrip("\n") + "\n\n"
+
+
+@pytest.mark.parametrize(
+    "pool_type",
+    [
+        member
+        for member in llir.DataType
+        if member.value.startswith("std::vector<coo_workspace_owner_1d<")
+    ],
+)
+def test_every_coo_pool_type_names_the_header_that_defines_it(
+    pool_type: llir.DataType,
+) -> None:
+    assert pool_type.packaged_header() == "workspace_pool.h"
+
+
+def test_types_the_preamble_defines_name_no_packaged_header() -> None:
+    pool_types = {
+        member
+        for member in llir.DataType
+        if member.value.startswith("std::vector<coo_workspace_owner_1d<")
+    }
+    assert len(pool_types) == 6
+    for member in llir.DataType:
+        if member not in pool_types:
+            assert member.packaged_header() is None, member
+
+
+def test_a_function_that_declares_a_pool_opens_with_the_pool_definitions() -> None:
+    body = [llir.VarDecl(var=llir.Var(name="w_pool_owner", type=_POOL))]
+    function = llir.Function(llir.DataType.VOID, "evaluate", [], body)
+
+    emitted = LLIRLowerer().lower_llir(function)
+
+    assert emitted == (
+        _pool_text()
+        + "void evaluate() {\n"
+        + "  std::vector<coo_workspace_owner_1d<double>> w_pool_owner;\n"
+        + "}"
+    )
+
+
+def test_a_pool_named_only_in_a_sizeof_brings_its_header() -> None:
+    # Every place emitted code names a type records its header, not only declarations.
+    sizeof_body = [llir.VarInit(_var("n"), llir.Sizeof(_POOL))]
+    sizeof_function = llir.Function(llir.DataType.VOID, "f", [], sizeof_body)
+
+    assert LLIRLowerer().lower_llir(sizeof_function).startswith(_pool_text())
+
+
+def test_no_header_without_a_pool_or_outside_a_function() -> None:
+    plain = llir.Function(
+        llir.DataType.VOID, "evaluate", [], [llir.VarDecl(var=_var("n"))]
+    )
+    assert LLIRLowerer().lower_llir(plain) == "void evaluate() {\n  int n;\n}"
+    # Statements alone (no function) render as before: the header goes ahead of a
+    # function definition only.
+    declaration = llir.VarDecl(var=llir.Var(name="w_pool_owner", type=_POOL))
+    assert LLIRLowerer().lower_llir(declaration) == (
+        "std::vector<coo_workspace_owner_1d<double>> w_pool_owner;"
+    )
+
+
+def test_each_function_carries_only_the_headers_its_own_types_need() -> None:
+    # One lowerer, two functions: the pool function's header does not leak into the
+    # next function, and a pool declared before a function is not charged to it.
+    lowerer = LLIRLowerer()
+    pool_function = llir.Function(
+        llir.DataType.VOID,
+        "with_pool",
+        [],
+        [llir.VarDecl(var=llir.Var(name="w_pool_owner", type=_POOL))],
+    )
+    plain = llir.Function(
+        llir.DataType.VOID, "without_pool", [], [llir.VarDecl(var=_var("n"))]
+    )
+
+    emitted = lowerer.lower_llir([pool_function, plain])
+
+    assert emitted.count("class coo_workspace_owner_1d") == 1
+    assert emitted.index("class coo_workspace_owner_1d") < emitted.index(
+        "void with_pool()"
+    )
+    assert emitted.endswith("void without_pool() {\n  int n;\n}")
+    lowerer.lower_llir(llir.VarDecl(var=llir.Var(name="p", type=_POOL)))
+    assert lowerer.lower_llir(plain) == "void without_pool() {\n  int n;\n}"

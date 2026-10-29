@@ -191,6 +191,28 @@ class DataType(Enum):
         "std::vector<linked_list_workspace_1d<uint8_t>>"
     )
 
+    # Owned per-worker coordinate-list workspace pools (one owner per worker,
+    # each worker's view taken from it), one member per scalar type a
+    # per-worker workspace pool may hold.
+    STD_VECTOR_COO_WORKSPACE_OWNER_1D_FLOAT32 = (
+        "std::vector<coo_workspace_owner_1d<float>>"
+    )
+    STD_VECTOR_COO_WORKSPACE_OWNER_1D_FLOAT64 = (
+        "std::vector<coo_workspace_owner_1d<double>>"
+    )
+    STD_VECTOR_COO_WORKSPACE_OWNER_1D_INT32 = (
+        "std::vector<coo_workspace_owner_1d<int32_t>>"
+    )
+    STD_VECTOR_COO_WORKSPACE_OWNER_1D_INT64 = (
+        "std::vector<coo_workspace_owner_1d<int64_t>>"
+    )
+    STD_VECTOR_COO_WORKSPACE_OWNER_1D_INT8 = (
+        "std::vector<coo_workspace_owner_1d<int8_t>>"
+    )
+    STD_VECTOR_COO_WORKSPACE_OWNER_1D_UINT8 = (
+        "std::vector<coo_workspace_owner_1d<uint8_t>>"
+    )
+
     # Pointer types
     PTR_INT = "int*"
     PTR_INT_32 = "int32_t*"
@@ -292,6 +314,31 @@ class DataType(Enum):
         return DataType(f"std::vector<linked_list_workspace_1d<{element_spelling}>>")
 
     @classmethod
+    def coo_workspace_1d_pool_type(cls, element: DataType) -> DataType:
+        """The owned per-worker ``coo_workspace_owner_1d<T>`` pool for one scalar type.
+
+        Enum lookup by value fails closed with :class:`ValueError` for a
+        scalar type without a dedicated pool member.
+        """
+        if type(element) is not DataType:
+            raise ScorchTypeError(
+                "coo workspace pool element must be a DataType",
+                code="internal_argument_type_invalid",
+            )
+        return DataType(f"std::vector<coo_workspace_owner_1d<{element.value}>>")
+
+    def packaged_header(self) -> Optional[str]:
+        """The packaged header under ``scorch/csrc`` that defines this type, if the JIT
+        preamble does not.
+
+        Code generation places that header's text in the source of each kernel that names
+        the type (``LLIRLowerer.lower_function_definition``), so a kernel that does not
+        name it is emitted as it would be without the header.  None for every type the
+        preamble defines.
+        """
+        return _PACKAGED_HEADER_OF_TYPE.get(self)
+
+    @classmethod
     def const_ptr_type(cls, element_spelling: str) -> DataType:
         """The const-qualified pointer for one recognized scalar spelling.
 
@@ -380,6 +427,19 @@ _DIRECT_INIT_DATA_TYPES = frozenset(
         DataType.STD_VECTOR_2D_TORCH_TENSOR,
     }
 )
+
+# The types the JIT preamble does not define, by the packaged header that does
+# (``DataType.packaged_header``).  The per-worker coordinate-list workspace pools are
+# used only by a scatter of a sparse workspace into a dense result, which no public
+# operation emits, so their definitions stay out of every other kernel's source.
+_PACKAGED_HEADER_OF_TYPE = {
+    DataType.STD_VECTOR_COO_WORKSPACE_OWNER_1D_FLOAT32: "workspace_pool.h",
+    DataType.STD_VECTOR_COO_WORKSPACE_OWNER_1D_FLOAT64: "workspace_pool.h",
+    DataType.STD_VECTOR_COO_WORKSPACE_OWNER_1D_INT32: "workspace_pool.h",
+    DataType.STD_VECTOR_COO_WORKSPACE_OWNER_1D_INT64: "workspace_pool.h",
+    DataType.STD_VECTOR_COO_WORKSPACE_OWNER_1D_INT8: "workspace_pool.h",
+    DataType.STD_VECTOR_COO_WORKSPACE_OWNER_1D_UINT8: "workspace_pool.h",
+}
 
 
 class TensorAccessRole(Enum):

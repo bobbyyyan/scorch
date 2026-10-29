@@ -155,7 +155,13 @@ def test_direct_string_encoded_var_expression_budget_is_explicit() -> None:
         # ``iter_lattice.py`` is 44 after a dense result's cell position is
         # computed in one place.  Both are position counters under plain
         # identifiers, and both sums below are unchanged.
-        "cin_lowerer.py": 203,
+        # 214 after a sparse workspace drained into an all-dense result is
+        # scattered (item 5): the drain iterator ``it`` and its two reads, the
+        # key component, the entry's sum and its read, the result's values
+        # array and the drained workspace (8); and that workspace made once per
+        # worker: its borrow ``<w>``, its pool ``<w>_pool_owner`` and the
+        # receiver of its ``clear`` (3).  Plain identifiers throughout.
+        "cin_lowerer.py": 214,
         # 31 after the SpGEMM work estimate reads each operand's stored count in
         # bounds: the chain helper's one position-array Var per level replaces the
         # estimate's two fixed ones, under the same plain identifiers.
@@ -170,8 +176,13 @@ def test_direct_string_encoded_var_expression_budget_is_explicit() -> None:
         "llir_traversal.py": 1,
         "loop_invariant_factor_pass.py": 3,
         # 15: a serial kernel now declares its dense workspace, which only a
-        # parallel loop used to place.
-        "parallel_marking_pass.py": 15,
+        # parallel loop used to place.  19: the pool of sparse workspaces
+        # (item 5): its owner ``<w>_pool_owner``, the worker index ``_worker``,
+        # the extent each workspace is made with and the worker count
+        # ``<w>_thread_count``, plain identifiers.  21 (item 5 v5): the worker's
+        # view ``<w>`` that the skip of a failed view tests and the pool
+        # ``<w>_pool_owner`` the check after the region reads, plain identifiers.
+        "parallel_marking_pass.py": 21,
         "result_write_pass.py": 3,
         # 1: the flag that records whether a scalar workspace's producer loop ran
         # (``<workspace>_visited``, a bool), named by an f-string over the
@@ -196,10 +207,11 @@ def test_direct_string_encoded_var_expression_budget_is_explicit() -> None:
         # them) each built before.  Plain identifiers throughout.
         "torch_cpp_abi.py": 89,
     }
-    assert sum(constructor_counts.values()) == 538
+    assert sum(constructor_counts.values()) == 555
     assert unclassified_counts == {
         "cin.py": 9,
-        "cin_lowerer.py": 195,
+        # 206: item 5's 11, as in constructor_counts above.
+        "cin_lowerer.py": 206,
         # 31: the work estimate's chain helper, as in constructor_counts above.
         "compressed_where_openmp_pass.py": 31,
         "dense_pointer_hoist_pass.py": 7,
@@ -208,7 +220,8 @@ def test_direct_string_encoded_var_expression_budget_is_explicit() -> None:
         "iterator.py": 21,
         "llir_traversal.py": 1,
         "loop_invariant_factor_pass.py": 3,
-        "parallel_marking_pass.py": 15,
+        # 21: the pool of sparse workspaces, as in constructor_counts above.
+        "parallel_marking_pass.py": 21,
         "result_write_pass.py": 3,
         "scalar_workspace_visit.py": 1,
         "schedule_lowerer.py": 106,
@@ -217,7 +230,7 @@ def test_direct_string_encoded_var_expression_budget_is_explicit() -> None:
         # 89: as in constructor_counts above.
         "torch_cpp_abi.py": 89,
     }
-    assert sum(unclassified_counts.values()) == 528
+    assert sum(unclassified_counts.values()) == 545
     assert known_indirect == {
         ("cin_lowerer.py", "actual_size"): 2,
         ("cin_lowerer.py", "expr.name.replace(old, new)"): 1,
@@ -226,7 +239,8 @@ def test_direct_string_encoded_var_expression_budget_is_explicit() -> None:
         ("cin_lowerer.py", "reserve_hint_var"): 1,
         ("cin_lowerer.py", "size_var"): 2,
         ("cin_lowerer.py", "sparse_values_tensor"): 1,
-        ("cin_lowerer.py", "wname"): 4,
+        # 5: the borrow of a scattered workspace's per-worker pool (item 5).
+        ("cin_lowerer.py", "wname"): 5,
         ("compressed_where_openmp_pass.py", "bound.name"): 3,
         ("compressed_where_openmp_pass.py", "loop_bound"): 1,
         ("compressed_where_openmp_pass.py", "loop_var.name"): 1,
@@ -235,7 +249,8 @@ def test_direct_string_encoded_var_expression_budget_is_explicit() -> None:
         ("compressed_where_openmp_pass.py", "sparse_pos"): 1,
         ("parallel_marking_pass.py", "bound_name"): 4,
         ("parallel_marking_pass.py", "sparse_pos"): 2,
-        ("parallel_marking_pass.py", "spec.extent"): 2,
+        # 3: the extent each pooled sparse workspace is made with (item 5).
+        ("parallel_marking_pass.py", "spec.extent"): 3,
         ("iter_lattice.py", "name"): 1,
         ("dense_pointer_hoist_pass.py", "candidate.base"): 1,
         ("dense_pointer_hoist_pass.py", "candidate.stride"): 1,
@@ -254,7 +269,7 @@ def test_direct_string_encoded_var_expression_budget_is_explicit() -> None:
         ("torch_cpp_abi.py", "pointer_name"): 4,
         ("torch_cpp_abi.py", "bound_name"): 1,
     }
-    assert sum(known_indirect.values()) == 52
+    assert sum(known_indirect.values()) == 54
 
     assert totals == {
         "subscript": 9,
@@ -405,16 +420,21 @@ def test_expression_producer_budgets_are_explicit() -> None:
         ("torch_cpp_abi.py", "tensor_storage_member"): 2,
     }
     assert member_call_constructors == {
-        "cin_lowerer.py": 2,
+        # 3: a scattered workspace's worker view, ``make_region_view()`` of its
+        # owner (item 5 v5).
+        "cin_lowerer.py": 3,
         "compressed_where_openmp_pass.py": 1,
         "llir_traversal.py": 1,
+        # 2 (item 5 v5): the skip's ``failed()`` of a worker's view, and the
+        # serial kernel's ``make_view()`` in place of ``make_region_view()``.
+        "parallel_marking_pass.py": 2,
         "schedule_lowerer.py": 2,
         # data_ptr's, mode_position_length's numel() (row 15b), and the value
         # post-ops' numel() of ``{name}_values_torch`` (row 16): the pass's loop
         # bound, the one count every assembly path's values tensor carries.
         "torch_cpp_abi.py": 3,
     }
-    assert sum(member_call_constructors.values()) == 9
+    assert sum(member_call_constructors.values()) == 12
 
 
 def test_panel_lower_bound_calls_cannot_return_to_var_names() -> None:
@@ -725,14 +745,18 @@ def test_workspace_clear_mutations_are_structured() -> None:
     )
     member_call_stmt_constructors += Counter()
     assert member_call_stmt_constructors == {
-        "cin_lowerer.py": 2,
+        # 3: the ``clear`` of a scattered workspace after its drain (item 5).
+        "cin_lowerer.py": 3,
         "compressed_where_openmp_pass.py": 3,
         "dense_pointer_hoist_pass.py": 1,
         "llir_traversal.py": 1,
+        # 2: the ``reserve`` and ``emplace_back`` of a pool of sparse
+        # workspaces (item 5).
+        "parallel_marking_pass.py": 2,
         "schedule_lowerer.py": 1,
         "single_iteration_loop_pass.py": 1,
     }
-    assert sum(member_call_stmt_constructors.values()) == 9
+    assert sum(member_call_stmt_constructors.values()) == 12
 
     compressed_path = _COMPILER_ROOT / "compressed_where_openmp_pass.py"
     compressed_source = compressed_path.read_text()
@@ -886,6 +910,17 @@ def test_dense_workspace_zero_fill_is_structured() -> None:
     assert pools.count('"omp_get_max_threads"') == 1
     assert pools.count("template_args=(spec.scalar_type,)") == 1
     assert pools.count("thread_policy_factory()") == 1
+    # The pool of sparse workspaces (item 5) is typed too: one declaration of
+    # the vector, its reserve, and one emplace_back per worker in a loop.
+    sparse_pools = marking_source.split("def _coo_workspace_pool_statements", 1)[
+        1
+    ].split("def attach_serial_workspace_pools", 1)[0]
+    assert sparse_pools.count("llir.RawStmt(") == 0
+    assert sparse_pools.count("llir.VarDecl(") == 1
+    assert sparse_pools.count("llir.MemberCallStmt(") == 2
+    assert sparse_pools.count('member="reserve"') == 1
+    assert sparse_pools.count('member="emplace_back"') == 1
+    assert sparse_pools.count("coo_workspace_1d_pool_type(spec.scalar_type)") == 1
     assert _llir_constructor_calls(marking_path, "RawStmt") == []
     for path in (lowerer_path, marking_path):
         for call in _llir_constructor_calls(path, "RawStmt"):
