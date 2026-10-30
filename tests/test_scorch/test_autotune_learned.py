@@ -73,6 +73,8 @@ def _split_on(feat_name, thr, lo_left, val_right):
 
 
 def _write_model(tmp_path, monkeypatch, trees, init=0.0, lr=1.0):
+    # The machine id hashes the LLC in force, and a model is only loaded under the LLC
+    # its id names, so a test forces its LLC before writing its model.
     spec = dict(kind="sklearn_gbr", version=T._LEARNED_VERSION,
                 machine_id=T._machine_id(), feature_names=list(T._FEATURES),
                 init=init, learning_rate=lr, trees=trees)
@@ -169,9 +171,9 @@ def test_foreign_machine_model_rejected(tmp_path, monkeypatch):
 # 4. widened gate: operand>C admits low-degree shapes, but 99% stays byte-neutral
 # --------------------------------------------------------------------------- #
 def test_widened_gate_admits_low_degree_but_keeps_operand_floor(tmp_path, monkeypatch):
+    T._llc_bytes = 4096  # tiny LLC so a small operand still exceeds it
     _write_model(tmp_path, monkeypatch, _ALL_EQUAL)
     assert T._load_learned_model() is not None
-    T._llc_bytes = 4096  # tiny LLC so a small operand still exceeds it
 
     # low-degree (deg ~5 << DEG_FLOOR) but operand>C: analytic REJECTS, learned ADMITS.
     A_lo, B_lo, _ = _make_eligible(M=300, J=300, deg=5, N=16)
@@ -180,6 +182,8 @@ def test_widened_gate_admits_low_degree_but_keeps_operand_floor(tmp_path, monkey
 
     # operand<=C (the 99%): learned must NOT admit it (byte-neutral v2) even with a model.
     T._llc_bytes = 64 << 20   # 64 MB, huge vs a tiny operand
+    _write_model(tmp_path, monkeypatch, _ALL_EQUAL)
+    assert T._load_learned_model() is not None
     A_sm, B_sm, _ = _make_eligible(M=64, J=64, deg=8, N=16)
     assert T.is_candidate(A_sm, B_sm, level="learned") is False
 
@@ -197,8 +201,8 @@ def test_widened_gate_needs_a_model(tmp_path, monkeypatch):
 # 5. v2 floor + routing
 # --------------------------------------------------------------------------- #
 def test_v2_floor_keeps_v2_when_no_predicted_advantage(tmp_path, monkeypatch):
-    _write_model(tmp_path, monkeypatch, _ALL_EQUAL)   # all candidates equal
     T._llc_bytes = 131072
+    _write_model(tmp_path, monkeypatch, _ALL_EQUAL)   # all candidates equal
     A_st, B_st, ref = _make_eligible()
     scorch.set_autotune("learned")
     out = scorch.matmul(A_st, B_st)
@@ -211,9 +215,9 @@ def test_v2_floor_keeps_v2_when_no_predicted_advantage(tmp_path, monkeypatch):
 def test_learned_routes_tilej_when_model_predicts_it(tmp_path, monkeypatch):
     """The model's ARGMIN must be tile-j. Measured separately from the confirm, which
     is entitled to overrule it — and does here, since these shapes are tiny."""
+    T._llc_bytes = 131072
     _write_model(tmp_path, monkeypatch, _PREFER_TILEJ)
     monkeypatch.setattr(T, "_CONFIRM_TILED", False)
-    T._llc_bytes = 131072
     A_st, B_st, ref = _make_eligible()
     scorch.set_autotune("learned")
     out = scorch.matmul(A_st, B_st)
@@ -231,8 +235,8 @@ def test_learned_confirms_inside_the_analytic_gate(tmp_path, monkeypatch):
     and the model's tile-ijk pick shipped at 0.385x of untiled. Over a 236-cell grid
     that hole was 3 of learned's 4 regressions. Here the shape passes the ordinary
     gate, the model insists on tile-j, and the confirm must still overrule it to v2."""
-    _write_model(tmp_path, monkeypatch, _PREFER_TILEJ)
     T._llc_bytes = 131072
+    _write_model(tmp_path, monkeypatch, _PREFER_TILEJ)
     A_st, B_st, _ = _make_eligible()
     assert T._eligible(int(A_st.shape[1]),
                        int(A_st.storage._mode_indices[1][1].numel()),
@@ -249,8 +253,8 @@ def test_learned_confirms_inside_the_analytic_gate(tmp_path, monkeypatch):
 # --------------------------------------------------------------------------- #
 @pytest.mark.parametrize("N", [16, 64, 128])
 def test_learned_bit_correct_grid(tmp_path, monkeypatch, N):
-    _write_model(tmp_path, monkeypatch, _PREFER_TILEJ)
     T._llc_bytes = 131072
+    _write_model(tmp_path, monkeypatch, _PREFER_TILEJ)
     A_st, B_st, ref = _make_eligible(N=N)
     scorch.set_autotune("learned")
     out = scorch.matmul(A_st, B_st)
@@ -262,10 +266,10 @@ def test_learned_bit_correct_grid(tmp_path, monkeypatch, N):
 # 7. one-shot v2-confirm opt-in stays correct
 # --------------------------------------------------------------------------- #
 def test_confirm_opt_in_bit_correct(tmp_path, monkeypatch):
+    T._llc_bytes = 131072
     _write_model(tmp_path, monkeypatch, _PREFER_TILEJ)
     monkeypatch.setenv("SCORCH_AUTOTUNE_CONFIRM", "1")
     monkeypatch.setattr(T, "_LEARNED_CONFIRM", True)
-    T._llc_bytes = 131072
     A_st, B_st, ref = _make_eligible()
     scorch.set_autotune("learned")
     out = scorch.matmul(A_st, B_st)

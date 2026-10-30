@@ -859,7 +859,9 @@ def _jc_ladder(base: int) -> list:
 _CACHE_VERSION = 1
 _cache_loaded = False
 _persist_cache: Optional[dict] = None
-_machine_id_val: Optional[str] = None
+# The host's fixed facts, read once, and the last id with the LLC it hashed.
+_host_facts: Optional[str] = None
+_machine_id_val: Optional[Tuple[int, str]] = None
 
 
 def _cache_path() -> Optional[str]:
@@ -879,38 +881,44 @@ def _cache_path() -> Optional[str]:
 
 def _machine_id() -> str:
     """Stable per-machine fingerprint so a cache built on one host is never
-    applied on another (system + arch + CPU brand + core count + LLC bytes)."""
-    global _machine_id_val
-    if _machine_id_val is not None:
-        return _machine_id_val
-    brand = ""
-    try:
-        if platform.system() == "Darwin":
-            brand = (
-                subprocess.check_output(
-                    ["sysctl", "-n", "machdep.cpu.brand_string"],
-                    stderr=subprocess.DEVNULL,
-                )
-                .decode()
-                .strip()
-            )
-        elif platform.system() == "Linux" and os.path.isfile("/proc/cpuinfo"):
-            with open("/proc/cpuinfo") as f:
-                for line in f:
-                    if line.lower().startswith("model name"):
-                        brand = line.split(":", 1)[1].strip()
-                        break
-    except Exception:
+    applied on another (system + arch + CPU brand + core count + LLC bytes).
+
+    The LLC is the one in force now, ``query_llc()``: the SCORCH_LLC_BYTES override,
+    a value a test set, or the OS query. Verdicts and models found under one LLC so
+    stay apart from those of another, whichever the process looked up first. The
+    host's facts cannot change in a process and are read once; the id is hashed
+    again only when the LLC differs from the one it last hashed."""
+    global _host_facts, _machine_id_val
+    llc = query_llc()
+    last = _machine_id_val
+    if last is not None and last[0] == llc:
+        return last[1]
+    if _host_facts is None:
         brand = ""
-    parts = (
-        platform.system(),
-        platform.machine(),
-        brand,
-        str(os.cpu_count()),
-        str(query_llc()),
-    )
-    _machine_id_val = hashlib.sha1("|".join(parts).encode()).hexdigest()[:16]
-    return _machine_id_val
+        try:
+            if platform.system() == "Darwin":
+                brand = (
+                    subprocess.check_output(
+                        ["sysctl", "-n", "machdep.cpu.brand_string"],
+                        stderr=subprocess.DEVNULL,
+                    )
+                    .decode()
+                    .strip()
+                )
+            elif platform.system() == "Linux" and os.path.isfile("/proc/cpuinfo"):
+                with open("/proc/cpuinfo") as f:
+                    for line in f:
+                        if line.lower().startswith("model name"):
+                            brand = line.split(":", 1)[1].strip()
+                            break
+        except Exception:
+            brand = ""
+        _host_facts = "|".join(
+            (platform.system(), platform.machine(), brand, str(os.cpu_count()))
+        )
+    mid = hashlib.sha1(f"{_host_facts}|{llc}".encode()).hexdigest()[:16]
+    _machine_id_val = (llc, mid)
+    return mid
 
 
 def _load_persist_cache() -> dict:
@@ -1213,6 +1221,7 @@ def _walker_predict(stacked: dict, X) -> "np.ndarray":
 _LEARNED_VERSION = 1
 _learned_loaded = False
 _learned_model: Optional[dict] = None
+_learned_llc: Optional[int] = None  # the LLC the loaded model's machine id hashed
 
 
 def _user_cache_dir() -> str:
@@ -1244,11 +1253,19 @@ def _learned_model_path() -> Optional[str]:
 
 def _load_learned_model() -> Optional[dict]:
     """The stacked model for THIS machine, or None (-> analytic fallback). Cached.
-    Rejected on version bump, machine mismatch, or feature-schema drift."""
-    global _learned_loaded, _learned_model
-    if _learned_loaded:
+    Rejected on version bump, machine mismatch, or feature-schema drift.
+
+    The model is found and checked by the machine id, which hashes the LLC in force
+    (``_machine_id``), so the cache holds the answer for one LLC and a call under
+    another loads again. The check reads ``_llc_bytes`` itself: this runs on every
+    call at the learned level, and a call of ``query_llc()`` would cost more than the
+    flag test it sits beside."""
+    global _learned_loaded, _learned_model, _learned_llc
+    if _learned_loaded and _learned_llc == _llc_bytes:
         return _learned_model
     _learned_loaded = True
+    _learned_llc = query_llc()
+    _learned_model = None
     path = _learned_model_path()
     if not path or not os.path.isfile(path):
         return None
@@ -1269,9 +1286,10 @@ def _load_learned_model() -> Optional[dict]:
 
 def _reset_learned_model_cache() -> None:
     """Force the next _load_learned_model() to re-read from disk (tests / retrain)."""
-    global _learned_loaded, _learned_model
+    global _learned_loaded, _learned_model, _learned_llc
     _learned_loaded = False
     _learned_model = None
+    _learned_llc = None
 
 
 def _degree_cv(a) -> float:

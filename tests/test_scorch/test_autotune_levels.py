@@ -9,7 +9,11 @@ ineligible shapes. Levels change WHICH kernel/width runs, never the numerics, so
 every level must match the same torch reference (CLAUDE.md correctness convention).
 """
 
+import hashlib
 import json
+import os
+import platform
+import subprocess
 import threading
 from types import SimpleNamespace
 
@@ -610,3 +614,105 @@ def test_clear_autotune_cache(tmp_path, monkeypatch):
     assert cache_file.exists()
     scorch.clear_autotune_cache()
     assert not cache_file.exists()
+
+
+# --------------------------------------------------------------------------- #
+# The machine id hashes the LLC in force, whatever was looked up first
+# --------------------------------------------------------------------------- #
+def _first_lookup(llc):
+    """As at a process's first lookup: no id hashed yet, ``llc`` in force (None: the
+    OS query)."""
+    T._machine_id_val = None
+    T._llc_bytes = llc
+
+
+def test_machine_id_follows_the_llc_after_a_forced_first_lookup(monkeypatch):
+    # A process whose first lookup ran inside a forced LLC (gate_open, this file's
+    # tests) used to keep that LLC's id after the LLC was restored.
+    monkeypatch.delenv("SCORCH_LLC_BYTES", raising=False)
+    _first_lookup(None)
+    unforced = T._machine_id()
+    _first_lookup(131072)
+    forced = T._machine_id()
+    T._llc_bytes = None
+    assert T._machine_id() == unforced
+    T._llc_bytes = 131072
+    assert T._machine_id() == forced
+
+
+def test_machine_ids_of_two_llcs_differ(monkeypatch):
+    # Verdicts and models found under one LLC stay apart from those of another.
+    monkeypatch.delenv("SCORCH_LLC_BYTES", raising=False)
+    _first_lookup(None)
+    unforced = T._machine_id()
+    _first_lookup(131072)
+    assert T._machine_id() != unforced
+
+
+def _brand():
+    if platform.system() == "Darwin":
+        out = subprocess.check_output(["sysctl", "-n", "machdep.cpu.brand_string"])
+        return out.decode().strip()
+    if platform.system() == "Linux" and os.path.isfile("/proc/cpuinfo"):
+        with open("/proc/cpuinfo") as f:
+            for line in f:
+                if line.lower().startswith("model name"):
+                    return line.split(":", 1)[1].strip()
+    return ""
+
+
+def test_machine_id_is_the_hash_of_its_documented_parts(monkeypatch):
+    # Every autotune.json entry and model_<id>.json file already written was keyed by
+    # this string, so it must not change: system|machine|brand|cpu count|LLC.
+    monkeypatch.delenv("SCORCH_LLC_BYTES", raising=False)
+    for llc in (None, 131072):
+        _first_lookup(llc)
+        parts = (
+            platform.system(),
+            platform.machine(),
+            _brand(),
+            str(os.cpu_count()),
+            str(T.query_llc()),
+        )
+        want = hashlib.sha1("|".join(parts).encode()).hexdigest()[:16]
+        _first_lookup(llc)
+        assert T._machine_id() == want
+
+
+def test_max_verdict_is_found_again_after_a_forced_first_lookup(monkeypatch):
+    monkeypatch.delenv("SCORCH_LLC_BYTES", raising=False)
+    sig = ("machine-id-test", 1, 2, 3)
+    _first_lookup(None)
+    T._persist_put(sig, "tilej", 2048)
+    _first_lookup(131072)
+    assert T._persist_get(sig) is None  # the verdict of another LLC
+    T._llc_bytes = None
+    assert T._persist_get(sig) == ("tilej", 2048)
+
+
+def test_learned_model_is_served_only_under_the_llc_its_id_names(tmp_path, monkeypatch):
+    monkeypatch.delenv("SCORCH_LLC_BYTES", raising=False)
+    _first_lookup(None)
+    leaf = dict(feature=[-2], threshold=[-2.0], left=[-1], right=[-1], value=[0.0])
+    spec = dict(
+        kind="sklearn_gbr",
+        version=T._LEARNED_VERSION,
+        machine_id=T._machine_id(),
+        feature_names=list(T._FEATURES),
+        init=0.0,
+        learning_rate=1.0,
+        trees=[leaf],
+    )
+    path = tmp_path / "learned_model.json"
+    path.write_text(json.dumps(spec))
+    monkeypatch.setenv("SCORCH_AUTOTUNE_MODEL", str(path))
+    T._reset_learned_model_cache()
+    try:
+        assert T._load_learned_model() is not None
+        # A model loaded under one LLC used to be served under every later one.
+        T._llc_bytes = 131072
+        assert T._load_learned_model() is None
+        T._llc_bytes = None
+        assert T._load_learned_model() is not None
+    finally:
+        T._reset_learned_model_cache()
