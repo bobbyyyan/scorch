@@ -90,9 +90,13 @@ sparse COO inputs are promoted to CSR).
   format is inferred from the operands.
 
 `use_cache` (bool, default `True`)
-: When `True`, allow the prebuilt fast path and the adaptive tiling selector.
-  Set `False` to force the generic compiler path (mainly useful for testing the
-  JIT pipeline).
+: When `True`, allow the prebuilt kernels, the adaptive tiling selector and the
+  call plans a sparse operand keeps for a repeated CSR x dense product
+  (`scorch.plan`). Set `False` to skip them, so the call gets the generated kernel.
+  It does not compile again: a kernel Scorch already keeps for the same call
+  still serves it, with no scheduling or lowering. To force a loop order, pass
+  `schedule`. `einsum` takes the same keyword (it skips the prebuilt SDDMM
+  kernel); `scorch.ops.spmv` accepts it and has nothing to skip.
 
 `time_dict` (dict)
 : If supplied, `time_dict["eval_time"]` is filled with the kernel execution wall

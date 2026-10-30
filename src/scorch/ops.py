@@ -1389,9 +1389,13 @@ def spmv(
         ``format``: ``output_format`` by another name; the two given together must
         name one format (``format_keywords_conflict``).  ``time_dict`` : dict,
         optional -- if given, ``time_dict["eval_time"]`` is set to the kernel
-        wall-clock time in seconds.  Also ``use_cache``, ``schedule`` (refused: the
-        SpMV path takes none yet), ``_compile_options`` and ``_compilation_context``.
-        Any other name raises ``KeywordArgumentError`` (``unknown_keyword_argument``).
+        wall-clock time in seconds.  ``use_cache`` is accepted, as ``matmul`` takes it,
+        and has nothing to bypass here: this function has no prebuilt kernel
+        (``matmul`` tries the prebuilt CSR SpMV before it calls this), and a kernel
+        already kept for the same call serves it either way.  ``schedule`` is refused:
+        the SpMV path takes none yet.  Also ``_compile_options`` and
+        ``_compilation_context``.  Any other name raises ``KeywordArgumentError``
+        (``unknown_keyword_argument``).
 
     Returns
     -------
@@ -3067,9 +3071,13 @@ def matmul(
             (resized as torch resizes it; refused in grad mode when an argument
             requires grad, and for another dtype or a sparse result).
         use_cache : bool, default True
-            When ``True``, allow the prebuilt-kernel fast path and the adaptive
-            tiling selector. ``False`` forces the generic ``einsum`` path (used by
-            the compiler gap tests).
+            When ``True``, allow the prebuilt kernels, the adaptive tiling selector
+            and the call plans a sparse operand keeps for a repeated CSR x dense
+            product (``scorch.plan``). ``False`` skips them, so the call gets the
+            generated kernel. It does not run the compiler again: a kernel the
+            einsum dispatch cache or the kernel caches already hold for the same
+            call still serves it, with no scheduling or lowering. To force a loop
+            order, pass ``schedule``.
         schedule : Schedule, optional
             Explicit JIT loop order and affine tiling decisions. Supplying one
             forces the generic compiler path even when a prebuilt kernel matches.
@@ -4822,12 +4830,15 @@ def _einsum_owned(
     # computes the bare product and has no post-operations, so a call that carries
     # them (``_post_ops``, ``_post_ops_tensors``) keeps the compiler path, which
     # applies them; taking this route returned the product without them.
+    # ``use_cache=False`` skips it, as it skips matmul's prebuilt kernels; tested after
+    # the expression, so a call of any other expression does no added work.
     if (
         effective_schedule is None
         and not compile_only
         and "_post_ops" not in kwargs
         and "_post_ops_tensors" not in kwargs
         and expression == "ij,ik,jk->ij"
+        and kwargs.get("use_cache", True)
         and len(tensors) == 3
         and cast(STensor, tensors[0])._raw_values.dtype == torch.float32
         and str(tensors[0].format) == "o,o"
@@ -5645,7 +5656,14 @@ def einsum(
     compile_only: Optional[bool] = False,
     **kwargs: Any,
 ) -> Union[torch.Tensor, STensor, TensorSpec]:
-    """Compile and evaluate a validated numpy-style sparse/dense einsum."""
+    """Compile and evaluate a validated numpy-style sparse/dense einsum.
+
+    ``use_cache`` (default ``True``) means what it means for ``matmul``: ``False`` skips
+    the prebuilt kernel this entry has (SDDMM, ``"ij,ik,jk->ij"`` with a float32 COO
+    first operand and dense others), so the call gets the generated kernel.  It does
+    not compile again: a kernel the einsum dispatch cache or the kernel caches already
+    hold for the same call still serves it.
+    """
 
     # The product entries' keyword rule first (patch 0072): a name einsum does not take
     # is refused, and output_format= is read as format=.  A call with no keywords pays

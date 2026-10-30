@@ -138,7 +138,8 @@ kernel when one matches. Passing `use_cache=False` bypasses that prebuilt
 dispatch and reaches the generic `einsum` compiler path; the scheduler then
 decides whether the selected loop order and output format require a workspace.
 The generated kernel still participates in the normal JIT kernel and persistent
-`.so` caches.
+`.so` caches, so a second call with the same operands' layouts is served the kept
+kernel without scheduling again. To choose the loop order, pass `schedule=`.
 
 ### SpGEMM — the COO-hashed workspace
 
