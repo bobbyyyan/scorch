@@ -72,15 +72,6 @@ def no_build(monkeypatch):
     monkeypatch.setattr(ops, "_prepare_generated_kernel_build", refuse)
 
 
-@pytest.fixture
-def fresh_caches(monkeypatch):
-    monkeypatch.setattr(ops, "_einsum_dispatch_cache", {})
-    monkeypatch.setattr(ops, "_kernel_cache", {})
-    monkeypatch.setattr(ops, "_kernel_level_totals", {})
-    monkeypatch.setattr(stensor, "_RESULT_BOUNDS", {})
-    monkeypatch.setattr(stensor, "_GENERATED_KERNELS", {})
-
-
 def _sparse_vector(n: int, stored: int, seed: int) -> STensor:
     generator = torch.Generator().manual_seed(seed)
     crd = torch.sort(torch.randperm(n, generator=generator)[:stored]).values.to(
@@ -293,7 +284,7 @@ def test_an_outer_product_past_the_bound_is_refused_before_a_build(result_format
     )
 
 
-def test_spgemm_into_ds_is_left_to_its_two_pass_total(fresh_caches):
+def test_spgemm_into_ds_is_left_to_its_two_pass_total(fresh_kernel_caches):
     """A's rows all store column 0 and B's row 0 is empty, so the product stores
     nothing, while the bound from the counts (nnz(A) * nnz(B) and the cells) passes the
     limit.  Into ``ds`` the kernel checks level 1's total itself and the result is
@@ -354,7 +345,7 @@ def test_a_warm_call_is_refused_when_only_the_stored_counts_grow():
 
 
 @pytest.fixture
-def bound_1000(monkeypatch, fresh_caches):
+def bound_1000(monkeypatch, fresh_kernel_caches):
     monkeypatch.setattr(result_bound, "MAX_INDEX_POSITION", 1000)
 
 
@@ -408,7 +399,7 @@ def test_to_sparse_from_dense_counts_the_nonzeros_exactly(bound_1000, monkeypatc
 
 
 def test_change_mode_order_is_bounded_by_the_sources_stored_entries(
-    fresh_caches, monkeypatch
+    fresh_kernel_caches, monkeypatch
 ):
     # Both sources are built under the real bound: to_sparse would refuse 1,200 entries
     # under the lowered one.

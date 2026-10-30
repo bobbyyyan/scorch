@@ -85,6 +85,7 @@ from scorch.utils import (  # type: ignore[import-untyped]
     get_extra_cflags,
     get_extra_ldflags,
 )
+from tests.test_scorch.kernel_cache_support import empty_kernel_caches
 
 _ENVIRONMENT_KEYS = (
     "SCORCH_REGBLOCK",
@@ -1004,6 +1005,7 @@ def test_compressed_output_discovers_positions_without_private_renderers(
 
 def test_public_einsum_snapshots_once_and_routes_one_identity_to_all_stages(
     monkeypatch: pytest.MonkeyPatch,
+    fresh_kernel_caches: None,
 ) -> None:
     snapshot = _default_options().with_regblock_enabled(True)
     snapshot_calls: list[tuple[tuple[object, ...], dict[str, object]]] = []
@@ -1056,8 +1058,6 @@ def test_public_einsum_snapshots_once_and_routes_one_identity_to_all_stages(
     monkeypatch.setattr(CINLowerer, "__init__", record_cin_init)
     monkeypatch.setattr(LLIRLowerer, "__init__", record_codegen_init)
     monkeypatch.setattr(ops, "_load_validated_prepared_kernel", record_build)
-    monkeypatch.setattr(ops, "_kernel_cache", {})
-    monkeypatch.setattr(ops, "_einsum_dispatch_cache", {})
 
     result = ops.einsum(
         "ik,kj->ij",
@@ -1341,12 +1341,21 @@ def test_build_boundary_snapshots_caller_owned_sequences_once(
     assert request.extra_ldflags == options.build.extra_ldflags
 
 
+def _public_einsum_with_empty_kernel_caches(
+    patch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    # A direct call runs no fixture: empty the kernel caches on the same monkeypatch,
+    # so the call compiles and reaches the replaced build, as under fresh_kernel_caches.
+    empty_kernel_caches(patch)
+    test_public_einsum_snapshots_once_and_routes_one_identity_to_all_stages(
+        patch, fresh_kernel_caches=None
+    )
+
+
 # The tests above that replace the build with one returning object(), each called with
 # its own monkeypatch.
 FAKE_BUILD_TESTS = {
-    "public einsum": lambda patch, tmp_path: (
-        test_public_einsum_snapshots_once_and_routes_one_identity_to_all_stages(patch)
-    ),
+    "public einsum": _public_einsum_with_empty_kernel_caches,
     "build boundary": lambda patch, tmp_path: (
         test_build_boundary_snapshots_caller_owned_sequences_once(patch, tmp_path)
     ),

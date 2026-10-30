@@ -51,7 +51,6 @@ import torch
 from torch.utils.cpp_extension import load_inline
 
 import scorch
-from scorch import ops
 from scorch.compiler import llir
 from scorch.compiler.cin import (
     BinaryOp as CINBinaryOp,
@@ -78,6 +77,7 @@ from scorch.compiler.torch_cpp_abi import (
 )
 from scorch.exceptions import IndexCapacityError, raise_if_native_coded
 from scorch.stensor import STensor
+from tests.test_scorch.kernel_cache_support import empty_kernel_caches
 from tests.test_scorch.test_cin_lowerer import _build_outer_workspace_statement
 from tests.test_scorch.test_dense_block_position_check import (
     _recorded_kernels,
@@ -548,8 +548,7 @@ def test_a_drained_sum_matches_the_float64_reference(monkeypatch):
     dense[::5] = 0
     operand = STensor.from_torch(dense.clone(), "A").to_sparse("ss")
     recorded = _recorded_kernels(monkeypatch)
-    monkeypatch.setattr(ops, "_kernel_cache", {})
-    monkeypatch.setattr(ops, "_einsum_dispatch_cache", {})
+    empty_kernel_caches(monkeypatch)
     result = scorch.einsum("ij->i", operand, format="s")
     checked = [body for _, body in recorded if _positions(_events(body), "drain_check")]
     assert checked, "no kernel lowered here drains into a coordinate tensor"

@@ -236,8 +236,7 @@ def test_a_warm_generated_product_makes_no_options_snapshot(monkeypatch):
     assert made == []
 
 
-def test_a_forced_schedule_reaches_the_generated_product(monkeypatch):
-    monkeypatch.setattr(ops, "_einsum_dispatch_cache", {})
+def test_a_forced_schedule_reaches_the_generated_product(fresh_kernel_caches):
     a, b, expected = _generated_product()
     schedule = Schedule(loop_order=("i", "j", "k"), tag="forced-generated-product")
     with schedule_force(schedule):

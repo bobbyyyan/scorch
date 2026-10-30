@@ -37,6 +37,7 @@ from scorch.layout import (
     common_value_dtype,
     require_same_value_dtype,
 )
+from tests.test_scorch.kernel_cache_support import empty_kernel_caches
 from tests.test_scorch.level_array_support import logical_dense, stored
 
 C_TYPE = {
@@ -87,7 +88,7 @@ def emitted(monkeypatch, call):
         raise _Emitted
 
     # A kernel an earlier test kept for this call would serve it without reaching the stop.
-    monkeypatch.setattr(stensor, "_GENERATED_KERNELS", {})
+    empty_kernel_caches(monkeypatch)
     monkeypatch.setattr(stensor, "_load_validated_prepared_kernel", stop_before_native)
     monkeypatch.setattr(ops, "_load_validated_prepared_kernel", stop_before_native)
     with pytest.raises(_Emitted):

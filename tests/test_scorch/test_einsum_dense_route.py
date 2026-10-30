@@ -53,6 +53,7 @@ from scorch.compiler.scheduler import Schedule, schedule_force
 from scorch.exceptions import defect_code
 from scorch.format import parse_format
 from scorch.stensor import STensor
+from tests.test_scorch.kernel_cache_support import empty_kernel_caches
 
 
 def _operands(dtype: torch.dtype = torch.float64) -> tuple[torch.Tensor, torch.Tensor]:
@@ -63,13 +64,21 @@ def _operands(dtype: torch.dtype = torch.float64) -> tuple[torch.Tensor, torch.T
 
 
 @pytest.fixture
-def no_build(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Fail the test if anything reaches the kernel build boundary."""
+def no_build(monkeypatch: pytest.MonkeyPatch, fresh_kernel_caches: None) -> None:
+    """Fail the test if the call asks for a generated kernel.
+
+    With the kept-kernel caches empty (``fresh_kernel_caches``), every generated kernel
+    is asked for through ``_prepare_jit_build``, under the name ops, stensor and utils
+    each import, before the source-keyed module cache or the extension directory is
+    read.  Refusing at the build child alone missed a call the caches served: a kernel
+    an earlier test in the process had kept or built was found without a build.
+    """
 
     def refuse(*args: Any, **kwargs: Any) -> Any:
-        raise AssertionError("an all-dense einsum built a kernel")
+        raise AssertionError("an all-dense einsum asked for a generated kernel")
 
-    monkeypatch.setattr(scorch.utils, "_run_jit_build_child_privately", refuse)
+    for module in (ops, stensor_module, scorch.utils):
+        monkeypatch.setattr(module, "_prepare_jit_build", refuse)
 
 
 @pytest.fixture
@@ -432,9 +441,7 @@ def test_compiler_entry_builds_what_einsum_builds(
     monkeypatch.setattr(ops, "_load_validated_prepared_kernel", record)
     runs = []
     for entry in (scorch.einsum, ops._einsum_via_compiler):
-        monkeypatch.setattr(ops, "_kernel_cache", {})
-        monkeypatch.setattr(ops, "_einsum_dispatch_cache", {})
-        monkeypatch.setattr(stensor_module, "_GENERATED_KERNELS", {})
+        empty_kernel_caches(monkeypatch)
         del builds[:]
         result = entry("ij,ij->ij", sparse, other, format="ds")
         runs.append((list(builds), set(ops._einsum_dispatch_cache), result.to_torch()))

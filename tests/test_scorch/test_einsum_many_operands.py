@@ -41,6 +41,7 @@ from scorch.compiler.compile_options import CompileOptions
 from scorch.compiler.merged_coordinate import merged_coordinate_name
 from scorch.layout import TensorSpec
 from scorch.ops import _einsum_tensor_names
+from tests.test_scorch.kernel_cache_support import empty_kernel_caches
 from tests.test_scorch.level_array_support import (
     assert_matches,
     coordinate_entries,
@@ -116,8 +117,7 @@ def emitted(monkeypatch, expression, formats, result_format, extents):
         captured.append(prepared.request.cpp_sources[-1])
         return object()
 
-    monkeypatch.setattr(ops, "_kernel_cache", {})
-    monkeypatch.setattr(ops, "_einsum_dispatch_cache", {})
+    empty_kernel_caches(monkeypatch)
     monkeypatch.setattr(ops, "_load_validated_prepared_kernel", stop_before_native)
     names = _einsum_tensor_names()
     specs = [

@@ -43,7 +43,7 @@ import pytest
 import torch
 
 import scorch
-from scorch import ops, result_bound, stensor
+from scorch import ops, result_bound
 from scorch.compiler.cin import (
     BinaryOp,
     ForAll,
@@ -85,12 +85,13 @@ U = 2.0**-53
 
 
 @pytest.fixture
-def fresh_caches(monkeypatch):
-    monkeypatch.setattr(ops, "_einsum_dispatch_cache", {})
-    monkeypatch.setattr(ops, "_kernel_cache", {})
-    monkeypatch.setattr(ops, "_kernel_level_totals", {})
-    monkeypatch.setattr(stensor, "_RESULT_BOUNDS", {})
-    monkeypatch.setattr(stensor, "_GENERATED_KERNELS", {})
+def fresh_caches(fresh_kernel_caches, monkeypatch):
+    """The kernel caches (fresh_kernel_caches) and the join-bound memo emptied.
+
+    The memo is not one of the kernel caches: it is keyed by the operands' live storages
+    and drops an entry when one of them dies, so it cannot carry a bound from one test
+    to the next. These tests count what one call computes, so it starts empty too.
+    """
     monkeypatch.setattr(result_bound, "_JOIN_CACHE", {})
 
 

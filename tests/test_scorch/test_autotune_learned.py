@@ -21,9 +21,9 @@ from scorch import STensor
 
 
 @pytest.fixture(autouse=True)
-def _isolate(tmp_path, monkeypatch):
-    """Restore global level/LLC/memo, redirect caches to tmp, and reset the lazily
-    loaded learned model around every test."""
+def _isolate(fresh_kernel_caches, tmp_path, monkeypatch):
+    """Restore global level/LLC and redirect caches to tmp around every test. The memo
+    and the lazily loaded learned model start empty (fresh_kernel_caches)."""
     prev_level = T._global_level
     prev_llc = T._llc_bytes
     monkeypatch.setenv("SCORCH_AUTOTUNE_CACHE", str(tmp_path / "autotune.json"))
@@ -31,16 +31,12 @@ def _isolate(tmp_path, monkeypatch):
     monkeypatch.setenv("SCORCH_AUTOTUNE_MODEL", "0")
     T._cache_loaded = False
     T._persist_cache = None
-    T._decision.clear()
-    T._reset_learned_model_cache()
     yield
     T._global_level = prev_level
     T._llc_bytes = prev_llc
-    T._decision.clear()
     T._tls.level = None
     T._cache_loaded = False
     T._persist_cache = None
-    T._reset_learned_model_cache()
 
 
 # --------------------------------------------------------------------------- #

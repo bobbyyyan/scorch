@@ -512,7 +512,9 @@ def test_sparse_storage_rejects_noncanonical_coo_order():
         )
 
 
-def test_einsum_compile_only_returns_spec_without_jit_or_operand_mutation(monkeypatch):
+def test_einsum_compile_only_returns_spec_without_jit_or_operand_mutation(
+    monkeypatch, fresh_kernel_caches
+):
     compiled_sources = []
 
     def fake_load_kernel(prepared):
@@ -520,7 +522,6 @@ def test_einsum_compile_only_returns_spec_without_jit_or_operand_mutation(monkey
         return object()
 
     monkeypatch.setattr(ops, "_load_validated_prepared_kernel", fake_load_kernel)
-    monkeypatch.setattr(ops, "_kernel_cache", {})
     a = TensorSpec("dd", (2, 3), mode_order=(1, 0), name="a")
     b = TensorSpec("dd", (3, 4), name="b")
 
@@ -544,12 +545,13 @@ def test_einsum_compile_only_returns_spec_without_jit_or_operand_mutation(monkey
     assert len(compiled_sources) == 1
 
 
-def test_einsum_compile_only_validates_contraction_shapes_before_codegen(monkeypatch):
+def test_einsum_compile_only_validates_contraction_shapes_before_codegen(
+    monkeypatch, fresh_kernel_caches
+):
     def fail_if_codegen_starts(**kwargs):
         raise AssertionError("shape validation must run before native code generation")
 
     monkeypatch.setattr(ops, "_prepare_jit_build", fail_if_codegen_starts)
-    monkeypatch.setattr(ops, "_kernel_cache", {})
     a = TensorSpec("dd", (2, 3), name="a")
     b = TensorSpec("dd", (5, 4), name="b")
 

@@ -135,7 +135,7 @@ def test_regblock_off_is_plain_baseline_nest():
 
 
 @pytest.mark.parametrize("n", [1, 8, 16, 64])
-def test_dual_path_correct_both_sides_of_cutoff(n):
+def test_dual_path_correct_both_sides_of_cutoff(n, fresh_kernel_caches):
     """The runtime branch is numerically correct for N on both sides of the cutoff:
     N <= 8 takes the register-block arm, N >= 16 the baseline else-arm. Both must
     match a dense reference (repo convention: atol=rtol=1e-3)."""
@@ -147,16 +147,12 @@ def test_dual_path_correct_both_sides_of_cutoff(n):
     b = torch.randn(k, n, dtype=torch.float32)
     ref = a @ b
 
-    # Force the dual-path regardless of the global default; clear the shape-agnostic
-    # dispatch cache first so the forced (dual) module is built rather than a
+    # Force the dual-path regardless of the global default. The kernel caches start
+    # empty (fresh_kernel_caches), so the forced (dual) module is built rather than a
     # previously-cached baseline module being reused (the dispatch key is
-    # regblock-agnostic by design).
-    ops._einsum_dispatch_cache.clear()
-    try:
-        with regblock_force(True):
-            out = matmul(a_csr, b, use_cache=False)
-    finally:
-        ops._einsum_dispatch_cache.clear()
+    # regblock-agnostic by design), and the forced module is not kept for later tests.
+    with regblock_force(True):
+        out = matmul(a_csr, b, use_cache=False)
 
     assert torch.allclose(out.to(torch.float32), ref, atol=1e-3, rtol=1e-3)
 

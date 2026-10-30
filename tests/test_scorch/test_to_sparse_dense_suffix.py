@@ -158,11 +158,11 @@ def test_rank_mismatch_fails_atomically_before_opening_a_stage():
     assert context.stage_run_records == ()
 
 
-def test_sparse_source_densification_uses_the_supplied_context(monkeypatch):
+def test_sparse_source_densification_uses_the_supplied_context(fresh_kernel_caches):
     # A densification the generated-kernel cache serves lowers nothing and records no
     # stage, in the caller's context or any other.  A kernel an earlier test in this
-    # process kept for the same call (stensor._GENERATED_KERNELS) would serve this one.
-    monkeypatch.setattr(stensor_module, "_GENERATED_KERNELS", {})
+    # process kept for the same call (stensor._GENERATED_KERNELS) would serve this one,
+    # so the kernel caches start empty.
     dense = torch.tensor([[0.0, 5.0], [3.0, 0.0], [0.0, 0.0]])
     source = STensor.from_torch(dense.to_sparse_csr(), "A")
     options = CompileOptions.from_environment()

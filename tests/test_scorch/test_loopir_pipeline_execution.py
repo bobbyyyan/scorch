@@ -308,19 +308,18 @@ def _keep_direct_add_kernel(ops_module, options):
 @pytest.mark.parametrize("entry_name", ("loopir", "legacy", "legacy_kept"))
 def test_post_relayout_snapshot_failure_makes_context_terminal(
     monkeypatch,
+    fresh_kernel_caches,
     entry_name,
 ):
     """Aligned operands validate before CIN mutation under a failure owner.
 
     ``legacy`` builds the kernel and ``legacy_kept`` is served the kept one: both
-    leave the handed context terminal.  The store starts empty, so neither depends on
-    what an earlier test kept.
+    leave the handed context terminal.  The kernel caches start empty
+    (fresh_kernel_caches), so neither depends on what an earlier test kept.
     """
 
     import scorch.ops as ops_module
-    import scorch.stensor as stensor_module
 
-    monkeypatch.setattr(stensor_module, "_GENERATED_KERNELS", {})
     options = CompileOptions.from_environment()
     if entry_name == "legacy_kept":
         _keep_direct_add_kernel(ops_module, options)
@@ -368,15 +367,16 @@ def test_post_relayout_snapshot_failure_makes_context_terminal(
 
 
 @pytest.mark.parametrize("kernel", ("built", "kept"))
-def test_direct_relayout_failure_makes_context_terminal(monkeypatch, kernel):
+def test_direct_relayout_failure_makes_context_terminal(
+    monkeypatch, fresh_kernel_caches, kernel
+):
     """A prerequisite failure between direct binding stages retires its context, on
     the call that builds its kernel and on the call whose kernel is kept alike.  The
-    store starts empty, so neither depends on what an earlier test kept."""
+    kernel caches start empty (fresh_kernel_caches), so neither depends on what an
+    earlier test kept."""
 
     import scorch.ops as ops_module
-    import scorch.stensor as stensor_module
 
-    monkeypatch.setattr(stensor_module, "_GENERATED_KERNELS", {})
     options = CompileOptions.from_environment()
     if kernel == "kept":
         _keep_direct_add_kernel(ops_module, options)
@@ -1287,6 +1287,9 @@ def test_source_entries_preserve_safe_sequence_shapes(entry, safe_shape):
     assert source
 
 
+# The replaced planner runs only on a call that compiles: a kernel kept for the same
+# (2, 3) call would be served without planning, and the test would not see its shape.
+@pytest.mark.usefixtures("fresh_kernel_caches")
 @pytest.mark.parametrize(
     "safe_shape",
     (

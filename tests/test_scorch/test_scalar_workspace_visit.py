@@ -28,7 +28,7 @@ import pytest
 import torch
 
 import scorch
-from scorch import ops, stensor
+from scorch import ops
 from scorch.compiler import llir
 from scorch.compiler.cin import (
     ForAll,
@@ -49,6 +49,7 @@ from scorch.compiler.scalar_workspace_visit import (
     visit_flag_set,
 )
 from scorch.stensor import STensor
+from tests.test_scorch.kernel_cache_support import empty_kernel_caches
 from tests.test_scorch.test_sparse_assembly_strategy import auto_options
 
 ROWS, COLUMNS = 7, 5
@@ -191,7 +192,7 @@ def _spmv_source(monkeypatch, fmt: str, kind: str, output: str) -> str:
     # earlier test of this process kept for the same call and options (section 3's
     # test_spmv_keeps_every_visited_row with SCORCH_REGBLOCK=0) would come back without
     # reaching the loader.
-    monkeypatch.setattr(stensor, "_GENERATED_KERNELS", {})
+    empty_kernel_caches(monkeypatch)
     monkeypatch.setattr(ops, "_load_validated_prepared_kernel", loader)
     matrix, _ = _matrix(fmt, torch.float64)
     vector, _ = _vector(kind, torch.float64)

@@ -60,8 +60,8 @@ _CASES = {
 
 
 @pytest.fixture
-def builds(monkeypatch: pytest.MonkeyPatch) -> List[Any]:
-    """Every kernel einsum loads, counted; the compiler's caches start empty."""
+def builds(monkeypatch: pytest.MonkeyPatch, fresh_kernel_caches: None) -> List[Any]:
+    """Every kernel einsum loads, counted; the kernel caches start empty."""
     loaded: List[Any] = []
     real = ops._load_validated_prepared_kernel
 
@@ -70,8 +70,6 @@ def builds(monkeypatch: pytest.MonkeyPatch) -> List[Any]:
         return real(prepared)
 
     monkeypatch.setattr(ops, "_load_validated_prepared_kernel", counted)
-    monkeypatch.setattr(ops, "_kernel_cache", {})
-    monkeypatch.setattr(ops, "_einsum_dispatch_cache", {})
     return loaded
 
 

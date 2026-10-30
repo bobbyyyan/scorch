@@ -66,12 +66,9 @@ from scorch.compiler.scheduler import (  # type: ignore[import-untyped]
 
 
 @pytest.fixture(autouse=True)
-def _empty_memo(monkeypatch: pytest.MonkeyPatch):
-    monkeypatch.setattr(scheduler_module, "_SCHEDULE_KEY_MEMO", {})
-    compile_options.clear_build_snapshot_cache()
-    monkeypatch.setattr(ops, "_einsum_dispatch_cache", {})
-    yield
-    compile_options.clear_build_snapshot_cache()
+def _empty_memo(fresh_kernel_caches: None):
+    """The memo, the build snapshots and the kernel caches start empty
+    (fresh_kernel_caches)."""
 
 
 @pytest.fixture

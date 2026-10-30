@@ -47,6 +47,7 @@ import torch
 import scorch
 import scorch.ops as ops
 from scorch.format import conversion_format, stores_only_its_entries
+from tests.test_scorch.kernel_cache_support import empty_kernel_caches
 
 import test_high_rank_programs as H
 
@@ -273,8 +274,7 @@ def _run(
 
     with pytest.MonkeyPatch.context() as patch:
         patch.setattr(ops, "_einsum_operand_relayout", recording)
-        patch.setattr(ops, "_kernel_cache", {})
-        patch.setattr(ops, "_einsum_dispatch_cache", {})
+        empty_kernel_caches(patch)
         result = scorch.einsum(
             program.expr,
             *operands,
@@ -459,8 +459,7 @@ def test_a_call_served_from_the_dispatch_cache_converts_the_same_way(program):
     # the decision stored in the cache entry.
     operands, reference, structure = _constructed(program, 0)
     with pytest.MonkeyPatch.context() as patch:
-        patch.setattr(ops, "_kernel_cache", {})
-        patch.setattr(ops, "_einsum_dispatch_cache", {})
+        empty_kernel_caches(patch)
         results = [
             scorch.einsum(
                 program.expr,
@@ -537,6 +536,7 @@ import scorch.ops as ops
 from scorch.layout import TensorSpec
 import test_high_rank_programs as H
 import test_einsum_operand_relayout as R
+from kernel_cache_support import clear_kernel_caches
 
 class Blocked(Exception):
     pass
@@ -559,8 +559,7 @@ def main_text(program, blocking, decide):
         return answer
 
     ops._einsum_operand_relayout = recording
-    ops._kernel_cache.clear()
-    ops._einsum_dispatch_cache.clear()
+    clear_kernel_caches()
     captured.clear()
     operands = [
         TensorSpec(fmt, program.shape(indices), dtype=H.DTYPE, name="ABDEFGH"[t])

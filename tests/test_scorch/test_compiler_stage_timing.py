@@ -93,6 +93,7 @@ from scorch.compiler.scheduler import (  # type: ignore[import-untyped]
 from scorch.format import parse_format  # type: ignore[import-untyped]
 from scorch.layout import TensorSpec  # type: ignore[import-untyped]
 from scorch.stensor import STensor  # type: ignore[import-untyped]
+from tests.test_scorch.kernel_cache_support import empty_kernel_caches
 
 _FULL_STAGE_SEQUENCE = [stage.value for stage in CANONICAL_COMPILER_STAGES]
 _MANUAL_STAGE_SEQUENCE = [
@@ -211,17 +212,11 @@ def _exact_stage_record_values(
     )
 
 
-def _isolate_compiler_caches(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setattr(ops, "_kernel_cache", {})
-    monkeypatch.setattr(ops, "_einsum_dispatch_cache", {})
-
-
-@pytest.fixture(autouse=True)
-def _no_kept_generated_kernels(monkeypatch: pytest.MonkeyPatch) -> None:
-    # These tests read the stages a compile records, and several stop a conversion or an
-    # addition at its loader.  A kernel an earlier test in this process kept for the
-    # same call (stensor._GENERATED_KERNELS) would serve it without either.
-    monkeypatch.setattr(stensor_module, "_GENERATED_KERNELS", {})
+# These tests read the stages a compile records, and several stop a conversion or an
+# addition at its loader.  A kernel an earlier test in this process kept for the same
+# call would serve it without either, so every test starts with empty kernel caches, and
+# a test that compiles the same call again empties them again (empty_kernel_caches).
+pytestmark = pytest.mark.usefixtures("fresh_kernel_caches")
 
 
 def _compile_explicit(
@@ -231,7 +226,7 @@ def _compile_explicit(
     *,
     prepared_builds: Optional[list[object]] = None,
 ) -> TensorSpec:
-    _isolate_compiler_caches(monkeypatch)
+    empty_kernel_caches(monkeypatch)
 
     def stop_before_native(prepared: object) -> object:
         if prepared_builds is not None:
@@ -572,7 +567,7 @@ def test_packed_storage_activation_is_independent_and_records_complete_pipeline(
         prepared_builds.append(prepared)
         return object()
 
-    _isolate_compiler_caches(monkeypatch)
+    empty_kernel_caches(monkeypatch)
     monkeypatch.setattr(ops, "_load_validated_prepared_kernel", record_prepared)
 
     first_context = CompilationContext(options)
@@ -586,8 +581,7 @@ def test_packed_storage_activation_is_independent_and_records_complete_pipeline(
     )
     first_stage_records = first_context.stage_run_records
     first_pass_records = first_context.llir_pass_run_records
-    ops._kernel_cache.clear()
-    ops._einsum_dispatch_cache.clear()
+    empty_kernel_caches(monkeypatch)
 
     second_context = CompilationContext(options)
     second = ops.einsum(
@@ -657,7 +651,7 @@ def test_regblock_dual_path_records_both_schedule_and_lowering_arms(
 ) -> None:
     options = _default_options(regblock_dual=True)
     context = CompilationContext(options)
-    _isolate_compiler_caches(monkeypatch)
+    empty_kernel_caches(monkeypatch)
     monkeypatch.setattr(
         ops, "_load_validated_prepared_kernel", lambda prepared: object()
     )
@@ -717,7 +711,7 @@ def test_regblock_dual_preflights_shared_compiler_root_once(
         "_preflight_cin_structure",
         counted_preflight,
     )
-    _isolate_compiler_caches(monkeypatch)
+    empty_kernel_caches(monkeypatch)
     monkeypatch.setattr(
         ops, "_load_validated_prepared_kernel", lambda prepared: object()
     )
@@ -753,7 +747,7 @@ def test_regblock_shared_preflight_failure_retires_compilation(
     context = CompilationContext(options)
     error = VerificationError("injected shared structural failure")
     monkeypatch.setattr(ops, "verify_cin_structure", _raise_same(error))
-    _isolate_compiler_caches(monkeypatch)
+    empty_kernel_caches(monkeypatch)
 
     with pytest.raises(VerificationError) as failure:
         ops.einsum(
@@ -797,7 +791,7 @@ def test_regblock_dual_second_arm_failure_keeps_first_arm_and_suppresses_codegen
         "hoist_loop_invariant_factors",
         fail_second_factor,
     )
-    _isolate_compiler_caches(monkeypatch)
+    empty_kernel_caches(monkeypatch)
     monkeypatch.setattr(
         ops, "_load_validated_prepared_kernel", lambda prepared: object()
     )
@@ -845,7 +839,7 @@ def test_regblock_dual_stitch_failure_has_failed_cin_stage_and_suppresses_codege
     context = CompilationContext(options)
     error = RuntimeError("injected dual-path stitch failure")
     monkeypatch.setattr(ops, "_stitch_regblock_dual_path", _raise_same(error))
-    _isolate_compiler_caches(monkeypatch)
+    empty_kernel_caches(monkeypatch)
     monkeypatch.setattr(
         ops, "_load_validated_prepared_kernel", lambda prepared: object()
     )
@@ -884,7 +878,7 @@ def test_regblock_dual_declined_stitch_records_only_artifact_producing_lowerings
     options = _default_options(regblock_dual=True)
     context = CompilationContext(options)
     monkeypatch.setattr(ops, "_stitch_regblock_dual_path", lambda *args: None)
-    _isolate_compiler_caches(monkeypatch)
+    empty_kernel_caches(monkeypatch)
     monkeypatch.setattr(
         ops, "_load_validated_prepared_kernel", lambda prepared: object()
     )
@@ -1208,7 +1202,7 @@ def test_result_abi_record_is_not_published_before_barrier_validation(
         "validate_body_assembly_artifact",
         _raise_same(error),
     )
-    _isolate_compiler_caches(monkeypatch)
+    empty_kernel_caches(monkeypatch)
     monkeypatch.setattr(
         ops, "_load_validated_prepared_kernel", lambda prepared: object()
     )
@@ -1249,7 +1243,7 @@ def test_einsum_frontend_completes_before_a_nested_runtime_relayout_native_seam(
         stensor_module, "_load_validated_prepared_kernel", stop_nested_relayout
     )
     monkeypatch.setattr(ops, "_load_validated_prepared_kernel", stop_nested_relayout)
-    _isolate_compiler_caches(monkeypatch)
+    empty_kernel_caches(monkeypatch)
     transposed = scorch.STensor.from_torch(
         torch.ones(3, 2, 4),
         mode_order=[1, 0, 2],
@@ -1302,7 +1296,7 @@ def test_einsum_preserves_topological_then_selected_operand_relayout_order(
         )
 
     monkeypatch.setattr(ops, "_with_compiler_mode_order", recording_relayout)
-    _isolate_compiler_caches(monkeypatch)
+    empty_kernel_caches(monkeypatch)
     monkeypatch.setattr(
         ops, "_load_validated_prepared_kernel", lambda prepared: object()
     )
@@ -1424,7 +1418,7 @@ def test_known_nnz_extent_is_independent_across_full_compilations(
         prepared_builds.append(prepared)
         return object()
 
-    _isolate_compiler_caches(monkeypatch)
+    empty_kernel_caches(monkeypatch)
     monkeypatch.setattr(ops, "_load_validated_prepared_kernel", record_prepared)
     first_context = CompilationContext(options)
     with scheduler_module.regblock_force(False):
@@ -1438,8 +1432,7 @@ def test_known_nnz_extent_is_independent_across_full_compilations(
         )
     first_stage_records = first_context.stage_run_records
     first_pass_records = first_context.llir_pass_run_records
-    ops._kernel_cache.clear()
-    ops._einsum_dispatch_cache.clear()
+    empty_kernel_caches(monkeypatch)
 
     second_context = CompilationContext(options)
     with scheduler_module.regblock_force(False):
@@ -1524,7 +1517,7 @@ def test_compressed_base_load_is_independent_across_full_compilations(
         prepared_builds.append(prepared)
         return object()
 
-    _isolate_compiler_caches(monkeypatch)
+    empty_kernel_caches(monkeypatch)
     monkeypatch.setattr(ops, "_load_validated_prepared_kernel", record_prepared)
     first_context = CompilationContext(options)
     first = ops.einsum(
@@ -1537,8 +1530,7 @@ def test_compressed_base_load_is_independent_across_full_compilations(
     )
     first_stage_records = first_context.stage_run_records
     first_pass_records = first_context.llir_pass_run_records
-    ops._kernel_cache.clear()
-    ops._einsum_dispatch_cache.clear()
+    empty_kernel_caches(monkeypatch)
 
     second_context = CompilationContext(options)
     second = ops.einsum(
@@ -1774,7 +1766,7 @@ def test_public_invalid_schedule_fails_its_stage_and_suppresses_later_work(
             (ops, "_load_validated_prepared_kernel", "native_load"),
         ),
     )
-    _isolate_compiler_caches(monkeypatch)
+    empty_kernel_caches(monkeypatch)
 
     with pytest.raises(InvalidSchedule) as failure:
         ops.einsum(
@@ -2188,7 +2180,7 @@ def test_stage_failures_raise_original_error_and_suppress_all_later_stages(
         monkeypatch.setattr(ops, "_prepare_jit_build", _raise_same(error))
     else:  # pragma: no cover - the parameter list is exhaustive
         raise AssertionError(failure_site)
-    _isolate_compiler_caches(monkeypatch)
+    empty_kernel_caches(monkeypatch)
     if failure_site.startswith("kernel_abi_"):
         _forbid_boundaries(
             monkeypatch,
@@ -2310,7 +2302,7 @@ def test_malformed_panel_bound_fails_schedule_stage_and_suppresses_later_work(
             (ops, "_load_validated_prepared_kernel", "native_load"),
         ),
     )
-    _isolate_compiler_caches(monkeypatch)
+    empty_kernel_caches(monkeypatch)
 
     with pytest.raises(LLIRTraversalError) as failure:
         ops.einsum(
@@ -2457,7 +2449,7 @@ def test_malformed_packed_storage_fails_schedule_owner_and_suppresses_later_work
             (ops, "_load_validated_prepared_kernel", "native_load"),
         ),
     )
-    _isolate_compiler_caches(monkeypatch)
+    empty_kernel_caches(monkeypatch)
 
     with pytest.raises(LLIRTraversalError) as failure:
         ops.einsum(
@@ -2623,7 +2615,7 @@ def test_malformed_heap_result_storage_fails_schedule_owner_and_stops_later_work
             (ops, "_load_validated_prepared_kernel", "native_load"),
         ),
     )
-    _isolate_compiler_caches(monkeypatch)
+    empty_kernel_caches(monkeypatch)
 
     with pytest.raises(LLIRTraversalError) as failure:
         ops.einsum(
@@ -2808,7 +2800,7 @@ def test_native_load_failure_is_outside_the_completed_compiler_stage_seam(
         prepared_builds.append(prepared)
         raise error
 
-    _isolate_compiler_caches(monkeypatch)
+    empty_kernel_caches(monkeypatch)
     monkeypatch.setattr(ops, "_load_validated_prepared_kernel", fail_at_native_boundary)
     with pytest.raises(RuntimeError) as failure:
         ops.einsum(
@@ -2842,7 +2834,7 @@ def test_prepared_build_validation_failure_is_owned_by_kernel_request_stage(
     context = CompilationContext(options)
     error = RuntimeError("injected prepared-build validation failure")
     loader_calls: list[object] = []
-    _isolate_compiler_caches(monkeypatch)
+    empty_kernel_caches(monkeypatch)
     monkeypatch.setattr(utils, "_validate_prepared_jit_build", _raise_same(error))
     monkeypatch.setattr(
         ops,
@@ -2922,7 +2914,7 @@ def test_dynamic_failure_after_abi_keeps_assembly_and_preceding_pass_records(
         "rewrite_dynamic_vector_accesses",
         _raise_same(error),
     )
-    _isolate_compiler_caches(monkeypatch)
+    empty_kernel_caches(monkeypatch)
     monkeypatch.setattr(
         ops, "_load_validated_prepared_kernel", lambda prepared: object()
     )
@@ -2991,7 +2983,7 @@ def test_malformed_assembled_call_fails_its_owner_and_suppresses_later_stages(
             (ops, "_load_validated_prepared_kernel", "native_load"),
         ),
     )
-    _isolate_compiler_caches(monkeypatch)
+    empty_kernel_caches(monkeypatch)
 
     with pytest.raises(LLIRTraversalError) as failure:
         ops.einsum(
@@ -3071,7 +3063,7 @@ def test_malformed_assembled_member_call_fails_owner_and_suppresses_later_stages
             (ops, "_load_validated_prepared_kernel", "native_load"),
         ),
     )
-    _isolate_compiler_caches(monkeypatch)
+    empty_kernel_caches(monkeypatch)
 
     with pytest.raises(LLIRTraversalError) as failure:
         ops.einsum(
@@ -3202,7 +3194,7 @@ def test_known_nnz_size_construction_failure_fails_result_abi_owner(
             (ops, "_load_validated_prepared_kernel", "native_load"),
         ),
     )
-    _isolate_compiler_caches(monkeypatch)
+    empty_kernel_caches(monkeypatch)
 
     with scheduler_module.regblock_force(False):
         with pytest.raises(RuntimeError) as failure:
@@ -3322,7 +3314,7 @@ def test_malformed_known_nnz_size_fails_dynamic_owner_and_suppresses_later_stage
             (ops, "_load_validated_prepared_kernel", "native_load"),
         ),
     )
-    _isolate_compiler_caches(monkeypatch)
+    empty_kernel_caches(monkeypatch)
 
     with scheduler_module.regblock_force(False):
         with pytest.raises(LLIRTraversalError) as failure:
@@ -3469,7 +3461,7 @@ def test_malformed_tiled_stack_decl_fails_first_pass_and_suppresses_later_stages
             (ops, "_load_validated_prepared_kernel", "native_load"),
         ),
     )
-    _isolate_compiler_caches(monkeypatch)
+    empty_kernel_caches(monkeypatch)
 
     with pytest.raises(LLIRTraversalError) as failure:
         ops.einsum(
@@ -3580,7 +3572,7 @@ def test_malformed_torch_empty_extent_fails_dynamic_owner_and_suppresses_later_s
             (ops, "_load_validated_prepared_kernel", "native_load"),
         ),
     )
-    _isolate_compiler_caches(monkeypatch)
+    empty_kernel_caches(monkeypatch)
 
     if route == "known_nnz":
         with scheduler_module.regblock_force(False):
@@ -3726,7 +3718,7 @@ def test_malformed_fixed_result_position_owner_fails_result_abi_and_stops_later_
             (ops, "_load_validated_prepared_kernel", "native_load"),
         ),
     )
-    _isolate_compiler_caches(monkeypatch)
+    empty_kernel_caches(monkeypatch)
 
     with pytest.raises(LLIRTraversalError) as failure:
         ops.einsum(
@@ -3850,7 +3842,7 @@ def test_malformed_known_nnz_coordinate_owner_fails_result_abi_and_stops_later_w
             (ops, "_load_validated_prepared_kernel", "native_load"),
         ),
     )
-    _isolate_compiler_caches(monkeypatch)
+    empty_kernel_caches(monkeypatch)
 
     with scheduler_module.regblock_force(False):
         with pytest.raises(LLIRTraversalError) as failure:
@@ -3981,7 +3973,7 @@ def test_malformed_final_qualified_name_fails_dynamic_owner_and_suppresses_later
             (ops, "_load_validated_prepared_kernel", "native_load"),
         ),
     )
-    _isolate_compiler_caches(monkeypatch)
+    empty_kernel_caches(monkeypatch)
 
     with pytest.raises(LLIRTraversalError) as failure:
         ops.einsum(
@@ -4116,7 +4108,7 @@ def test_malformed_intermediate_qualified_name_fails_first_managed_pass(
             (ops, "_load_validated_prepared_kernel", "native_load"),
         ),
     )
-    _isolate_compiler_caches(monkeypatch)
+    empty_kernel_caches(monkeypatch)
 
     with pytest.raises(LLIRTraversalError) as failure:
         ops.einsum(
@@ -4231,7 +4223,7 @@ def test_malformed_tiled_workspace_read_fails_cin_lowering_and_stops_later_work(
             (ops, "_load_validated_prepared_kernel", "native_load"),
         ),
     )
-    _isolate_compiler_caches(monkeypatch)
+    empty_kernel_caches(monkeypatch)
 
     with pytest.raises(LLIRTraversalError) as failure:
         ops.einsum(
@@ -4322,7 +4314,7 @@ def test_malformed_all_coo_coordinate_read_fails_cin_lowering_and_stops_later_wo
             (ops, "_load_validated_prepared_kernel", "native_load"),
         ),
     )
-    _isolate_compiler_caches(monkeypatch)
+    empty_kernel_caches(monkeypatch)
 
     with scheduler_module.regblock_force(False):
         with pytest.raises(LLIRTraversalError) as failure:
@@ -4415,7 +4407,7 @@ def test_malformed_all_coo_end_bound_fails_cin_lowering_and_stops_later_work(
             (ops, "_load_validated_prepared_kernel", "native_load"),
         ),
     )
-    _isolate_compiler_caches(monkeypatch)
+    empty_kernel_caches(monkeypatch)
 
     with scheduler_module.regblock_force(False):
         with pytest.raises(LLIRTraversalError) as failure:
@@ -4486,7 +4478,7 @@ def test_malformed_mode_iterator_coordinate_read_stops_all_later_work(
             (ops, "_load_validated_prepared_kernel", "native_load"),
         ),
     )
-    _isolate_compiler_caches(monkeypatch)
+    empty_kernel_caches(monkeypatch)
 
     with pytest.raises(LLIRTraversalError) as failure:
         ops.einsum(
@@ -4554,7 +4546,7 @@ def test_malformed_mode_iterator_position_bound_stops_all_later_work(
             (ops, "_load_validated_prepared_kernel", "native_load"),
         ),
     )
-    _isolate_compiler_caches(monkeypatch)
+    empty_kernel_caches(monkeypatch)
 
     with pytest.raises(LLIRTraversalError) as failure:
         ops.einsum(
@@ -4684,7 +4676,7 @@ def test_malformed_compressed_base_load_fails_owner_and_stops_later_work(
             (ops, "_load_validated_prepared_kernel", "native_load"),
         ),
     )
-    _isolate_compiler_caches(monkeypatch)
+    empty_kernel_caches(monkeypatch)
 
     with pytest.raises(LLIRTraversalError) as failure:
         ops.einsum(
@@ -4833,7 +4825,7 @@ def test_malformed_compressed_offset_init_fails_owner_and_stops_later_work(
             (ops, "_load_validated_prepared_kernel", "native_load"),
         ),
     )
-    _isolate_compiler_caches(monkeypatch)
+    empty_kernel_caches(monkeypatch)
 
     with pytest.raises(LLIRTraversalError) as failure:
         ops.einsum(
@@ -4919,7 +4911,7 @@ def test_compressed_where_partial_failures_preserve_exact_nested_pass_prefix(
         "rewrite_result_writes",
         fail_selected_mode,
     )
-    _isolate_compiler_caches(monkeypatch)
+    empty_kernel_caches(monkeypatch)
     monkeypatch.setattr(
         ops, "_load_validated_prepared_kernel", lambda prepared: object()
     )
@@ -4958,7 +4950,7 @@ def test_compressed_where_ordinary_fill_failure_preserves_completed_count(
         return original_rewrite(value, pass_context)  # type: ignore[arg-type]
 
     monkeypatch.setattr(llir_pass_manager, "rewrite_result_writes", fail_fill)
-    _isolate_compiler_caches(monkeypatch)
+    empty_kernel_caches(monkeypatch)
     monkeypatch.setattr(
         ops, "_load_validated_prepared_kernel", lambda prepared: object()
     )
@@ -4996,7 +4988,7 @@ def test_compressed_where_ordinary_parent_failure_preserves_count_and_fill(
         return original_record(*args, **kwargs)  # type: ignore[arg-type]
 
     monkeypatch.setattr(llir_pass_manager, "_record", fail_parent_record)
-    _isolate_compiler_caches(monkeypatch)
+    empty_kernel_caches(monkeypatch)
     monkeypatch.setattr(
         ops, "_load_validated_prepared_kernel", lambda prepared: object()
     )
@@ -5038,7 +5030,7 @@ def test_compressed_where_result_epilogue_failure_stops_before_later_stages(
         "emit_storage_epilogue",
         fail_result_epilogue,
     )
-    _isolate_compiler_caches(monkeypatch)
+    empty_kernel_caches(monkeypatch)
     monkeypatch.setattr(
         ops, "_load_validated_prepared_kernel", lambda prepared: object()
     )
@@ -5072,7 +5064,7 @@ def test_compressed_where_success_retains_count_fill_and_all_seven_pass_ids(
 ) -> None:
     options = _default_options()
     context = CompilationContext(options)
-    _isolate_compiler_caches(monkeypatch)
+    empty_kernel_caches(monkeypatch)
     monkeypatch.setattr(
         ops, "_load_validated_prepared_kernel", lambda prepared: object()
     )
@@ -5388,7 +5380,7 @@ def test_matmul_routes_one_owner_through_the_auto_einsum_path(
     context = CompilationContext(options)
     error = RuntimeError("stop nested matmul compiler path")
     sparse, dense, _ = _runtime_compiler_inputs()
-    _isolate_compiler_caches(monkeypatch)
+    empty_kernel_caches(monkeypatch)
     monkeypatch.setattr(ops, "_load_validated_prepared_kernel", _raise_same(error))
 
     with pytest.raises(RuntimeError) as failure:
@@ -5418,7 +5410,7 @@ def test_dispatch_cache_hit_records_no_compiler_work(
         )
     )
     fake_module = SimpleNamespace(evaluate=lambda *args: fake_result)
-    _isolate_compiler_caches(monkeypatch)
+    empty_kernel_caches(monkeypatch)
     monkeypatch.setattr(
         ops, "_load_validated_prepared_kernel", lambda prepared: fake_module
     )
@@ -5510,7 +5502,7 @@ def test_kernel_cache_prebuilt_and_noop_paths_do_not_fabricate_records(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     options = _explicit_options()
-    _isolate_compiler_caches(monkeypatch)
+    empty_kernel_caches(monkeypatch)
     monkeypatch.setattr(
         ops, "_load_validated_prepared_kernel", lambda prepared: object()
     )

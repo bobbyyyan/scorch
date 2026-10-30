@@ -154,11 +154,11 @@ def _child(expr, result_fmt, programs):
     import torch
 
     import scorch
-    from scorch import ops
     from scorch.compiler.cin import ForAll
     from scorch.compiler.cin_lowerer import CINLowerer
     from scorch.format import LevelType
     from scorch.stensor import STensor
+    from tests.test_scorch.kernel_cache_support import clear_kernel_caches
     from tests.test_scorch.test_dense_below_compressed_result import (
         _inputs,
         _judge,
@@ -226,8 +226,7 @@ def _child(expr, result_fmt, programs):
         # a program whose relaid operands match an earlier program's would take
         # that kernel without lowering, and read as not reaching the case (five
         # programs refused before did, in a run of all 64 into ``sd``).
-        ops._kernel_cache.clear()
-        ops._einsum_dispatch_cache.clear()
+        clear_kernel_caches()
         seed = zlib.crc32(",".join(operand_fmts).encode()) % 997
         reached.clear()
         relabelled.clear()

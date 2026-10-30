@@ -15,6 +15,7 @@ import torch
 from scorch import ops
 from scorch.layout import TensorSpec
 from scorch.stensor import STensor
+from tests.test_scorch.kernel_cache_support import empty_kernel_caches
 
 
 def level_arrays(
@@ -208,7 +209,7 @@ def emitted_einsum_cpp(
     """The kernel body public ``einsum`` emits for ``expr``; nothing is built.
 
     Operands are payload-free ``TensorSpec`` descriptions, so no operand conversion
-    runs either.  The compiler caches are emptied for the call.
+    runs either.  The kernel caches are emptied for the call (empty_kernel_caches).
     """
 
     captured: List[str] = []
@@ -217,8 +218,7 @@ def emitted_einsum_cpp(
         captured.append(prepared.request.cpp_sources[-1])
         return object()
 
-    monkeypatch.setattr(ops, "_kernel_cache", {})
-    monkeypatch.setattr(ops, "_einsum_dispatch_cache", {})
+    empty_kernel_caches(monkeypatch)
     monkeypatch.setattr(ops, "_load_validated_prepared_kernel", stop_before_native)
     terms = expr.split("->")[0].split(",")
     specs = [

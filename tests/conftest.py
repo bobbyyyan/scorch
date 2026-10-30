@@ -1,4 +1,5 @@
 import os
+import sys
 
 import pytest
 
@@ -15,6 +16,44 @@ def _set_torch_extensions_dir(tmp_path_factory):
             os.environ.pop("TORCH_EXTENSIONS_DIR", None)
         else:
             os.environ["TORCH_EXTENSIONS_DIR"] = old_value
+
+
+@pytest.fixture(scope="session", autouse=True)
+def _private_autotune_files(tmp_path_factory):
+    """Point the tiling selector's two files into the session's temporary directory.
+
+    The "max" autotune level keeps its verdicts in $XDG_CACHE_HOME/scorch/autotune.json
+    unless SCORCH_AUTOTUNE_CACHE names another file, and the "learned" level reads its
+    model from the same directory or from the tree's autotune-levels/models/ unless
+    SCORCH_AUTOTUNE_MODEL names one. Without this the suite read and wrote the
+    developer's own files: test_every_autotune_level_composes[max] stored its verdicts in
+    the real autotune.json, and the runs after it were served them instead of probing.
+    The model variable names a file that does not exist, which is what a machine with no
+    model has. Tests of either file point the variable at a file of their own.
+    """
+    directory = tmp_path_factory.mktemp("autotune")
+    paths = {
+        "SCORCH_AUTOTUNE_CACHE": str(directory / "autotune.json"),
+        "SCORCH_AUTOTUNE_MODEL": str(directory / "no_model.json"),
+    }
+    old_values = {name: os.environ.get(name) for name in paths}
+    os.environ.update(paths)
+    if "scorch.tiling" in sys.modules:
+        # Read either file again, from the new paths, if anything read it already. The
+        # module is loaded, so the import only binds it, with its types for a checker.
+        from scorch import tiling
+
+        tiling._cache_loaded = False
+        tiling._persist_cache = None
+        tiling._reset_learned_model_cache()
+    try:
+        yield
+    finally:
+        for name, value in old_values.items():
+            if value is None:
+                os.environ.pop(name, None)
+            else:
+                os.environ[name] = value
 
 
 @pytest.fixture(scope="session", autouse=True)
@@ -110,3 +149,44 @@ def torch_threads():
 
     yield use
     torch.set_num_threads(before)
+
+
+@pytest.fixture
+def fresh_kernel_caches(monkeypatch):
+    """Run a test with empty kernel caches, so its calls choose, lower and build again.
+
+    The caches are tests/test_scorch/kernel_cache_support.py's ``KERNEL_CACHES``: the
+    einsum dispatch cache, the kernel cache and the generated-kernel store, which let a
+    call skip the compiler, and the caches beside them that let it skip a check, a
+    schedule's validation, the choice of a prebuilt kernel or of a tiling, or resolving
+    its build options. They live for the process, and their keys cannot see a replaced
+    function. So a test that replaces a scheduler, lowering, LLIR-pass, codegen, tiling or
+    prebuilt-resolution function and then calls a public entry is served what an earlier
+    test with the same key kept, and its replacement never runs. Such a test must request
+    this fixture, and a test that needs fresh caches for any other reason asks the same
+    way, so that every one of them empties the same list.
+
+    A cache held in one dict is replaced by an empty dict for the test and restored after
+    it; a cache its module empties with a function is emptied before the test and again
+    after it (``_finish_kernel_caches``). Either way the test's own entries are not kept
+    for later tests. A test that must empty them again partway through calls
+    ``kernel_cache_support.empty_kernel_caches``.
+    """
+    from tests.test_scorch.kernel_cache_support import empty_kernel_caches
+
+    empty_kernel_caches(monkeypatch)
+
+
+@pytest.fixture(autouse=True)
+def _finish_kernel_caches():
+    """After a test that emptied the kernel caches, empty again the ones a function empties.
+
+    A dict ``empty_kernel_caches`` replaced is restored by ``monkeypatch``; a cache its
+    module empties with a function cannot be restored, so it is emptied again instead,
+    and what the test put in it is not kept for later tests. Nothing runs after a test
+    that did not empty the caches.
+    """
+    yield
+    from tests.test_scorch.kernel_cache_support import finish_test
+
+    finish_test()

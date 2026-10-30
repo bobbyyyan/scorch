@@ -53,13 +53,12 @@ from scorch.compiler.scheduler import (  # type: ignore[import-untyped]
     regblock_force,
     schedule_force,
 )
+from tests.test_scorch.kernel_cache_support import empty_kernel_caches
 
 
 @pytest.fixture(autouse=True)
-def _nothing_kept_between_tests():
-    compile_options.clear_build_snapshot_cache()
-    yield
-    compile_options.clear_build_snapshot_cache()
+def _nothing_kept_between_tests(fresh_kernel_caches: None):
+    """The build snapshots and the kernel caches start empty (fresh_kernel_caches)."""
 
 
 @pytest.fixture
@@ -445,7 +444,7 @@ def test_a_warm_einsum_call_makes_no_compilation_context(
         return context
 
     monkeypatch.setattr(ops, "CompilationContext", counted)
-    monkeypatch.setattr(ops, "_einsum_dispatch_cache", {})
+    empty_kernel_caches(monkeypatch)
 
     first = scorch.einsum("ij,j->i", matrix, vector, format="d")
     assert torch.allclose(_dense(first), expected, rtol=1e-12, atol=1e-12)

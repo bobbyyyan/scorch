@@ -66,13 +66,13 @@ def _snapshot(environ: Dict[str, str]) -> CompileOptions:
 
 
 @pytest.fixture(autouse=True)
-def _own_memo(monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
-    """A memo directory of the test's own, and no snapshot kept across tests."""
+def _own_memo(
+    fresh_kernel_caches: None, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+):
+    """A memo directory of the test's own, and no snapshot kept across tests
+    (fresh_kernel_caches)."""
 
     monkeypatch.setenv("TORCH_EXTENSIONS_DIR", str(tmp_path / "extensions"))
-    compile_options.clear_build_snapshot_cache()
-    yield
-    compile_options.clear_build_snapshot_cache()
 
 
 @pytest.fixture

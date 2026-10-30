@@ -41,7 +41,6 @@ import scorch
 import scorch.ops as ops  # type: ignore[import-untyped]
 import scorch.stensor as stensor_module  # type: ignore[import-untyped]
 from scorch import STensor  # type: ignore[import-untyped]
-from scorch.compiler import compile_options  # type: ignore[import-untyped]
 from scorch.compiler.cin_analysis import (  # type: ignore[import-untyped]
     full_cin_verification,
 )
@@ -132,15 +131,15 @@ def _kept() -> _Recording:
 
 
 @pytest.fixture(autouse=True)
-def _nothing_kept_between_tests(monkeypatch: pytest.MonkeyPatch) -> Iterator[None]:
-    compile_options.clear_build_snapshot_cache()
+def _nothing_kept_between_tests(
+    fresh_kernel_caches: None, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # The kernel caches and the build snapshots start empty (fresh_kernel_caches); the
+    # store these tests read is a recording one in their place.
     monkeypatch.setattr(stensor_module, "_GENERATED_KERNELS", _Recording())
-    monkeypatch.setattr(ops, "_einsum_dispatch_cache", {})
     # These tests count snapshots, which a hit check makes; the negative controls and
     # the check's own tests turn it on.
     monkeypatch.setattr(stensor_module, "_CHECK_GENERATED_KERNEL_HITS", [False])
-    yield
-    compile_options.clear_build_snapshot_cache()
 
 
 @pytest.fixture
@@ -1130,10 +1129,7 @@ def test_spmv_of_a_moved_operand_hits_the_kernel_of_one_stored_row_first() -> No
     assert [hit for key, hit in lookups if key[0] == "spmv"] == [True], lookups
 
 
-def test_one_snapshot_serves_a_relayout_miss_and_an_einsum_miss(
-    seen: _Seen, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    monkeypatch.setattr(ops, "_kernel_cache", {})
+def test_one_snapshot_serves_a_relayout_miss_and_an_einsum_miss(seen: _Seen) -> None:
     seen.reset()
     assert _outcome(_generated_moved) == ("correct",)
     assert seen.snapshots == 1
@@ -1167,9 +1163,7 @@ def test_the_schedule_does_not_depend_on_which_step_resolves_it(
     spelling: Callable[[], Tuple[Dict[str, Any], Any]],
     moved: bool,
     seen: _Seen,
-    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    monkeypatch.setattr(ops, "_kernel_cache", {})
     a, logical = _tensor(fmt="ss", mode_order=(1, 0) if moved else None)
     b = _dense((5, 3), 9)
     kwargs, context = spelling()
@@ -1202,9 +1196,8 @@ def test_a_holder_with_a_schedule_is_refused() -> None:
 
 
 def test_a_scheduled_conversion_gets_the_schedule_free_copy_of_the_snapshot(
-    seen: _Seen, monkeypatch: pytest.MonkeyPatch
+    seen: _Seen,
 ) -> None:
-    monkeypatch.setattr(ops, "_kernel_cache", {})
     a, logical = _tensor(fmt="ss", mode_order=(1, 0))
     b = _dense((5, 3), 9)
     seen.reset()

@@ -34,7 +34,6 @@ import torch.autograd.forward_ad as fwad
 import scorch  # type: ignore[import-untyped]
 import scorch.ops as ops  # type: ignore[import-untyped]
 from scorch import STensor  # type: ignore[import-untyped]
-from scorch.compiler import compile_options  # type: ignore[import-untyped]
 from scorch.compiler.scheduler import (  # type: ignore[import-untyped]
     Schedule,
     schedule_force,
@@ -43,11 +42,8 @@ from scorch.format import LevelFormat, TensorFormat  # type: ignore[import-untyp
 
 
 @pytest.fixture(autouse=True)
-def _nothing_kept_between_tests(monkeypatch: pytest.MonkeyPatch):
-    compile_options.clear_build_snapshot_cache()
-    monkeypatch.setattr(ops, "_einsum_dispatch_cache", {})
-    yield
-    compile_options.clear_build_snapshot_cache()
+def _nothing_kept_between_tests(fresh_kernel_caches: None):
+    """The kernel caches and the build snapshots start empty (fresh_kernel_caches)."""
 
 
 def _sparse(rows: int = 6, cols: int = 5, seed: int = 0) -> STensor:

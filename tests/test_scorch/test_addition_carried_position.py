@@ -32,6 +32,7 @@ import pytest
 import torch
 
 from scorch import stensor
+from tests.test_scorch.kernel_cache_support import empty_kernel_caches
 from tests.test_scorch.level_array_support import assert_matches, stored
 
 ONE = ["d", "s", "o"]
@@ -123,7 +124,7 @@ def emitted_addition_cpp(monkeypatch, left, right, shape, dtype=torch.float64):
         raise _Emitted
 
     # A kernel an earlier test kept for this sum would serve it without reaching the stop.
-    monkeypatch.setattr(stensor, "_GENERATED_KERNELS", {})
+    empty_kernel_caches(monkeypatch)
     monkeypatch.setattr(stensor, "_load_validated_prepared_kernel", stop_before_native)
     a, b = pair(left, right, shape, dtype, 3)
     with pytest.raises(_Emitted):

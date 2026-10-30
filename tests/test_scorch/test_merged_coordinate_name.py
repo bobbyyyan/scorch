@@ -61,6 +61,7 @@ from scorch.compiler.loopir.pipeline import (
 from scorch.compiler.merged_coordinate import merged_coordinate_name
 from scorch.compiler.scheduler import Schedule
 from scorch.layout import TensorSpec
+from tests.test_scorch.kernel_cache_support import empty_kernel_caches
 from tests.test_scorch.level_array_support import assert_matches, reference, stored
 
 SMALL = dict(i=5, m=7, M=7)
@@ -122,8 +123,7 @@ def shipped_text(monkeypatch, expression, formats, result_format, names, extents
         captured.append(prepared.request.cpp_sources[-1])
         return object()
 
-    monkeypatch.setattr(ops, "_kernel_cache", {})
-    monkeypatch.setattr(ops, "_einsum_dispatch_cache", {})
+    empty_kernel_caches(monkeypatch)
     monkeypatch.setattr(ops, "_load_validated_prepared_kernel", stop_before_native)
     specs = [
         TensorSpec(
@@ -462,8 +462,7 @@ def kernel_macros():
         return load(prepared)
 
     with pytest.MonkeyPatch.context() as patch:
-        patch.setattr(ops, "_kernel_cache", {})
-        patch.setattr(ops, "_einsum_dispatch_cache", {})
+        empty_kernel_caches(patch)
         patch.setattr(ops, "_load_validated_prepared_kernel", recording)
         scorch.einsum(expression, *tensors, format="ds")
     assert requests, "einsum prepared no kernel for " + expression

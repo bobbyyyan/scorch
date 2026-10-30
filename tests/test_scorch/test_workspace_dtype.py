@@ -114,6 +114,11 @@ def _logical_dense(tensor: STensor) -> torch.Tensor:
     return physical.permute([mode_order.index(axis) for axis in range(len(shape))])
 
 
+# The recorder replaces ``Workspace`` in the module that builds the CIN, so these two
+# tests need the compiler to run: a kernel an earlier test kept for the same call would
+# be served without building a workspace (test_stensor_autograd.py's dss structure-keys
+# case keeps this file's ddd reordering, for one).
+@pytest.mark.usefixtures("fresh_kernel_caches")
 @pytest.mark.parametrize("fmt", ["ss", "oo"])
 def test_float64_matrix_vector_product_accumulates_in_float64(monkeypatch, fmt):
     matrix = _filled((48, 40), 0.3, 1746)
@@ -139,6 +144,7 @@ def test_float64_matrix_vector_product_accumulates_in_float64(monkeypatch, fmt):
     assert workspaces == [torch.float64]
 
 
+@pytest.mark.usefixtures("fresh_kernel_caches")
 @pytest.mark.parametrize(
     ("fmt", "mode_order"),
     [("ddd", [2, 0, 1]), ("dss", [1, 2, 0]), ("sss", [1, 2, 0]), ("ooo", [2, 0, 1])],

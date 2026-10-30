@@ -503,11 +503,11 @@ def _block_levels(level_types):
 
 
 @pytest.mark.parametrize("cell", CELLS, ids=_cell_id)
-def test_the_shipped_compiler_declares_exactly_the_blocks_it_checks(monkeypatch, cell):
+def test_the_shipped_compiler_declares_exactly_the_blocks_it_checks(
+    monkeypatch, fresh_kernel_caches, cell
+):
     expr, operand_fmts, result_fmt = cell
     recorded = _recorded_kernels(monkeypatch)
-    monkeypatch.setattr(ops, "_kernel_cache", {})
-    monkeypatch.setattr(ops, "_einsum_dispatch_cache", {})
     monkeypatch.setattr(
         ops, "_load_validated_prepared_kernel", lambda prepared: object()
     )

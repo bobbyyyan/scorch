@@ -46,7 +46,7 @@ import re
 import subprocess
 import sys
 import textwrap
-from typing import Any, Callable, Iterator, List, Optional, Sequence, Tuple
+from typing import Any, Callable, List, Optional, Sequence, Tuple
 
 import pytest
 import torch
@@ -157,14 +157,15 @@ def _store() -> _Recording:
 
 
 @pytest.fixture(autouse=True)
-def _nothing_kept_between_tests(monkeypatch: pytest.MonkeyPatch) -> Iterator[None]:
-    compile_options.clear_build_snapshot_cache()
+def _nothing_kept_between_tests(
+    fresh_kernel_caches: None, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # The kernel caches and the build snapshots start empty (fresh_kernel_caches); the
+    # store these tests read is a recording one in their place.
     monkeypatch.setattr(stensor_module, "_GENERATED_KERNELS", _Recording())
     # These tests count snapshots, which a hit check makes; the check's own tests turn
     # it on.
     monkeypatch.setattr(stensor_module, "_CHECK_GENERATED_KERNEL_HITS", [False])
-    yield
-    compile_options.clear_build_snapshot_cache()
 
 
 @pytest.fixture

@@ -315,14 +315,14 @@ def test_context_owned_by_foreign_options_is_rejected():
     assert str(tensor.format) == "d"
 
 
-def test_sparse_source_densification_uses_the_supplied_context(monkeypatch):
+def test_sparse_source_densification_uses_the_supplied_context(fresh_kernel_caches):
     """A sparse receiver's densification is recorded by the caller's owner when it
     compiles, and records nothing when the kept kernel serves it."""
 
     # A densification the generated-kernel cache serves lowers nothing and records no
     # stage, in the caller's context or any other.  A kernel an earlier test in this
-    # process kept for the same call (stensor._GENERATED_KERNELS) would serve this one.
-    monkeypatch.setattr(stensor_module, "_GENERATED_KERNELS", {})
+    # process kept for the same call (stensor._GENERATED_KERNELS) would serve this one,
+    # so the kernel caches start empty.
     options = CompileOptions.from_environment()
     context = CompilationContext(options)
     tensor = STensor.from_torch(torch.tensor(VECTOR), "A").to_sparse("s")

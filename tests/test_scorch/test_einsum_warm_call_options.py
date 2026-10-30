@@ -68,11 +68,8 @@ _KEYS = compile_options._ENVIRONMENT_OPTION_KEYS
 
 
 @pytest.fixture(autouse=True)
-def _nothing_kept_between_tests(monkeypatch: pytest.MonkeyPatch):
-    compile_options.clear_build_snapshot_cache()
-    monkeypatch.setattr(ops, "_einsum_dispatch_cache", {})
-    yield
-    compile_options.clear_build_snapshot_cache()
+def _nothing_kept_between_tests(fresh_kernel_caches: None):
+    """The kernel caches and the build snapshots start empty (fresh_kernel_caches)."""
 
 
 @pytest.fixture

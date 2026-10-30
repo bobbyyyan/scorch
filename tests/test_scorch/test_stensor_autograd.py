@@ -22,7 +22,6 @@ import torch.autograd.forward_ad as fwAD
 
 import scorch
 from scorch import autograd as scorch_autograd
-from scorch import ops
 from scorch import stensor as stensor_module
 from scorch import stensor_grad
 from scorch.exceptions import (
@@ -33,6 +32,7 @@ from scorch.exceptions import (
 )
 from scorch.plan import GRAD_ATTR
 from scorch.stensor import STensor
+from tests.test_scorch.kernel_cache_support import empty_kernel_caches, kernel_caches
 
 F64 = torch.float64
 AUTOGRAD_VALUES = stensor_grad.AUTOGRAD_VALUES
@@ -179,7 +179,7 @@ def native_boundary(monkeypatch):
 
     import scorch_ops
 
-    from scorch import prebuilt_kernels, utils
+    from scorch import utils
 
     crossings, readers, wrapped = [], set(), set()
 
@@ -226,8 +226,7 @@ def native_boundary(monkeypatch):
             lambda *args, _load=original, **kwargs: wrap_kernel(_load(*args, **kwargs)),
         )
     # The caches that hold a native function itself, resolved before this test.
-    monkeypatch.setattr(prebuilt_kernels, "_resolve_matmul_cache", {})
-    monkeypatch.setattr(ops, "_einsum_dispatch_cache", {})
+    empty_kernel_caches(monkeypatch)
 
     values_property = STensor.values
 
@@ -1147,16 +1146,12 @@ def test_caches_hold_no_history(monkeypatch):
     leaf = torch.rand(6, 5, dtype=F64, requires_grad=True)
     scorch.from_torch(leaf.t())
     assert len(stensor_module._OPERAND_COPY_CACHE) >= 1
-    caches = {
-        "_OPERAND_COPY_CACHE": stensor_module,
-        "_RESULT_PARTS_CACHE": stensor_module,
-        "_DENSE_PARTS_CACHE": stensor_module,
-        "_GENERATED_KERNELS": stensor_module,
-        "_kernel_cache": ops,
-        "_einsum_dispatch_cache": ops,
-    }
-    for name, module in caches.items():
-        for tensor in _tensors_in(getattr(module, name), set()):
+    caches = [
+        (name, getattr(stensor_module, name))
+        for name in ("_OPERAND_COPY_CACHE", "_RESULT_PARTS_CACHE", "_DENSE_PARTS_CACHE")
+    ] + kernel_caches()
+    for name, cache in caches:
+        for tensor in _tensors_in(cache, set()):
             assert not tensor.requires_grad, name
 
 

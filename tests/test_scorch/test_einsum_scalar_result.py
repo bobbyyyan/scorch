@@ -175,12 +175,6 @@ def shipped_einsum(expr, *operands, **kwargs):
     return scorch.einsum(expr, *operands, **kwargs)
 
 
-@pytest.fixture
-def empty_caches(monkeypatch):
-    monkeypatch.setattr(ops, "_kernel_cache", {})
-    monkeypatch.setattr(ops, "_einsum_dispatch_cache", {})
-
-
 # -- the shipped compiler, through the public einsum --------------------------------
 
 
@@ -188,7 +182,7 @@ def empty_caches(monkeypatch):
 @EACH_DTYPE
 @EACH_PROGRAM
 def test_shipped_einsum_computes_the_program(
-    empty_caches, expr, formats, dtype, regblock
+    fresh_kernel_caches, expr, formats, dtype, regblock
 ):
     dense, built = operands_of(expr, formats, dtype)
 
@@ -205,7 +199,7 @@ def test_shipped_einsum_computes_the_program(
 @ARMS
 @EACH_PROGRAM
 def test_shipped_einsum_computes_the_program_under_an_empty_schedule(
-    empty_caches, expr, formats, regblock
+    fresh_kernel_caches, expr, formats, regblock
 ):
     dense, built = operands_of(expr, formats, F64)
     scheduled = replace(options(regblock), requested_schedule=Schedule())
@@ -215,7 +209,7 @@ def test_shipped_einsum_computes_the_program_under_an_empty_schedule(
     check(result, expr, dense, F64)
 
 
-def test_a_scalar_result_has_its_own_cache_entry(empty_caches):
+def test_a_scalar_result_has_its_own_cache_entry(fresh_kernel_caches):
     """``"i,i->"`` and ``"i,i->i"`` over the same operands are different programs."""
 
     dense, built = operands_of("i,i->", ["s", "d"], F64)
@@ -231,7 +225,7 @@ def test_a_scalar_result_has_its_own_cache_entry(empty_caches):
 
 
 @pytest.mark.parametrize("dtype", [torch.float32, torch.float64, torch.int64])
-def test_a_dense_torch_operand_is_summed(empty_caches, dtype):
+def test_a_dense_torch_operand_is_summed(fresh_kernel_caches, dtype):
     """By the compiler through its entry, and by ``torch.einsum`` through the public one,
     which hands it an all-dense call unchanged."""
 
@@ -292,7 +286,7 @@ def result_shape_of(program):
 @EACH_DTYPE
 @EACH_PROGRAM
 def test_new_compiler_computes_the_program(
-    monkeypatch, empty_caches, expr, formats, dtype, regblock
+    monkeypatch, fresh_kernel_caches, expr, formats, dtype, regblock
 ):
     dense, built = operands_of(expr, formats, dtype)
     program, moved = captured_program(monkeypatch, expr, built, options(regblock))
@@ -323,7 +317,7 @@ LARGE = [
 )
 @pytest.mark.parametrize(("expr", "formats"), LARGE, ids=[program_id(p) for p in LARGE])
 def test_a_large_sum_is_exact_on_both_compilers(
-    monkeypatch, empty_caches, expr, formats, dtype, regblock
+    monkeypatch, fresh_kernel_caches, expr, formats, dtype, regblock
 ):
     dense, built = operands_of(expr, formats, dtype, LARGE_EXTENT)
     program, moved = captured_program(monkeypatch, expr, built, options(regblock))
@@ -345,7 +339,7 @@ def test_a_large_sum_is_exact_on_both_compilers(
     "formats", [("d", "d"), ("d", "s"), ("s", "d"), ("s", "s")], ids="x".join
 )
 def test_matmul_of_two_vectors_is_their_dot_product(
-    monkeypatch, empty_caches, formats, arm
+    monkeypatch, fresh_kernel_caches, formats, arm
 ):
     monkeypatch.setenv("SCORCH_REGBLOCK", arm)
     left, right = (operand_values("i", F64, seed) for seed in (31, 32))
@@ -374,7 +368,9 @@ def a_matrix():
 @pytest.mark.parametrize(
     "requested", ["", [], TensorFormat("")], ids=("string", "list", "object")
 )
-def test_the_result_format_of_a_scalar_is_the_rank_zero_format(empty_caches, requested):
+def test_the_result_format_of_a_scalar_is_the_rank_zero_format(
+    fresh_kernel_caches, requested
+):
     dense, matrix = a_matrix()
 
     result = scorch.einsum("ij->", matrix, format=requested)
@@ -391,7 +387,7 @@ def test_a_result_format_of_another_rank_is_refused():
         scorch.einsum("ij->", matrix, format="d")
 
 
-def test_the_output_mode_order_of_a_scalar_is_empty(empty_caches):
+def test_the_output_mode_order_of_a_scalar_is_empty(fresh_kernel_caches):
     dense, matrix = a_matrix()
 
     check(scorch.einsum("ij->", matrix, output_mode_order=[]), "ij->", [dense], F64)
@@ -399,7 +395,7 @@ def test_the_output_mode_order_of_a_scalar_is_empty(empty_caches):
         scorch.einsum("ij->", matrix, output_mode_order=[0])
 
 
-def test_compile_only_returns_the_scalar_specification(empty_caches):
+def test_compile_only_returns_the_scalar_specification(fresh_kernel_caches):
     spec = scorch.einsum(
         "ij->", TensorSpec("ss", (5, 4), dtype=F64, name="A"), compile_only=True
     )
@@ -409,7 +405,7 @@ def test_compile_only_returns_the_scalar_specification(empty_caches):
     assert spec.dtype == F64
 
 
-def test_a_zero_dim_torch_operand_is_a_scalar_operand(empty_caches):
+def test_a_zero_dim_torch_operand_is_a_scalar_operand(fresh_kernel_caches):
     scale = torch.tensor(1.75, dtype=F64)
     dense, matrix = a_matrix()
 
@@ -553,7 +549,7 @@ def test_the_shipped_lowering_reads_and_writes_position_zero(scalar_format):
 @SPELLINGS
 @CIN_PROGRAMS
 def test_both_compilers_compute_a_program_with_a_scalar_tensor(
-    empty_caches, program, scalar_format, regblock
+    fresh_kernel_caches, program, scalar_format, regblock
 ):
     statement, result_shape, _ = program(scalar_format)
     operands, expected = cin_operands(program)

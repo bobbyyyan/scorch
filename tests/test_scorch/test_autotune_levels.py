@@ -22,20 +22,19 @@ from scorch import STensor
 
 
 @pytest.fixture(autouse=True)
-def _isolate_autotune(tmp_path, monkeypatch):
-    """Restore global level + memo + queried LLC around every test, and redirect
-    the persistent cache to a per-test tmp file so no test ever touches the user's
-    real ~/.cache/scorch/autotune.json (tests exercise the 'max' level)."""
+def _isolate_autotune(fresh_kernel_caches, tmp_path, monkeypatch):
+    """Restore global level + queried LLC around every test, and redirect the
+    persistent cache to a per-test tmp file so no test ever touches the user's real
+    ~/.cache/scorch/autotune.json (tests exercise the 'max' level). The memo starts
+    empty (fresh_kernel_caches)."""
     prev_level = T._global_level
     prev_llc = T._llc_bytes
     monkeypatch.setenv("SCORCH_AUTOTUNE_CACHE", str(tmp_path / "autotune.json"))
     T._cache_loaded = False
     T._persist_cache = None
-    T._decision.clear()
     yield
     T._global_level = prev_level
     T._llc_bytes = prev_llc
-    T._decision.clear()
     T._tls.level = None
     T._cache_loaded = False
     T._persist_cache = None

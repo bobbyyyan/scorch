@@ -57,12 +57,13 @@ def _snapshot(environ: dict[str, str] | None = None) -> CompileOptions:
 
 
 @pytest.fixture(autouse=True)
-def _nothing_kept_between_tests(monkeypatch: pytest.MonkeyPatch):
-    compile_options.clear_build_snapshot_cache()
+def _nothing_kept_between_tests(
+    fresh_kernel_caches: None, monkeypatch: pytest.MonkeyPatch
+):
+    # The build snapshots and the kernel caches start empty (fresh_kernel_caches); the
+    # preamble memos, which these tests change the files of, do too.
     monkeypatch.setattr(utils, "_preamble_text_memo", None)
     monkeypatch.setattr(utils, "_preamble_paths_memo", None)
-    yield
-    compile_options.clear_build_snapshot_cache()
 
 
 @pytest.fixture
