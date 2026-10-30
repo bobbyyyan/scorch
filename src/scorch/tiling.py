@@ -74,8 +74,10 @@ import math
 import os
 import platform
 import subprocess
+import sys
 import threading
 import time
+import warnings
 from typing import Callable, Iterable, Optional, Tuple
 
 import numpy as np
@@ -1436,11 +1438,108 @@ def _clears_noise(t_tiled: float, t_first: float, t_last: float) -> bool:
     return t_tiled * spread < base
 
 
+def _time_candidates(cands: list) -> Tuple[list, dict]:
+    """Time ``cands``, a list of ``(kind, param, fn)``, with _interleaved_times, and
+    return ``(times, raised)``: ``raised`` maps the ``(kind, param)`` of each tiled
+    candidate whose ``fn`` raised an Exception to its error.
+
+    A tiled candidate that raises is not a candidate. It runs no more, and its time --
+    that of a call that did nothing -- is meaningless, so a caller must leave it out
+    of its verdict. Uncaught, its error left nothing in the memo, so every later call
+    on the shape timed the candidates again and raised again. A baseline (kind "v2")
+    that raises is the caller's own path, which raises the same way without the
+    selector, so its error propagates.
+
+    Every entry runs through the same wrapper, so the wrapper costs every arm the same
+    and the A/A spread between the two baseline entries still measures the cell's
+    floor. Entries with the same ``fn`` -- the baseline, entered at both ends -- share
+    one wrapper, so the timer is still handed the same function object twice."""
+    raised: dict = {}
+
+    def guarded(kind, param, fn):
+        def run():
+            if (kind, param) in raised:
+                return None
+            try:
+                return fn()
+            except Exception as error:
+                if kind == "v2":
+                    raise
+                raised[(kind, param)] = error
+                return None
+
+        return run
+
+    wrapped: dict = {}
+    for kind, param, fn in cands:
+        if fn not in wrapped:
+            wrapped[fn] = guarded(kind, param, fn)
+    return _interleaved_times([wrapped[fn] for _, _, fn in cands]), raised
+
+
+# The directories whose frames a selector warning skips to reach the user's call:
+# scorch's package (this module sits at its root) and torch's.
+_LIBRARY_DIRS = tuple(
+    os.path.dirname(os.path.abspath(path)) + os.sep
+    for path in (__file__, torch.__file__)
+)
+
+
+def _user_stacklevel() -> int:
+    """The ``stacklevel`` with which a ``warnings.warn`` in this function's caller names
+    the first frame outside scorch and torch: the user's call.
+
+    A fixed number cannot do that. How many scorch frames lie between the user and the
+    selector depends on the route: ops.matmul directly, ``x @ A`` through autograd.py,
+    ``scorch.compile``'s fused path, or a torch CSR operand that the C entry point
+    hands back to ops.matmul. torch's frames are skipped too: a ``torch`` call the shim
+    serves would otherwise name torch's own dispatch line. When every frame is a
+    library frame, the outermost one is named."""
+    level = 1
+    frame = sys._getframe(1)  # the caller, which calls warnings.warn
+    while frame.f_back is not None and os.path.abspath(
+        frame.f_code.co_filename
+    ).startswith(_LIBRARY_DIRS):
+        frame = frame.f_back
+        level += 1
+    return level
+
+
+def _warn_candidates_raised(raised: dict) -> None:
+    """The warning for tiled candidates that raised while the selector ran them for a
+    verdict, attributed to the user's call (_user_stacklevel). ``raised`` maps each
+    one's ``(kind, param)`` to its error. A shape warns once: the verdict that follows
+    is memoized."""
+    named = "; ".join(
+        f"{kind} (parameter {param!r}) raised {type(error).__name__}: {error}"
+        for (kind, param), error in raised.items()
+    )
+    warnings.warn(
+        f"scorch's tiling selector: while choosing a kernel for this product, {named}. "
+        "It is left out of the choice, which is kept for this process only.",
+        RuntimeWarning,
+        stacklevel=_user_stacklevel(),
+    )
+
+
 def _confirm_vs_baseline(
-    a, b, result_shape, kind, param, nt, baseline_fn, nthreads, epilogue=None
+    a,
+    b,
+    result_shape,
+    kind,
+    param,
+    nt,
+    baseline_fn,
+    nthreads,
+    epilogue=None,
+    raised: Optional[dict] = None,
 ):
     """One-shot confirm: time {predicted winner, the caller's baseline} once each and
     keep the faster.
+
+    A predicted winner that raises an Exception while it is timed is not a candidate:
+    the verdict is v2, and its error is added to ``raised`` (see _time_candidates).
+    A baseline that raises is the caller's own path, and its error propagates.
 
     Keeps a level that does not run the full ladder probe no-slower than *that
     caller's own baseline*, at 9 kernel invocations (3 entries x 1 warmup + 2
@@ -1473,7 +1572,14 @@ def _confirm_vs_baseline(
     # neither bias was measured. Floor: two timings of the same baseline are an A/A
     # control, and without one there is no way to tell a real 3% win from noise
     # before memoizing the verdict for good. See _interleaved_times, _clears_noise.
-    t_first, t_win, t_last = _interleaved_times([base, win, base])
+    times, failed = _time_candidates(
+        [("v2", None, base), (kind, param, win), ("v2", None, base)]
+    )
+    if failed:
+        if raised is not None:
+            raised.update(failed)
+        return ("v2", None)
+    t_first, t_win, t_last = times
 
     # The "v2" sentinel keeps its historical name at every level of this module and
     # in the on-disk cache; it means "run the caller's own baseline path", which is
@@ -1528,6 +1634,13 @@ def maybe_dispatch(
     balanced/max/learned); when None it is resolved from the current thread-local /
     global autotune level. The eligibility GATE is identical at every non-off level.
 
+    At every level above off, a tiled candidate that raises an Exception while the
+    selector runs it for a verdict -- timed by the probe or the confirm, or run for
+    this call's output just before its verdict is memoized -- is left out, with a
+    RuntimeWarning; with no tiled candidate left, the verdict is v2. Such a verdict
+    is memoized for the process but not written to max's file. A baseline that
+    raises is the caller's own path and is not caught.
+
     When a tiled kernel is returned and `time_dict` is supplied, its "eval_time" is
     populated (the winning kernel's measured/timed duration) so the tiled route
     honors the same timing contract as the caller's v2 fallthrough
@@ -1578,6 +1691,32 @@ def maybe_dispatch(
             time_dict["eval_time"] = time.perf_counter() - t0
         return out
 
+    def _adopt(kind, param, raised, run=None):
+        """Memoize the verdict this call has just made, and serve the call from it.
+
+        A tiled verdict's kernel runs once here, before the verdict is memoized:
+        ``run()`` if given, else the memoized dispatch. If it raises an Exception, the
+        verdict becomes v2. Memoized, a tiled verdict whose kernel raises would make
+        every later call on the shape raise. ``raised`` maps each candidate that
+        raised while it was timed (_time_candidates), and this one if it raised, to
+        its error. When it is not empty a RuntimeWarning names them, and max does not
+        write the verdict to its file: a raise can be transient (MemoryError, say),
+        and the file outlives the process. Returns what maybe_dispatch returns."""
+        served = None
+        if kind != "v2":
+            try:
+                served = run() if run is not None else _timed_dispatch(kind, param)
+            except Exception as error:
+                raised[(kind, param)] = error
+                kind, param = "v2", None
+        _decision[memo_key] = (kind, param)
+        if raised:
+            _warn_candidates_raised(raised)
+        elif level == "max":
+            # pay the search once EVER
+            _persist_put(sig, kind, param, baseline_tag)
+        return served
+
     cached = _decision.get(memo_key)
     if cached is not None:
         return _timed_dispatch(cached[0], cached[1])
@@ -1604,6 +1743,7 @@ def maybe_dispatch(
             _decision[memo_key] = ("v2", None)
             return None
         kind, param = _learned_decide(a, b, M, J, N, nnz, C, learned_model)
+        raised: dict = {}
         # When WIDENED, a tiled pick in the widened-only region (analytic gate would
         # reject) extrapolates into v2-territory, so confirm it against v2 once
         # (guaranteed no-regression; memoized). Data-driven: without this, redwood FEM
@@ -1627,11 +1767,9 @@ def maybe_dispatch(
                     baseline_fn,
                     nthreads,
                     epilogue,
+                    raised,
                 )
-        _decision[memo_key] = (kind, param)
-        if kind == "v2":
-            return None
-        return _timed_dispatch(kind, param)
+        return _adopt(kind, param, raised)
 
     # Locality gate (first time only, then memoized): well-ordered/banded matrices
     # (FEM) pass the degree filter but have no cross-row B-reuse for the tile path
@@ -1672,14 +1810,21 @@ def maybe_dispatch(
         # makes every non-off level no-regression-vs-v2 by construction rather than by
         # the gate happening to be right. What still separates analytic from balanced
         # is the search: analytic checks one width, balanced searches the ladder.
+        raised = {}
         if _CONFIRM_TILED:
             kind, param = _confirm_vs_baseline(
-                a, b, result_shape, kind, param, nt, baseline_fn, nthreads, epilogue
+                a,
+                b,
+                result_shape,
+                kind,
+                param,
+                nt,
+                baseline_fn,
+                nthreads,
+                epilogue,
+                raised,
             )
-        _decision[memo_key] = (kind, param)
-        if kind == "v2":
-            return None
-        return _timed_dispatch(kind, param)
+        return _adopt(kind, param, raised)
 
     # balanced/max first-call micro-probe: time every candidate, keep the fastest's
     # result. v2 is always a candidate -> the winner is never slower than v2. The
@@ -1728,35 +1873,36 @@ def maybe_dispatch(
     # compared against a baseline timed only on a cold machine.
     cands.append(("v2", None, _baseline))
 
-    # Interleaved, not one candidate at a time -- see _interleaved_times.
-    times = _interleaved_times([fn for _, _, fn in cands])
+    # Interleaved, not one candidate at a time -- see _interleaved_times. A tiled
+    # candidate that raises is left out (see _time_candidates).
+    times, raised = _time_candidates(cands)
     t_first, t_last = times[0], times[-1]
 
     # The winner is chosen among the tiled candidates only; both baseline entries
     # are controls, and either one winning means the same thing (route to v2).
     best_i, best_t = -1, float("inf")
     for i in range(1, len(cands) - 1):
-        if times[i] < best_t:
+        if (cands[i][0], cands[i][1]) not in raised and times[i] < best_t:
             best_i, best_t = i, times[i]
 
     if best_i < 0 or not _clears_noise(best_t, t_first, t_last):
-        # Inside the floor, or no tiled candidate at all: fail closed to the
+        # Inside the floor, or no tiled candidate left: fail closed to the
         # baseline. A verdict here is memoized for the process (and for the
         # machine, at "max"), so guessing from noise is not a one-call error.
         best_kind, best_param = "v2", None
     else:
         best_kind, best_param = cands[best_i][0], cands[best_i][1]
 
-    _decision[memo_key] = (best_kind, best_param)
-    if level == "max":
-        # pay the search once EVER
-        _persist_put(sig, best_kind, best_param, baseline_tag)
-    if best_kind == "v2":
-        return None  # caller runs its own baseline + populates time_dict itself
-    if time_dict is not None:
-        time_dict["eval_time"] = best_t  # the winning kernel's measured time
-    # Re-run the winner for its output rather than retaining every candidate's:
-    # one dense output per candidate is hundreds of megabytes at a wide free
-    # dimension. One call on a budget of three per candidate, and only on the
-    # tiled branch -- when the baseline wins, the caller runs it anyway.
-    return cands[best_i][2](), True
+    def _winner():
+        # Re-run the winner for its output rather than retaining every candidate's:
+        # one dense output per candidate is hundreds of megabytes at a wide free
+        # dimension. One call on a budget of three per candidate, and only on the
+        # tiled branch -- when the baseline wins, the caller runs it anyway.
+        out = cands[best_i][2]()
+        if time_dict is not None:
+            time_dict["eval_time"] = best_t  # the winning kernel's measured time
+        return out, True
+
+    # None when the verdict is v2: the caller runs its own baseline and populates
+    # time_dict itself.
+    return _adopt(best_kind, best_param, raised, _winner)

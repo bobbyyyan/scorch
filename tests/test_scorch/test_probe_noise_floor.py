@@ -25,12 +25,20 @@ and measuring would make them machine-dependent and flaky in exactly the regime
 they exist to pin down.
 """
 
+import json
 import os
+import sys
+import warnings
+
 import pytest
 import torch
 
 import scorch
 from scorch import tiling
+from scorch.prebuilt_kernels import (
+    execute_prebuilt_binary_kernel,
+    resolve_prebuilt_matmul,
+)
 from scorch.stensor import STensor
 
 ROWS, DEGREE, N, LLC = 800, 70, 64, 131072
@@ -330,6 +338,273 @@ def test_the_declined_verdict_is_memoized_so_the_floor_is_paid_once():
         assert first is None and second is None
         # One probe, not two: the second call reads the memo.
         assert injected.calls == 1
+
+
+# ---------------------------------------------------------------------------
+# a candidate that raises
+# ---------------------------------------------------------------------------
+class PlantedFailure(Exception):
+    pass
+
+
+class tilej_raises:
+    """Make the tile-j candidate at panel width ``width`` (every width when None)
+    raise on its runs from the ``after``-th on (0: from its first). ``runs`` counts
+    every run, per width. It works through _tilej_args, which every tile-j run calls:
+    the probe's candidates, the winner's run for its output, and a memoized dispatch."""
+
+    def __init__(self, width=None, after=0):
+        self.width = width
+        self.after = after
+        self.runs = {}
+
+    def __enter__(self):
+        self.original = tiling._tilej_args
+
+        def fake(a, b, result_shape, jc, nthreads):
+            n = self.runs.get(jc, 0)
+            self.runs[jc] = n + 1
+            if (self.width is None or jc == self.width) and n >= self.after:
+                raise PlantedFailure(f"planted at width {jc}")
+            return self.original(a, b, result_shape, jc, nthreads)
+
+        tiling._tilej_args = fake
+        return self
+
+    def __exit__(self, *exc):
+        tiling._tilej_args = self.original
+        return False
+
+
+class runs_each_once:
+    """As injects_times, but the fake timer runs every candidate once, as the real
+    one's warm-up does, so a candidate that raises is found."""
+
+    def __init__(self, times_for):
+        self.times_for = times_for
+        self.fns = None
+
+    def __enter__(self):
+        self.original = tiling._interleaved_times
+
+        def fake(fns, rounds=2):
+            self.fns = list(fns)
+            for fn in self.fns:
+                fn()
+            return self.times_for(len(self.fns))
+
+        tiling._interleaved_times = fake
+        return self
+
+    def __exit__(self, *exc):
+        tiling._interleaved_times = self.original
+        return False
+
+
+@pytest.fixture
+def own_max_file(tmp_path, monkeypatch):
+    """Max's file in this test's directory, read afresh. Returns its path."""
+    path = tmp_path / "autotune.json"
+    monkeypatch.setenv("SCORCH_AUTOTUNE_CACHE", str(path))
+    monkeypatch.setattr(tiling, "_cache_loaded", False)
+    monkeypatch.setattr(tiling, "_persist_cache", None)
+    return path
+
+
+def _direct_operands():
+    """The probe's operands, with a baseline that calls the drop-in SpMM directly.
+    A baseline calling scorch.matmul would reach the selector again from inside the
+    probe, and with a timer that runs the candidates the memo is still empty there."""
+    a = scattered_csr()
+    bst = STensor.from_torch(torch.randn(ROWS, N))
+    resolved = resolve_prebuilt_matmul(a, bst, output_format="dd")
+
+    def baseline_fn(nthreads):
+        out, _ = execute_prebuilt_binary_kernel(resolved.fn, a, bst, nthreads=nthreads)
+        return out
+
+    return a, bst, baseline_fn
+
+
+def _ladder():
+    return tiling._jc_ladder(tiling._panel_width(N, LLC))
+
+
+def _selector_warnings(caught):
+    return [w for w in caught if issubclass(w.category, RuntimeWarning)]
+
+
+@pytest.mark.parametrize("level", ("balanced", "max"))
+def test_every_tiled_candidate_raising_gives_v2_once(level, own_max_file):
+    a, bst, baseline_fn = _direct_operands()
+    with gate_open(level=level), tilej_raises() as raises:
+        # The raising candidates are planted fastest, so only leaving them out gives v2.
+        with runs_each_once(lambda n: [1.0] + [0.1] * (n - 2) + [1.0]):
+            with pytest.warns(RuntimeWarning, match="PlantedFailure") as caught:
+                out = tiling.maybe_dispatch(a, bst, [ROWS, N], baseline_fn, None)
+        (warning,) = _selector_warnings(caught)
+        assert warning.filename == __file__, "the warning names a library frame"
+        assert out is None, "the call must be served by the caller's baseline"
+        assert set(tiling._decision.values()) == {("v2", None)}
+        runs = dict(raises.runs)
+        assert set(runs) == set(_ladder()) and set(runs.values()) == {1}
+        with warnings.catch_warnings():
+            warnings.simplefilter("error", RuntimeWarning)
+            again = tiling.maybe_dispatch(a, bst, [ROWS, N], baseline_fn, None)
+        assert again is None
+        assert raises.runs == runs, "a later call ran a tiled candidate"
+        assert tiling._persist_get(tiling._signature(a, N)) is None
+    assert not own_max_file.exists(), "a verdict from a raising probe was written"
+
+
+def test_the_raising_candidate_is_left_out_and_the_next_best_wins():
+    a, bst, baseline_fn = _direct_operands()
+    ladder = _ladder()
+    assert len(ladder) >= 2, "the shape needs two tile-j widths"
+    # Candidates in order: base, ladder[0], ladder[1], ..., base'. ladder[0] is
+    # planted fastest and raises; ladder[1] clears the floor.
+    planted = [1.0, 0.1, 0.5] + [0.9] * (len(ladder) - 2) + [1.0]
+    with gate_open(level="balanced"), tilej_raises(width=ladder[0]):
+        with runs_each_once(lambda n: planted):
+            with pytest.warns(RuntimeWarning, match=f"width {ladder[0]}") as caught:
+                out = tiling.maybe_dispatch(a, bst, [ROWS, N], baseline_fn, None)
+        assert len(_selector_warnings(caught)) == 1
+        assert f"width {ladder[1]}" not in str(_selector_warnings(caught)[0].message)
+        assert out is not None and out[1] is True
+        assert tiling.decided(a, N, level="balanced") == ("tilej", ladder[1])
+
+
+def test_a_winner_that_raises_when_it_runs_for_its_output_gives_v2(own_max_file):
+    a, bst, baseline_fn = _direct_operands()
+    ladder = _ladder()
+    # ladder[0] wins, runs once in the timer, and raises on its run for the output.
+    planted = [1.0, 0.1] + [0.9] * (len(ladder) - 1) + [1.0]
+    with gate_open(level="max"), tilej_raises(width=ladder[0], after=1) as raises:
+        with runs_each_once(lambda n: planted):
+            with pytest.warns(RuntimeWarning, match="PlantedFailure") as caught:
+                out = tiling.maybe_dispatch(a, bst, [ROWS, N], baseline_fn, None)
+        assert len(_selector_warnings(caught)) == 1
+        assert raises.runs[ladder[0]] == 2
+        assert out is None
+        assert set(tiling._decision.values()) == {("v2", None)}
+    assert not own_max_file.exists(), "a verdict from a raising probe was written"
+
+
+def test_a_probe_where_nothing_raised_still_writes_max_s_file(own_max_file):
+    # The control for the two "not written" checks above: the same probe, nothing
+    # raising, does write the file, so their absence of a file is informative.
+    a, bst, baseline_fn = _direct_operands()
+    with gate_open(level="max"):
+        with runs_each_once(lambda n: [1.0] + [0.1] * (n - 2) + [1.0]):
+            with warnings.catch_warnings():
+                warnings.simplefilter("error", RuntimeWarning)
+                out = tiling.maybe_dispatch(a, bst, [ROWS, N], baseline_fn, None)
+    assert out is not None and out[1] is True
+    assert own_max_file.exists()
+
+
+@pytest.mark.parametrize("level", ("analytic", "balanced"))
+def test_a_raising_baseline_raises_and_memoizes_nothing(level):
+    a, bst, _baseline_fn = _direct_operands()
+
+    def baseline_fn(nthreads):
+        raise PlantedFailure("planted in the baseline")
+
+    with gate_open(level=level):
+        with runs_each_once(lambda n: [1.0] * n):
+            with warnings.catch_warnings():
+                warnings.simplefilter("error", RuntimeWarning)
+                with pytest.raises(PlantedFailure):
+                    tiling.maybe_dispatch(a, bst, [ROWS, N], baseline_fn, None)
+        assert tiling._decision == {}
+
+
+@pytest.fixture
+def learned_prefers_tilej(tmp_path, monkeypatch):
+    """Returns a function that writes a learned model under which tile-j is predicted
+    fastest (test_autotune_learned.py's _PREFER_TILEJ) and loads it. Call it inside
+    gate_open: the model's machine id hashes the LLC in force. The loaded model is
+    dropped afterwards, so later tests read the session's (absent) one."""
+    path = tmp_path / "learned_model.json"
+
+    def write():
+        fi = list(tiling._FEATURES).index("f_is_tilej")
+        tree = dict(
+            feature=[fi, -2, -2],
+            threshold=[0.5, -2.0, -2.0],
+            left=[1, -1, -1],
+            right=[2, -1, -1],
+            value=[0.0, 1.0, -1.0],
+        )
+        spec = dict(
+            kind="sklearn_gbr",
+            version=tiling._LEARNED_VERSION,
+            machine_id=tiling._machine_id(),
+            feature_names=list(tiling._FEATURES),
+            init=0.0,
+            learning_rate=1.0,
+            trees=[tree],
+        )
+        path.write_text(json.dumps(spec))
+        monkeypatch.setenv("SCORCH_AUTOTUNE_MODEL", str(path))
+        tiling._reset_learned_model_cache()
+        assert tiling._load_learned_model() is not None
+
+    yield write
+    tiling._reset_learned_model_cache()
+
+
+@pytest.mark.parametrize("level", ("analytic", "learned"))
+@pytest.mark.parametrize("after", (0, 1), ids=("in_the_confirm", "after_the_confirm"))
+def test_a_confirmed_pick_that_raises_gives_v2_once(
+    after, level, learned_prefers_tilej
+):
+    """analytic's (the default level's) or learned's pick raises while the confirm
+    times it (after=0), or on its run for this call's output once it has cleared the
+    confirm (after=1). learned runs with a model that picks tile-j, since without one
+    it is analytic."""
+    a, bst, baseline_fn = _direct_operands()
+    with gate_open(level=level), tilej_raises(after=after) as raises:
+        if level == "learned":
+            learned_prefers_tilej()
+        with runs_each_once(lambda n: [1.0, 0.5, 1.0]) as timer:
+            with pytest.warns(RuntimeWarning, match="PlantedFailure") as caught:
+                out = tiling.maybe_dispatch(a, bst, [ROWS, N], baseline_fn, None)
+        assert len(timer.fns) == 3, "not the confirm's [base, pick, base]"
+        (warning,) = _selector_warnings(caught)
+        assert warning.filename == __file__, "the warning names a library frame"
+        assert out is None
+        assert set(tiling._decision.values()) == {("v2", None)}
+        runs = dict(raises.runs)
+        assert sum(runs.values()) == after + 1
+        with warnings.catch_warnings():
+            warnings.simplefilter("error", RuntimeWarning)
+            assert tiling.maybe_dispatch(a, bst, [ROWS, N], baseline_fn, None) is None
+        assert raises.runs == runs, "a later call ran the pick"
+
+
+def test_through_scorch_matmul_the_warning_names_the_callers_line():
+    """Through ops.matmul the selector sits several scorch frames below the caller,
+    and the warning still names the caller's line. The call returns v2's product."""
+    a, bst, _baseline_fn = _direct_operands()
+    # in_place=False: to_torch's default densifies the STensor itself, and a dense `a`
+    # takes ops.matmul's dense x dense route, which never reaches the selector.
+    want = a.to_torch(in_place=False) @ bst.to_torch(in_place=False)
+    assert not a.format.is_dense(), "the operand is dense, so no SpMM reaches the gate"
+    with gate_open(level="analytic"), tilej_raises() as raises:
+        with runs_each_once(lambda n: [1.0, 0.5, 1.0]):
+            with warnings.catch_warnings(record=True) as caught:
+                warnings.simplefilter("always")
+                line = sys._getframe().f_lineno + 1
+                got = scorch.matmul(a, bst)
+        # The route first, so a call that never reached the selector says so.
+        assert sum(raises.runs.values()) == 1, "the call never ran the analytic pick"
+        (warning,) = _selector_warnings(caught)
+        assert "PlantedFailure" in str(warning.message)
+        assert (warning.filename, warning.lineno) == (__file__, line)
+        assert set(tiling._decision.values()) == {("v2", None)}
+    got = got if isinstance(got, torch.Tensor) else got.to_torch(in_place=False)
+    torch.testing.assert_close(got, want, atol=1e-3, rtol=1e-3)
 
 
 # ---------------------------------------------------------------------------
