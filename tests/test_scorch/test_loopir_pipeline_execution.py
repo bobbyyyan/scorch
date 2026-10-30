@@ -285,16 +285,45 @@ def test_loopir_runtime_binding_failure_makes_explicit_context_terminal():
     assert terminal.value.diagnostic.code == "failed_compilation"
 
 
-@pytest.mark.parametrize("entry_name", ("loopir", "legacy"))
+def _keep_direct_add_kernel(ops_module, options):
+    """Run the (2, 2) dense ADD once through ``lower_and_exec_cin``, to keep its kernel.
+
+    The caller has emptied the store (``stensor._GENERATED_KERNELS``), so this call
+    builds, and the next call with the same statement, shape, operands and options is
+    served the kept kernel (``_bind_direct_cin_hit``).
+    """
+
+    import scorch.stensor as stensor_module
+
+    ops_module.lower_and_exec_cin(
+        build_elementwise(Operation.ADD),
+        (2, 2),
+        dense_stensor(torch.ones(2, 2), "A"),
+        dense_stensor(torch.ones(2, 2), "B"),
+        _compile_options=options,
+    )
+    assert len(stensor_module._GENERATED_KERNELS) == 1
+
+
+@pytest.mark.parametrize("entry_name", ("loopir", "legacy", "legacy_kept"))
 def test_post_relayout_snapshot_failure_makes_context_terminal(
     monkeypatch,
     entry_name,
 ):
-    """Aligned operands validate before CIN mutation under a failure owner."""
+    """Aligned operands validate before CIN mutation under a failure owner.
+
+    ``legacy`` builds the kernel and ``legacy_kept`` is served the kept one: both
+    leave the handed context terminal.  The store starts empty, so neither depends on
+    what an earlier test kept.
+    """
 
     import scorch.ops as ops_module
+    import scorch.stensor as stensor_module
 
+    monkeypatch.setattr(stensor_module, "_GENERATED_KERNELS", {})
     options = CompileOptions.from_environment()
+    if entry_name == "legacy_kept":
+        _keep_direct_add_kernel(ops_module, options)
     context = CompilationContext(options)
     forged = object.__new__(STensor)
 
@@ -338,12 +367,19 @@ def test_post_relayout_snapshot_failure_makes_context_terminal(
     assert terminal.value.diagnostic.code == "failed_compilation"
 
 
-def test_direct_relayout_failure_makes_context_terminal(monkeypatch):
-    """A prerequisite failure between direct binding stages retires its context."""
+@pytest.mark.parametrize("kernel", ("built", "kept"))
+def test_direct_relayout_failure_makes_context_terminal(monkeypatch, kernel):
+    """A prerequisite failure between direct binding stages retires its context, on
+    the call that builds its kernel and on the call whose kernel is kept alike.  The
+    store starts empty, so neither depends on what an earlier test kept."""
 
     import scorch.ops as ops_module
+    import scorch.stensor as stensor_module
 
+    monkeypatch.setattr(stensor_module, "_GENERATED_KERNELS", {})
     options = CompileOptions.from_environment()
+    if kernel == "kept":
+        _keep_direct_add_kernel(ops_module, options)
     context = CompilationContext(options)
     error = RuntimeError("injected direct relayout failure")
 

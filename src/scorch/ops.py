@@ -6385,6 +6385,27 @@ def _direct_cin_dispatch_key(
     return key, snapshots, checked_shape
 
 
+def _retire_after_binding_failure(
+    compilation_context: CompilationContext, compile_options: CompileOptions
+) -> None:
+    """Make ``compilation_context`` terminal after a direct call's binding raised
+    outside a stage: fail a frontend stage begun for it, unless a stage has failed
+    already.
+
+    A failure between the binding stages of ``lower_and_exec_cin`` (the relayouts, and
+    on a kept kernel everything before its call) retires the context the caller handed
+    in, on the call that compiles and on the call whose kernel is kept alike, so the
+    next ``begin_stage`` refuses with ``failed_compilation`` whichever call ran.
+    """
+
+    if compilation_context._failed_stage_id is None:
+        failure_token = compilation_context.begin_stage(
+            CompilerStageId.FRONTEND_VALIDATED_OPERATION_CONSTRUCTION,
+            compile_options=compile_options,
+        )
+        compilation_context.fail_stage(failure_token)
+
+
 def _compile_direct_cin(
     cin_stmt: IndexStmt,
     result_shape: Sequence[int],
@@ -6421,12 +6442,7 @@ def _compile_direct_cin(
             snapshots=runtime_args,
         )
     except Exception:
-        if compilation_context._failed_stage_id is None:
-            relayout_failure_token = compilation_context.begin_stage(
-                CompilerStageId.FRONTEND_VALIDATED_OPERATION_CONSTRUCTION,
-                compile_options=compile_options,
-            )
-            compilation_context.fail_stage(relayout_failure_token)
+        _retire_after_binding_failure(compilation_context, compile_options)
         raise
 
     frontend_binding_token = compilation_context.begin_stage(
@@ -6530,38 +6546,48 @@ def _bind_direct_cin_hit(
     of the kept alignment plan.  Returns the snapshots of the operands the kernel
     reads: the call's own, taken when it was keyed, or new ones of the relaid
     operands, validated as the compile validates them.
+
+    A handed-in context records nothing when all of this passes.  When any of it
+    raises, the context is retired as the compiling call retires it
+    (``_retire_after_binding_failure``): the two calls leave the caller's context in
+    one state.
     """
 
-    if entry.verify_cin:
-        verify_cin_if_enabled(cin_stmt, True)
-    if handed_context is not None:
-        handed_context.cancel_stage(
-            handed_context.begin_stage(
-                CompilerStageId.FRONTEND_VALIDATED_OPERATION_CONSTRUCTION,
-                compile_options=options.options(),
+    try:
+        if entry.verify_cin:
+            verify_cin_if_enabled(cin_stmt, True)
+        if handed_context is not None:
+            handed_context.cancel_stage(
+                handed_context.begin_stage(
+                    CompilerStageId.FRONTEND_VALIDATED_OPERATION_CONSTRUCTION,
+                    compile_options=options.options(),
+                )
             )
+        if _checking_generated_kernel_hits():
+            compile_options = options.options()
+            rebuilt, _, _ = _compile_direct_cin(
+                cin_stmt,
+                result_shape,
+                tuple(snapshot.tensor for snapshot in snapshots),
+                compile_options,
+                CompilationContext(compile_options=compile_options),
+            )
+            _refuse_unlike_kept(key, entry, rebuilt)
+        args = tuple(snapshot.tensor for snapshot in snapshots)
+        aligned = _relayout_mode_order_args(
+            args,
+            entry.alignment_plan,
+            options,
+            handed_context,
+            snapshots=snapshots,
         )
-    if _checking_generated_kernel_hits():
-        compile_options = options.options()
-        rebuilt, _, _ = _compile_direct_cin(
-            cin_stmt,
-            result_shape,
-            tuple(snapshot.tensor for snapshot in snapshots),
-            compile_options,
-            CompilationContext(compile_options=compile_options),
-        )
-        _refuse_unlike_kept(key, entry, rebuilt)
-    args = tuple(snapshot.tensor for snapshot in snapshots)
-    aligned = _relayout_mode_order_args(
-        args,
-        entry.alignment_plan,
-        options,
-        handed_context,
-        snapshots=snapshots,
-    )
-    if any(new is not old for new, old in zip(aligned, args)):
-        return _snapshot_runtime_tensors(aligned, expected_count=len(snapshots))
-    return snapshots
+        if any(new is not old for new, old in zip(aligned, args)):
+            return _snapshot_runtime_tensors(aligned, expected_count=len(snapshots))
+        return snapshots
+    except Exception:
+        if handed_context is not None:
+            _retire_after_binding_failure(handed_context, options.options())
+        raise
 
 
 def lower_and_exec_cin(
