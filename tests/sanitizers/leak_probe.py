@@ -3,12 +3,27 @@
 The harness runs this file only on Linux. Tracking is disabled while CPython,
 PyTorch, OpenMP, and the extension initialize, then enabled only for the warmed
 native call. This avoids treating process-lifetime framework caches as leaks.
+
+CPython must run with PYTHONMALLOC=malloc. Its default allocator keeps small
+objects in arenas it maps itself, which LeakSanitizer does not scan, so a block
+referenced only from such an object reads as leaked. On CPython 3.12.15 the
+check before the native call reported 220 such blocks, all allocated by CPython
+before this file could disable tracking. With every object in malloc'd memory
+the references are visible, so the probe refuses to run without the setting.
 """
 
 from __future__ import annotations
 
 import ctypes
 import gc
+import os
+import sys
+
+if os.environ.get("PYTHONMALLOC") != "malloc" or sys.flags.ignore_environment:
+    raise SystemExit(
+        "leak_probe.py needs PYTHONMALLOC=malloc and no -E or -I: LeakSanitizer "
+        "does not scan pymalloc's arenas, so blocks they reference read as leaks"
+    )
 
 runtime = ctypes.CDLL(None)
 try:

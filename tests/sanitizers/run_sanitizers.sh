@@ -126,7 +126,8 @@ if [[ "$(uname -s)" == "Darwin" ]]; then
 fi
 
 if [[ "$(uname -s)" == "Linux" ]]; then
-  "$python_bin" "$repo_root/tests/sanitizers/leak_probe.py"
+  # leak_probe.py says why it needs PYTHONMALLOC=malloc and refuses to run without it.
+  PYTHONMALLOC=malloc "$python_bin" "$repo_root/tests/sanitizers/leak_probe.py"
 fi
 
 "$python_bin" -m pytest \
