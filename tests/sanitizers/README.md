@@ -9,6 +9,14 @@ bash tests/sanitizers/run_sanitizers.sh
 
 The harness rebuilds the editable `scorch_ops` extension and all JIT modules
 through `sanitizer_cxx.sh` with AddressSanitizer and UndefinedBehaviorSanitizer.
+A JIT build child runs its compiler in a closed environment, so the harness
+compiles through a copy of `sanitizer_cxx.sh` in its work directory with the real
+compiler and the log path written into it. The child gets the sanitizer runtime's
+variables (`LD_PRELOAD` or `DYLD_INSERT_LIBRARIES` and the `*SAN_OPTIONS`) because
+it loads instrumented code, and deletes them before it starts the compiler.
+On macOS the harness adds `strip_env=0` to `ASAN_OPTIONS`: by default the ASan
+runtime removes itself from `DYLD_INSERT_LIBRARIES` when a process starts, and a
+child, a JIT build child or one a test starts, would then abort at its start.
 It uses a fresh Torch extensions directory and verifies that both the prebuilt
 extension and at least one JIT translation unit were instrumented, preventing a
 cached unsanitized binary from producing a false-green result.

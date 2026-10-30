@@ -24,8 +24,25 @@ cleanup() {
 trap cleanup EXIT
 
 export SCORCH_SANITIZER_CXX="$real_cxx"
-export CXX="$repo_root/tests/sanitizers/sanitizer_cxx.sh"
 export SCORCH_SANITIZER_LOG="${SCORCH_SANITIZER_LOG:-$work_dir/compiler.log}"
+# A JIT build child runs its compiler in a closed environment
+# (KernelBuildOptions.build_child_environment), which neither variable above
+# reaches. So CXX is a copy of sanitizer_cxx.sh with both written into its text.
+# It lies in this run's work_dir, so the toolchain identity, and with it every JIT
+# build directory's name, changes on every run of this harness.
+real_cxx_path="$(command -v "$real_cxx" || true)"
+if [[ -z "$real_cxx_path" ]]; then
+  echo "Could not find the compiler $real_cxx" >&2
+  exit 2
+fi
+export CXX="$work_dir/sanitizer_cxx.sh"
+{
+  echo '#!/usr/bin/env bash'
+  printf 'SCORCH_SANITIZER_CXX=%q\n' "$real_cxx_path"
+  printf 'SCORCH_SANITIZER_LOG=%q\n' "$SCORCH_SANITIZER_LOG"
+  tail -n +2 "$repo_root/tests/sanitizers/sanitizer_cxx.sh"
+} >"$CXX"
+chmod +x "$CXX"
 export TORCH_EXTENSIONS_DIR="$work_dir/torch_extensions"
 export MAX_JOBS="${MAX_JOBS:-2}"
 mkdir -p "$TORCH_EXTENSIONS_DIR"
@@ -61,7 +78,10 @@ case "$(uname -s)" in
       exit 2
     fi
     export DYLD_INSERT_LIBRARIES="$asan_runtime${DYLD_INSERT_LIBRARIES:+:$DYLD_INSERT_LIBRARIES}"
-    macos_asan_options="detect_stack_use_after_return=1:strict_string_checks=1:halt_on_error=1"
+    # strip_env=0: by default the runtime removes itself from DYLD_INSERT_LIBRARIES
+    # when a process starts, so a JIT build child, or any child a test starts from
+    # os.environ, would start without it and abort ("Interceptors are not working").
+    macos_asan_options="detect_stack_use_after_return=1:strict_string_checks=1:halt_on_error=1:strip_env=0"
     export ASAN_OPTIONS="${ASAN_OPTIONS:+$ASAN_OPTIONS:}$macos_asan_options"
     ;;
 esac
@@ -82,6 +102,27 @@ fi
 if ! grep -q "ubsan_" <<<"$undefined_symbols"; then
   echo "scorch_ops is not UBSan-instrumented: $extension_path" >&2
   exit 1
+fi
+
+# A JIT build child gets this process's sanitizer runtime only when scorch finds
+# the runtime loaded here (scorch.utils._sanitizer_runtime_loaded); if the lookup
+# missed it, every JIT build child would die at its start.
+runtime_check='import torch, scorch.utils as u; print(u._sanitizer_runtime_loaded())'
+runtime_found="$("$python_bin" -c "$runtime_check")"
+echo "ASan runtime found by scorch.utils._sanitizer_runtime_loaded: $runtime_found"
+if [[ "$runtime_found" != "True" ]]; then
+  echo "scorch does not find the ASan runtime in a sanitizer run" >&2
+  exit 1
+fi
+# On macOS the child gets the runtime through DYLD_INSERT_LIBRARIES read from
+# os.environ, which holds it only while the runtime keeps it (strip_env=0 above).
+if [[ "$(uname -s)" == "Darwin" ]]; then
+  inherited="$("$python_bin" -c 'import os; print(os.environ.get("DYLD_INSERT_LIBRARIES", ""))')"
+  echo "DYLD_INSERT_LIBRARIES in a sanitizer-run python: ${inherited:-unset}"
+  if [[ ":$inherited:" != *":$asan_runtime:"* ]]; then
+    echo "a python started here does not keep the ASan runtime in DYLD_INSERT_LIBRARIES" >&2
+    exit 1
+  fi
 fi
 
 if [[ "$(uname -s)" == "Linux" ]]; then

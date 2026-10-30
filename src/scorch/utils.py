@@ -479,6 +479,43 @@ _JIT_BUILD_CHILD_ERRORS = {
     for name in (builtin.__name__, variant.__name__)
 }
 
+# The variables that load a sanitizer runtime into a process and configure it. In a
+# sanitizer run (``_sanitizer_runtime_loaded``) the build child gets this process's
+# values: it loads scorch_ops and the kernel it builds, which are then instrumented and
+# need the runtime. The child deletes them before it starts any program
+# (``_run_jit_build_request``), so the toolchain runs in ``build_child_environment``.
+_SANITIZER_RUNTIME_VARIABLES = (
+    "LD_PRELOAD",
+    "DYLD_INSERT_LIBRARIES",
+    "ASAN_OPTIONS",
+    "LSAN_OPTIONS",
+    "UBSAN_OPTIONS",
+)
+_SANITIZER_RUNTIME_LOADED: Optional[bool] = None
+
+
+def _sanitizer_runtime_loaded() -> bool:
+    """Whether this process has AddressSanitizer's runtime loaded, asked once.
+
+    ``__asan_init`` is looked up in the process's global scope: on Linux through
+    ``dlopen(NULL)``, whose scope holds what LD_PRELOAD loaded; on macOS through
+    ``RTLD_DEFAULT``, which searches every loaded image, the one DYLD_INSERT_LIBRARIES
+    inserted included.
+    """
+
+    global _SANITIZER_RUNTIME_LOADED
+    if _SANITIZER_RUNTIME_LOADED is None:
+        import ctypes
+
+        # RTLD_DEFAULT is (void *)-2 on macOS; None asks ctypes for dlopen(NULL).
+        handle = ctypes.c_void_p(-2).value if sys.platform == "darwin" else None
+        try:
+            ctypes.CDLL(None, handle=handle)["__asan_init"]
+            _SANITIZER_RUNTIME_LOADED = True
+        except (AttributeError, OSError):
+            _SANITIZER_RUNTIME_LOADED = False
+    return _SANITIZER_RUNTIME_LOADED
+
 
 def _run_jit_build_request() -> None:
     """Child-process entry point; build without mutating the parent environment.
@@ -488,6 +525,15 @@ def _run_jit_build_request() -> None:
     is reported after ``_JIT_BUILD_ERROR_MARKER`` on stderr, so the parent
     raises the type and message an in-process ``load_inline`` would.
     """
+
+    # In a sanitizer run the parent passed its runtime's variables
+    # (_jit_build_environment_from_request). This runs after the child's
+    # `from scorch.utils import ...` has loaded scorch_ops, so the runtimes have
+    # started and read their options. With the variables deleted, every program
+    # load_inline starts (ninja, the compiler, the linker) inherits exactly
+    # build_child_environment, the environment the toolchain identity holds.
+    for name in _SANITIZER_RUNTIME_VARIABLES:
+        os.environ.pop(name, None)
 
     from torch.utils.cpp_extension import load_inline
 
@@ -858,10 +904,29 @@ def _jit_build_environment_from_request(
     *,
     toolchain_directory: Optional[str],
 ) -> Dict[str, str]:
-    """Build a child environment without requiring a second option snapshot."""
+    """Build a child environment without requiring a second option snapshot.
+
+    It is ``build_child_environment`` and nothing else, except in a sanitizer run, where
+    the child also gets this process's ``_SANITIZER_RUNTIME_VARIABLES`` that are set,
+    with ASAN_OPTIONS ending in ``detect_leaks=0``.
+    """
 
     # One definition, so the toolchain probe asks the driver under this environment.
-    return request.build_options.build_child_environment(toolchain_directory)
+    environment = request.build_options.build_child_environment(toolchain_directory)
+    if _sanitizer_runtime_loaded():
+        for name in _SANITIZER_RUNTIME_VARIABLES:
+            value = os.environ.get(name)
+            if value is not None:
+                environment[name] = value
+        # The build child never runs LeakSanitizer. A leak pass checks the parent: at
+        # the child's exit LSan would report what CPython and torch keep for the
+        # process's life (tests/sanitizers/README.md), and the parent would fail the
+        # build. Of two settings of one option, the sanitizer runtime takes the last.
+        asan_options = environment.get("ASAN_OPTIONS")
+        environment["ASAN_OPTIONS"] = (
+            f"{asan_options}:" if asan_options else ""
+        ) + "detect_leaks=0"
+    return environment
 
 
 def _prepare_jit_build(
