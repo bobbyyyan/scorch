@@ -20,7 +20,7 @@ from .torch_cpp_abi import dense_block_check
 from ..utils import dtype_to_c_datatype, flatten_2d_list
 
 if TYPE_CHECKING:
-    from src.scorch.compiler.cin_lowerer import CINLowerer
+    from .cin_lowerer import CINLowerer
 
 from .cin import (
     IndexVar,
