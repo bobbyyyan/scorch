@@ -36,6 +36,10 @@ from .tiling import (
     set_autotune,
 )
 
+# scorch.sparse is torch.sparse's namespace with the calls Scorch answers itself;
+# without this import the module __getattr__ below would return torch.sparse.
+from . import sparse  # noqa: F401
+
 from_torch = STensor.from_torch
 from_coo = STensor.from_coo
 from_csr = STensor.from_csr

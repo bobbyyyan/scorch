@@ -803,3 +803,24 @@ def test_every_refusal_reaching_an_entry_has_a_code():
             ),
             pytrace=False,
         )
+
+
+def test_spsolve_is_in_scope_and_its_refusals_are_coded():
+    """scorch.sparse.spsolve is an in-scope entry, and the inventory finds its three
+    raise sites, each coded and each escaping to it: two SparseSolveUnsupportedError
+    (class code spsolve_unsupported) and one TensorTypeError
+    (code="spsolve_operand_type_invalid").  test_sparse_spsolve_refusal.py checks the
+    codes the calls raise."""
+
+    result = scorch_inventory(os.path.dirname(scorch.__file__))
+    assert "scorch.sparse.spsolve" in {label for _, label in result.roots}
+    sites = [s for s in result.sites if s["function"] == "scorch.sparse.spsolve"]
+    classes = sorted(s["class"].rsplit(".", 1)[-1] for s in sites)
+    assert classes == [
+        "SparseSolveUnsupportedError",
+        "SparseSolveUnsupportedError",
+        "TensorTypeError",
+    ], sites
+    for s in sites:
+        assert s["coded"], s
+        assert "scorch.sparse.spsolve" in s["escapes_in_scope"], s

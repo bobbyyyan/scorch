@@ -127,9 +127,9 @@ kept apart from escapes that need a name-only edge.
 Entries.  The functions in ``scorch/__init__.py``'s ``__all__`` (aliases included),
 every method of ``STensor`` that is a dunder or does not start with ``_`` (operators,
 conversions, constructors, properties) but ``__repr__`` and ``__str__``, and
-``scorch.ops.spmv``, which ``__all__`` does not list.  In scope: ``einsum``, ``matmul``,
-``spmv``, ``from_torch`` / ``from_coo`` / ``from_csr`` / ``from_components`` and
-``STensor``'s methods.
+``scorch.ops.spmv`` and ``scorch.sparse.spsolve``, which ``__all__`` does not list.  In
+scope: ``einsum``, ``matmul``, ``spmv``, ``spsolve``, ``from_torch`` / ``from_coo`` /
+``from_csr`` / ``from_components`` and ``STensor``'s methods.
 
 Provisional kind, by class and message, to help whoever writes the codes: invalid input
 (``TypeError``, ``ValueError``, ``IndexError``, ``KeyError``, ``LookupError`` and the
@@ -200,6 +200,7 @@ REQUIRED_ENTRIES = {
     "scorch.einsum",
     "scorch.matmul",
     "scorch.ops.spmv",
+    "scorch.sparse.spsolve",
     "scorch.from_torch",
     "STensor.__add__",
     "STensor.to_dense",
@@ -2909,13 +2910,14 @@ def unmodeled_special(fn):
 
 
 def in_scope_entries(roots):
-    """The entry labels the gate covers: STensor's methods, spmv and SCOPE_EXPORTED."""
+    """The entry labels the gate covers: STensor's methods, spmv, spsolve and
+    SCOPE_EXPORTED."""
 
     return {
         label
         for _, label in roots
         if label.startswith("STensor.")
-        or label == "scorch.ops.spmv"
+        or label in ("scorch.ops.spmv", "scorch.sparse.spsolve")
         or label.split(".", 1)[1] in SCOPE_EXPORTED
     }
 
@@ -2925,7 +2927,13 @@ def scorch_inventory(pkg_dir):
     in-scope entries it escapes to (``escapes_in_scope``)."""
 
     result = inventory(
-        pkg_dir, "scorch", "STensor", [("scorch.ops.spmv", "scorch.ops.spmv")]
+        pkg_dir,
+        "scorch",
+        "STensor",
+        [
+            ("scorch.ops.spmv", "scorch.ops.spmv"),
+            ("scorch.sparse.spsolve", "scorch.sparse.spsolve"),
+        ],
     )
     in_scope = in_scope_entries(result.roots)
     for s in result.sites:

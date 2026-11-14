@@ -257,6 +257,21 @@ class ScheduleWithoutSparseOperandError(UnsupportedScheduleError):
         super().__init__(message)
 
 
+class SparseSolveUnsupportedError(ScorchNotImplementedError):
+    """``scorch.sparse.spsolve`` was called where no kernel solves the system.
+
+    Scorch has no sparse solver.  The call is torch's own ``torch.sparse.spsolve`` when
+    torch's dispatcher holds a kernel for the backend the operands dispatch to (a CSR
+    matrix on a CUDA build with cuDSS), and is refused with this error otherwise: an
+    ``STensor`` operand always, and torch tensors whose backend has no kernel, which on
+    CPU is every layout (torch raised its uncoded "Could not run 'aten::_spsolve'"
+    there).  A ``NotImplementedError``, the type torch raises for a backend without a
+    kernel.
+    """
+
+    code = "spsolve_unsupported"
+
+
 class DerivativeUnsupportedError(ScorchNotImplementedError):
     """A gradient was asked of a result whose operation has no derivative.
 

@@ -1,6 +1,7 @@
 import pytest
 import torch
 
+import scorch
 from scorch import STensor
 from scorch.compiler.cin import (
     ForAll,
@@ -11,7 +12,11 @@ from scorch.compiler.cin import (
 )
 from scorch.compiler.cin_analysis import canonical_cin_dump
 from scorch.compiler.compile_options import CompileOptions
-from scorch.exceptions import TensorIndexError, defect_code
+from scorch.exceptions import (
+    SparseSolveUnsupportedError,
+    TensorIndexError,
+    defect_code,
+)
 from scorch.ops import lower_and_exec_cin
 
 
@@ -201,3 +206,52 @@ def test_known_gap_sd_result_with_a_reduction_below_its_compressed_level(
     assert got.shape == (n, m)
     assert torch.isfinite(got).all(), got
     assert torch.allclose(got, b @ c, rtol=1e-12, atol=0.0), (got, b @ c)
+
+
+def _spsolve_system():
+    """A 6 x 6 float64 matrix with a dominant diagonal, and a right-hand side."""
+
+    generator = torch.Generator().manual_seed(81)
+    dense = torch.rand(6, 6, generator=generator, dtype=torch.float64)
+    dense = dense + 16 * torch.eye(6, dtype=torch.float64)
+    return dense, torch.rand(6, generator=generator, dtype=torch.float64)
+
+
+@pytest.mark.xfail(
+    raises=SparseSolveUnsupportedError,
+    strict=True,
+    reason="Scorch has no sparse solver: scorch.sparse.spsolve refuses an STensor "
+    "system (spsolve_unsupported)",
+)
+def test_known_gap_spsolve_of_an_stensor_system():
+    """scorch.sparse.spsolve of a CSR STensor and a dense right-hand side.  Scorch has
+    no sparse solver, and torch has none on CPU, so the call is refused with
+    spsolve_unsupported (test_sparse_spsolve_refusal.py).  When Scorch solves it, this
+    test passes and strict=True fails it: update it then."""
+
+    dense, rhs = _spsolve_system()
+    got = scorch.sparse.spsolve(STensor.from_torch(dense.to_sparse_csr()), rhs)
+    torch.testing.assert_close(got, torch.linalg.solve(dense, rhs))
+
+
+@pytest.mark.xfail(
+    raises=TypeError,
+    strict=True,
+    reason="torch.sparse.spsolve itself (not scorch.sparse.spsolve) given an STensor "
+    "raises torch's uncoded TypeError: STensor has no __torch_function__ yet, the "
+    "drop-in work of item 81 (j)",
+)
+def test_known_gap_torch_spsolve_of_an_stensor():
+    """torch's own torch.sparse.spsolve given a CSR STensor.  torch's argument parser
+    raises "argument 'A' (position 1) must be Tensor, not STensor", a TypeError with no
+    code.  Once STensor's __torch_function__ takes the call, it should be refused as
+    scorch.sparse.spsolve refuses it; this test then passes and strict=True fails it:
+    update it then.  scorch.sparse.spsolve must then check for an STensor operand
+    before it asks has_torch_function: otherwise it hands the call to
+    torch.sparse.spsolve, whose override protocol calls STensor.__torch_function__,
+    which can call scorch.sparse.spsolve again without end."""
+
+    dense, rhs = _spsolve_system()
+    with pytest.raises(SparseSolveUnsupportedError) as caught:
+        torch.sparse.spsolve(STensor.from_torch(dense.to_sparse_csr()), rhs)
+    assert defect_code(caught.value) == "spsolve_unsupported"
