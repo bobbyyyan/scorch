@@ -1,4 +1,9 @@
-# <img src="docs/source/_static/img/scorch-icon-pixel.svg" alt="" width="42" height="42"> Scorch
+<h1>
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="docs/source/_static/img/scorch-logo-dark.svg">
+    <img src="docs/source/_static/img/scorch-logo.svg" alt="Scorch" width="200">
+  </picture>
+</h1>
 
 **A CPU sparse-tensor compiler for PyTorch.**
 

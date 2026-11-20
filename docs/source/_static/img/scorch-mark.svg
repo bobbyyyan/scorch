@@ -1,0 +1,5 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="14 3 72 91" role="img" aria-label="Scorch">
+<title>Scorch</title>
+<defs><linearGradient id="ember" gradientUnits="userSpaceOnUse" x1="37.000" y1="-3.500" x2="63.000" y2="100.500"><stop offset="0" stop-color="#F2381D"/><stop offset="1" stop-color="#FFA01C"/></linearGradient></defs>
+<path d="M14 74L14 70C14 54 31.346 45.883 39.5 38.5C46.913 31.788 55.749 17.981 55 3C63.286 15.504 86 32 86 56L86 74C86 88.046 80.046 94 66 94L34 94C19.954 94 14 88.046 14 74Z" fill="url(#ember)"/>
+</svg>

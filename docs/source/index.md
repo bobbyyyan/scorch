@@ -5,7 +5,8 @@ sd_hide_title: true
 # Scorch
 
 <div class="scorch-hero">
-  <div class="scorch-hero-flame">🔥</div>
+  <img class="scorch-hero-mark only-light" src="_static/img/scorch-mark.svg" alt="">
+  <img class="scorch-hero-mark only-dark" src="_static/img/scorch-mark-dark.svg" alt="">
   <h1><span class="scorch-gradient-text">Scorch</span></h1>
   <p class="scorch-tagline">A compiler-based sparse tensor library for PyTorch — declare a format, and Scorch generates the kernel.</p>
   <div class="scorch-cta">

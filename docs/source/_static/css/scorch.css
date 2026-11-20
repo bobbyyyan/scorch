@@ -66,9 +66,9 @@ aside.bd-header-announcement {
     radial-gradient(60% 120% at 50% 0%, var(--scorch-hero-glow), transparent 70%);
 }
 
-.scorch-hero .scorch-hero-flame {
-  font-size: 3.25rem;
-  line-height: 1;
+.scorch-hero .scorch-hero-mark {
+  height: 4rem;
+  width: auto;
   filter: drop-shadow(0 6px 18px var(--scorch-hero-glow));
 }
 
