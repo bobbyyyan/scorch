@@ -1,0 +1,83 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 880 378" width="880" height="378" role="img" aria-labelledby="t d">
+<title id="t">How Scorch runs a sparse operation</title>
+<desc id="d">A call to scorch.matmul or scorch.einsum (or torch.matmul and torch.einsum under "import scorch as torch") goes to dispatch. Two dense operands run on torch.matmul. Formats that match a hand-written kernel run that kernel from the scorch_ops extension. Any other call is compiled the first time: concrete index notation (CIN), scheduling, lowering with iteration lattices to LLIR, C++ code generation with OpenMP, and a JIT compile whose shared library is cached on disk and in memory. Later calls with the same formats reuse the cached kernel.</desc>
+<style>
+  .sans { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif; }
+  .mono { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
+  .ink { fill: #1D1D1F; }
+  .muted { fill: #59636E; }
+  .ember { fill: #E8431F; }
+  .onfill { fill: #FFFFFF; }
+  .hair { stroke: #D1D9E0; }
+  .t15 { font-size: 15px; font-weight: 600; }
+  .t14 { font-size: 14px; font-weight: 600; }
+  .t13 { font-size: 13px; }
+  .t12 { font-size: 12px; }
+  .b { font-weight: 600; }
+</style>
+<defs><linearGradient id="ember" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="#F2381D"/><stop offset="1" stop-color="#FFA01C"/></linearGradient><marker id="ah" viewBox="0 0 8 8" refX="7" refY="4" markerWidth="8" markerHeight="8" orient="auto-start-reverse"><path d="M0,0.8 L7,4 L0,7.2 Z" fill="#8C959F"/></marker></defs>
+<rect x="12.5" y="20.5" width="225" height="111" rx="8" fill="#F6F8FA" stroke="#D1D9E0" stroke-width="1"/>
+<text x="26" y="44" class="sans t14 ink">Call</text>
+<text x="26" y="61" class="mono t12 ink">scorch.matmul(A, B)</text>
+<text x="26" y="78" class="mono t12 ink">scorch.einsum(…)</text>
+<text x="26" y="95" class="sans t12 muted">or torch.matmul, torch.einsum</text>
+<text x="26" y="112"><tspan class="sans t12 muted">under </tspan><tspan class="mono t12 muted">import scorch as torch</tspan></text>
+<rect x="276.5" y="20.5" width="183" height="111" rx="8" fill="#F6F8FA" stroke="#D1D9E0" stroke-width="1"/>
+<text x="290" y="44" class="sans t14 ink">Dispatch</text>
+<text x="290" y="61" class="sans t12 muted">picks how the call runs</text>
+<text x="290" y="78" class="sans t12 muted">from the operands’ formats,</text>
+<text x="290" y="95" class="sans t12 muted">dtypes and ranks</text>
+<path d="M238,76.0 L274,76.0" fill="none" stroke="#8C959F" stroke-width="1.5" marker-end="url(#ah)"/>
+<rect x="520.5" y="20.5" width="347" height="47" rx="8" fill="none" stroke="#D1D9E0" stroke-width="1"/>
+<text x="534" y="39" class="sans t12 muted">matmul with both operands dense</text>
+<text x="534" y="57"><tspan class="sans t13 ink">runs </tspan><tspan class="mono t13 ink">torch.matmul</tspan></text>
+<path d="M460,44.0 L518,44.0" fill="none" stroke="#8C959F" stroke-width="1.5" marker-end="url(#ah)"/>
+<rect x="520.5" y="84.5" width="347" height="47" rx="8" fill="none" stroke="#D1D9E0" stroke-width="1"/>
+<text x="534" y="103" class="sans t12 muted">formats match a hand-written kernel</text>
+<text x="534" y="121"><tspan class="sans t13 ink">runs it from the </tspan><tspan class="mono t13 ink">scorch_ops</tspan><tspan class="sans t13 ink"> extension</tspan></text>
+<path d="M460,108.0 L518,108.0" fill="none" stroke="#8C959F" stroke-width="1.5" marker-end="url(#ah)"/>
+<rect x="12.5" y="236.5" width="145" height="127" rx="8" fill="#F6F8FA" stroke="#D1D9E0" stroke-width="1"/>
+<rect x="12" y="246" width="3" height="108" rx="1.5" fill="url(#ember)"/>
+<text x="26" y="260" class="sans t14 ink">CIN</text>
+<text x="26" y="277" class="sans t12 muted">concrete index</text>
+<text x="26" y="294" class="sans t12 muted">notation: forall</text>
+<text x="26" y="311" class="sans t12 muted">loops, where</text>
+<text x="26" y="328" class="sans t12 muted">statements and</text>
+<text x="26" y="345" class="sans t12 muted">workspaces</text>
+<rect x="172.5" y="236.5" width="159" height="127" rx="8" fill="#F6F8FA" stroke="#D1D9E0" stroke-width="1"/>
+<rect x="172" y="246" width="3" height="108" rx="1.5" fill="url(#ember)"/>
+<text x="186" y="260" class="sans t14 ink">Scheduling</text>
+<text x="186" y="277" class="sans t12 muted">chooses loop order,</text>
+<text x="186" y="294" class="sans t12 muted">tiling, parallelization</text>
+<text x="186" y="311" class="sans t12 muted">and vectorization;</text>
+<text x="186" y="328" class="sans t12 muted">infers the output format</text>
+<rect x="346.5" y="236.5" width="163" height="127" rx="8" fill="#F6F8FA" stroke="#D1D9E0" stroke-width="1"/>
+<rect x="346" y="246" width="3" height="108" rx="1.5" fill="url(#ember)"/>
+<text x="360" y="260" class="sans t14 ink">Lowering</text>
+<text x="360" y="277" class="sans t12 muted">iteration lattices merge</text>
+<text x="360" y="294" class="sans t12 muted">the sparse operands’</text>
+<text x="360" y="311" class="sans t12 muted">coordinates into loops</text>
+<text x="360" y="328" class="sans t12 muted">and branches (LLIR)</text>
+<rect x="524.5" y="236.5" width="137" height="127" rx="8" fill="#F6F8FA" stroke="#D1D9E0" stroke-width="1"/>
+<rect x="524" y="246" width="3" height="108" rx="1.5" fill="url(#ember)"/>
+<text x="538" y="260" class="sans t14 ink">Code generation</text>
+<text x="538" y="277" class="sans t12 muted">C++ from LLIR,</text>
+<text x="538" y="294" class="sans t12 muted">parallel loops as</text>
+<text x="538" y="311" class="sans t12 muted">OpenMP pragmas</text>
+<rect x="676.5" y="236.5" width="195" height="127" rx="8" fill="#F6F8FA" stroke="#D1D9E0" stroke-width="1"/>
+<rect x="676" y="246" width="3" height="108" rx="1.5" fill="url(#ember)"/>
+<text x="690" y="260" class="sans t14 ink">JIT compile and cache</text>
+<text x="690" y="277" class="mono t12 ink">-O3 -march=native</text>
+<text x="690" y="294" class="mono t12 ink">-ffast-math -fopenmp</text>
+<text x="690" y="311" class="mono t12 ink">-funroll-loops</text>
+<text x="690" y="328" class="sans t12 muted">shared library cached</text>
+<text x="690" y="345" class="sans t12 muted">on disk and in memory</text>
+<path d="M158,300.0 L170,300.0" fill="none" stroke="#8C959F" stroke-width="1.5" marker-end="url(#ah)"/>
+<path d="M332,300.0 L344,300.0" fill="none" stroke="#8C959F" stroke-width="1.5" marker-end="url(#ah)"/>
+<path d="M510,300.0 L522,300.0" fill="none" stroke="#8C959F" stroke-width="1.5" marker-end="url(#ah)"/>
+<path d="M662,300.0 L674,300.0" fill="none" stroke="#8C959F" stroke-width="1.5" marker-end="url(#ah)"/>
+<path d="M316,132 L316,170 L85.0,170 L85.0,234" fill="none" stroke="#8C959F" stroke-width="1.5" marker-end="url(#ah)"/>
+<text x="97.0" y="190" class="sans t12 muted">otherwise, the first call compiles a kernel</text>
+<path d="M436,132 L436,208 L774.0,208 L774.0,234" fill="none" stroke="#8C959F" stroke-width="1.5" stroke-dasharray="4 3" marker-end="url(#ah)"/>
+<text x="448" y="200" class="sans t12 muted">later calls with the same formats reuse the cached kernel</text>
+</svg>

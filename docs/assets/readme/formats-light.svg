@@ -1,0 +1,226 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 880 486" width="880" height="486" role="img" aria-labelledby="t d">
+<title id="t">One sparse matrix stored in three formats</title>
+<desc id="d">A 4 by 6 matrix with 7 nonzeros, values 1 to 7, and an empty row 1, stored as CSR (format "ds"), DCSR (format "ss") and COO (format "oo"). CSR: level 1 dense of size 4; level 2 compressed with pos 0 2 2 5 7 and crd 0 3 1 2 5 0 4. DCSR: level 1 compressed with pos 0 3 and crd 0 2 3; level 2 compressed with pos 0 2 5 7 and crd 0 3 1 2 5 0 4. COO: level 1 coordinate with crd 0 0 2 2 2 3 3; level 2 coordinate with crd 0 3 1 2 5 0 4. Values in every format: 1 2 3 4 5 6 7.</desc>
+<style>
+  .sans { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif; }
+  .mono { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
+  .ink { fill: #1D1D1F; }
+  .muted { fill: #59636E; }
+  .ember { fill: #E8431F; }
+  .onfill { fill: #FFFFFF; }
+  .hair { stroke: #D1D9E0; }
+  .t15 { font-size: 15px; font-weight: 600; }
+  .t14 { font-size: 14px; font-weight: 600; }
+  .t13 { font-size: 13px; }
+  .t12 { font-size: 12px; }
+  .b { font-weight: 600; }
+</style>
+<defs><linearGradient id="ember" x1="0" y1="0" x2="1" y2="1"><stop offset="0" stop-color="#F2381D"/><stop offset="1" stop-color="#FFA01C"/></linearGradient></defs>
+<text x="44" y="124" class="sans t14 ink">Matrix A</text>
+<text x="44" y="142" class="sans t12 muted">4 × 6, 7 nonzeros</text>
+<text x="61.0" y="167" class="mono t12 muted" text-anchor="middle">0</text>
+<text x="95.0" y="167" class="mono t12 muted" text-anchor="middle">1</text>
+<text x="129.0" y="167" class="mono t12 muted" text-anchor="middle">2</text>
+<text x="163.0" y="167" class="mono t12 muted" text-anchor="middle">3</text>
+<text x="197.0" y="167" class="mono t12 muted" text-anchor="middle">4</text>
+<text x="231.0" y="167" class="mono t12 muted" text-anchor="middle">5</text>
+<text x="32" y="197.5" class="mono t12 muted" text-anchor="middle">0</text>
+<text x="32" y="231.5" class="mono t12 muted" text-anchor="middle">1</text>
+<text x="32" y="265.5" class="mono t12 muted" text-anchor="middle">2</text>
+<text x="32" y="299.5" class="mono t12 muted" text-anchor="middle">3</text>
+<rect x="46" y="178" width="30" height="30" rx="4" fill="url(#ember)"/>
+<text x="61.0" y="198.0" class="mono t14 onfill" text-anchor="middle">1</text>
+<rect x="148" y="178" width="30" height="30" rx="4" fill="url(#ember)"/>
+<text x="163.0" y="198.0" class="mono t14 onfill" text-anchor="middle">2</text>
+<rect x="80" y="246" width="30" height="30" rx="4" fill="url(#ember)"/>
+<text x="95.0" y="266.0" class="mono t14 onfill" text-anchor="middle">3</text>
+<rect x="114" y="246" width="30" height="30" rx="4" fill="url(#ember)"/>
+<text x="129.0" y="266.0" class="mono t14 onfill" text-anchor="middle">4</text>
+<rect x="216" y="246" width="30" height="30" rx="4" fill="url(#ember)"/>
+<text x="231.0" y="266.0" class="mono t14 onfill" text-anchor="middle">5</text>
+<rect x="46" y="280" width="30" height="30" rx="4" fill="url(#ember)"/>
+<text x="61.0" y="300.0" class="mono t14 onfill" text-anchor="middle">6</text>
+<rect x="182" y="280" width="30" height="30" rx="4" fill="url(#ember)"/>
+<text x="197.0" y="300.0" class="mono t14 onfill" text-anchor="middle">7</text>
+<line x1="44" y1="176.5" x2="248" y2="176.5" stroke="#D1D9E0" stroke-width="1"/>
+<line x1="44" y1="210.5" x2="248" y2="210.5" stroke="#D1D9E0" stroke-width="1"/>
+<line x1="44" y1="244.5" x2="248" y2="244.5" stroke="#D1D9E0" stroke-width="1"/>
+<line x1="44" y1="278.5" x2="248" y2="278.5" stroke="#D1D9E0" stroke-width="1"/>
+<line x1="44" y1="312.5" x2="248" y2="312.5" stroke="#D1D9E0" stroke-width="1"/>
+<line x1="44.5" y1="176" x2="44.5" y2="312" stroke="#D1D9E0" stroke-width="1"/>
+<line x1="78.5" y1="176" x2="78.5" y2="312" stroke="#D1D9E0" stroke-width="1"/>
+<line x1="112.5" y1="176" x2="112.5" y2="312" stroke="#D1D9E0" stroke-width="1"/>
+<line x1="146.5" y1="176" x2="146.5" y2="312" stroke="#D1D9E0" stroke-width="1"/>
+<line x1="180.5" y1="176" x2="180.5" y2="312" stroke="#D1D9E0" stroke-width="1"/>
+<line x1="214.5" y1="176" x2="214.5" y2="312" stroke="#D1D9E0" stroke-width="1"/>
+<line x1="248.5" y1="176" x2="248.5" y2="312" stroke="#D1D9E0" stroke-width="1"/>
+<text x="146" y="338" class="sans t12 muted" text-anchor="middle">columns →</text>
+<text x="14" y="244" class="sans t12 muted" text-anchor="middle" transform="rotate(-90 14 244)">← rows</text>
+<line x1="276.5" y1="18" x2="276.5" y2="468" stroke="#D1D9E0" stroke-width="1"/>
+<text x="298" y="38" class="sans t15 ink">CSR</text>
+<text x="338" y="38" class="mono t14 ember">"ds"</text>
+<text x="380" y="38" class="sans t13 muted">dense rows, compressed columns</text>
+<text x="298" y="65" class="sans t13 ink">Level 1 · rows</text>
+<text x="298" y="80" class="sans t12 muted">dense</text>
+<text x="448" y="71" class="mono t12 muted">size</text>
+<rect x="482.5" y="54.5" width="25" height="23" rx="3" fill="none" stroke="#D1D9E0" stroke-dasharray="3 2" stroke-width="1"/>
+<text x="495.0" y="70.5" class="mono t13 ink" text-anchor="middle">4</text>
+<text x="298" y="103" class="sans t13 ink">Level 2 · columns</text>
+<text x="298" y="118" class="sans t12 muted">compressed</text>
+<text x="448" y="109" class="mono t12 muted">pos</text>
+<rect x="482.5" y="92.5" width="129" height="23" rx="3" fill="#FFFFFF" stroke="#D1D9E0" stroke-width="1"/>
+<line x1="508.5" y1="93" x2="508.5" y2="115" stroke="#D1D9E0" stroke-width="1"/>
+<line x1="534.5" y1="93" x2="534.5" y2="115" stroke="#D1D9E0" stroke-width="1"/>
+<line x1="560.5" y1="93" x2="560.5" y2="115" stroke="#D1D9E0" stroke-width="1"/>
+<line x1="586.5" y1="93" x2="586.5" y2="115" stroke="#D1D9E0" stroke-width="1"/>
+<text x="495.0" y="108.5" class="mono t13 ink" text-anchor="middle">0</text>
+<text x="521.0" y="108.5" class="mono t13 ink" text-anchor="middle">2</text>
+<text x="547.0" y="108.5" class="mono t13 ink" text-anchor="middle">2</text>
+<text x="573.0" y="108.5" class="mono t13 ink" text-anchor="middle">5</text>
+<text x="599.0" y="108.5" class="mono t13 ink" text-anchor="middle">7</text>
+<text x="628" y="109" class="mono t12 muted">crd</text>
+<rect x="662.5" y="92.5" width="181" height="23" rx="3" fill="#FFFFFF" stroke="#D1D9E0" stroke-width="1"/>
+<line x1="688.5" y1="93" x2="688.5" y2="115" stroke="#D1D9E0" stroke-width="1"/>
+<line x1="714.5" y1="93" x2="714.5" y2="115" stroke="#D1D9E0" stroke-width="1"/>
+<line x1="740.5" y1="93" x2="740.5" y2="115" stroke="#D1D9E0" stroke-width="1"/>
+<line x1="766.5" y1="93" x2="766.5" y2="115" stroke="#D1D9E0" stroke-width="1"/>
+<line x1="792.5" y1="93" x2="792.5" y2="115" stroke="#D1D9E0" stroke-width="1"/>
+<line x1="818.5" y1="93" x2="818.5" y2="115" stroke="#D1D9E0" stroke-width="1"/>
+<text x="675.0" y="108.5" class="mono t13 ink" text-anchor="middle">0</text>
+<text x="701.0" y="108.5" class="mono t13 ink" text-anchor="middle">3</text>
+<text x="727.0" y="108.5" class="mono t13 ink" text-anchor="middle">1</text>
+<text x="753.0" y="108.5" class="mono t13 ink" text-anchor="middle">2</text>
+<text x="779.0" y="108.5" class="mono t13 ink" text-anchor="middle">5</text>
+<text x="805.0" y="108.5" class="mono t13 ink" text-anchor="middle">0</text>
+<text x="831.0" y="108.5" class="mono t13 ink" text-anchor="middle">4</text>
+<text x="298" y="147" class="sans t13 ink">Values</text>
+<text x="628" y="147" class="mono t12 muted">vals</text>
+<rect x="662" y="130" width="182" height="24" rx="3" fill="url(#ember)"/>
+<line x1="688" y1="134" x2="688" y2="150" stroke="#FFFFFF" stroke-opacity="0.45" stroke-width="1"/>
+<line x1="714" y1="134" x2="714" y2="150" stroke="#FFFFFF" stroke-opacity="0.45" stroke-width="1"/>
+<line x1="740" y1="134" x2="740" y2="150" stroke="#FFFFFF" stroke-opacity="0.45" stroke-width="1"/>
+<line x1="766" y1="134" x2="766" y2="150" stroke="#FFFFFF" stroke-opacity="0.45" stroke-width="1"/>
+<line x1="792" y1="134" x2="792" y2="150" stroke="#FFFFFF" stroke-opacity="0.45" stroke-width="1"/>
+<line x1="818" y1="134" x2="818" y2="150" stroke="#FFFFFF" stroke-opacity="0.45" stroke-width="1"/>
+<text x="675.0" y="146.5" class="mono t13 onfill b" text-anchor="middle">1</text>
+<text x="701.0" y="146.5" class="mono t13 onfill b" text-anchor="middle">2</text>
+<text x="727.0" y="146.5" class="mono t13 onfill b" text-anchor="middle">3</text>
+<text x="753.0" y="146.5" class="mono t13 onfill b" text-anchor="middle">4</text>
+<text x="779.0" y="146.5" class="mono t13 onfill b" text-anchor="middle">5</text>
+<text x="805.0" y="146.5" class="mono t13 onfill b" text-anchor="middle">6</text>
+<text x="831.0" y="146.5" class="mono t13 onfill b" text-anchor="middle">7</text>
+<line x1="298" y1="167.5" x2="864" y2="167.5" stroke="#D1D9E0" stroke-width="1"/>
+<text x="298" y="196" class="sans t15 ink">DCSR</text>
+<text x="350" y="196" class="mono t14 ember">"ss"</text>
+<text x="392" y="196" class="sans t13 muted">compressed rows, compressed columns</text>
+<text x="298" y="223" class="sans t13 ink">Level 1 · rows</text>
+<text x="298" y="238" class="sans t12 muted">compressed</text>
+<text x="448" y="229" class="mono t12 muted">pos</text>
+<rect x="482.5" y="212.5" width="51" height="23" rx="3" fill="#FFFFFF" stroke="#D1D9E0" stroke-width="1"/>
+<line x1="508.5" y1="213" x2="508.5" y2="235" stroke="#D1D9E0" stroke-width="1"/>
+<text x="495.0" y="228.5" class="mono t13 ink" text-anchor="middle">0</text>
+<text x="521.0" y="228.5" class="mono t13 ink" text-anchor="middle">3</text>
+<text x="628" y="229" class="mono t12 muted">crd</text>
+<rect x="662.5" y="212.5" width="77" height="23" rx="3" fill="#FFFFFF" stroke="#D1D9E0" stroke-width="1"/>
+<line x1="688.5" y1="213" x2="688.5" y2="235" stroke="#D1D9E0" stroke-width="1"/>
+<line x1="714.5" y1="213" x2="714.5" y2="235" stroke="#D1D9E0" stroke-width="1"/>
+<text x="675.0" y="228.5" class="mono t13 ink" text-anchor="middle">0</text>
+<text x="701.0" y="228.5" class="mono t13 ink" text-anchor="middle">2</text>
+<text x="727.0" y="228.5" class="mono t13 ink" text-anchor="middle">3</text>
+<text x="298" y="261" class="sans t13 ink">Level 2 · columns</text>
+<text x="298" y="276" class="sans t12 muted">compressed</text>
+<text x="448" y="267" class="mono t12 muted">pos</text>
+<rect x="482.5" y="250.5" width="103" height="23" rx="3" fill="#FFFFFF" stroke="#D1D9E0" stroke-width="1"/>
+<line x1="508.5" y1="251" x2="508.5" y2="273" stroke="#D1D9E0" stroke-width="1"/>
+<line x1="534.5" y1="251" x2="534.5" y2="273" stroke="#D1D9E0" stroke-width="1"/>
+<line x1="560.5" y1="251" x2="560.5" y2="273" stroke="#D1D9E0" stroke-width="1"/>
+<text x="495.0" y="266.5" class="mono t13 ink" text-anchor="middle">0</text>
+<text x="521.0" y="266.5" class="mono t13 ink" text-anchor="middle">2</text>
+<text x="547.0" y="266.5" class="mono t13 ink" text-anchor="middle">5</text>
+<text x="573.0" y="266.5" class="mono t13 ink" text-anchor="middle">7</text>
+<text x="628" y="267" class="mono t12 muted">crd</text>
+<rect x="662.5" y="250.5" width="181" height="23" rx="3" fill="#FFFFFF" stroke="#D1D9E0" stroke-width="1"/>
+<line x1="688.5" y1="251" x2="688.5" y2="273" stroke="#D1D9E0" stroke-width="1"/>
+<line x1="714.5" y1="251" x2="714.5" y2="273" stroke="#D1D9E0" stroke-width="1"/>
+<line x1="740.5" y1="251" x2="740.5" y2="273" stroke="#D1D9E0" stroke-width="1"/>
+<line x1="766.5" y1="251" x2="766.5" y2="273" stroke="#D1D9E0" stroke-width="1"/>
+<line x1="792.5" y1="251" x2="792.5" y2="273" stroke="#D1D9E0" stroke-width="1"/>
+<line x1="818.5" y1="251" x2="818.5" y2="273" stroke="#D1D9E0" stroke-width="1"/>
+<text x="675.0" y="266.5" class="mono t13 ink" text-anchor="middle">0</text>
+<text x="701.0" y="266.5" class="mono t13 ink" text-anchor="middle">3</text>
+<text x="727.0" y="266.5" class="mono t13 ink" text-anchor="middle">1</text>
+<text x="753.0" y="266.5" class="mono t13 ink" text-anchor="middle">2</text>
+<text x="779.0" y="266.5" class="mono t13 ink" text-anchor="middle">5</text>
+<text x="805.0" y="266.5" class="mono t13 ink" text-anchor="middle">0</text>
+<text x="831.0" y="266.5" class="mono t13 ink" text-anchor="middle">4</text>
+<text x="298" y="305" class="sans t13 ink">Values</text>
+<text x="628" y="305" class="mono t12 muted">vals</text>
+<rect x="662" y="288" width="182" height="24" rx="3" fill="url(#ember)"/>
+<line x1="688" y1="292" x2="688" y2="308" stroke="#FFFFFF" stroke-opacity="0.45" stroke-width="1"/>
+<line x1="714" y1="292" x2="714" y2="308" stroke="#FFFFFF" stroke-opacity="0.45" stroke-width="1"/>
+<line x1="740" y1="292" x2="740" y2="308" stroke="#FFFFFF" stroke-opacity="0.45" stroke-width="1"/>
+<line x1="766" y1="292" x2="766" y2="308" stroke="#FFFFFF" stroke-opacity="0.45" stroke-width="1"/>
+<line x1="792" y1="292" x2="792" y2="308" stroke="#FFFFFF" stroke-opacity="0.45" stroke-width="1"/>
+<line x1="818" y1="292" x2="818" y2="308" stroke="#FFFFFF" stroke-opacity="0.45" stroke-width="1"/>
+<text x="675.0" y="304.5" class="mono t13 onfill b" text-anchor="middle">1</text>
+<text x="701.0" y="304.5" class="mono t13 onfill b" text-anchor="middle">2</text>
+<text x="727.0" y="304.5" class="mono t13 onfill b" text-anchor="middle">3</text>
+<text x="753.0" y="304.5" class="mono t13 onfill b" text-anchor="middle">4</text>
+<text x="779.0" y="304.5" class="mono t13 onfill b" text-anchor="middle">5</text>
+<text x="805.0" y="304.5" class="mono t13 onfill b" text-anchor="middle">6</text>
+<text x="831.0" y="304.5" class="mono t13 onfill b" text-anchor="middle">7</text>
+<line x1="298" y1="325.5" x2="864" y2="325.5" stroke="#D1D9E0" stroke-width="1"/>
+<text x="298" y="354" class="sans t15 ink">COO</text>
+<text x="340" y="354" class="mono t14 ember">"oo"</text>
+<text x="382" y="354" class="sans t13 muted">coordinate rows, coordinate columns</text>
+<text x="298" y="381" class="sans t13 ink">Level 1 · rows</text>
+<text x="298" y="396" class="sans t12 muted">coordinate</text>
+<text x="628" y="387" class="mono t12 muted">crd</text>
+<rect x="662.5" y="370.5" width="181" height="23" rx="3" fill="#FFFFFF" stroke="#D1D9E0" stroke-width="1"/>
+<line x1="688.5" y1="371" x2="688.5" y2="393" stroke="#D1D9E0" stroke-width="1"/>
+<line x1="714.5" y1="371" x2="714.5" y2="393" stroke="#D1D9E0" stroke-width="1"/>
+<line x1="740.5" y1="371" x2="740.5" y2="393" stroke="#D1D9E0" stroke-width="1"/>
+<line x1="766.5" y1="371" x2="766.5" y2="393" stroke="#D1D9E0" stroke-width="1"/>
+<line x1="792.5" y1="371" x2="792.5" y2="393" stroke="#D1D9E0" stroke-width="1"/>
+<line x1="818.5" y1="371" x2="818.5" y2="393" stroke="#D1D9E0" stroke-width="1"/>
+<text x="675.0" y="386.5" class="mono t13 ink" text-anchor="middle">0</text>
+<text x="701.0" y="386.5" class="mono t13 ink" text-anchor="middle">0</text>
+<text x="727.0" y="386.5" class="mono t13 ink" text-anchor="middle">2</text>
+<text x="753.0" y="386.5" class="mono t13 ink" text-anchor="middle">2</text>
+<text x="779.0" y="386.5" class="mono t13 ink" text-anchor="middle">2</text>
+<text x="805.0" y="386.5" class="mono t13 ink" text-anchor="middle">3</text>
+<text x="831.0" y="386.5" class="mono t13 ink" text-anchor="middle">3</text>
+<text x="298" y="419" class="sans t13 ink">Level 2 · columns</text>
+<text x="298" y="434" class="sans t12 muted">coordinate</text>
+<text x="628" y="425" class="mono t12 muted">crd</text>
+<rect x="662.5" y="408.5" width="181" height="23" rx="3" fill="#FFFFFF" stroke="#D1D9E0" stroke-width="1"/>
+<line x1="688.5" y1="409" x2="688.5" y2="431" stroke="#D1D9E0" stroke-width="1"/>
+<line x1="714.5" y1="409" x2="714.5" y2="431" stroke="#D1D9E0" stroke-width="1"/>
+<line x1="740.5" y1="409" x2="740.5" y2="431" stroke="#D1D9E0" stroke-width="1"/>
+<line x1="766.5" y1="409" x2="766.5" y2="431" stroke="#D1D9E0" stroke-width="1"/>
+<line x1="792.5" y1="409" x2="792.5" y2="431" stroke="#D1D9E0" stroke-width="1"/>
+<line x1="818.5" y1="409" x2="818.5" y2="431" stroke="#D1D9E0" stroke-width="1"/>
+<text x="675.0" y="424.5" class="mono t13 ink" text-anchor="middle">0</text>
+<text x="701.0" y="424.5" class="mono t13 ink" text-anchor="middle">3</text>
+<text x="727.0" y="424.5" class="mono t13 ink" text-anchor="middle">1</text>
+<text x="753.0" y="424.5" class="mono t13 ink" text-anchor="middle">2</text>
+<text x="779.0" y="424.5" class="mono t13 ink" text-anchor="middle">5</text>
+<text x="805.0" y="424.5" class="mono t13 ink" text-anchor="middle">0</text>
+<text x="831.0" y="424.5" class="mono t13 ink" text-anchor="middle">4</text>
+<text x="298" y="463" class="sans t13 ink">Values</text>
+<text x="628" y="463" class="mono t12 muted">vals</text>
+<rect x="662" y="446" width="182" height="24" rx="3" fill="url(#ember)"/>
+<line x1="688" y1="450" x2="688" y2="466" stroke="#FFFFFF" stroke-opacity="0.45" stroke-width="1"/>
+<line x1="714" y1="450" x2="714" y2="466" stroke="#FFFFFF" stroke-opacity="0.45" stroke-width="1"/>
+<line x1="740" y1="450" x2="740" y2="466" stroke="#FFFFFF" stroke-opacity="0.45" stroke-width="1"/>
+<line x1="766" y1="450" x2="766" y2="466" stroke="#FFFFFF" stroke-opacity="0.45" stroke-width="1"/>
+<line x1="792" y1="450" x2="792" y2="466" stroke="#FFFFFF" stroke-opacity="0.45" stroke-width="1"/>
+<line x1="818" y1="450" x2="818" y2="466" stroke="#FFFFFF" stroke-opacity="0.45" stroke-width="1"/>
+<text x="675.0" y="462.5" class="mono t13 onfill b" text-anchor="middle">1</text>
+<text x="701.0" y="462.5" class="mono t13 onfill b" text-anchor="middle">2</text>
+<text x="727.0" y="462.5" class="mono t13 onfill b" text-anchor="middle">3</text>
+<text x="753.0" y="462.5" class="mono t13 onfill b" text-anchor="middle">4</text>
+<text x="779.0" y="462.5" class="mono t13 onfill b" text-anchor="middle">5</text>
+<text x="805.0" y="462.5" class="mono t13 onfill b" text-anchor="middle">6</text>
+<text x="831.0" y="462.5" class="mono t13 onfill b" text-anchor="middle">7</text>
+</svg>

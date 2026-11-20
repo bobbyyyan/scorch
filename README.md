@@ -1,256 +1,332 @@
-<h1>
-  <picture>
-    <source media="(prefers-color-scheme: dark)" srcset="docs/source/_static/img/scorch-logo-dark.svg">
-    <img src="docs/source/_static/img/scorch-logo.svg" alt="Scorch" width="200">
-  </picture>
-</h1>
+<div align="center">
 
-**A CPU sparse-tensor compiler for PyTorch.**
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="docs/source/_static/img/scorch-logo-dark.svg">
+  <img alt="Scorch" src="docs/source/_static/img/scorch-logo.svg" height="72">
+</picture>
 
-[![License: MIT](https://img.shields.io/badge/license-MIT-blue?style=flat)](LICENSE)
-[![Python 3.9+](https://img.shields.io/badge/python-3.9%2B-blue?style=flat&logo=python&logoColor=white)](https://www.python.org/)
-[![PyTorch 2.0+](https://img.shields.io/badge/pytorch-2.0%2B-ee4c2c?style=flat&logo=pytorch&logoColor=white)](https://pytorch.org/)
-[![Paper](https://img.shields.io/badge/CGO%202026-paper-blueviolet?style=flat)](https://doi.org/10.1109/CGO68049.2026.11394842)
-[![Platform](https://img.shields.io/badge/platform-linux%20%7C%20macOS-blue?style=flat)](https://github.com/bobbyyyan/scorch)
+<h3>A sparse tensor compiler for PyTorch</h3>
 
-[Installation](#installation) · [Quickstart](#quickstart) ·
-[Formats](#format-system) · [Examples](#examples-and-documentation) ·
-[Paper](#citation)
+[![CGO 2026 paper](https://img.shields.io/badge/CGO%202026-paper-E8431F?style=flat)](https://doi.org/10.1109/CGO68049.2026.11394842)
+[![Python 3.9+](https://img.shields.io/badge/python-3.9%2B-3776AB?style=flat&logo=python&logoColor=white)](https://www.python.org/)
+[![PyTorch 2.6+](https://img.shields.io/badge/pytorch-2.6%2B-EE4C2C?style=flat&logo=pytorch&logoColor=white)](https://pytorch.org/)
+[![Linux | macOS](https://img.shields.io/badge/platform-linux%20%7C%20macOS-555?style=flat)](#installation)
+[![License: MIT](https://img.shields.io/badge/license-MIT-007EC6?style=flat)](LICENSE)
 
-Scorch lets you describe a tensor's physical layout, write familiar operations
-such as `matmul` or explicit `einsum`, and run specialized C++/OpenMP kernels.
-It interoperates with PyTorch tensors while making sparse storage formats a
-first-class part of compilation.
+[Installation](#installation) · [Quickstart](#quickstart) · [Formats](#storage-formats) ·
+[How it works](#how-scorch-compiles-an-operation) · [Performance](#performance) ·
+[Documentation](#documentation) · [Citation](#citation)
 
-Scorch is research software focused on sparse inference and compiler research.
+</div>
 
-## Why Scorch?
+Scorch generates, compiles and caches a C++ kernel for each sparse tensor
+operation and each combination of operand storage formats. It works on ordinary
+PyTorch tensors: under `import scorch as torch`, `torch.matmul` and `torch.einsum`
+run on Scorch, and every other name is PyTorch's own.
 
-- **Declarative formats.** Describe each tensor mode as dense, compressed, or
-  coordinate. CSR is `"ds"`, COO is `"oo"`, and supported layouts can be
-  composed without hand-writing an operation-specific kernel.
-- **A compiler, not only a kernel library.** Generic operations lower through
-  Compiler Index Notation (CIN), scheduling, LLIR, and C++ code generation.
-- **PyTorch interoperability.** Build an `STensor` from dense, COO, or CSR
-  `torch.Tensor` inputs and convert results back with `.to_torch()`.
-- **Fast common paths.** Frequently used sparse matrix operations dispatch to
-  prebuilt native kernels; other supported format and operation combinations
-  are JIT-compiled and cached.
+```python
+import scorch as torch                    # torch.matmul and torch.einsum now run on Scorch
 
-The [CGO 2026 paper](https://fredrikbk.com/publications/scorch.pdf) reports
-1.05–5.80× speedups over PyTorch Sparse on its evaluated end-to-end graph neural
-network, sparse autoencoder, and sparse transformer workloads. Performance is
-hardware- and workload-dependent.
+dense = torch.rand(4096, 4096)
+A = torch.where(dense < 0.01, dense, 0.0).to_sparse_csr()   # a PyTorch CSR tensor, 1% nonzero
+X = torch.rand(4096, 256)
+
+Y = torch.matmul(A, X)                    # Scorch's CSR × dense kernel; Y is a torch.Tensor
+```
+
+Storage formats are part of the program. Each mode of a tensor is dense,
+compressed or coordinate, and Scorch compiles a kernel for the combination it is
+given:
+
+```python
+import scorch
+
+A = scorch.from_torch(dense, "A").to_sparse("ss")    # DCSR: compressed rows and columns
+Y = scorch.einsum("ij,jk->ik", A, X, format="dd")    # first call compiles a DCSR × dense kernel
+```
+
+- **Formats.** One letter per mode: `"ds"` is CSR, `"ss"` is DCSR, `"oo"` is COO,
+  `"dd"` is dense. Operands of a call can have different formats.
+- **Compiler.** Generic operations are lowered from concrete index notation through
+  iteration lattices to C++ with OpenMP. Loop order, tiling and parallelization
+  are chosen automatically, as described in the
+  [CGO 2026 paper](#citation).
+- **Hand-written kernels** serve the common `matmul` cases (CSR × dense, CSR × vector,
+  CSR × CSR, COO × dense, COO × COO) without compiling anything.
+- **Autograd.** Gradients flow through `matmul` for sparse × dense products, to the
+  dense operand and to a sparse operand that requires grad.
+
+> [!NOTE]
+> Scorch is research software (version 0.0.1). Its kernels run on the CPU, on Linux
+> and macOS. See [Current scope](#current-scope).
 
 ## Installation
 
-Scorch requires Python 3.9 or newer (3.11 recommended), PyTorch, Ninja, a C++
-toolchain, and OpenMP. The supported installation path is currently from source.
-
-### First-time setup
-
-On macOS, install the OpenMP headers before running setup:
-
-```bash
-brew install libomp
-```
+Scorch builds from source. It needs Python 3.9 or newer (3.11 recommended), a C++
+compiler with C++17 support, OpenMP and Ninja; `setup.sh` installs PyTorch and the
+other Python dependencies.
 
 ```bash
 git clone https://github.com/bobbyyyan/scorch.git
 cd scorch
-./setup.sh
+./setup.sh                    # macOS: run `brew install libomp` first
+conda activate scorch         # or `source venv/bin/activate` when Conda is not installed
+python scripts/verify_quickstart.py
 ```
 
-When Conda is available, `setup.sh` creates a fresh Python 3.11 environment
-named `scorch` (after backing up an existing environment with that name). It
-otherwise creates `venv/`. Activate the environment with the command printed by
-the script:
+`setup.sh` creates a Python 3.11 Conda environment named `scorch` (it first backs up
+an existing environment of that name) or, without Conda, a `venv/` directory. It
+then builds the native `scorch_ops` extension with an editable install.
 
-```bash
-conda activate scorch
-# Without Conda: source venv/bin/activate
-```
-
-### Rebuild in an existing environment
+<details>
+<summary>Rebuild in an existing environment</summary>
 
 ```bash
 python -m pip install -r requirements.txt
 python -m pip install -e . --no-build-isolation
 ```
 
-The editable install builds the native `scorch_ops` extension. Re-run the second
-command after changing code under `src/scorch/csrc/`.
+`--no-build-isolation` is required because the build imports `torch`. Rerun the
+second command after editing anything under `src/scorch/csrc/`. The
+[installation guide](docs/source/getting_started/installation.md) covers platform
+details and troubleshooting.
 
-Verify the installation with:
-
-```bash
-python scripts/verify_quickstart.py
-```
-
-The first verification run may compile kernels and take longer than later runs.
-
-See the [installation guide](docs/source/getting_started/installation.md) for
-platform details and troubleshooting.
+</details>
 
 ## Quickstart
 
-This example stores `A` in CSR, multiplies it by a dense PyTorch tensor, and
-checks both `matmul` and `einsum` against PyTorch:
+### Run existing PyTorch code on Scorch
+
+`import scorch as torch` replaces two functions, `torch.matmul` and `torch.einsum`,
+with Scorch's. Every other attribute is read from PyTorch, so the rest of the
+program is unchanged. Operands stay `torch.Tensor`s, sparse or dense, and a dense
+result comes back as a `torch.Tensor`.
+
+```python
+import scorch as torch
+
+dense = torch.rand(4096, 4096)
+A = torch.where(dense < 0.01, dense, 0.0).to_sparse_csr()
+X = torch.rand(4096, 256)
+
+Y = torch.matmul(A, X)                    # SpMM on Scorch
+y = torch.matmul(A, X[:, 0])              # SpMV
+C = torch.matmul(A, A)                    # SpGEMM, returns a sparse CSR tensor
+```
+
+`torch.mm`, `torch.sparse.mm` and the `@` operator are not replaced; they run
+PyTorch's own kernels.
+
+### Choose a storage format
+
+`scorch.from_torch` wraps a tensor as an `STensor`, Scorch's tensor type, and
+`to_sparse` converts it to a format. `einsum` takes any supported combination of
+formats and an explicit output format:
 
 ```python
 import torch
 import scorch
 
-A_dense = torch.tensor(
-    [
-        [1.0, 0.0, 2.0],
-        [0.0, 3.0, 0.0],
-        [4.0, 0.0, 5.0],
-    ]
-)
-B = torch.tensor(
-    [
-        [1.0, 2.0],
-        [3.0, 4.0],
-        [5.0, 6.0],
-    ]
-)
+dense = torch.where(torch.rand(4096, 4096) < 0.01, torch.rand(4096, 4096), 0.0)
+X = torch.rand(4096, 256)
 
-# from_torch preserves the source layout; choose CSR explicitly.
-A = scorch.from_torch(A_dense, "A").to_sparse("ds")
+A = scorch.from_torch(dense, "A").to_sparse("ss")    # DCSR
+print(A.format)                                       # s,s
 
-# CSR × dense returns a dense torch.Tensor.
-C = scorch.matmul(A, B)
-expected = A_dense @ B
-assert torch.allclose(C, expected, atol=1e-3, rtol=1e-3)
-
-# einsum requires an explicit output and returns an STensor.
-D = scorch.einsum("ij,jk->ik", A, B, format="dd")
-assert torch.allclose(D.to_torch(), expected, atol=1e-3, rtol=1e-3)
-
-print(C)
-print(D.to_torch())
+Y = scorch.einsum("ij,jk->ik", A, X, format="dd")    # STensor with format d,d
+assert torch.allclose(Y.to_torch(), dense @ X, atol=1e-3, rtol=1e-3)
 ```
 
-```text
-tensor([[11., 14.],
-        [ 9., 12.],
-        [29., 38.]])
-tensor([[11., 14.],
-        [ 9., 12.],
-        [29., 38.]])
+The first call compiles the kernel. On an Apple M5 Max this script compiled two
+kernels (the conversion to DCSR and the product) in 21 s with an empty cache; run
+again, it took 1.0 s in total, because both kernels load from the on-disk cache.
+
+### Train through a sparse product
+
+```python
+import scorch as torch
+
+A = torch.where(torch.rand(4096, 4096) < 0.01, torch.rand(4096, 4096), 0.0).to_sparse_csr()
+X = torch.rand(4096, 256, requires_grad=True)
+
+loss = torch.matmul(A, X).square().sum()
+loss.backward()                           # X.grad = 2 Aᵀ(A X), computed with Scorch's kernels
 ```
 
-Generic format/operation combinations compile on first use and reuse the cached
-shared library afterward. Common `matmul` combinations may use a prebuilt kernel
-instead, so not every first call incurs JIT compilation.
+## Storage formats
 
-## Format system
+A format gives one level type per tensor mode, outermost first. A dense level
+stores nothing but its size. A compressed level stores, for each position of the
+level above it, the range of its children (`pos`) and their coordinates (`crd`). A
+coordinate level stores one coordinate per stored entry. The figure shows one
+matrix stored three ways; the arrays are the ones Scorch builds for it.
 
-A format has one level per tensor dimension, written from the outermost mode to
-the innermost. Compact strings are accepted when constructing or converting an
-`STensor`:
+<p align="center">
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="docs/assets/readme/formats-dark.svg">
+  <img alt="A 4 × 6 matrix with 7 nonzeros and an empty row, stored as CSR, DCSR and COO, with the pos, crd and value arrays of each level" src="docs/assets/readme/formats-light.svg" width="880">
+</picture>
+</p>
 
-| Notation | Kind | Meaning |
-|:--:|---|---|
-| `d` | Level | Dense: iterate the full dimension. |
-| `s` or `c` | Level | Compressed: store positions and coordinates. |
-| `o` | Level | Coordinate: store explicit coordinates. |
-| `"dd"` | Matrix | Fully dense. |
-| `"ds"` | Matrix | CSR: dense rows, compressed columns. |
-| `"oo"` | Matrix | COO: coordinate rows and columns. |
-| `"ss"` | Matrix | Doubly compressed. |
+| String | Level types | Common name |
+|---|---|---|
+| `"dd"` | dense, dense | dense matrix |
+| `"ds"` | dense, compressed | CSR |
+| `"ss"` | compressed, compressed | DCSR (doubly compressed) |
+| `"oo"` | coordinate, coordinate | COO |
 
-For example, `to_sparse("ds")` converts a matrix to CSR and `str(A.format)`
-prints `d,s`. The `singleton` level exists in the type system but is reserved
-and is not currently supported by the runtime or code generator.
+`s` and `c` are synonyms for compressed. A format can also be given as a list
+(`["d", "s"]`) or a `scorch.TensorFormat`. `A.change_mode_order([1, 0])` stores a
+CSR matrix by columns instead, which is CSC. The
+[format guide](docs/source/user_guide/format_system.md)
+covers constructors, conversion and mode orders. The `singleton` level type is
+parsed but reserved: generated kernels support dense, compressed and coordinate
+levels.
 
-Read the [format-system guide](docs/source/user_guide/format_system.md) for
-constructors, aliases, mode ordering, and storage details.
+## How Scorch compiles an operation
 
-## Execution model
+<p align="center">
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="docs/assets/readme/pipeline-dark.svg">
+  <img alt="Scorch's pipeline: a call is dispatched to PyTorch, to a hand-written kernel, or to the compiler, which goes through concrete index notation, scheduling, lowering with iteration lattices, C++ code generation, and a JIT compile whose result is cached" src="docs/assets/readme/pipeline-light.svg" width="880">
+</picture>
+</p>
 
-Scorch uses a hybrid runtime:
+1. **Dispatch.** A product of two dense tensors goes to `torch.matmul`. A `matmul`
+   whose formats and dtype match a hand-written kernel in the `scorch_ops` extension
+   runs that kernel. Everything else goes to the compiler.
+2. **Concrete index notation.** The operation becomes a statement of `forall` loops,
+   `where` statements and workspaces
+   ([Kjolstad et al., CGO 2019](https://doi.org/10.1109/CGO.2019.8661185)).
+3. **Scheduling.** Loop order, tiling, parallelization, vectorization and the output
+   format are chosen by the heuristics in the CGO 2026 paper, which take
+   milliseconds instead of a search over schedules.
+4. **Lowering.** Iteration lattices
+   ([Kjolstad et al., OOPSLA 2017](https://doi.org/10.1145/3133901)) merge the
+   coordinates of the sparse operands into loops and conditionals.
+5. **Code generation and caching.** The loops are emitted as C++ with OpenMP,
+   compiled with `-O3 -march=native -ffast-math -funroll-loops -fopenmp`, and loaded
+   as a shared library. The library is cached in memory and on disk (under
+   `TORCH_EXTENSIONS_DIR`), so a later call with the same formats, including one in a
+   new process, does not compile again.
 
-1. Dense-only `matmul` delegates to PyTorch.
-2. Common sparse `matmul` layouts use prebuilt kernels from `scorch_ops`.
-3. Generic supported expressions follow the compiler pipeline:
+This is the loop nest Scorch generated for the DCSR × dense product in the
+quickstart (the branch for more than 8 columns, with the generated comments
+removed):
 
-   ```text
-   torch.Tensor → STensor + format → CIN → scheduling → LLIR
-                → C++/OpenMP → JIT-compiled shared library
-   ```
+```cpp
+#pragma omp parallel for num_threads(scorch_nthreads(-1, pA0_end)) schedule(dynamic, scorch_chunk(pA0_end, -1))
+for (int pA0 = A0_pos[0]; pA0 < pA0_end; pA0++) {
+  int i = A0_crd[pA0];
+  int pC0 = i;
+  int pA1_end = A1_pos[pA0 + 1];
+  for (int pA1 = A1_pos[pA0]; pA1 < pA1_end; pA1++) {
+    if (pA1 + 1 < pA1_end) __builtin_prefetch(&B_val[A1_crd[pA1 + 1] * B1_size], 0, 1);
+    int j = A1_crd[pA1];
+    int pB0 = j;
+    const float* __restrict__ _B_val_ptr = &B_val[pB0 * B1_size];
+    for (int64_t k = 0; k < B1_size; k++) {
+      int pC1 = pC0 * C1_size + k;
+      C_values[pC1] += A_val[pA1] * _B_val_ptr[k];
+    }
+  }
+}
+```
 
-Generated kernels are cached in memory and on disk. Reuse the same formats when
-benchmarking, and time warmed calls rather than compilation.
+The outer loop visits only the stored rows of `A` (its first level is compressed),
+so empty rows cost nothing. For 8 or fewer columns the same kernel takes a second
+loop nest that strip-mines `k` by 8 and accumulates each strip in a workspace held
+in registers. The [compiler guide](docs/source/compiler/index.md) describes each
+stage in detail.
 
-The main public operations include:
+## Operations
 
-- `scorch.matmul` for sparse matrix-vector, sparse matrix-dense matrix, and
-  sparse matrix-sparse matrix products;
-- `scorch.einsum` for supported explicit-output contractions, elementwise
-  expressions, and SDDMM;
-- `scorch.sparse_linear`, `scorch.sparse_attention`, and related fused inference
-  helpers; and
-- `scorch.autotune` / `scorch.set_autotune` for selecting CSR × dense SpMM
-  kernel and tiling variants.
+| Call | Computes | Notes |
+|---|---|---|
+| `scorch.matmul(a, b)` | SpMV, SpMM, SpGEMM, batched products | `torch.matmul` under the drop-in import. Returns a `torch.Tensor` for a dense result. |
+| `scorch.einsum(expr, *operands, format=…)` | Contractions, elementwise products, SDDMM (`"ij,ik,kj->ij"`) | `torch.einsum` under the drop-in import. Needs an explicit output (`->`); returns an `STensor`. |
+| `scorch.sparse_linear(x, weight, bias, activation)` | `F.linear` with a sparse weight | Bias and activation fused into the product. |
+| `scorch.sparse_attention(crow, col, Q, K, V, scale)` | Multi-head attention masked by a CSR pattern | Fused; the mask is shared by all heads. |
+| `scorch.sparse_softmax_csr(crow, values, scale)` | Row-wise softmax over the nonzeros of a CSR matrix | |
+| `@scorch.compile` | Traces a function with `torch.fx` | Fuses a contraction with the elementwise operations after it. |
+| `scorch.set_autotune(level)`, `scorch.autotune(level)` | Tiling selection for CSR × dense SpMM | Levels `off`, `analytic` (default), `balanced`, `max`, `learned`. |
+| `scorch.set_num_threads(n)` | Thread count | Applies to PyTorch and to every Scorch kernel. |
+
+The [API reference](docs/source/api/index.md) lists every public name.
+
+## Performance
+
+The [CGO 2026 paper](#citation) reports 1.05–5.80× speedups over PyTorch Sparse on
+end-to-end graph neural network, sparse autoencoder and sparse transformer
+workloads, measured on an Intel Core i9-14900K and an Apple M1 Ultra with the
+paper's version of Scorch.
+
+## Examples
+
+| Example | Contents |
+|---|---|
+| [Kernels](examples/kernels/README.md) | SpMV, SpMM, SpGEMM and SDDMM on SuiteSparse matrices |
+| [Graph convolutional network](examples/gcn/README.md) | GCN training and inference on Cora, Citeseer, PubMed and ogbn-arxiv, with PyTorch, PyG and DGL versions for comparison |
+| [Sparse autoencoder](examples/sparse_autoencoder/README.md) | Autoencoders with sparse weights on MNIST, CIFAR-10, CIFAR-100 and CelebA |
+| [Sparse transformer](examples/sparse_transformer/README.md) | BigBird-style sparse attention on IMDB, AG News and Yahoo Answers |
+
+The benchmark harnesses for these workloads are in [`bench/`](bench);
+[Benchmarks](docs/source/performance/benchmarks.md) lists them.
 
 ## Current scope
 
-- Scorch tensors and generated kernels are CPU-only.
-- Scorch targets inference; `STensor` does not participate in autograd.
-- `STensor` does not implement the `@` operator. Use `scorch.matmul(A, B)`.
-- `scorch.einsum` requires an explicit output, such as `"ij,jk->ik"`.
-- Linux and macOS are supported; Windows is not currently supported.
+- Kernels run on the CPU: x86-64 and ARM64, Linux and macOS. Windows is not supported.
+- `import scorch as torch` replaces `torch.matmul` and `torch.einsum` only.
+  `torch.mm`, `torch.sparse.mm` and the `@` operator run PyTorch's kernels.
+- `STensor` defines no `@` operator; call `scorch.matmul`.
+- `einsum` needs an explicit output, as in `"ij,jk->ik"`.
+- The first call for a new combination of operation, formats and dtype compiles
+  C++, which takes several seconds. `scorch.precompile_kernels()` compiles the common
+  SpMM and SpGEMM kernels ahead of time.
+- The API can change between releases.
 
-## Examples and documentation
+## Documentation
 
-Runnable examples live in:
-
-| Example | What it covers |
-|---|---|
-| [Standard kernels](examples/kernels/README.md) | SpMV, SpMM, SpGEMM, and SDDMM. |
-| [Graph convolutional networks](examples/gcn/README.md) | GCN inference across several graph datasets. |
-| [Sparse autoencoder](examples/sparse_autoencoder/README.md) | Sparse-weight autoencoder inference. |
-| [Sparse transformer](examples/sparse_transformer/README.md) | Sparse attention workloads. |
-
-The documentation source provides deeper guides:
-
-- [Getting started](docs/source/getting_started/index.md)
-- [User guide](docs/source/user_guide/index.md)
-- [Compiler internals](docs/source/compiler/index.md)
+- [Getting started](docs/source/getting_started/index.md): installation, quickstart, key concepts
+- [User guide](docs/source/user_guide/index.md): sparse tensors, formats, operations, neural-network layers, `scorch.compile`, autotuning
+- [Compiler](docs/source/compiler/index.md): concrete index notation, lowering, workspaces, code generation
+- [Performance](docs/source/performance/index.md): benchmarks and tuning
 - [API reference](docs/source/api/index.md)
-- [Performance and tuning](docs/source/performance/index.md)
 
 ## Development
 
-After activating the Scorch environment:
-
 ```bash
-# Full test suite
-pytest tests
-
-# Focused test file
-pytest tests/test_scorch/test_tensor.py -q
-
-# Formatting, type checking, and linting
-bash pre-commit.sh
+conda activate scorch
+pytest tests                      # full suite; compiles kernels on first use
+pytest -m "not perf"              # skip the performance tests
+bash pre-commit.sh                # black, mypy, flake8
 ```
 
-Tests may JIT-compile kernels on first execution. Add regression tests beside the
-affected subsystem and compare numerical results against PyTorch with explicit
-tolerances.
+Tests compare every result with a PyTorch reference (`atol = rtol = 1e-3`). Kernels
+are cached, so after changing code generation, point `TORCH_EXTENSIONS_DIR` at an
+empty directory (the test suite does this) to make sure the change is compiled.
 
 ## Citation
 
-If you use Scorch in academic work, please cite:
+If you use Scorch in your research, please cite the CGO 2026 paper:
 
 > Bobby Yan, Alexander J. Root, Trevor Gale, David Broman, and Fredrik Kjolstad.
-> “Fast Autoscheduling for Sparse ML Frameworks.” 2026 IEEE/ACM International
-> Symposium on Code Generation and Optimization (CGO), pp. 28–43, 2026.
+> Fast Autoscheduling for Sparse ML Frameworks. In *2026 IEEE/ACM International
+> Symposium on Code Generation and Optimization (CGO)*, pages 28–43, 2026.
 > [DOI](https://doi.org/10.1109/CGO68049.2026.11394842) ·
 > [PDF](https://fredrikbk.com/publications/scorch.pdf)
 
+```bibtex
+@inproceedings{yan2026fast,
+  author    = {Yan, Bobby and Root, Alexander J. and Gale, Trevor and Broman, David and Kjolstad, Fredrik},
+  title     = {Fast Autoscheduling for Sparse {ML} Frameworks},
+  booktitle = {2026 IEEE/ACM International Symposium on Code Generation and Optimization (CGO)},
+  pages     = {28--43},
+  year      = {2026},
+  doi       = {10.1109/CGO68049.2026.11394842}
+}
+```
+
 ## License
 
-Scorch is available under the [MIT License](LICENSE).
+Scorch is released under the [MIT License](LICENSE).
