@@ -4,17 +4,20 @@ Scorch accompanies the paper presented at **CGO 2026** (the International
 Symposium on Code Generation and Optimization). If you use Scorch in academic
 work, please cite it.
 
-The authoritative citation — with the final author list, page numbers, and DOI —
-is on the [paper page](https://ieeexplore.ieee.org/abstract/document/11394842). A template BibTeX
-entry:
+> Bobby Yan, Alexander J. Root, Trevor Gale, David Broman, and Fredrik Kjolstad.
+> Fast Autoscheduling for Sparse ML Frameworks. In *2026 IEEE/ACM International
+> Symposium on Code Generation and Optimization (CGO)*, pages 28–43, 2026.
+> [DOI](https://doi.org/10.1109/CGO68049.2026.11394842) ·
+> [PDF](https://fredrikbk.com/publications/scorch.pdf)
 
 ```bibtex
-@inproceedings{scorch-cgo26,
-  title     = {Scorch: A Compiler for Sparse Tensor Computation in PyTorch},
-  booktitle = {Proceedings of the 2026 IEEE/ACM International Symposium on
-               Code Generation and Optimization (CGO)},
+@inproceedings{yan2026fast,
+  author    = {Yan, Bobby and Root, Alexander J. and Gale, Trevor and Broman, David and Kjolstad, Fredrik},
+  title     = {Fast Autoscheduling for Sparse {ML} Frameworks},
+  booktitle = {2026 IEEE/ACM International Symposium on Code Generation and Optimization (CGO)},
+  pages     = {28--43},
   year      = {2026},
-  note      = {See https://ieeexplore.ieee.org/abstract/document/11394842 for the canonical entry},
+  doi       = {10.1109/CGO68049.2026.11394842}
 }
 ```
 
@@ -31,7 +34,8 @@ To cite the software implementation specifically:
 
 ```{admonition} Reported results
 :class: tip
-The paper reports **1.05–5.80× speedups over PyTorch Sparse** across sparse-matrix
-and graph-neural-network workloads. When quoting Scorch's performance, cite that
-range and the paper; per-machine benchmark numbers vary with hardware.
+The paper reports 1.05–5.80× speedups over PyTorch Sparse on end-to-end graph
+neural network, sparse autoencoder and sparse transformer workloads. When quoting
+Scorch's performance, cite that range and the paper; per-machine benchmark numbers
+vary with hardware.
 ```
